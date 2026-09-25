@@ -1,0 +1,570 @@
+//! What the files layout knows of each indexed file since indexing: fresh,
+//! stale (scanned in full) or gone (excluded).
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+
+use crate::Stamp;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+
+/// Per-doc mtimes of a files-layout index, at the index root.
+pub const DOCS_STAMPS: &str = "docs.stamps";
+
+/// Write `docs.stamps`: one little-endian i64 mtime (ns) per doc, no header.
+pub fn write_stamps(output: &Path, mtimes: &[i64]) -> Result<(), String> {
+    let path = output.join(DOCS_STAMPS);
+    let failed = |e: std::io::Error| format!("error: cannot write {}: {e}", path.display());
+    let file = std::fs::File::create(&path).map_err(failed)?;
+    let mut out = std::io::BufWriter::new(file);
+    for m in mtimes {
+        out.write_all(&m.to_le_bytes()).map_err(failed)?;
+    }
+    out.flush().map_err(failed)
+}
+
+/// The mapped `docs.stamps`.
+pub struct Stamps {
+    map: memmap2::Mmap,
+}
+
+impl Stamps {
+    /// Map `docs.stamps` under `index_dir`; a size other than 8 bytes per doc
+    /// is refused.
+    pub fn open(index_dir: &Path, num_docs: usize) -> Result<Self, String> {
+        let path = index_dir.join(DOCS_STAMPS);
+        let failed = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
+        let file = std::fs::File::open(&path).map_err(failed)?;
+        // Safety: the index is read-only while loaded, as `blobs.shard` is.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(failed)?;
+        if map.len() as u64 != num_docs as u64 * 8 {
+            return Err(format!(
+                "error: {} holds {} byte(s), want {} for {num_docs} doc(s); refusing a tampered index",
+                path.display(),
+                map.len(),
+                num_docs as u64 * 8
+            ));
+        }
+        Ok(Self { map })
+    }
+
+    pub fn get(&self, doc: usize) -> i64 {
+        let at = doc * 8;
+        let bytes: [u8; 8] = self.map[at..at + 8].try_into().expect("8-byte slot");
+        i64::from_le_bytes(bytes)
+    }
+}
+
+/// Per-doc states, plus [`WARNED`] once a doc's exclusion was reported.
+const FRESH: u8 = 0;
+const STALE: u8 = 1;
+const GONE: u8 = 2;
+const KIND: u8 = 3;
+const WARNED: u8 = 4;
+
+/// Docs above this are statted on several threads.
+const PARALLEL_STAT_MIN: usize = 64;
+const STAT_THREADS: usize = 16;
+/// How long the watcher waits for a burst of events to end.
+const WATCH_SETTLE: Duration = Duration::from_millis(20);
+/// How often an idle watcher checks its stop flag.
+const WATCH_TICK: Duration = Duration::from_millis(50);
+
+/// What stats and reads learned about each doc.
+struct Known {
+    root: PathBuf,
+    stamps: Stamps,
+    state: Vec<AtomicU8>,
+    /// Docs not [`FRESH`].
+    changed: AtomicUsize,
+    /// Bumped on every change of kind.
+    epoch: AtomicUsize,
+}
+
+impl Known {
+    fn kind(&self, id: usize) -> u8 {
+        self.state[id].load(Ordering::Acquire) & KIND
+    }
+
+    fn set(&self, id: usize, kind: u8) {
+        let old = self.state[id]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                Some(s & WARNED | kind)
+            })
+            .expect("the update always applies");
+        // `changed` moves before `epoch`: a reader that sees the new epoch
+        // sees the new count.
+        match (old & KIND == FRESH, kind == FRESH) {
+            (true, false) => {
+                self.changed.fetch_add(1, Ordering::AcqRel);
+            }
+            (false, true) => {
+                self.changed.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        if old & KIND != kind {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Mark `id` gone; the first exclusion of a doc per process warns.
+    fn exclude(&self, id: usize, path: &Path, why: &str) {
+        self.set(id, GONE);
+        if self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0 {
+            eprintln!("warning: excluding {}: {why}", path.display());
+        }
+    }
+
+    /// Stat `id` against its stamp: why it is gone, if it is.
+    fn stat(&self, id: usize, files: &[String], lens: &[u64]) -> Option<String> {
+        let want = Stamp {
+            len: lens[id],
+            mtime_ns: self.stamps.get(id),
+        };
+        match std::fs::metadata(self.root.join(&files[id])) {
+            Ok(meta) => {
+                self.set(
+                    id,
+                    if Stamp::of(&meta) == want {
+                        FRESH
+                    } else {
+                        STALE
+                    },
+                );
+                None
+            }
+            Err(e) => {
+                self.set(id, GONE);
+                Some(match e.kind() {
+                    std::io::ErrorKind::NotFound => "is missing".to_string(),
+                    _ => format!("cannot stat ({e})"),
+                })
+            }
+        }
+    }
+
+    /// Stat `ids` (ascending) on up to `threads` threads, then warn about the
+    /// gone ones in order.
+    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64], threads: usize) {
+        let stat = |part: &[usize]| -> Vec<(usize, String)> {
+            part.iter()
+                .filter_map(|&id| self.stat(id, files, lens).map(|why| (id, why)))
+                .collect()
+        };
+        let gone = if ids.len() <= PARALLEL_STAT_MIN || threads <= 1 {
+            stat(ids)
+        } else {
+            let chunk = ids.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = ids
+                    .chunks(chunk)
+                    .map(|part| scope.spawn(move || stat(part)))
+                    .collect();
+                workers
+                    .into_iter()
+                    .flat_map(|w| w.join().expect("stat worker panicked"))
+                    .collect()
+            })
+        };
+        for (id, why) in gone {
+            self.exclude(id, &self.root.join(&files[id]), &why);
+        }
+    }
+
+    fn stat_all(&self, files: &[String], lens: &[u64]) {
+        let ids: Vec<usize> = (0..self.state.len()).collect();
+        self.stat_ids(&ids, files, lens, STAT_THREADS);
+    }
+}
+
+/// The files source: root plus the recorded stamps, and what is known of
+/// each doc since.
+pub struct Files {
+    known: Arc<Known>,
+}
+
+impl Files {
+    /// Checks the root only; no doc is statted here.
+    pub fn open(root: PathBuf, stamps: Stamps, num_docs: usize) -> Result<Self, String> {
+        if !root.is_dir() {
+            return Err(format!(
+                "error: corpus root {} is not a directory; move the tree back or re-run `fmgrep index`",
+                root.display()
+            ));
+        }
+        Ok(Self {
+            known: Arc::new(Known {
+                root,
+                stamps,
+                state: (0..num_docs).map(|_| AtomicU8::new(FRESH)).collect(),
+                changed: AtomicUsize::new(0),
+                epoch: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// Stat every doc; each newly gone one warns, in doc order.
+    pub fn stat_all(&self, files: &[String], lens: &[u64]) {
+        self.known.stat_all(files, lens);
+    }
+
+    /// Whether any doc is stale or gone.
+    pub fn changed(&self) -> bool {
+        self.known.changed.load(Ordering::Acquire) > 0
+    }
+
+    /// A count that moves whenever a doc changes kind.
+    pub fn epoch(&self) -> usize {
+        self.known.epoch.load(Ordering::Acquire)
+    }
+
+    /// The stale and the gone docs, each ascending.
+    pub fn snapshot(&self) -> (Vec<usize>, Vec<usize>) {
+        let (mut stale, mut gone) = (Vec::new(), Vec::new());
+        if self.changed() {
+            for id in 0..self.known.state.len() {
+                match self.known.kind(id) {
+                    STALE => stale.push(id),
+                    GONE => gone.push(id),
+                    _ => {}
+                }
+            }
+        }
+        (stale, gone)
+    }
+
+    /// Doc `doc`'s current bytes: `buf` (its recorded length) filled while
+    /// the stamp holds, else the whole file, and the doc turns stale. A file
+    /// that cannot be read or now looks binary is excluded: `None`.
+    pub fn read(&self, doc: usize, rel: &str, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let known = &*self.known;
+        let path = known.root.join(rel);
+        let failed = |e: std::io::Error| {
+            known.exclude(doc, &path, &format!("cannot read ({e})"));
+            None
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => return failed(e),
+        };
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => return failed(e),
+        };
+        let want = Stamp {
+            len: buf.len() as u64,
+            mtime_ns: known.stamps.get(doc),
+        };
+        if Stamp::of(&meta) == want {
+            return match file.read_exact(&mut buf) {
+                Ok(()) => Some(buf),
+                Err(e) => failed(e),
+            };
+        }
+        known.set(doc, STALE);
+        let mut whole = Vec::with_capacity(meta.len().try_into().unwrap_or(0));
+        if let Err(e) = file.read_to_end(&mut whole) {
+            return failed(e);
+        }
+        if crate::is_binary_doc(&whole) {
+            known.exclude(doc, &path, "looks binary");
+            return None;
+        }
+        Some(whole)
+    }
+
+    /// Watch the root, recursively; events queue until [`Watch::run`].
+    pub fn watch(&self) -> Result<Watch, String> {
+        let failed =
+            |e: &dyn std::fmt::Display| format!("cannot watch {}: {e}", self.known.root.display());
+        let root = self.known.root.canonicalize().map_err(|e| failed(&e))?;
+        let (tx, events) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        })
+        .map_err(|e| failed(&e))?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|e| failed(&e))?;
+        Ok(Watch {
+            known: Arc::clone(&self.known),
+            root,
+            events,
+            _watcher: watcher,
+        })
+    }
+}
+
+/// Filesystem events on the corpus root, re-statting the docs they name.
+pub struct Watch {
+    known: Arc<Known>,
+    /// Canonical, as events name paths.
+    root: PathBuf,
+    events: mpsc::Receiver<notify::Result<Event>>,
+    _watcher: RecommendedWatcher,
+}
+
+impl Watch {
+    /// Re-stat the docs each burst of events names until `stop`; a watcher
+    /// error or overflow re-stats every doc.
+    pub fn run(self, files: &[String], lens: &[u64], stop: &AtomicBool) {
+        let mut by_path: Vec<usize> = (0..files.len()).collect();
+        by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
+        while !stop.load(Ordering::Relaxed) {
+            let first = match self.events.recv_timeout(WATCH_TICK) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            std::thread::sleep(WATCH_SETTLE);
+            let mut all = false;
+            let mut ids = Vec::new();
+            for event in std::iter::once(first).chain(self.events.try_iter()) {
+                match event {
+                    Ok(e) if e.need_rescan() => all = true,
+                    Ok(e) if matches!(e.kind, EventKind::Access(_)) => {}
+                    Ok(e) => {
+                        for path in &e.paths {
+                            all |= self.docs_at(path, files, &by_path, &mut ids);
+                        }
+                    }
+                    Err(_) => all = true,
+                }
+            }
+            if all {
+                self.known.stat_all(files, lens);
+            } else {
+                ids.sort_unstable();
+                ids.dedup();
+                self.known.stat_ids(&ids, files, lens, STAT_THREADS);
+            }
+        }
+    }
+
+    /// Push the docs at or under `path`; true when `path` holds the root.
+    fn docs_at(
+        &self,
+        path: &Path,
+        files: &[String],
+        by_path: &[usize],
+        ids: &mut Vec<usize>,
+    ) -> bool {
+        if self.root.starts_with(path) {
+            return true;
+        }
+        let Some(rel) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) else {
+            return false;
+        };
+        let at = by_path.partition_point(|&id| files[id].as_str() < rel);
+        if by_path.get(at).is_some_and(|&id| files[id] == rel) {
+            ids.push(by_path[at]);
+        }
+        let dir = format!("{rel}/");
+        let lo = by_path.partition_point(|&id| files[id].as_str() < dir.as_str());
+        ids.extend(
+            by_path[lo..]
+                .iter()
+                .take_while(|&&id| files[id].starts_with(&dir)),
+        );
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamps_round_trip_and_size_skew_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_stamps(tmp.path(), &[1, -2, i64::MAX]).unwrap();
+        let stamps = Stamps::open(tmp.path(), 3).unwrap();
+        assert_eq!(
+            [stamps.get(0), stamps.get(1), stamps.get(2)],
+            [1, -2, i64::MAX]
+        );
+        let Err(err) = Stamps::open(tmp.path(), 2) else {
+            panic!("a skewed docs.stamps must be refused");
+        };
+        assert!(
+            err.contains(DOCS_STAMPS) && err.contains("tampered"),
+            "got: {err}"
+        );
+    }
+
+    /// One file per doc under `<dir>/corpus`, stamped into `<dir>`.
+    struct Fix {
+        path: PathBuf,
+        index: PathBuf,
+        files: Vec<String>,
+        lens: Vec<u64>,
+    }
+
+    fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
+        let path = dir.join("corpus");
+        std::fs::create_dir_all(&path).unwrap();
+        let files: Vec<String> = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
+        let mut mtimes = Vec::new();
+        for (name, d) in files.iter().zip(docs) {
+            std::fs::write(path.join(name), d).unwrap();
+            mtimes.push(Stamp::of(&std::fs::metadata(path.join(name)).unwrap()).mtime_ns);
+        }
+        write_stamps(dir, &mtimes).unwrap();
+        Fix {
+            path,
+            index: dir.to_path_buf(),
+            files,
+            lens: docs.iter().map(|d| d.len() as u64).collect(),
+        }
+    }
+
+    fn open_files(fix: &Fix) -> Files {
+        let stamps = Stamps::open(&fix.index, fix.lens.len()).unwrap();
+        Files::open(fix.path.clone(), stamps, fix.lens.len()).unwrap()
+    }
+
+    impl Files {
+        fn kinds(&self) -> Vec<u8> {
+            (0..self.known.state.len())
+                .map(|id| self.known.kind(id))
+                .collect()
+        }
+
+        fn warned(&self, id: usize) -> bool {
+            self.known.state[id].load(Ordering::Acquire) & WARNED != 0
+        }
+    }
+
+    #[test]
+    fn stat_all_finds_stale_and_gone_and_warns_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"printk zz"]);
+        std::fs::write(fix.path.join(&fix.files[1]), b"zzzz").unwrap();
+        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+        let files = open_files(&fix);
+        assert!(!files.changed(), "nothing is statted at open");
+        files.stat_all(&fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [FRESH, STALE, GONE]);
+        assert_eq!(files.snapshot(), (vec![1], vec![2]));
+        assert!(files.changed() && files.warned(2) && !files.warned(1));
+    }
+
+    #[test]
+    fn stat_pass_tracks_fresh_stale_gone_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let many: Vec<Vec<u8>> = (0..200).map(|i| format!("doc {i}").into_bytes()).collect();
+        let docs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        let fix = stage_files(tmp.path(), &docs);
+        let files = open_files(&fix);
+        let path = |id: usize| fix.path.join(&fix.files[id]);
+        files.stat_all(&fix.files, &fix.lens);
+        assert!(!files.changed());
+        std::fs::write(path(150), b"changed!!").unwrap();
+        std::fs::remove_file(path(7)).unwrap();
+        files.stat_all(&fix.files, &fix.lens);
+        assert_eq!(files.snapshot(), (vec![150], vec![7]));
+        // A reappearing file is stale; one matching its stamp again is fresh.
+        std::fs::write(path(7), b"back").unwrap();
+        let old = std::fs::File::options()
+            .write(true)
+            .open(path(150))
+            .unwrap();
+        old.set_len(0).unwrap();
+        std::io::Write::write_all(&mut &old, &many[150]).unwrap();
+        old.set_modified(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_nanos(files.known.stamps.get(150) as u64),
+        )
+        .unwrap();
+        files.stat_all(&fix.files, &fix.lens);
+        assert_eq!(files.snapshot(), (vec![7], vec![]));
+        assert_eq!(files.known.changed.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn read_turns_a_changed_doc_stale_and_an_unreadable_one_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        let files = open_files(&fix);
+        files.stat_all(&fix.files, &fix.lens);
+        std::fs::write(fix.path.join(&fix.files[1]), b"zz grew").unwrap();
+        std::fs::write(fix.path.join(&fix.files[2]), b"a\0binary").unwrap();
+        let read = |id: usize| files.read(id, &fix.files[id], vec![0; fix.lens[id] as usize]);
+        assert_eq!(read(0).as_deref(), Some(&b"printk"[..]));
+        assert_eq!(read(1).as_deref(), Some(&b"zz grew"[..]));
+        assert_eq!(read(2), None);
+        std::fs::remove_file(fix.path.join(&fix.files[0])).unwrap();
+        assert_eq!(read(0), None);
+        assert_eq!(files.kinds(), [GONE, STALE, GONE]);
+        assert!(files.warned(0) && files.warned(2));
+    }
+
+    /// Wait up to 60 s for `done`: a loaded box can hold events that long.
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        done()
+    }
+
+    /// Stops the watcher when dropped, so a failed assertion inside the
+    /// scope fails instead of joining the watcher forever.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn watch_restats_what_events_name_and_returns_on_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        std::fs::create_dir(fix.path.join("sub")).unwrap();
+        let files = open_files(&fix);
+        let watch = files.watch().unwrap();
+        files.stat_all(&fix.files, &fix.lens);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
+            let _stop = StopOnDrop(&stop);
+            let saw = || format!("kinds {:?}, snapshot {:?}", files.kinds(), files.snapshot());
+            // FSEvents can miss changes made just after the watch starts, so
+            // the write repeats until one is seen.
+            let changed = || {
+                std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
+                files.snapshot().0 == [1]
+            };
+            assert!(eventually(changed), "{}", saw());
+            std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+            assert!(eventually(|| files.snapshot().1 == [2]), "{}", saw());
+        });
+    }
+
+    #[test]
+    fn watch_maps_a_directory_event_to_the_docs_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"a"]);
+        let files = open_files(&fix);
+        let watch = files.watch().unwrap();
+        let names: Vec<String> = ["a/b", "a/b/c.c", "a/b/d.c", "a/bc.c", "z.c"]
+            .map(String::from)
+            .to_vec();
+        let by_path: Vec<usize> = (0..names.len()).collect();
+        let mut ids = Vec::new();
+        assert!(!watch.docs_at(&watch.root.join("a/b"), &names, &by_path, &mut ids));
+        assert_eq!(ids, [0, 1, 2]);
+        assert!(watch.docs_at(&watch.root, &names, &by_path, &mut ids));
+        assert!(!watch.docs_at(Path::new("/elsewhere/a/b"), &names, &by_path, &mut ids));
+        assert_eq!(ids, [0, 1, 2]);
+    }
+}

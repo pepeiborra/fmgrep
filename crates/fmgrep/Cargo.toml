@@ -1,0 +1,39 @@
+[package]
+name = "fmgrep"
+description = "Indexed grep: ripgrep-compatible search over a persistent FM-index"
+readme = "../../README.md"
+keywords = ["grep", "search", "regex", "fm-index", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fmgrep"
+path = "src/main.rs"
+
+[dependencies]
+docfm = { path = "../docfm", version = "0.1.0" }
+memchr = "2"
+memmap2 = "0.9"
+notify = "7.0.0"
+rayon = "1"
+regex = "1"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "unicode", "nfa-thompson", "dfa-build", "dfa-search"] }
+regex-syntax = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tikv-jemallocator = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+jemalloc = ["dep:tikv-jemallocator"]

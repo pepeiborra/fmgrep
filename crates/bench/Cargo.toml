@@ -1,0 +1,27 @@
+[package]
+name = "bench"
+description = "Benchmark harness: fmgrep against ripgrep over a corpus"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench/main.rs"
+
+[dependencies]
+fmgrep = { path = "../fmgrep" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[dev-dependencies]
+regex = "1"
+regex-syntax = "0.8"
