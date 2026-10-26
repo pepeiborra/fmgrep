@@ -139,7 +139,8 @@ impl Watchman {
         let mut stream = rx.recv_timeout(left).ok()?.ok()?;
         let left = self.deadline.checked_duration_since(Instant::now())?;
         stream.set_write_timeout(Some(left)).ok()?;
-        writeln!(stream, "{command}").ok()?;
+        // One write: watchman misreads a PDU whose first read is short.
+        stream.write_all(format!("{command}\n").as_bytes()).ok()?;
         let mut lines = BufReader::new(Until(&stream, self.deadline)).lines();
         loop {
             let reply: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
