@@ -62,7 +62,7 @@ hold both.
 AWS i4i.4xlarge spot instance (16 vCPUs, Intel Xeon Platinum 8375C at 2.90
 GHz, 123 GiB, local NVMe formatted ext4), Ubuntu 24.04, kernel 7.0. fmgrep
 0.1.0 (release build), ripgrep 15.2.0, tgrep 1.0.8. One run per corpus,
-measured 2026-10-09 (UTC).
+measured 2026-10-23 (UTC).
 
 ### Results
 
@@ -70,16 +70,16 @@ measured 2026-10-09 (UTC).
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 149 ms | 149 ms | 150 ms | 152 ms | 323 ms | 341 ms | 149 ms | 159 ms | 38.55 MB | 42.05 MB | - | 4.94->5.78! |
-| fmgrep | 16.05 s | 2.18 GB | 243 ms | 7.93 ms | 9.92 ms | 12.9 ms | 16.3 ms | 29.3 ms | 28.4 ms | 8.85 ms | 11.4 ms | 51.98 MB | 1.85 GB | 8.11 GB | 5.78->7.16! |
-| fmgrep `--store-docs` | 16.25 s | 3.71 GB | 15.2 ms | 5.75 ms | 6.59 ms | 7.64 ms | 10.1 ms | 19.0 ms | 18.8 ms | 5.97 ms | 7.49 ms | 53.98 MB | 1.85 GB | 9.30 GB | 7.16->8.36! |
-| tgrep | 17.14 s | 1.02 GB | 2.24 s | 22.3 ms | 34.7 ms | 45.7 ms | 41.5 ms | 1.05 s | 848 ms | 23.1 ms | 73.3 ms | 2.08 GB | 2.23 GB | 207.72 MB | 8.36->6.53! |
+| rg | - | - | - | 128 ms | 128 ms | 128 ms | 130 ms | 247 ms | 257 ms | 128 ms | 134 ms | 40.09 MB | 43.85 MB | - | 10.03->9.31! |
+| fmgrep | 11.50 s | 2.18 GB | 199 ms | 4.74 ms | 5.94 ms | 7.63 ms | 10.4 ms | 17.6 ms | 17.5 ms | 5.04 ms | 6.89 ms | 50.24 MB | 1.92 GB | 8.16 GB | 9.31->10.61! |
+| fmgrep `--store-docs` | 11.50 s | 3.71 GB | 18.5 ms | 4.10 ms | 4.90 ms | 6.15 ms | 7.93 ms | 16.7 ms | 16.8 ms | 4.30 ms | 5.74 ms | 57.48 MB | 1.93 GB | 9.33 GB | 10.61->11.44! |
+| tgrep | 16.32 s | 1.02 GB | 1.86 s | 18.5 ms | 29.9 ms | 37.7 ms | 35.5 ms | 901 ms | 747 ms | 20.4 ms | 64.0 ms | 2.07 GB | 2.22 GB | 189.32 MB | 11.44->9.08! |
 
 ### chromium
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 638 ms | 649 ms | 645 ms | 656 ms | 662 ms | 660 ms | 642 ms | 651 ms | 207.48 MB | 210.98 MB | - | 6.74->6.88! |
-| fmgrep | 30.87 s | 4.26 GB | 1.11 s | 52.2 ms | 112 ms | 153 ms | 167 ms | 7.09 ms | 7.00 ms | 48.5 ms | 106 ms | 224.42 MB | 4.20 GB | 8.52 GB | 6.88->9.14! |
-| fmgrep `--store-docs` | 27.39 s | 7.10 GB | 54.4 ms | 41.0 ms | 90.0 ms | 115 ms | 116 ms | 7.36 ms | 8.71 ms | 35.8 ms | 83.0 ms | 280.18 MB | 4.27 GB | 9.53 GB | 9.14->11.09! |
-| tgrep | 45.56 s | 2.70 GB | 14.71 s | 223 ms | 554 ms | 920 ms | 772 ms | 714 ms | 667 ms | 303 ms | 596 ms | 3.67 GB | 3.69 GB | 923.72 MB | 11.09->3.60! |
+| rg | - | - | - | 553 ms | 561 ms | 571 ms | 571 ms | 571 ms | 567 ms | 556 ms | 563 ms | 213.30 MB | 217.06 MB | - | 9.74->9.09! |
+| fmgrep | 23.10 s | 4.26 GB | 942 ms | 38.7 ms | 81.2 ms | 108 ms | 120 ms | 4.47 ms | 4.56 ms | 36.4 ms | 76.5 ms | 228.47 MB | 4.12 GB | 8.47 GB | 9.09->11.12! |
+| fmgrep `--store-docs` | 22.24 s | 7.10 GB | 55.0 ms | 28.9 ms | 62.5 ms | 79.8 ms | 77.8 ms | 5.45 ms | 5.60 ms | 25.6 ms | 57.3 ms | 277.45 MB | 4.19 GB | 9.57 GB | 11.12->12.03! |
+| tgrep | 39.57 s | 2.70 GB | 10.18 s | 162 ms | 418 ms | 642 ms | 554 ms | 484 ms | 446 ms | 231 ms | 438 ms | 3.67 GB | 3.69 GB | 899.19 MB | 12.03->4.90! |

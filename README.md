@@ -100,8 +100,8 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 |---|--:|--:|
 | index size | 2.18 GB / - | 4.26 GB / - |
 | files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 |
-| literal p50 | 7.93 / 149 ms | 52.2 / 638 ms |
-| regex p50 | 12.9 / 150 ms | 153 / 645 ms |
+| literal p50 | 4.74 / 128 ms | 38.7 / 553 ms |
+| regex p50 | 7.63 / 128 ms | 108 / 571 ms |
 
 AWS i4i.4xlarge, Linux; method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
 
