@@ -111,7 +111,8 @@ mod watchman_tests {
                     ("watch-project", _) => json!({"watch": "/w", "relative_path": "sub"}),
                     ("get-config", IGNORES) => json!({"config": {"ignore_dirs": ["build"]}}),
                     ("get-config", _) => json!({"config": {}}),
-                    ("clock", _) => json!({"clock": "c:1:2"}),
+                    ("clock", _) if cmd[2]["sync_timeout"].is_u64() => json!({"clock": "c:1:2"}),
+                    ("clock", _) => json!({"clock": "c:1:3"}),
                     ("query", ERROR) => json!({"error": "bad"}),
                     ("query", _) => {
                         let asked = (&cmd[1], &cmd[2]["since"], &cmd[2]["relative_root"]);
@@ -149,6 +150,11 @@ mod watchman_tests {
             })
         };
         assert!(matches!(ask(root), Since::Paths(p) if p == ["a.c", "d/x.c"]));
+        assert_eq!(
+            w.mark(root).unwrap()["clock"],
+            "c:1:3",
+            "a load's mark does not sync"
+        );
         assert!(
             matches!(ask(Path::new("/w")), Since::Unknown(_)),
             "another root"
@@ -162,6 +168,38 @@ mod watchman_tests {
         let none = Watchman::at(tmp.path().join("none"), Duration::from_secs(5));
         assert!(none.mark(root).is_none(), "no daemon");
         assert!(Watchman::of(&json!({"watch": "/w"}), Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn watchman_is_asked_from_50_000_docs_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = fake(tmp.path(), Arc::new(AtomicU8::new(NORMAL)));
+        let root = Path::new("/w/sub");
+        let tokens = vec![Token {
+            kind: "watchman".into(),
+            token: token(&sock),
+        }];
+        for (knob, docs, asks) in [
+            (Knob::Auto, 49_999, false),
+            (Knob::Auto, 50_000, true),
+            (Knob::On, 10, true),
+        ] {
+            let journal = Journal {
+                v: VERSION,
+                root: "/w/sub".into(),
+                tokens: tokens.clone(),
+                recheck: Vec::new(),
+                relist: Vec::new(),
+                named: Vec::new(),
+                knob,
+            };
+            let (marks, replay) = journal.ask(root, docs);
+            assert_eq!(
+                (marks.len(), replay.map(|r| r.kind)),
+                (usize::from(asks), asks.then_some("watchman")),
+                "{knob:?} {docs}"
+            );
+        }
     }
 
     const BUDGET: Duration = Duration::from_secs(1);
@@ -266,12 +304,17 @@ mod watchman_tests {
         };
         std::fs::write(root.join("new.c"), b"new").unwrap();
         let w = Watchman::of(&token, Duration::from_secs(5)).unwrap();
-        let ask = Ask {
-            root: &root,
-            token: &token,
+        let named = |token: &Value| match w.since(&Ask { root: &root, token }) {
+            Since::Paths(p) => p,
+            Since::Unknown(why) => panic!("cannot vouch: {why}"),
         };
-        let named = w.since(&ask);
-        assert!(matches!(named, Since::Paths(p) if p.iter().any(|p| p == "new.c")));
+        assert!(named(&token).iter().any(|p| p == "new.c"));
+        for i in 0..10 {
+            let token = w.mark(&root).unwrap();
+            let name = format!("r{i}.c");
+            std::fs::write(root.join(&name), b"raced").unwrap();
+            assert!(named(&token).contains(&name), "rep {i}");
+        }
     }
 
     #[test]

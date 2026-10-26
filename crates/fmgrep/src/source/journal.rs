@@ -18,6 +18,8 @@ mod watchman;
 pub const DOCS_JOURNAL: &str = "docs.journal";
 const VERSION: u32 = 1;
 const VAR: &str = "FMGREP_JOURNAL";
+/// Below this many docs the stat pass beats a source's fixed cost.
+const MIN_DOCS: usize = 50_000;
 
 /// Whether an index marks and a load asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -79,10 +81,6 @@ pub struct Ask<'a> {
 /// A filesystem change record, marked before the walk and asked at load.
 pub trait ChangeSource {
     fn kind(&self) -> &'static str;
-    /// Whether asking beats the stat pass of `docs` docs.
-    fn pays_off(&self, _docs: usize) -> bool {
-        true
-    }
     /// A token for now; `None` when `root` is not covered.
     fn mark(&self, root: &Path) -> Option<Value>;
     fn since(&self, ask: &Ask<'_>) -> Since;
@@ -237,7 +235,7 @@ impl Journal {
         let mut asked = Vec::new();
         for t in &self.tokens {
             match source(t, docs) {
-                Some(s) if forced || s.pays_off(docs) => asked.push((t, s)),
+                Some(s) if forced || docs >= MIN_DOCS => asked.push((t, s)),
                 Some(s) => note(format_args!(
                     "{} does not pay off for {docs} files",
                     s.kind()

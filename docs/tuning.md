@@ -50,4 +50,4 @@ from the tree, which on linux (about 800 documents per literal) dwarfs it.
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_JOURNAL` | unset: a running watchman | `off` writes and reads no `docs.journal`, so every load stats every file; `on` asks watchman, as unset does. A watchman that misses its deadline warns on stderr and falls back to the stat pass. |
+| `FMGREP_JOURNAL` | unset: a running watchman, where it pays off | `off` writes and reads no `docs.journal`, so every load stats every file; `on` asks watchman even on a small tree. A watchman that misses its deadline warns on stderr and falls back to the stat pass. |

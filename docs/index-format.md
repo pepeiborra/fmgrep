@@ -106,11 +106,12 @@ the tree) for a token before the walk. The token goes to `docs.journal`
 dangling symlink. A load asks watchman what changed since its token,
 re-checks only those paths, the symlinked documents and those directories,
 and skips the stat pass and the directory check; a search then rewrites
-the token with what differs now. A watchman that answers too slowly or
-names too many paths, and an index without `docs.journal`, fall back to
-the stat pass. An edit made while a directory above the root is renamed
-away and back, and a hard-linked file edited outside the root, are missed
-by the journal. `FMGREP_JOURNAL` disables it (`docs/tuning.md`).
+the token with what differs now. Watchman is asked from 50,000 documents.
+A watchman that answers too slowly or names too many paths, and an index
+without `docs.journal`, fall back to the stat pass. An edit made while a
+directory above the root is renamed away and back, and a hard-linked file
+edited outside the root, are missed by the journal. `FMGREP_JOURNAL`
+forces or disables it (`docs/tuning.md`).
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;

@@ -19,6 +19,7 @@ pub struct Watchman {
     sock: PathBuf,
     deadline: Instant,
     late: Cell<bool>,
+    settle: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +58,7 @@ impl Watchman {
             sock,
             deadline,
             late: Cell::new(false),
+            settle: true,
         }
     }
 
@@ -65,10 +67,14 @@ impl Watchman {
         Self::until(sock, Instant::now() + budget)
     }
 
-    /// The daemon that marked `token`.
+    /// The daemon that marked `token`; its marks do not sync, as an early
+    /// clock only names more paths.
     pub fn of(token: &Value, budget: Duration) -> Option<Self> {
         let sock = token.get("sock")?.as_str()?;
-        Some(Self::at(sock.into(), budget))
+        Some(Self {
+            settle: false,
+            ..Self::at(sock.into(), budget)
+        })
     }
 
     /// `$WATCHMAN_SOCK`, else the socket of a daemon already running.
@@ -173,7 +179,12 @@ impl ChangeSource for Watchman {
         if ignores.is_some_and(|d| !d.is_empty()) {
             return None;
         }
-        let clock = self.call(&json!(["clock", watch, {"sync_timeout": self.left_ms()}]))?;
+        let clock = if self.settle {
+            json!(["clock", watch, {"sync_timeout": self.left_ms()}])
+        } else {
+            json!(["clock", watch])
+        };
+        let clock = self.call(&clock)?;
         let token = Token {
             sock: self.sock.to_str()?.to_owned(),
             watch: watch.to_owned(),
