@@ -23,7 +23,9 @@ nothing. A pull request that claims a speedup includes a `scripts/bench.sh`
 table from a quiet machine, before and after; see
 [docs/benchmark.md](docs/benchmark.md). For the optional tgrep row, build
 Microsoft's tgrep from https://github.com/microsoft/tgrep; `cargo install
-tgrep` installs an unrelated crate, which the harness skips.
+tgrep` installs an unrelated crate, which the harness skips. For the
+optional elgrep row, `cargo install --locked elgrep --version 1.0.0`; its
+index answers only on Linux.
 
 ## License
 

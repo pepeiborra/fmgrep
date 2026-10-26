@@ -209,7 +209,7 @@ fn and(tgrep: &impl Fn(&[&str]) -> Command, leaves: &[&str], what: &str) -> Resu
     search(&mut tgrep(&args), what)
 }
 
-fn dir_size(dir: &Path) -> u64 {
+pub fn dir_size(dir: &Path) -> u64 {
     let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
     let size = |e: std::fs::DirEntry| match e.metadata() {
         Ok(m) if m.is_dir() => dir_size(&e.path()),

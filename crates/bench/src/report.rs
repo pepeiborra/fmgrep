@@ -21,8 +21,8 @@ pub struct Run {
 pub struct Stamps {
     pub machine: String,
     pub versions: String,
-    /// Why there is no tgrep row.
-    pub tgrep_note: Option<String>,
+    /// Why an optional tool has no row.
+    pub notes: Vec<String>,
     pub date: String,
 }
 
@@ -68,7 +68,11 @@ fn machine() -> Option<String> {
     Some(format!("{cpu}, {cores} cores, {gb:.0} GB; {os} ({uname})"))
 }
 
-pub fn stamps(fmgrep: Option<&Path>, tgrep: &Result<crate::tgrep::Tgrep, String>) -> Stamps {
+pub fn stamps(
+    fmgrep: Option<&Path>,
+    tgrep: &Result<crate::tgrep::Tgrep, String>,
+    elgrep: &Result<crate::elgrep::Elgrep, String>,
+) -> Stamps {
     let unknown = || "unknown".to_string();
     let ws = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let rev = run("git", &["-C", ws, "rev-parse", "--short", "HEAD"]).map(|rev| {
@@ -83,13 +87,21 @@ pub fn stamps(fmgrep: Option<&Path>, tgrep: &Result<crate::tgrep::Tgrep, String>
         rev.unwrap_or_default(),
         rg.unwrap_or_else(unknown)
     );
-    if let Ok(t) = tgrep {
-        versions += &format!("; {}", t.version);
+    let found = [
+        tgrep.as_ref().map(|t| &t.version),
+        elgrep.as_ref().map(|e| &e.version),
+    ];
+    let mut notes = Vec::new();
+    for tool in found {
+        match tool {
+            Ok(version) => versions += &format!("; {version}"),
+            Err(note) => notes.push(note.clone()),
+        }
     }
     Stamps {
         machine: machine().unwrap_or_else(unknown),
         versions,
-        tgrep_note: tgrep.as_ref().err().cloned(),
+        notes,
         date: run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_else(unknown),
     }
 }
@@ -115,7 +127,7 @@ fn ms(d: Duration) -> String {
     }
 }
 
-fn bytes(n: u64) -> String {
+pub fn bytes(n: u64) -> String {
     let (gb, mb) = ((1u64 << 30) as f64, (1u64 << 20) as f64);
     match n as f64 {
         n if n >= gb => format!("{:.2} GB", n / gb),
@@ -149,10 +161,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         format!("{count} {}", k.name())
     });
     let stamps = &run.stamps;
-    let note = stamps
-        .tgrep_note
-        .as_ref()
-        .map_or(String::new(), |n| format!("- {n}\n"));
+    let note: String = stamps.notes.iter().map(|n| format!("- {n}\n")).collect();
     let mut md = format!(
         "## fmgrep benchmark: {}{}\n\n- corpus: {} files, {}\n- revision: {revision}\n\
          - queries: {n} ({})\n- machine: {}\n- versions: {}\n{note}\
@@ -190,6 +199,13 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         ]);
         md += &format!("| {} |\n", cells.join(" | "));
     }
+    let notes = rows
+        .iter()
+        .flat_map(|r| r.notes.iter().map(|n| (label(r.name), n)));
+    let notes: String = notes.map(|(row, n)| format!("- {row}: {n}\n")).collect();
+    if !notes.is_empty() {
+        md += &format!("\n{notes}");
+    }
     let tgrep = if rows.iter().any(|r| r.name == "tgrep") {
         ", or a `tgrep` client against one `tgrep serve`"
     } else {
@@ -200,10 +216,14 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     } else {
         ", or several `tgrep` clients"
     };
+    let has_eg = rows.iter().any(|r| r.name == "elgrep");
+    let eg = [", or `eg` beside one `eg-indexd`", ", or an `eg` pipe"];
+    let [elgrep, elgrep_and] = eg.map(|s| if has_eg { s } else { "" });
     md += &format!(
         "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
          `rg` over a staged copy of the corpus, or `fmgrep --server` against one \
-         `fmgrep serve`{tgrep}. An intersection is an `rg` pipe{tgrep_and}. \
+         `fmgrep serve`{tgrep}{elgrep}. \
+         An intersection is an `rg` pipe{tgrep_and}{elgrep_and}. \
          Footprint is the peak anonymous memory while querying; RSS also counts \
          file-backed pages such as the mapped index. load1 is the 1-minute load average \
          at the row's start and end; `!` marks 4 or more, where timings are likely inflated.\n\n"
@@ -303,6 +323,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
             "query_peak_rss_bytes": r.query_rss,
             "loadavg_start": r.load1.map(|l| l.0),
             "loadavg_end": r.load1.map(|l| l.1),
+            "notes": r.notes,
         }));
     }
     lines.iter().map(|l| format!("{l}\n")).collect()
@@ -318,12 +339,12 @@ mod tests {
     const TERMS: [&str; 3] = ["a", "/b/", "a AND b"];
 
     fn run_of(fixture: bool, revision: &str) -> (Run, Vec<Row>) {
-        let note = Some("tgrep: not found on PATH".to_string());
+        let notes = vec!["tgrep: not found on PATH".to_string()];
         let (machine, versions, date) = ("m".into(), "v".into(), "d".into());
         let stamps = Stamps {
             machine,
             versions,
-            tgrep_note: note,
+            notes,
             date,
         };
         let (mut set, revision) = (crate::query_set("ghc"), Some(revision.to_string()));
@@ -355,6 +376,7 @@ mod tests {
             }
         }
         (rg.footprint, rg.query_rss) = (Some(1 << 20), Some(2 << 20));
+        rg.notes = vec!["n".to_string()];
         (docs.index_time, docs.load1) = (Some(Duration::from_secs(2)), Some((1.0, 4.5)));
         (run, vec![rg, docs])
     }
@@ -383,12 +405,14 @@ mod tests {
         let doc = include_str!("../../../BENCHMARKS.md");
         assert!(doc.contains(SUMMARY));
         let lines = crate::rows::LINES[..2].join(" ");
-        for row in ["rg", "fmgrep --server ADDR", "tgrep"] {
+        for row in ["rg", "fmgrep --server ADDR", "tgrep", "eg"] {
             let command = format!("`{row} {lines}");
             assert!(doc.contains(&command), "{command} not in BENCHMARKS.md");
         }
-        let pipe = format!("xargs -0 -r rg {lines}");
-        assert!(doc.contains(&pipe), "{pipe} not in BENCHMARKS.md");
+        for tool in ["rg", "eg"] {
+            let pipe = format!("xargs -0 -r {tool} {lines}");
+            assert!(doc.contains(&pipe), "{pipe} not in BENCHMARKS.md");
+        }
         assert!(
             doc.contains("-t and`"),
             "tgrep's intersection not in BENCHMARKS.md"
@@ -405,6 +429,7 @@ mod tests {
                 "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | - | - | - | 1.00->4.50! |\n",
                 "\n- queries: 3 (1 literal, 1 regex, 1 intersection)\n",
                 "\n- tgrep: not found on PATH\n",
+                " 1.00->4.50! |\n\n- rg: n\n\nLatency is",
                 "verify: OK, 2 rows agree on 3 queries",
             ],
         );

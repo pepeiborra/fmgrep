@@ -40,6 +40,19 @@ tgrep-cli`, or clone that repository and `cargo build --release`. Do not
 `cargo install tgrep`: the crates.io crate named `tgrep` is an unrelated grep
 clone without an index.
 
+## elgrep (optional)
+
+The elgrep row runs [elgrep](https://github.com/eliosai/sngram)'s `eg`:
+`FMGREP_BENCH_ELGREP_BIN`, else the first `eg` on `PATH`, provided
+`eg --version` starts `elgrep (eg) ` and `eg-indexd` sits beside it.
+Otherwise the row is skipped, with the reason on stderr and in the results.
+Install it with `cargo install --locked elgrep --version 1.0.0`. The
+harness starts its own `eg-indexd` and keeps the index and the daemon's
+state in the row's temporary directory, so it never touches an index of
+yours, and stops the daemon when the row ends. The index answers only on
+Linux, so the default rows include elgrep only there; elsewhere
+`--rows elgrep` runs a row in which every query is a scan, as its note says.
+
 ## Queries
 
 Each corpus's queries and pinned commit are in

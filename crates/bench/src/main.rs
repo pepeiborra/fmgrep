@@ -1,5 +1,7 @@
-//! Benchmarks fmgrep against ripgrep, and tgrep when installed, over one corpus.
+//! Benchmarks fmgrep against ripgrep, and tgrep and elgrep when installed,
+//! over one corpus.
 
+mod elgrep;
 mod report;
 mod rows;
 mod tgrep;
@@ -18,15 +20,16 @@ prints the same lines as the first, and prints the results as markdown.
 
   --corpus ID    ghc (default), linux or chromium; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
-  --rows ROWS    comma-separated rg, fmgrep, fmgrep-store-docs, tgrep;
-                 default rg,fmgrep, and tgrep when it is on PATH
+  --rows ROWS    comma-separated rg, fmgrep, fmgrep-store-docs, tgrep,
+                 elgrep; default rg,fmgrep, tgrep when it is on PATH, and
+                 elgrep when it is on PATH on Linux, where its index answers
   --fixture      search one file of the query set's literals instead
   --trace FILE   write one JSON line per query and per row
 
 Exits 1 when a row fails or the rows disagree, 2 on a usage or corpus error.";
 
 const CORPORA: [&str; 3] = ["ghc", "linux", "chromium"];
-const ROWS: [&str; 4] = ["rg", "fmgrep", "fmgrep-store-docs", "tgrep"];
+const ROWS: [&str; 5] = ["rg", "fmgrep", "fmgrep-store-docs", "tgrep", "elgrep"];
 
 pub struct Query {
     pub term: String,
@@ -46,6 +49,8 @@ pub struct Row {
     pub footprint: Option<u64>,
     pub query_rss: Option<u64>,
     pub load1: Option<(f64, f64)>,
+    /// Printed under the summary as `- row: note`.
+    pub notes: Vec<String>,
 }
 
 impl Query {
@@ -136,19 +141,22 @@ fn failed(e: impl std::fmt::Display) -> Fail {
 fn select_rows(
     spec: Option<&str>,
     tgrep: &Result<tgrep::Tgrep, String>,
+    elgrep: &Result<elgrep::Elgrep, String>,
 ) -> Result<Vec<&'static str>, String> {
-    let default = if tgrep.is_ok() {
-        "rg,fmgrep,tgrep"
-    } else {
-        "rg,fmgrep"
-    };
-    let spec = spec.unwrap_or(default);
+    let eg = elgrep.is_ok() && cfg!(target_os = "linux");
+    let found = [(tgrep.is_ok(), ",tgrep"), (eg, ",elgrep")];
+    let default: String = found.iter().filter(|f| f.0).map(|f| f.1).collect();
+    let default = format!("rg,fmgrep{default}");
+    let spec = spec.unwrap_or(&default);
     let wanted: Vec<&str> = spec.split(',').map(str::trim).collect();
     if let Some(bad) = wanted.iter().find(|w| !ROWS.contains(w)) {
         return Err(format!("--rows: {bad:?} is not one of {}", ROWS.join(", ")));
     }
     if let (true, Err(note)) = (wanted.contains(&"tgrep"), tgrep) {
         return Err(format!("--rows names tgrep, but {note}"));
+    }
+    if let (true, Err(note)) = (wanted.contains(&"elgrep"), elgrep) {
+        return Err(format!("--rows names elgrep, but {note}"));
     }
     Ok(ROWS.into_iter().filter(|r| wanted.contains(r)).collect())
 }
@@ -242,8 +250,9 @@ fn run() -> Result<(), Fail> {
             _ => return Err(usage(format!("unknown argument {arg:?}\n{USAGE}"))),
         }
     }
-    let tgrep = tgrep::detect();
-    let rows = select_rows(rows.as_deref(), &tgrep).map_err(usage)?;
+    let (tgrep, elgrep) = (tgrep::detect(), elgrep::detect());
+    let eg_dropped = rows.is_none() && elgrep.is_ok() && !cfg!(target_os = "linux");
+    let rows = select_rows(rows.as_deref(), &tgrep, &elgrep).map_err(usage)?;
     let fmgrep = fmgrep_bin();
     if fmgrep.is_none() && rows.iter().any(|r| r.starts_with("fmgrep")) {
         return Err(usage("no fmgrep next to bench or on PATH"));
@@ -273,10 +282,11 @@ fn run() -> Result<(), Fail> {
     for &name in &rows {
         eprintln!("running {name}");
         let before = rows::load1();
-        let row = match (name, &fmgrep, &tgrep) {
-            ("rg", _, _) => rows::rg(staged, n, terms),
-            ("tgrep", _, Ok(t)) => tgrep::row(&t.bin, staged, n, terms),
-            (_, Some(bin), _) => rows::fmgrep(bin, staged, name == "fmgrep-store-docs", terms),
+        let row = match (name, &fmgrep, &tgrep, &elgrep) {
+            ("rg", ..) => rows::rg(staged, n, terms),
+            ("tgrep", _, Ok(t), _) => tgrep::row(&t.bin, staged, n, terms),
+            ("elgrep", _, _, Ok(e)) => elgrep::row(e, staged, n, terms),
+            (_, Some(bin), ..) => rows::fmgrep(bin, staged, name == "fmgrep-store-docs", terms),
             _ => unreachable!("rows are checked above"),
         };
         let mut row = row.map_err(|e| failed(format!("row {name}: {e}")))?;
@@ -287,15 +297,19 @@ fn run() -> Result<(), Fail> {
     let diffs = verify(&results);
     let root_str = root.to_str().filter(|_| !fixture);
     let head = root_str.and_then(|r| report::run("git", &["-C", r, "rev-parse", "HEAD"]));
-    let run = report::Run {
+    let mut run = report::Run {
         corpus,
         fixture,
         revision: head,
         files: n,
         bytes: docs.iter().map(|d| d.len).sum(),
-        stamps: report::stamps(fmgrep.as_deref(), &tgrep),
+        stamps: report::stamps(fmgrep.as_deref(), &tgrep, &elgrep),
         set,
     };
+    if eg_dropped {
+        let note = "elgrep: not run by default, its index answers only on Linux";
+        run.stamps.notes.push(note.to_owned());
+    }
     print!("{}", report::markdown(&run, &results, &diffs));
     if let Some(path) = &trace {
         let written = std::fs::write(path, report::trace(&run, &results));
@@ -377,7 +391,7 @@ mod tests {
         assert_eq!(names, ["literal", "regex", "intersection"]);
     }
 
-    /// The rg and tgrep rows' last stage reads literal leaves as regexes.
+    /// The rg, tgrep and elgrep rows' last stage reads literal leaves as regexes.
     #[test]
     fn intersection_literals_need_no_escaping() {
         for id in CORPORA {
@@ -410,6 +424,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn select_rows_defaults_follow_detection() {
+        let bin = PathBuf::from("x");
+        let version = String::new();
+        let t = Ok(tgrep::Tgrep {
+            bin: bin.clone(),
+            version: version.clone(),
+        });
+        fn absent<T>() -> Result<T, String> {
+            Err("absent".to_string())
+        }
+        let daemon = bin.clone();
+        let e = Ok(elgrep::Elgrep {
+            bin,
+            daemon,
+            version,
+        });
+        let elgrep = if cfg!(target_os = "linux") {
+            vec!["elgrep"]
+        } else {
+            vec![]
+        };
+        assert_eq!(
+            select_rows(None, &absent(), &absent()).unwrap(),
+            ["rg", "fmgrep"]
+        );
+        let all = select_rows(None, &t, &e).unwrap();
+        assert_eq!(all, [&["rg", "fmgrep", "tgrep"][..], &elgrep].concat());
+        let picked = select_rows(Some("elgrep,rg"), &absent(), &e).unwrap();
+        assert_eq!(picked, ["rg", "elgrep"]);
+        let err = select_rows(Some("rg,elgrep"), &t, &absent()).unwrap_err();
+        assert_eq!(err, "--rows names elgrep, but absent");
     }
 
     #[test]

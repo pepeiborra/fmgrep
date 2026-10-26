@@ -34,7 +34,7 @@ pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
                 cmd.args(fixed).args(["-e", pattern, "--"]).arg(staged);
                 cmd
             }
-            all => rg_and(staged, all),
+            all => and_pipe("rg", &WALK.join(" "), staged, all),
         };
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let what = format!("rg {term:?}");
@@ -52,13 +52,12 @@ pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
 
 const WALK: [&str; 3] = ["-a", "--no-ignore", "--no-require-git"];
 
-/// Lists the files holding every leaf, one rg per leaf, then prints their
-/// lines matching any leaf.
-fn rg_and(staged: &Path, leaves: &[&str]) -> Command {
-    let walk = WALK.join(" ");
+/// Lists the files holding every leaf, one `prog flags` per leaf, then
+/// prints their lines matching any leaf; `prog` and `flags` are shell words.
+pub fn and_pipe(prog: &str, flags: &str, staged: &Path, leaves: &[&str]) -> Command {
     let list = |k: usize, leaf: &str| {
         let fixed = regex_pattern(leaf).map_or(" -F", |_| "");
-        format!("rg {walk} --files-with-matches --null{fixed} -e \"${{{k}}}\" --")
+        format!("{prog} {flags} --files-with-matches --null{fixed} -e \"${{{k}}}\" --")
     };
     let n = leaves.len();
     let mut script = format!("{} \"${{{}}}\"", list(1, leaves[0]), n + 1);
@@ -67,7 +66,7 @@ fn rg_and(staged: &Path, leaves: &[&str]) -> Command {
     }
     let any: String = (1..=n).map(|k| format!(" -e \"${{{k}}}\"")).collect();
     let lines = LINES.join(" ");
-    script += &format!(" | xargs -0 -r rg {lines} --with-filename {walk}{any} --");
+    script += &format!(" | xargs -0 -r {prog} {lines} --with-filename {flags}{any} --");
     let mut cmd = Command::new("sh");
     let patterns = leaves.iter().map(|l| regex_pattern(l).unwrap_or(l));
     cmd.args(["-c", &script, "sh"]).args(patterns).arg(staged);
@@ -298,7 +297,7 @@ impl Sampler {
 }
 
 /// Footprint is macOS `phys_footprint` or Linux resident minus shared pages.
-fn memory(pid: u32) -> Option<Peak> {
+pub fn memory(pid: u32) -> Option<Peak> {
     #[cfg(target_os = "macos")]
     {
         let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
@@ -362,6 +361,19 @@ mod tests {
     fn memory_reads_rss_and_footprint_of_a_live_process() {
         let peak = memory(std::process::id()).unwrap();
         assert!(peak.rss > 0 && peak.footprint > 0);
+    }
+
+    #[test]
+    fn rg_pipe_script_is_unchanged() {
+        let cmd = and_pipe("rg", &WALK.join(" "), Path::new("/s"), &["a", "/b+/"]);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        let walk = "-a --no-ignore --no-require-git";
+        let script = format!(
+            "rg {walk} --files-with-matches --null -F -e \"${{1}}\" -- \"${{3}}\" \
+             | xargs -0 -r rg {walk} --files-with-matches --null -e \"${{2}}\" -- \
+             | xargs -0 -r rg -n --no-heading --color never --with-filename {walk} -e \"${{1}}\" -e \"${{2}}\" --"
+        );
+        assert_eq!(args, ["-c", &script, "sh", "a", "b+", "/s"]);
     }
 
     #[test]

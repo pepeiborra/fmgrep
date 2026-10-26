@@ -11,12 +11,14 @@ fn bench(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
         "FMGREP_CORPUS_LINUX",
         "FMGREP_CORPUS_CHROMIUM",
         "FMGREP_BENCH_TGREP_BIN",
+        "FMGREP_BENCH_ELGREP_BIN",
     ] {
         cmd.env_remove(var);
     }
-    // Without tgrep, so no machine-dependent tgrep note reaches stderr.
+    // Without tgrep or eg, so no machine-dependent note reaches stderr.
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let path = std::env::split_paths(&path).filter(|d| !d.join("tgrep").exists());
+    let path = std::env::split_paths(&path)
+        .filter(|d| !d.join("tgrep").exists() && !d.join("eg").exists());
     cmd.env("PATH", std::env::join_paths(path).unwrap());
     for (var, val) in env {
         cmd.env(var, val);
