@@ -1,6 +1,7 @@
 //! rg's `-g`, `--iglob` and PATH arguments.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,8 @@ pub struct PathFilter {
 struct Rule {
     exclude: bool,
     dir_only: bool,
+    /// What every path the glob matches starts with; None when case-folded.
+    prefix: Option<String>,
 }
 
 impl PathFilter {
@@ -49,9 +52,10 @@ impl PathFilter {
         let mut set = GlobSetBuilder::new();
         let mut rules = Vec::new();
         for (glob, fold) in lines {
-            let Some((actual, rule)) = parse(glob) else {
+            let Some((actual, mut rule)) = parse(glob) else {
                 continue;
             };
+            rule.prefix = (!fold).then(|| literal_prefix(&actual));
             let built = GlobBuilder::new(&actual)
                 .literal_separator(true)
                 .backslash_escape(true)
@@ -79,6 +83,107 @@ impl PathFilter {
         !self.rules.is_empty()
     }
 
+    /// Ascending disjoint id ranges of `files` holding every file a search
+    /// keeps; None when unbounded.
+    pub fn cover(&self, files: &[String]) -> Option<Vec<Range<usize>>> {
+        let includes: Option<Vec<&str>> = match self.includes {
+            0 => None,
+            _ => self
+                .rules
+                .iter()
+                .filter(|r| !r.exclude)
+                .map(|r| r.prefix.as_deref().filter(|p| !p.is_empty()))
+                .collect(),
+        };
+        let mut prefixes = Vec::new();
+        for root in self.roots() {
+            let path = root.path.trim_end_matches('/');
+            let below = match path {
+                "" => String::new(),
+                _ => format!("{path}/"),
+            };
+            match (&includes, self.shown(root)) {
+                (Some(includes), Some(shown)) => {
+                    for p in includes {
+                        if let Some(rest) = p.strip_prefix(shown.as_str()) {
+                            prefixes.push((format!("{below}{rest}"), false));
+                        } else if shown.starts_with(p) {
+                            prefixes.push((below.clone(), false));
+                        }
+                    }
+                }
+                _ => prefixes.push((below, false)),
+            }
+            if !path.is_empty() {
+                prefixes.push((path.to_owned(), true));
+            }
+        }
+        if prefixes.iter().any(|(p, _)| p.is_empty()) {
+            return None;
+        }
+        let mut ranges: Vec<Range<usize>> = prefixes
+            .iter()
+            .map(|(p, exact)| {
+                let lo = files.partition_point(|f| f.as_str() < p.as_str());
+                let n = match exact {
+                    true => usize::from(files.get(lo) == Some(p)),
+                    false => files[lo..].partition_point(|f| f.starts_with(p.as_str())),
+                };
+                lo..lo + n
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut out: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match out.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => out.push(r),
+            }
+        }
+        Some(out)
+    }
+
+    /// What `seen` puts before every path below `root`; None when that
+    /// depends on the path.
+    fn shown(&self, root: &SearchPath) -> Option<String> {
+        if root.name.is_empty() {
+            return Some(String::new());
+        }
+        let mut s = String::new();
+        join(&root.name, "", &mut s);
+        let s = s.strip_prefix("./").unwrap_or(&s);
+        if self.cwd.is_empty() {
+            return Some(s.to_owned());
+        }
+        match s.strip_prefix(self.cwd.as_str()) {
+            Some(r) => Some(r.strip_prefix('/').unwrap_or(r).to_owned()),
+            None if self.cwd.starts_with(s) && !(s.is_empty() && self.cwd.starts_with('/')) => None,
+            None => Some(s.to_owned()),
+        }
+    }
+
+    fn roots(&self) -> &[SearchPath] {
+        static ROOT: [SearchPath; 1] = [SearchPath {
+            path: String::new(),
+            name: String::new(),
+        }];
+        match self.paths.is_empty() {
+            true => &ROOT,
+            false => &self.paths,
+        }
+    }
+
+    /// The ids of `ids` a search keeps, in order.
+    pub fn kept<'a>(
+        &'a self,
+        paths: &'a Paths<'_>,
+        ids: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let mut keep = self.keeper();
+        ids.filter(move |&id| paths.path(id).is_some_and(&mut keep))
+    }
+
     pub fn retain<T>(&self, paths: &Paths<'_>, items: &mut Vec<T>, id: impl Fn(&T) -> usize) {
         let mut keep = self.keeper();
         items.retain(|t| paths.path(id(t)).is_some_and(&mut keep));
@@ -97,15 +202,7 @@ impl PathFilter {
     /// Whether a search covers the file at a path, remembering the last
     /// parent directory's verdict: paths in order share it.
     fn keeper(&self) -> impl FnMut(&str) -> bool + '_ {
-        static ROOT: [SearchPath; 1] = [SearchPath {
-            path: String::new(),
-            name: String::new(),
-        }];
-        let roots = if self.paths.is_empty() {
-            &ROOT[..]
-        } else {
-            &self.paths
-        };
+        let roots = self.roots();
         let mut last: Option<(usize, String, bool)> = None;
         let mut hits = Vec::new();
         let mut buf = String::new();
@@ -248,6 +345,7 @@ fn parse(line: &str) -> Option<(String, Rule)> {
     let mut rule = Rule {
         exclude: false,
         dir_only: false,
+        prefix: None,
     };
     let mut anchored = false;
     if line.starts_with("\\!") || line.starts_with("\\#") {
@@ -274,6 +372,23 @@ fn parse(line: &str) -> Option<(String, Rule)> {
         actual.push_str("/*");
     }
     Some((actual, rule))
+}
+
+/// The literal text a glob starts with.
+fn literal_prefix(glob: &str) -> String {
+    let mut out = String::new();
+    let mut chars = glob.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '?' | '[' | '{' => break,
+            '\\' => match chars.next() {
+                Some(c) => out.push(c),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

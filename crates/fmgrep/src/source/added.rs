@@ -125,10 +125,10 @@ impl Discovery {
     /// not list; with a record, only changed and new directories are listed.
     pub fn run(self, files: &[String], stop: &AtomicBool) {
         let known = &*self.known;
-        if stop.load(Ordering::Relaxed) || !files.is_sorted() {
+        if stop.load(Ordering::Relaxed) {
             return;
         }
-        known.sorted.store(true, Ordering::Release);
+        known.discovering.store(true, Ordering::Release);
         match &known.recorded {
             Some(recorded) => known.discover_recorded(recorded, files),
             None => known.discover(&known.root, &known.root, files),
@@ -233,7 +233,7 @@ impl Known {
     /// Reconcile what is at `path` now: a text file not in ascending `files`
     /// is added, a directory is walked, anything else is dropped.
     pub fn reconcile_path(&self, root: &Path, path: &Path, files: &[String]) {
-        if !self.sorted.load(Ordering::Acquire) {
+        if !self.discovering.load(Ordering::Acquire) {
             return;
         }
         let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {

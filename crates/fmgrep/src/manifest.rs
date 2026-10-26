@@ -172,6 +172,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
             manifest.blob_lens.len(),
         ));
     }
+    debug_assert!(manifest.files.is_sorted());
     Ok(manifest)
 }
 

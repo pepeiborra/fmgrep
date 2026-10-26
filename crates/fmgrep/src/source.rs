@@ -102,9 +102,9 @@ struct Known {
     exclude: Option<PathBuf>,
     added: Mutex<added::Added>,
     latch: added::Latch,
-    /// Whether discovery found the manifest ascending, which added files
-    /// need.
-    sorted: AtomicBool,
+    /// Whether discovery has started; added files are reconciled only after
+    /// it.
+    discovering: AtomicBool,
     recorded: Option<Recorded>,
 }
 
@@ -238,7 +238,7 @@ impl Files {
                 exclude: None,
                 added: Mutex::default(),
                 latch: added::Latch::default(),
-                sorted: AtomicBool::new(false),
+                discovering: AtomicBool::new(false),
                 recorded: None,
             }),
         })
@@ -403,7 +403,7 @@ impl Watch {
             }
             if all {
                 self.known.stat_all(files, lens);
-                if self.known.sorted.load(Ordering::Acquire) {
+                if self.known.discovering.load(Ordering::Acquire) {
                     self.known.discover(&self.root, &self.root, files);
                 }
             } else {

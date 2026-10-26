@@ -202,7 +202,7 @@ fn shape(answers: Vec<Answer>, num_docs: usize) -> Answers {
 }
 
 fn answers_of(index: &DocfmIndex, qs: &[Query<'_>]) -> Answers {
-    shape(index.probe_all(qs), index.num_files_indexed())
+    shape(index.probe_all(qs, None), index.num_files_indexed())
 }
 
 fn panic_message(f: impl FnOnce()) -> String {
@@ -215,12 +215,12 @@ fn panic_message(f: impl FnOnce()) -> String {
 }
 
 fn hits(index: &DocfmIndex, term: &str) -> Vec<(usize, u64)> {
-    index.probe_literal(term.as_bytes())
+    index.probe_literal(term.as_bytes(), None)
 }
 
 fn candidates(index: &DocfmIndex, pattern: &str, num_docs: usize) -> Vec<usize> {
     let prepared = PreparedPattern::prepare(pattern).expect("valid pattern");
-    candidate_docs(index.regex_candidates(&prepared), num_docs)
+    candidate_docs(index.regex_candidates(&prepared, None), num_docs)
 }
 
 #[test]
@@ -245,6 +245,47 @@ fn counts_are_shard_count_invariant() {
     // Overlapping counts survive the split: "aa" in "aaaa" is 3.
     assert_eq!(hits(&whole, "aa"), vec![(2, 3)]);
     assert_eq!(hits(&whole, "printk"), vec![(1, 2), (5, 1)]);
+}
+
+#[test]
+fn a_batch_within_skips_other_shards() {
+    let docs = fixture();
+    let index = DocfmIndex::build_with_cap(&docs, 6);
+    let patterns = prepared();
+    let mut qs = queries(&patterns);
+    let some = [1..2, 5..6];
+    qs.push(Query::Count(b"printk"));
+    qs.push(Query::LiteralWithin {
+        term: b"printk",
+        within: &some,
+    });
+    for pairs in [&[(1, 2)][..], &[(4, 6)], &[(0, 1), (5, 6)], &[]] {
+        let within: Vec<Range<usize>> = pairs.iter().map(|&(a, b)| a..b).collect();
+        let kept: Vec<&Range<usize>> = (index.metas.iter())
+            .map(|m| &m.docs)
+            .filter(|d| within.iter().any(|w| w.start < d.end && d.start < w.end))
+            .collect();
+        assert!(kept.len() < index.blob_slots(), "{within:?}");
+        let inside = |d: usize| kept.iter().any(|r| r.contains(&d));
+        let all = index.probe_all(&qs, None);
+        let got = index.probe_all(&qs, Some(&within));
+        for (a, g) in all.into_iter().zip(got) {
+            let mut exact = a.exact;
+            exact.retain(|&(d, _)| inside(d));
+            assert_eq!(g.exact, exact, "{within:?}");
+            match (a.candidates, g.candidates) {
+                (None, None) => {}
+                (Some(mut want), Some(got)) => {
+                    want.retain(|&d| inside(d));
+                    assert_eq!(got, want, "{within:?}");
+                }
+                _ => panic!("{within:?}: candidates changed kind"),
+            }
+            let mut counts = a.counts;
+            counts.retain(|(r, _)| kept.contains(&r));
+            assert_eq!(g.counts, counts, "{within:?}");
+        }
+    }
 }
 
 #[test]
@@ -736,10 +777,10 @@ fn probe_all_matches_per_query_probes() {
         let want: Answers = qs
             .iter()
             .map(|q| match *q {
-                Query::Literal(term) => (index.probe_literal(term), Vec::new()),
+                Query::Literal(term) => (index.probe_literal(term, None), Vec::new()),
                 Query::Regex(p) => (
                     Vec::new(),
-                    candidate_docs(index.regex_candidates(p), docs.len()),
+                    candidate_docs(index.regex_candidates(p, None), docs.len()),
                 ),
                 Query::Count(_) | Query::LiteralWithin { .. } => unreachable!("not queried"),
             })

@@ -6,6 +6,7 @@ mod build;
 mod shard;
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -171,21 +172,25 @@ impl DocfmIndex {
         self.total_docs
     }
 
-    /// Per-shard hits concatenated in shard order, so the result stays
-    /// ascending.
-    fn map_shards<T, F>(&self, hits: F) -> Vec<T>
+    /// Per-shard hits of the shards overlapping `within` (all when None),
+    /// concatenated in shard order, so the result stays ascending.
+    fn map_shards<T, F>(&self, within: Option<&[Range<usize>]>, hits: F) -> Vec<T>
     where
         T: Send,
         F: Fn(&Structure, &ShardMeta) -> Vec<T> + Sync,
     {
+        let hits = |(s, m): (&Structure, &ShardMeta)| match within.is_none_or(|w| m.overlaps(w)) {
+            true => hits(s, m),
+            false => Vec::new(),
+        };
         let shards = self.shards.iter().zip(&self.metas);
         if self.shards.len() <= 1 {
-            return shards.flat_map(|(s, m)| hits(s, m)).collect();
+            return shards.flat_map(hits).collect();
         }
         self.shards
             .par_iter()
             .zip(&self.metas)
-            .flat_map_iter(|(s, m)| hits(s, m))
+            .flat_map_iter(hits)
             .collect()
     }
 
@@ -194,43 +199,53 @@ impl DocfmIndex {
     /// holding the separator counts 0 everywhere. Counts are document-wide
     /// and overlapping, which is rg's only for a literal that can neither
     /// overlap itself nor cross a line.
-    fn probe_literal(&self, term: &[u8]) -> Vec<(usize, u64)> {
+    fn probe_literal(&self, term: &[u8], within: Option<&[Range<usize>]>) -> Vec<(usize, u64)> {
         match literal_term(term) {
-            Some(term) => self.map_shards(|s, meta| meta.counts(s, term)),
+            Some(term) => self.map_shards(within, |s, meta| meta.counts(s, term)),
             None => Vec::new(),
         }
     }
 
     /// Docs that could match `pattern`; the rest count 0 with no fetch.
-    fn regex_candidates(&self, pattern: &PreparedPattern) -> Option<Vec<usize>> {
+    fn regex_candidates(
+        &self,
+        pattern: &PreparedPattern,
+        within: Option<&[Range<usize>]>,
+    ) -> Option<Vec<usize>> {
         if !crate::pattern::narrows(pattern) {
             return None;
         }
-        Some(self.map_shards(|s, meta| meta.regex_docs(s, pattern)))
+        Some(self.map_shards(within, |s, meta| meta.regex_docs(s, pattern)))
     }
 
-    /// One answer per query, in order.
-    pub fn probe_all(&self, queries: &[Query<'_>]) -> Vec<Answer> {
+    /// One answer per query, in order; shards outside ascending disjoint
+    /// `within` answer nothing.
+    pub fn probe_all(&self, queries: &[Query<'_>], within: Option<&[Range<usize>]>) -> Vec<Answer> {
         queries
             .iter()
             .map(|q| {
                 let start = Instant::now();
                 let mut counts = Vec::new();
                 let (exact, candidates) = match *q {
-                    Query::Literal(term) => (self.probe_literal(term), Some(Vec::new())),
-                    Query::LiteralWithin { term, within } => {
+                    Query::Literal(term) => (self.probe_literal(term, within), Some(Vec::new())),
+                    Query::LiteralWithin { term, within: w } => {
                         let exact = match literal_term(term) {
-                            Some(term) => self.map_shards(|s, meta| match meta.overlaps(within) {
-                                true => meta.counts(s, term),
-                                false => Vec::new(),
-                            }),
+                            Some(term) => {
+                                self.map_shards(within, |s, meta| match meta.overlaps(w) {
+                                    true => meta.counts(s, term),
+                                    false => Vec::new(),
+                                })
+                            }
                             None => Vec::new(),
                         };
                         (exact, Some(Vec::new()))
                     }
                     Query::Count(term) => {
                         // Sequential: a count-only shard is one backward search.
-                        for (s, meta) in self.shards.iter().zip(&self.metas) {
+                        let kept = |(_, m): &(&Structure, &ShardMeta)| {
+                            within.is_none_or(|w| m.overlaps(w))
+                        };
+                        for (s, meta) in self.shards.iter().zip(&self.metas).filter(kept) {
                             match literal_term(term).map_or(0, |term| meta.count(s, term)) {
                                 0 => {}
                                 n => counts.push((meta.docs.clone(), n)),
@@ -238,7 +253,7 @@ impl DocfmIndex {
                         }
                         (Vec::new(), Some(Vec::new()))
                     }
-                    Query::Regex(pattern) => (Vec::new(), self.regex_candidates(pattern)),
+                    Query::Regex(pattern) => (Vec::new(), self.regex_candidates(pattern, within)),
                 };
                 Answer {
                     exact,

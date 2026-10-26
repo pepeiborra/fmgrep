@@ -119,7 +119,12 @@ pub struct Group {
 }
 
 /// The count pass; it probes nothing unless some AND can demote.
-pub fn plan(index: &DocfmIndex, expr: &Expr, leaves: &[Leaf<'_>]) -> Plan {
+pub fn plan(
+    index: &DocfmIndex,
+    expr: &Expr,
+    leaves: &[Leaf<'_>],
+    within: Option<&[Range<usize>]>,
+) -> Plan {
     let n = leaves.len();
     let terms: Vec<Option<&[u8]>> = leaves
         .iter()
@@ -150,7 +155,7 @@ pub fn plan(index: &DocfmIndex, expr: &Expr, leaves: &[Leaf<'_>]) -> Plan {
     if !queries.is_empty() {
         for (i, a) in (0..n)
             .filter(|&i| counted[i])
-            .zip(index.probe_all(&queries))
+            .zip(index.probe_all(&queries, within))
         {
             probe_us += a.probe_us;
             counts[i] = a.counts;

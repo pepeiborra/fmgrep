@@ -10,6 +10,7 @@ pub fn candidate_docs(candidates: Option<Vec<usize>>, num_docs: usize) -> Vec<us
 }
 
 /// One term as the query drive hands it to the index.
+#[derive(Clone, Copy)]
 pub enum Query<'a> {
     Literal(&'a [u8]),
     /// A literal's per-shard counts, no locate: [`Answer::counts`].

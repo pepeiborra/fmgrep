@@ -143,7 +143,7 @@ fn watch_waits_for_discovery_before_applying_events() {
             "no event is applied before discovery"
         );
         // Unrun, it only releases; a rewrite covers events FSEvents dropped.
-        files.known.sorted.store(true, Ordering::Release);
+        files.known.discovering.store(true, Ordering::Release);
         drop(discovery);
         let seen = || {
             write(&fix.path, "x.c", b"printk");

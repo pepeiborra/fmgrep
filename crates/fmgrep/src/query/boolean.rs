@@ -4,7 +4,7 @@
 
 mod demote;
 
-pub use demote::ReadBand;
+pub use demote::{ReadBand, read_band};
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -243,11 +243,12 @@ pub fn answer_expr(
     };
     let manifest = req.manifest;
     let num_docs = manifest.files.len();
-    let band = demote::read_band(loaded.band);
+    let band = read_band(loaded.band);
     loaded.docs.begin();
     let docs = &mut loaded.docs;
 
-    let mut plan = demote::plan(index, expr, &leaves);
+    let cover = req.filter.as_ref().and_then(|f| f.cover(&manifest.files));
+    let mut plan = demote::plan(index, expr, &leaves, cover.as_deref());
     let probed = |i: usize, plan: &demote::Plan| {
         !plan.demoted[i] && !matches!(leaves[i].probe, Probe::Never)
     };
@@ -273,7 +274,7 @@ pub fn answer_expr(
     let first: Vec<usize> = (0..leaves.len())
         .filter(|&i| probed(i, &plan) && !plan.candidate[i])
         .collect();
-    let got = index.probe_all(&queries(&leaves, &plan, &first));
+    let got = index.probe_all(&queries(&leaves, &plan, &first), cover.as_deref());
     store(&first, got, &mut answers)?;
     let mut sample_us = 0u64;
     if !plan.groups.is_empty() {
@@ -298,7 +299,7 @@ pub fn answer_expr(
         .filter(|&i| plan.candidate[i] && probed(i, &plan))
         .collect();
     if !second.is_empty() {
-        let got = index.probe_all(&queries(&leaves, &plan, &second));
+        let got = index.probe_all(&queries(&leaves, &plan, &second), cover.as_deref());
         store(&second, got, &mut answers)?;
     }
     let start = Instant::now();
@@ -619,7 +620,7 @@ pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
 
 /// A literal whose containment in the BOM-stripped text is exactly a
 /// nonzero index count: no separator, no first byte of a BOM.
-fn demotable(lit: &[u8]) -> bool {
+pub fn demotable(lit: &[u8]) -> bool {
     !lit.contains(&UNIFIED_SEPARATOR) && !matches!(lit.first(), None | Some(0xEF | 0xBB | 0xBF))
 }
 

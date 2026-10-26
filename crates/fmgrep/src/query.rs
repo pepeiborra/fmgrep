@@ -12,7 +12,7 @@ use crate::filter::PathFilter;
 use crate::manifest::Manifest;
 use crate::matching::{self, DocOutcome, LineMatcher, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
-use crate::probe::{Query, candidate_docs};
+use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
 use crate::sink::{DocMatches, MatchSink};
 use crate::source::{Discovery, Watch};
@@ -39,6 +39,7 @@ pub struct QueryRequest<'a> {
 }
 
 mod boolean;
+mod read;
 
 /// The document state a query answers from.
 pub struct Loaded {
@@ -299,7 +300,41 @@ fn answer_terms(
             }
         })
         .collect();
-    let answers = index.probe_all(&probes);
+    let cover = req.filter.as_ref().and_then(|f| f.cover(&manifest.files));
+    let reads = match (&req.filter, cover.as_deref()) {
+        (Some(f), Some(c)) => {
+            let literals: Vec<Option<&[u8]>> = probes
+                .iter()
+                .zip(terms)
+                .map(|(q, t)| match *q {
+                    Query::Literal(l) if t.pattern.is_none() && boolean::demotable(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+            let paths = docs.paths(&manifest.files);
+            let ids = c.iter().cloned().flatten();
+            let kept = f.kept(&paths, ids.filter(|&i| manifest.doc_lens[i] > 0));
+            let file_us = boolean::read_band(loaded.band).min_us;
+            read::read_instead(index, &literals, c, kept, &manifest.doc_lens, file_us)
+        }
+        _ => probes.iter().map(|_| None).collect(),
+    };
+    let located: Vec<Query<'_>> = (probes.iter().zip(&reads))
+        .filter(|(_, r)| r.is_none())
+        .map(|(q, _)| *q)
+        .collect();
+    let mut got = match located.is_empty() {
+        true => Vec::new(),
+        false => index.probe_all(&located, cover.as_deref()),
+    }
+    .into_iter();
+    let reading: Vec<bool> = reads.iter().map(Option::is_some).collect();
+    let answers: Vec<Answer> = (reads.into_iter())
+        .map(|r| {
+            r.or_else(|| got.next())
+                .expect("probe_all answers every query")
+        })
+        .collect();
     drop(probes);
     debug_assert_eq!(answers.len(), terms.len());
 
@@ -312,8 +347,8 @@ fn answer_terms(
     }
     let mut queries = Vec::with_capacity(terms.len());
     let membership = req.output == QueryOutput::FilesWithMatches;
-    for (((t, pattern), answer), matcher) in terms.iter().zip(&prepared).zip(answers).zip(&matchers)
-    {
+    let each = terms.iter().zip(&prepared).zip(answers).zip(&matchers);
+    for ((((t, pattern), answer), matcher), read) in each.zip(reading) {
         let (term, literal) = (&*t.name, t.literal);
         let fetch_start = Instant::now();
         let mut exact = answer.exact;
@@ -321,9 +356,9 @@ fn answer_terms(
         in_index(&exact, &candidates, num_docs)?;
         docs.screen(&mut exact, &mut candidates);
         debug_assert!(exact.windows(2).all(|w| w[0].0 < w[1].0));
-        // Counts mode counts a fetched document with the pattern: a literal
-        // never has candidates.
-        debug_assert!(emit || pattern.is_some() || candidates.is_empty());
+        // Counts mode counts a fetched document with the pattern, or a read
+        // literal's occurrences; a located literal has no candidates.
+        debug_assert!(emit || pattern.is_some() || read || candidates.is_empty());
         let paths = docs.paths(&manifest.files);
         let mut stale = docs.stale().to_vec();
         if let Some(f) = &req.filter {

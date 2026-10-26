@@ -268,3 +268,85 @@ fn a_path_outside_the_tree_is_refused() {
         )
     );
 }
+
+#[test]
+fn filtered_answers_match_on_a_multi_shard_index() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::tests::SHARD_BYTES.set(Some(16));
+        let all = dotted_tree(tmp.path(), "all", &FILES, store_docs);
+        let kept = dotted_tree(tmp.path(), "kept", &FILES[2..4], store_docs);
+        crate::tests::SHARD_BYTES.set(None);
+        let one = dotted_tree(tmp.path(), "one", &FILES, store_docs);
+        assert!(read_manifest(&all.join(INDEX_DIR)).unwrap().blobs.len() > 2);
+        let sub = |tree: &Path| tree.join("sub").display().to_string();
+        for flags in MODES {
+            for terms in [&["printk"][..], &["/al[a-z]ha/"], &["printk", "alpha"]] {
+                same(&all, &kept, &["-g", "sub/**"], flags, terms);
+                same(&all, &kept, &["-g", "/sub/*"], flags, terms);
+                let pathed = |tree: &Path| {
+                    let sub = sub(tree);
+                    let terms = [terms, &[sub.as_str()]].concat();
+                    printed(tree, flags, &terms).replace(&sub, "SUB")
+                };
+                assert_eq!(
+                    comparable(flags, &pathed(&all)),
+                    comparable(flags, &pathed(&one)),
+                    "{flags:?} {terms:?}"
+                );
+            }
+            let expr = [&["--expr", "printk AND alpha"], flags].concat();
+            same(&all, &kept, &["-g", "sub/**"], &expr, &[]);
+        }
+    }
+}
+
+#[test]
+fn reading_instead_of_locating_answers_alike() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::tests::SHARD_BYTES.set(Some(16));
+        let all = dotted_tree(tmp.path(), "all", &FILES, store_docs);
+        let kept = dotted_tree(tmp.path(), "kept", &FILES[2..4], store_docs);
+        crate::tests::SHARD_BYTES.set(None);
+        for band in [(0.0, 0.0), (f64::INFINITY, f64::INFINITY)] {
+            crate::tests::BAND.set(Some(band));
+            for flags in MODES {
+                for terms in [&["printk"][..], &["printk", "/al[a-z]ha/"]] {
+                    same(&all, &kept, &["-g", "sub/**"], flags, terms);
+                }
+            }
+            crate::tests::BAND.set(None);
+        }
+    }
+}
+
+#[test]
+fn a_filtered_literal_reads_or_locates_by_cost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let common = "printk ".repeat(40) + "alpha\n";
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"printk alpha\n"),
+        ("sub/c.c", common.as_bytes()),
+        ("sub/z.h", b"nothing\n"),
+    ];
+    crate::tests::SHARD_BYTES.set(Some(16));
+    let all = dotted_tree(tmp.path(), "all", &files, true);
+    crate::tests::SHARD_BYTES.set(None);
+    // sub/z.h, the last document, cut off the shard: reading it fails.
+    let index = all.join(INDEX_DIR);
+    let manifest = read_manifest(&index).unwrap();
+    let offsets = crate::manifest::shard_offsets(&manifest.doc_lens).unwrap();
+    let shard = std::fs::OpenOptions::new()
+        .write(true)
+        .open(index.join(DOCS_SHARD))
+        .unwrap();
+    shard.set_len(offsets[manifest.files.len() - 1]).unwrap();
+    let sub = ["-g", "sub/**", "-l"];
+    assert!(query(&all, &sub, &["printk"]).is_err());
+    assert_eq!(printed(&all, &sub, &["alpha"]), "sub/c.c\n");
+    assert_eq!(
+        printed(&all, &["-g", "*.[ch]", "-l"], &["printk"]),
+        "a.c\nsub/c.c\n"
+    );
+}

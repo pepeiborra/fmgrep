@@ -20,9 +20,9 @@
 # --corpus DIR indexes DIR instead and checks AND / OR pairs of GHC terms:
 # -l, -c and --count-matches against rg over the manifest's files, the
 # served counts, --and / --or and --expr of the served label; then -g sets:
-# our -l of every line, local and served, against rg's walk with the same
-# globs over the manifest's files; then, for the files layout, PATH and
-# no-PATH sets the same way from DIR/compiler. Needs jq.
+# our -l of every line and of a literal, local and served, against rg's walk
+# with the same globs over the manifest's files; then, for the files layout,
+# PATH and no-PATH sets the same way from DIR/compiler. Needs jq.
 #
 # Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
 # `pass N / fail M` (plus the served count); exits 1 if any case
@@ -487,6 +487,11 @@ globbed() {
     [[ "$src" == "$rc" ]] || fail+=" served-exit=$src"
     cmp -s "$WORK/ours-g" "$WORK/rg-g" || fail+=" files"
     cmp -s "$WORK/ours-g" "$WORK/srv-g" || fail+=" served"
+    "$BIN" --index "$IDX" -l "${args[@]}" import > "$WORK/raw" 2> /dev/null || true
+    LC_ALL=C sort "$WORK/raw" > "$WORK/ours-l"
+    ( cd "$CORPUS" && rg --no-ignore --no-require-git -a -l "${args[@]}" -F import < /dev/null ) > "$WORK/raw" 2> /dev/null || true
+    sed 's|^\./||' "$WORK/raw" | LC_ALL=C sort | LC_ALL=C comm -12 - "$WORK/files" > "$WORK/rg-l"
+    cmp -s "$WORK/ours-l" "$WORK/rg-l" || fail+=" literal"
     if [[ -z "$fail" ]]; then
         echo "ok   glob [${args[*]}] files=$(wc -l < "$WORK/ours-g" | tr -d ' ') exit=$rc"
         OK=$((OK + 1))

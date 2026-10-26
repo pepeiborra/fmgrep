@@ -335,3 +335,147 @@ fn the_cwd_of_a_search_without_paths_is_an_unnamed_path() {
     assert!(kept(&cwd(&["sub/**"])).is_empty());
     assert!(!cwd(&[]).globs() && cwd(&["*"]).globs());
 }
+
+fn cover(globs: &[&str], fold: bool, paths: &[&str], files: &[&str]) -> Option<Vec<Range<usize>>> {
+    filter(globs, &[], fold, paths).cover(&strings(files))
+}
+
+const ORDERED: [&str; 8] = [
+    "a.txt", "p", "p-x/a", "p.x", "p/a", "p/b/c.rs", "p/c.rs", "q/p/a",
+];
+
+#[test]
+fn prefix_globs_cover_only_their_subtrees() {
+    let at = |globs: &[&str], paths: &[&str]| -> Vec<(usize, usize)> {
+        let cover = cover(globs, false, paths, &ORDERED).unwrap();
+        cover.into_iter().map(|r| (r.start, r.end)).collect()
+    };
+    assert_eq!(at(&["p/**"], &[]), [(4, 7)]);
+    assert_eq!(at(&["/p/*.rs"], &[]), [(4, 7)]);
+    assert_eq!(at(&["p/c*", "/a*"], &[]), [(0, 1), (6, 7)]);
+    assert_eq!(at(&["p\\-x/*"], &[]), [(2, 3)]);
+    assert_eq!(at(&["p/{a,c.rs}"], &[]), [(4, 7)]);
+    assert_eq!(at(&["p/**", "!p/b/**"], &[]), [(4, 7)]);
+    assert_eq!(at(&[], &["p"]), [(1, 2), (4, 7)]);
+    assert_eq!(at(&[], &["p/c.rs", "a.txt"]), [(0, 1), (6, 7)]);
+    assert_eq!(at(&["p/b/**"], &["p"]), [(1, 2), (5, 6)]);
+    assert_eq!(at(&["/p*"], &["p/b"]), [(5, 6)]);
+    assert_eq!(at(&["q/**"], &["p"]), [(1, 2)]);
+    assert!(at(&["z/**"], &[]).is_empty());
+}
+
+#[test]
+fn unprefixed_folded_or_exclude_only_filters_are_unbounded() {
+    for globs in [
+        &["*.rs"][..],
+        &["**/p"],
+        &["p/"],
+        &["!p/**"],
+        &["p/**", "*.txt"],
+    ] {
+        assert_eq!(cover(globs, false, &[], &ORDERED), None, "{globs:?}");
+    }
+    assert_eq!(cover(&["p/**"], true, &[], &ORDERED), None);
+    assert_eq!(cover(&["*.rs"], false, &["", "p"], &ORDERED), None);
+    let iglob = PathFilter::new(&[], &strings(&["p/**"]), false, &[], "");
+    assert_eq!(iglob.unwrap().unwrap().cover(&strings(&ORDERED)), None);
+}
+
+#[test]
+fn the_cover_holds_every_kept_file() {
+    const PARTS: [&str; 7] = ["a", "a-b", "a.b", "b", "GHC", "x.rs", "y.txt"];
+    let mut seed = 0x9e37_79b9_u32;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % n
+    };
+    let mut files: Vec<String> = (0..400)
+        .map(|_| {
+            let depth = 1 + next(4);
+            let parts: Vec<&str> = (0..depth).map(|_| PARTS[next(PARTS.len())]).collect();
+            parts.join("/")
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    let sets: [&[&str]; 17] = [
+        &["a/**"],
+        &["/a*"],
+        &["a/b/*.rs"],
+        &["a.b/**", "!**/x.rs"],
+        &["a-b/**", "b/GHC/*"],
+        &["a/**", "!a/b/"],
+        &["GHC/**/*.txt"],
+        &["b/{a,b}/**"],
+        &["a/[ab]*"],
+        &["b/?/x.rs"],
+        &["*.rs"],
+        &["!b/**"],
+        &["GHC/**"],
+        &["../b/**"],
+        &["/x.rs"],
+        &[".b/**"],
+        &["b/**", "a/a*"],
+    ];
+    let roots: [(&str, &[(&str, &str)]); 13] = [
+        ("/r", &[]),
+        ("/r/a", &[("a", "")]),
+        ("/r", &[("a", "a")]),
+        ("/r", &[("a/b", "a/b"), ("b", "./b")]),
+        ("/r", &[("a/x.rs", "a/x.rs"), ("", ".")]),
+        ("/r/a", &[("a", ".")]),
+        ("/r/a", &[("", "..")]),
+        ("/r/a", &[("b", "../b"), ("a/b", "b/")]),
+        ("/r/a", &[("a", "/r/a")]),
+        ("/r/a", &[("", "/r")]),
+        ("/r/a", &[("a/GHC", "/r/a/GHC"), ("a.b", "/r/a.b")]),
+        ("/r/a/b", &[("a", "..")]),
+        ("/r/a/b", &[("", "/r")]),
+    ];
+    for globs in sets {
+        for (cwd, paths) in roots {
+            let f = PathFilter::new(&strings(globs), &[], false, &named(paths), cwd);
+            let f = f.unwrap().unwrap();
+            let mut keep = f.keeper();
+            let ctx = format!("{globs:?} {cwd} {paths:?}");
+            let Some(cover) = f.cover(&files) else {
+                continue;
+            };
+            for (id, path) in files.iter().enumerate() {
+                if keep(path) {
+                    assert!(cover.iter().any(|r| r.contains(&id)), "{ctx}: {path}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cover_follows_the_path_the_globs_see() {
+    let files = strings(&FILES);
+    let at = |cwd: &str, globs: &[&str], paths: &[(&str, &str)]| {
+        let cover = from(cwd, globs, paths).cover(&files);
+        cover.map(|c| c.into_iter().map(|r| (r.start, r.end)).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        at("/r/sub", &["deep/*"], &[("sub", ".")]),
+        Some(vec![(7, 9)])
+    );
+    assert_eq!(
+        at("/r/sub", &["deep/*"], &[("sub", "/r/sub")]),
+        Some(vec![(7, 9)])
+    );
+    assert_eq!(at("/r/sub", &["sub/**"], &[("sub", ".")]), Some(vec![]));
+    assert_eq!(
+        at("/r/sub", &["../sub2/*"], &[("", "..")]),
+        Some(vec![(9, 10)])
+    );
+    assert_eq!(at("/r/sub", &["/2/*"], &[("", "/r")]), None);
+    assert_eq!(
+        at("/r/sub", &["deep/*"], &[("sub", "")]),
+        Some(vec![(7, 9)])
+    );
+    assert_eq!(at("/r/sub", &[], &[("sub", "")]), Some(vec![(6, 9)]));
+}

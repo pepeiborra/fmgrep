@@ -21,7 +21,7 @@ const COUNTED: [&[u8]; 7] = [b"printk", b"aa", b"a", b"doc 1", b"missing", b"", 
 fn counts(index: &DocfmIndex, terms: &[&[u8]]) -> Vec<Vec<(Range<usize>, u64)>> {
     let qs: Vec<Query<'_>> = terms.iter().map(|t| Query::Count(t)).collect();
     index
-        .probe_all(&qs)
+        .probe_all(&qs, None)
         .into_iter()
         .map(|a| {
             assert!(a.exact.is_empty());
@@ -33,7 +33,7 @@ fn counts(index: &DocfmIndex, terms: &[&[u8]]) -> Vec<Vec<(Range<usize>, u64)>> 
 
 /// `probe_literal` summed per shard, nonzero shards only.
 fn per_shard(index: &DocfmIndex, term: &[u8]) -> Vec<(Range<usize>, u64)> {
-    let hits = index.probe_literal(term);
+    let hits = index.probe_literal(term, None);
     index
         .metas
         .iter()
@@ -70,7 +70,7 @@ fn ranges(pairs: &[(usize, usize)]) -> Vec<Range<usize>> {
 
 fn within(index: &DocfmIndex, term: &[u8], within: &[Range<usize>]) -> Vec<(usize, u64)> {
     index
-        .probe_all(&[Query::LiteralWithin { term, within }])
+        .probe_all(&[Query::LiteralWithin { term, within }], None)
         .remove(0)
         .exact
 }
@@ -88,7 +88,7 @@ fn literal_within_skips_shards_outside_within() {
     // One doc per shard; the empty doc shares one.
     let index = DocfmIndex::build_with_cap(&docs, 1);
     assert_eq!(index.metas.len(), 5);
-    let everywhere = index.probe_literal(b"printk");
+    let everywhere = index.probe_literal(b"printk", None);
     assert_eq!(everywhere.len(), 5);
     for w in [&[][..], &[(0, 1)], &[(0, 1), (2, 5)], &[(3, 4)], &[(4, 6)]].map(ranges) {
         let shard_in = |d: usize| {

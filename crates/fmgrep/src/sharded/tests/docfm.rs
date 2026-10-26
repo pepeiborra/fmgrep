@@ -20,7 +20,7 @@ fn docs() -> Vec<Document> {
 }
 
 fn hits(idx: &DocfmIndex, term: &[u8]) -> Vec<(usize, u64)> {
-    idx.probe_literal(term)
+    idx.probe_literal(term, None)
 }
 
 fn build(docs: &[Document], cap: u64) -> DocfmIndex {
@@ -144,7 +144,7 @@ fn regex_candidates_prune_via_locate() {
     let docs = docs();
     let idx = build(&docs, 1 << 20);
     let nullable = PreparedPattern::prepare("a*").unwrap();
-    assert!(idx.regex_candidates(&nullable).is_none());
+    assert!(idx.regex_candidates(&nullable, None).is_none());
     for pattern in [
         "printk",
         "aa",
@@ -155,7 +155,7 @@ fn regex_candidates_prune_via_locate() {
         "printk.*hello",
     ] {
         let prepared = PreparedPattern::prepare(pattern).unwrap();
-        let Some(got) = idx.regex_candidates(&prepared) else {
+        let Some(got) = idx.regex_candidates(&prepared, None) else {
             panic!("{pattern} narrows");
         };
         for (i, d) in docs.iter().enumerate() {
@@ -166,7 +166,7 @@ fn regex_candidates_prune_via_locate() {
         }
     }
     let absent = PreparedPattern::prepare("\u{00fe}+z").unwrap();
-    assert_eq!(idx.regex_candidates(&absent), Some(Vec::new()));
+    assert_eq!(idx.regex_candidates(&absent, None), Some(Vec::new()));
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn fold_candidates_are_exact() {
         ] {
             let prepared = PreparedPattern::prepare_with(pattern, ci).unwrap();
             assert!(prepared.fold().is_some(), "{pattern:?} must plan");
-            let Some(got) = idx.regex_candidates(&prepared) else {
+            let Some(got) = idx.regex_candidates(&prepared, None) else {
                 panic!("{pattern} has a fold plan");
             };
             assert_eq!(got, want, "cap={cap} pattern={pattern:?}");
