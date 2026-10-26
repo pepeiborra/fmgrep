@@ -140,6 +140,7 @@ impl QueryParams {
             Mode::Lines | Mode::Only | Mode::JsonMatches => QueryOutput::Matches {
                 before: self.context.before,
                 after: self.context.after,
+                line_numbers: self.line_numbers,
             },
             Mode::Files => QueryOutput::FilesWithMatches,
             Mode::Count => QueryOutput::CountLines,

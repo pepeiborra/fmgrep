@@ -42,7 +42,12 @@ pub enum QueryOutput {
     /// Wire counts only: the harness path.
     Counts,
     /// Matched lines with spans and text, plus `before`/`after` context.
-    Matches { before: usize, after: usize },
+    /// `LineHit::line` is 0 without `line_numbers` and context.
+    Matches {
+        before: usize,
+        after: usize,
+        line_numbers: bool,
+    },
     /// Matched lines per file (rg `-c`).
     CountLines,
     /// Matches per file, rg's non-overlapping count (rg `--count-matches`).
@@ -58,6 +63,11 @@ impl QueryOutput {
 
     fn first_match_suffices(self) -> bool {
         matches!(self, Self::FilesWithMatches)
+    }
+
+    fn numbers_lines(self) -> bool {
+        matches!(self, Self::Matches { before, after, line_numbers }
+            if line_numbers || before > 0 || after > 0)
     }
 }
 
@@ -110,7 +120,7 @@ impl DocOutcome {
 /// One line of output. The content is `raw[start..end]` of the document the
 /// scan ran over: terminator excluded, `\r` kept, exact bytes.
 pub struct LineHit {
-    /// 1-based, like rg.
+    /// 1-based, like rg; 0 when the scan was not asked for numbers.
     pub line: u64,
     pub start: usize,
     pub end: usize,
@@ -121,7 +131,7 @@ pub struct LineHit {
     pub matched: bool,
 }
 
-/// A line's 1-based number and its content range in the document.
+/// A line's 1-based number (0 when unnumbered) and its content range.
 #[derive(Clone, Copy)]
 struct Line {
     no: u64,
@@ -162,32 +172,40 @@ impl Iterator for Lines<'_> {
     }
 }
 
-/// Maps ascending byte offsets to their lines in one forward walk.
-struct LineWalker<'a> {
-    lines: Lines<'a>,
-    cur: Line,
+/// Maps ascending offsets to their lines without visiting the lines between.
+struct LineCursor<'a> {
+    raw: &'a [u8],
+    numbered: bool,
+    cur: Option<Line>,
 }
 
-impl<'a> LineWalker<'a> {
-    fn new(raw: &'a [u8]) -> Self {
-        let mut lines = Lines::new(raw);
-        let cur = lines.next().unwrap_or(Line {
-            no: 0,
-            start: 0,
-            end: 0,
-        });
-        Self { lines, cur }
+impl<'a> LineCursor<'a> {
+    fn new(raw: &'a [u8], numbered: bool) -> Self {
+        Self {
+            raw,
+            numbered,
+            cur: None,
+        }
     }
 
-    /// The line holding `pos`. `pos` must not decrease across calls.
-    fn advance_to(&mut self, pos: usize) -> Line {
-        while pos >= self.cur.end && self.cur.end < self.lines.raw.len() {
-            match self.lines.next() {
-                Some(l) => self.cur = l,
-                None => break,
-            }
-        }
-        self.cur
+    /// The line holding `pos`; a terminator belongs to the line it ends.
+    /// `pos` must not decrease. `no` is 0 unless numbered.
+    fn at(&mut self, pos: usize) -> Line {
+        let (from, no) = match self.cur {
+            Some(l) if pos <= l.end => return l,
+            Some(l) => (l.end + 1, l.no),
+            None => (0, 0),
+        };
+        let start = memchr::memrchr(b'\n', &self.raw[from..pos]).map_or(from, |i| from + i + 1);
+        let end = memchr::memchr(b'\n', &self.raw[pos..]).map_or(self.raw.len(), |i| pos + i);
+        let no = if self.numbered {
+            no + 1 + memchr::memchr_iter(b'\n', &self.raw[from..start]).count() as u64
+        } else {
+            0
+        };
+        let line = Line { no, start, end };
+        self.cur = Some(line);
+        line
     }
 }
 
@@ -292,9 +310,9 @@ impl LineMatcher {
             Self::Literal(finder) => {
                 let len = finder.needle().len();
                 if len > 0 {
-                    let mut walker = LineWalker::new(raw);
+                    let mut cursor = LineCursor::new(raw, output.numbers_lines());
                     for pos in finder.find_iter(raw) {
-                        let line = walker.advance_to(pos);
+                        let line = cursor.at(pos);
                         acc.push(line, (pos - line.start) as u32, len as u32);
                         if acc.done() {
                             break;
@@ -314,14 +332,14 @@ impl LineMatcher {
                 re,
                 anchor: Some(finder),
             } => {
-                let mut walker = LineWalker::new(raw);
-                let mut last = 0u64;
+                let mut cursor = LineCursor::new(raw, output.numbers_lines());
+                let mut last = None;
                 for pos in finder.find_iter(raw) {
-                    let line = walker.advance_to(pos);
-                    if line.no == last {
+                    let line = cursor.at(pos);
+                    if last == Some(line.start) {
                         continue;
                     }
-                    last = line.no;
+                    last = Some(line.start);
                     scan_line(re, raw, line, &mut acc);
                     if acc.done() {
                         break;
@@ -493,7 +511,7 @@ impl Accum {
     }
 
     fn open(&mut self, line: Line) -> bool {
-        let fresh = self.cur.as_ref().is_none_or(|(l, _)| l.no != line.no);
+        let fresh = self.cur.as_ref().is_none_or(|(l, _)| l.start != line.start);
         if fresh {
             self.flush();
             self.cur = Some((line, Vec::new()));
@@ -550,7 +568,7 @@ impl Accum {
         self.flush();
         let lines = match output {
             _ if self.matched_lines == 0 => Vec::new(),
-            QueryOutput::Matches { before, after } if before > 0 || after > 0 => {
+            QueryOutput::Matches { before, after, .. } if before > 0 || after > 0 => {
                 with_context(raw, &self.hits, before as u64, after as u64)
             }
             QueryOutput::Matches { .. } => self

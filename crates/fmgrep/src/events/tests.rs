@@ -15,6 +15,7 @@ const B: (&str, &[u8]) = ("sub/b.txt", b"first\nalpha in sub\nthird\n");
 const MATCHES: QueryOutput = QueryOutput::Matches {
     before: 0,
     after: 0,
+    line_numbers: true,
 };
 
 fn cfg() -> JsonConfig {
@@ -128,7 +129,8 @@ fn context_events_carry_empty_submatches() {
             &["alpha"],
             QueryOutput::Matches {
                 before: 1,
-                after: 1
+                after: 1,
+                line_numbers: true
             },
             cfg()
         ),
@@ -395,7 +397,8 @@ fn a_multiline_submatch_carries_its_terminators_and_context_stays_per_line() {
             &["/one\\nbeta/"],
             QueryOutput::Matches {
                 before: 1,
-                after: 1
+                after: 1,
+                line_numbers: true
             },
             multi_cfg()
         ),
@@ -407,4 +410,25 @@ fn a_multiline_submatch_carries_its_terminators_and_context_stays_per_line() {
             r#"{"data":{"elapsed_total":{},"stats":{"bytes_printed":374,"bytes_searched":64,"elapsed":{"human":"0.000000s","nanos":0,"secs":0},"matched_lines":2,"matches":1,"searches":1,"searches_with_match":1}},"type":"summary"}"#,
         ])
     );
+}
+
+#[test]
+fn multiline_blocks_merge_without_line_numbers() {
+    let unnumbered = || JsonConfig {
+        line_numbers: false,
+        multiline: true,
+    };
+    let off = QueryOutput::Matches {
+        before: 0,
+        after: 0,
+        line_numbers: false,
+    };
+    // Lines 1-4 of A hold "a": one block.
+    for term in ["a", "alpha"] {
+        assert_eq!(
+            render(&[A, B], &[term], off, unnumbered()),
+            render(&[A, B], &[term], MATCHES, unnumbered()),
+            "{term}"
+        );
+    }
 }

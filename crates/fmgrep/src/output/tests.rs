@@ -16,6 +16,7 @@ const FIXTURE: [(&str, &[u8]); 2] = [
 const MATCHES: QueryOutput = QueryOutput::Matches {
     before: 0,
     after: 0,
+    line_numbers: true,
 };
 
 fn cfg(format: Format) -> OutputConfig {
@@ -82,7 +83,11 @@ fn alpha(cfg: OutputConfig, output: QueryOutput) -> String {
 }
 
 fn context(before: usize, after: usize) -> QueryOutput {
-    QueryOutput::Matches { before, after }
+    QueryOutput::Matches {
+        before,
+        after,
+        line_numbers: true,
+    }
 }
 
 fn with_context(format: Format, heading: bool, on: bool) -> OutputConfig {

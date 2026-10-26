@@ -3,6 +3,7 @@ use super::*;
 const MATCHES: QueryOutput = QueryOutput::Matches {
     before: 0,
     after: 0,
+    line_numbers: true,
 };
 
 /// `(line, text, spans)` per emitted line.
@@ -239,6 +240,7 @@ fn context_lines_are_captured_and_deduplicated() {
         QueryOutput::Matches {
             before: 1,
             after: 1,
+            line_numbers: true,
         },
     );
     let want: Vec<u64> = vec![2, 3, 4, 5, 6, 7];
@@ -252,6 +254,7 @@ fn context_lines_are_captured_and_deduplicated() {
         QueryOutput::Matches {
             before: 3,
             after: 3,
+            line_numbers: true,
         },
     );
     assert_eq!(wide.len(), 7);
@@ -438,4 +441,98 @@ fn ignore_case_composes_with_multiline() {
     // The literal path folds nothing, so `-i` reaches it only as a pattern.
     let ci_lit = LineMatcher::regex("ALPHA\nBETA", None, CI_MULTI).unwrap();
     assert_eq!(count_matches(&ci_lit, "alpha\nbeta\n"), 1);
+}
+
+const UNNUMBERED: QueryOutput = QueryOutput::Matches {
+    before: 0,
+    after: 0,
+    line_numbers: false,
+};
+
+fn line_of(raw: &[u8], pos: usize) -> (u64, usize, usize) {
+    let l = Lines::new(raw).find(|l| pos <= l.end).unwrap();
+    (l.no, l.start, l.end)
+}
+
+#[test]
+fn line_cursor_agrees_with_a_line_walk() {
+    for raw in [
+        "",
+        "a",
+        "a\n",
+        "\n\n",
+        "ab\ncd",
+        "ab\r\n\ncd\n",
+        "x\n\n\ny\nzz\n\n",
+    ] {
+        let raw = raw.as_bytes();
+        let positions: Vec<usize> = (0..raw.len()).filter(|&p| raw[p] != b'\n').collect();
+        for stride in [1, 2, 3, 7] {
+            for numbered in [true, false] {
+                let mut cursor = LineCursor::new(raw, numbered);
+                for &pos in positions.iter().step_by(stride) {
+                    let (no, start, end) = line_of(raw, pos);
+                    let got = cursor.at(pos);
+                    let want = (if numbered { no } else { 0 }, start, end);
+                    assert_eq!(
+                        (got.no, got.start, got.end),
+                        want,
+                        "{raw:?} pos={pos} stride={stride}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_terminator_belongs_to_the_line_it_ends() {
+    let raw = b"\n\nab\n\ncd";
+    let mut cursor = LineCursor::new(raw, true);
+    for pos in [0, 1, 4, 5, raw.len()] {
+        let got = cursor.at(pos);
+        assert_eq!((got.no, got.start, got.end), line_of(raw, pos), "pos={pos}");
+    }
+}
+
+#[test]
+fn unnumbered_matches_keep_lines_spans_and_counts() {
+    let doc = "printk(a)\n\nno\nprintk(b) printk(c)\r\n\n\nx printk\nprintk";
+    let anchored =
+        LineMatcher::regex("printk\\(.\\)", Some(b"printk"), MatchMode::default()).unwrap();
+    for m in [lit("printk"), anchored] {
+        let (on, off) = (
+            m.scan(doc.as_bytes(), MATCHES),
+            m.scan(doc.as_bytes(), UNNUMBERED),
+        );
+        assert!(!off.lines.is_empty());
+        assert_eq!(on.lines.len(), off.lines.len());
+        for (a, b) in on.lines.iter().zip(&off.lines) {
+            assert_eq!(
+                (a.start, a.end, &a.spans, a.matched),
+                (b.start, b.end, &b.spans, b.matched)
+            );
+            assert!(a.line > 0 && b.line == 0);
+        }
+        assert_eq!(
+            (on.matched_lines, on.matched_spans, on.spanless_lines),
+            (off.matched_lines, off.matched_spans, off.spanless_lines)
+        );
+    }
+}
+
+#[test]
+fn context_numbers_lines_without_line_numbers() {
+    let doc = "1\n2\nhit\n4\nhit\n";
+    let out = |line_numbers| QueryOutput::Matches {
+        before: 1,
+        after: 0,
+        line_numbers,
+    };
+    let got = hits_out(&lit("hit"), doc, out(false));
+    assert_eq!(
+        got.iter().map(|h| h.0).collect::<Vec<_>>(),
+        vec![2, 3, 4, 5]
+    );
+    assert_eq!(got, hits_out(&lit("hit"), doc, out(true)));
 }

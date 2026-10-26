@@ -30,6 +30,7 @@ fn written(index: &Path, terms: &[&str], output: QueryOutput, cfg: OutputConfig)
 const MATCHES: QueryOutput = QueryOutput::Matches {
     before: 0,
     after: 0,
+    line_numbers: true,
 };
 
 #[test]

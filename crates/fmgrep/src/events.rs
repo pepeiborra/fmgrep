@@ -121,7 +121,7 @@ impl<W: Write> MatchSink for JsonSink<W> {
             if self.cfg.multiline && head.matched {
                 while tail + 1 < hits.len()
                     && hits[tail + 1].matched
-                    && hits[tail + 1].line == hits[tail].line + 1
+                    && hits[tail + 1].start == hits[tail].end + 1
                 {
                     tail += 1;
                 }

@@ -9,6 +9,7 @@ use crate::wire::QueryReport;
 const MATCHES: QueryOutput = QueryOutput::Matches {
     before: 0,
     after: 0,
+    line_numbers: true,
 };
 
 /// One `doc` call: the document, its counts, and `(line, match columns,

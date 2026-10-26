@@ -79,6 +79,7 @@ fn text_modes_map_to_query_outputs() {
     let lines = QueryOutput::Matches {
         before: 1,
         after: 2,
+        line_numbers: true,
     };
     for (mode, output, format) in [
         (Mode::Counts, QueryOutput::Counts, Format::Lines),
@@ -105,6 +106,16 @@ fn text_modes_map_to_query_outputs() {
         assert_eq!(p.output(), output, "{mode:?}");
         assert_eq!(p.output_config().format, format, "{mode:?}");
     }
+    let unnumbered = parse(r#"{"terms":["a"],"mode":"lines","line_numbers":false}"#).unwrap();
+    assert_eq!(
+        unnumbered.output(),
+        QueryOutput::Matches {
+            before: 0,
+            after: 0,
+            line_numbers: false,
+        }
+    );
+    assert!(!unnumbered.output_config().line_numbers && !unnumbered.json_config().line_numbers);
 }
 
 #[test]
