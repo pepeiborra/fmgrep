@@ -48,12 +48,28 @@ pub struct Loaded {
     watch: Option<Watch>,
     discovery: Option<Discovery>,
     band: boolean::ReadBand,
+    locate_us: f64,
 }
 
 impl Loaded {
     /// Plan ANDs from this machine's warm read cost, measured now.
     pub fn measure_band(&mut self, manifest: &Manifest) {
         self.band = boolean::warm_band(&mut self.docs, manifest);
+    }
+
+    /// Price a locate from this machine's warm locates, measured now; under
+    /// verbose, note both costs.
+    pub fn measure_locate(&mut self, index: &DocfmIndex) {
+        let start = Instant::now();
+        self.locate_us = read::locate_us(index.sample_rate(), index.locate_us());
+        if crate::verbose::verbose() {
+            eprintln!(
+                "note: a read costs {:.1} µs per file, a locate {:.3} µs per occurrence (sampled in {} µs)",
+                self.band.min_us,
+                self.locate_us,
+                start.elapsed().as_micros()
+            );
+        }
     }
 
     /// The watch [`load`] started, if asked to.
@@ -134,6 +150,7 @@ pub fn load(
         watch,
         discovery,
         band: boolean::ReadBand::DEFAULT,
+        locate_us: read::locate_us(index.sample_rate(), None),
     };
     let loaded = finish(loaded, manifest);
     covers(index.num_files_indexed(), manifest)?;
@@ -324,7 +341,20 @@ fn answer_terms(
             let ids = c.iter().cloned().flatten();
             let kept = f.kept(&paths, ids.filter(|&i| manifest.doc_lens[i] > 0));
             let file_us = boolean::read_band(loaded.band).min_us;
-            read::read_instead(index, &literals, c, kept, &manifest.doc_lens, file_us)
+            let costs = read::Costs {
+                file_us,
+                locate_us: loaded.locate_us,
+            };
+            let fetched = |l: &[u8]| reads_exact(req.output, l);
+            read::read_instead(
+                index,
+                &literals,
+                c,
+                kept,
+                &manifest.doc_lens,
+                costs,
+                fetched,
+            )
         }
         _ => probes.iter().map(|_| None).collect(),
     };
@@ -514,6 +544,15 @@ fn probe_count_is_rgs(output: QueryOutput, term: &[u8]) -> bool {
     output == QueryOutput::CountMatches && matching::literal_counts_are_exact(term)
 }
 
+/// Whether this mode reads the probe-exact documents of `term`.
+fn reads_exact(output: QueryOutput, term: &[u8]) -> bool {
+    match output {
+        QueryOutput::Counts | QueryOutput::FilesWithMatches => false,
+        QueryOutput::CountMatches => !probe_count_is_rgs(output, term),
+        QueryOutput::CountLines | QueryOutput::Matches { .. } => true,
+    }
+}
+
 /// Documents whose bytes this mode must see: the index's candidate set,
 /// widened with the probe-exact documents whose lines or rg-exact counts the
 /// mode still needs.
@@ -523,12 +562,7 @@ fn scan_ids(
     candidates: &[usize],
     exact: &[(usize, u64)],
 ) -> Vec<usize> {
-    let widen = match output {
-        QueryOutput::Counts | QueryOutput::FilesWithMatches => false,
-        QueryOutput::CountMatches => !probe_count_is_rgs(output, term),
-        QueryOutput::CountLines | QueryOutput::Matches { .. } => true,
-    };
-    if !widen {
+    if !reads_exact(output, term) {
         return candidates.to_vec();
     }
     let mut ids: Vec<usize> = candidates

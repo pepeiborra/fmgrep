@@ -138,6 +138,11 @@ impl<D: AsRef<[u8]>> FmIndex<D> {
         self.header.num_docs
     }
 
+    /// The sample rate it was built at.
+    pub fn sample_rate(&self) -> u32 {
+        self.header.sample_rate
+    }
+
     /// Visit the doc id of every occurrence of `pattern`.
     pub fn locate(&self, pattern: &[u8], visit: &mut dyn FnMut(usize)) {
         self.cursor().extend_front(pattern).locate(visit);
@@ -279,6 +284,16 @@ impl Cursor<'_> {
             next.hi = self.view.step(code, next.hi).max(next.lo);
         }
         next
+    }
+
+    /// Its rows `within`, clamped to its count; the root stays the root.
+    pub fn rows(&self, within: std::ops::Range<u64>) -> Self {
+        let at = |row: u64| self.lo + row.min(self.count()) as usize;
+        Self {
+            lo: at(within.start),
+            hi: at(within.end).max(at(within.start)),
+            ..*self
+        }
     }
 
     /// Occurrences of the query; `n + 1` at the root.

@@ -694,3 +694,48 @@ fn interleaved_locate_equals_rowwise() {
         }
     }
 }
+
+#[test]
+fn a_view_reports_its_sample_rate() {
+    for rate in [1, 3, 16, 32] {
+        let index = Built::build(b"abracadabra\0".to_vec(), rate).unwrap();
+        assert_eq!(index.sample_rate(), rate);
+        assert_eq!(FmIndex::view(encode(&index)).unwrap().sample_rate(), rate);
+    }
+}
+
+#[test]
+fn rows_locates_a_slice_of_the_rows() {
+    for text in texts() {
+        let index = Built::build(text.clone(), 4).unwrap();
+        for pattern in patterns(&text) {
+            let cursor = index.cursor().extend_front(&pattern);
+            for within in [
+                0..0,
+                0..1,
+                2..7,
+                5..17,
+                std::ops::Range { start: 3, end: 1 },
+                1..u64::MAX,
+                u64::MAX..u64::MAX,
+            ] {
+                let slice = cursor.rows(within.clone());
+                let n = cursor.count();
+                let want_count = within.end.min(n).saturating_sub(within.start.min(n));
+                assert_eq!(slice.count(), want_count);
+                assert_eq!(slice.lo, cursor.lo + within.start.min(n) as usize);
+                let mut want: Vec<usize> =
+                    (slice.lo..slice.hi).map(|r| cursor.view.doc(r)).collect();
+                let mut got = Vec::new();
+                slice.locate(&mut |d| got.push(d));
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "pattern {pattern:?} rows {within:?}");
+            }
+        }
+    }
+    let mut visited = 0;
+    let index = Built::build(b"abracadabra\0".to_vec(), 4).unwrap();
+    index.cursor().rows(0..5).locate(&mut |_| visited += 1);
+    assert_eq!(visited, 0, "the root visits nothing");
+}

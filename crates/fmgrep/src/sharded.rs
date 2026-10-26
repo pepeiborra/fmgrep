@@ -6,7 +6,7 @@ mod build;
 mod shard;
 
 use std::borrow::Cow;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -23,6 +23,12 @@ use crate::sharded::shard::{Shard, ShardMeta, Structure, encode_shard, sample_pr
 
 const DOC_SAMPLE_RATE: u32 = 16;
 const SAMPLE_RATE_VAR: &str = "FMGREP_SAMPLE_RATE";
+/// LF steps per sampled pass, about: rows times the rate.
+const SAMPLE_STEPS: u64 = 4096;
+/// Rows a locate sample takes per shard.
+const SAMPLE_ROWS: RangeInclusive<u64> = 256..=4096;
+/// Contiguous rows per sampled chunk: a few batches of docfm's lanes.
+const SAMPLE_CHUNK: u64 = 64;
 
 // The shard text's separator is docfm's document end.
 const _: () = assert!(docfm::DOC_END == UNIFIED_SEPARATOR);
@@ -34,6 +40,10 @@ fn literal_term(term: &[u8]) -> Option<&[u8]> {
 
 /// docfm's sample rate for a build, from `FMGREP_SAMPLE_RATE`.
 fn sample_rate() -> Result<u32, String> {
+    #[cfg(test)]
+    if let Some(rate) = crate::tests::SAMPLE_RATE.get() {
+        return Ok(rate);
+    }
     let rate = crate::env::count(SAMPLE_RATE_VAR, DOC_SAMPLE_RATE.into())?;
     u32::try_from(rate)
         .ok()
@@ -85,6 +95,33 @@ fn build_one(cut: &Cut, docs: Cow<'_, [Document]>, rate: u32) -> Shard {
         refuse("locate self-check failed".to_string());
     }
     Shard { structure, meta }
+}
+
+/// µs per occurrence locating `rows` rows of `shard`'s commonest byte, in
+/// chunks spread through one third of its rows; fastest of the 3 thirds.
+fn sample_locate(shard: &Structure, rows: u64) -> Option<f64> {
+    let root = shard.cursor();
+    let byte = (1..=u8::MAX).max_by_key(|&b| root.extend_front(&[b]).count())?;
+    let cursor = root.extend_front(&[byte]);
+    if cursor.count() < rows {
+        return None;
+    }
+    let chunks = rows.div_ceil(SAMPLE_CHUNK);
+    let third = cursor.count() / 3;
+    let stride = third / chunks;
+    let len = SAMPLE_CHUNK.min(stride);
+    let mut docs = Vec::with_capacity(rows as usize);
+    let mut fastest = f64::INFINITY;
+    for pass in 0..3 {
+        docs.clear();
+        let start = Instant::now();
+        for chunk in 0..chunks {
+            let at = pass * third + chunk * stride;
+            cursor.rows(at..at + len).locate(&mut |d| docs.push(d));
+        }
+        fastest = fastest.min(start.elapsed().as_secs_f64());
+    }
+    Some(fastest * 1e6 / (chunks * len) as f64)
 }
 
 /// One shard's documents, borrowed when the caller already holds them.
@@ -170,6 +207,28 @@ impl DocfmIndex {
     /// Documents this index answers for.
     pub fn num_files_indexed(&self) -> usize {
         self.total_docs
+    }
+
+    /// Its shards' sample rate; the build default without shards.
+    pub fn sample_rate(&self) -> u32 {
+        self.shards
+            .first()
+            .map_or(DOC_SAMPLE_RATE, |s| s.sample_rate())
+    }
+
+    /// Warm µs per located occurrence, sampled; None when no shard is wide enough.
+    pub fn locate_us(&self) -> Option<f64> {
+        let last = self.shards.len().checked_sub(1)?;
+        let mut picks = vec![0, last / 2, last];
+        picks.dedup();
+        let rows = (SAMPLE_STEPS / u64::from(self.sample_rate()))
+            .clamp(*SAMPLE_ROWS.start(), *SAMPLE_ROWS.end());
+        let mut us: Vec<f64> = picks
+            .par_iter()
+            .filter_map(|&i| sample_locate(&self.shards[i], rows))
+            .collect();
+        us.sort_by(f64::total_cmp);
+        us.get(us.len() / 2).copied()
     }
 
     /// Per-shard hits of the shards overlapping `within` (all when None),

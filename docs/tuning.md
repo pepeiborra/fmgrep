@@ -15,7 +15,7 @@ empty is the default, and any other value that does not parse is an error.
 | variable | default | trades |
 |---|---|---|
 | `FMGREP_SHARD_BYTES` | `100MB` | Text per shard. A term probes every shard its PATHs, globs and cwd leave, so small shards add per-term work; large ones build slower in more memory. 100 MiB keeps a 90 MB tree in one shard. |
-| `FMGREP_VERBOSE` | `0`; a count over `0` turns it on | As `index -v`: lists each skipped binary file. |
+| `FMGREP_VERBOSE` | `0`; a count over `0` turns it on | As `index -v`: lists each skipped binary file; `serve` also prints the read and locate costs it measured. |
 
 ## Index (developer)
 

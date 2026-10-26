@@ -343,6 +343,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         return Err(format!("error: {why} under {}", root.display()));
     }
     docs.measure_band(req.manifest);
+    docs.measure_locate(&index);
     Ok(Served {
         index,
         docs,
