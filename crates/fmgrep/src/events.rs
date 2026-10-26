@@ -33,9 +33,6 @@ pub struct JsonSink<W: Write> {
     corpus: (u64, u64),
     term: TermStats,
     started: Instant,
-    /// This term's previous path: the ascending contract.
-    #[cfg(debug_assertions)]
-    last: Option<String>,
 }
 
 #[derive(Default)]
@@ -54,8 +51,6 @@ impl<W: Write> JsonSink<W> {
             corpus: (0, 0),
             term: TermStats::default(),
             started: Instant::now(),
-            #[cfg(debug_assertions)]
-            last: None,
         }
     }
 
@@ -89,22 +84,10 @@ impl<W: Write> MatchSink for JsonSink<W> {
     fn term_start(&mut self, _: &str) -> Result<(), String> {
         self.term = TermStats::default();
         self.started = Instant::now();
-        #[cfg(debug_assertions)]
-        {
-            self.last = None;
-        }
         Ok(())
     }
 
     fn doc(&mut self, m: DocMatches<'_>) -> Result<(), String> {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.last.as_deref().is_none_or(|p| p < m.path),
-                "paths must ascend"
-            );
-            self.last = Some(m.path.to_owned());
-        }
         let at = self.pipe.written();
         self.emit(&Event::Begin(Begin {
             path: Data::Text(m.path),

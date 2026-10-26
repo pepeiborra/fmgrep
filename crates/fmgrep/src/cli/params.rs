@@ -1,12 +1,12 @@
 //! `query` params: a search's flags on the wire.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
 use crate::events::JsonConfig;
 use crate::expr::Expr;
-use crate::filter::PathFilter;
+use crate::filter::{PathFilter, SearchPath};
 use crate::manifest::Manifest;
 use crate::matching::{MatchMode, QueryOutput};
 use crate::output::{Format, OutputConfig};
@@ -48,9 +48,16 @@ pub struct QueryParams {
     pub iglobs: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub glob_case_insensitive: bool,
-    /// Files or directories relative to the indexed root, `""` the root.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
+    pub paths: Vec<SearchPath>,
+    /// The client's working directory: what rg strips before matching globs
+    /// under `paths`; without `paths`, the search's scope when it lies in the
+    /// tree.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    /// False for one file PATH, as in rg.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub filename: bool,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -127,11 +134,40 @@ impl Default for QueryParams {
             iglobs: Vec::new(),
             glob_case_insensitive: false,
             paths: Vec::new(),
+            cwd: String::new(),
+            filename: true,
         }
     }
 }
 
 impl QueryParams {
+    /// Without `paths`, rg's scope: only the subtree of `cwd` when it lies
+    /// below `tree`.
+    pub fn scope(&mut self, tree: Option<&Path>) {
+        if !self.paths.is_empty() || self.cwd.is_empty() {
+            return;
+        }
+        let Some(tree) = tree.and_then(|t| std::fs::canonicalize(t).ok()) else {
+            return;
+        };
+        let Ok(rel) = Path::new(&self.cwd).strip_prefix(&tree) else {
+            return;
+        };
+        let parts: Option<Vec<&str>> = rel
+            .components()
+            .map(|c| match c {
+                Component::Normal(c) => c.to_str(),
+                _ => None,
+            })
+            .collect();
+        if let Some(parts) = parts.filter(|p| !p.is_empty()) {
+            self.paths = vec![SearchPath {
+                path: parts.join("/"),
+                name: String::new(),
+            }];
+        }
+    }
+
     pub fn request<'a>(
         &'a self,
         index_dir: &'a Path,
@@ -161,6 +197,7 @@ impl QueryParams {
             &self.iglobs,
             self.glob_case_insensitive,
             &self.paths,
+            &self.cwd,
         )
     }
 
@@ -194,6 +231,7 @@ impl QueryParams {
             multiline: self.multiline,
             color: self.color == Color::Always,
             banner: self.terms.len() > 1,
+            filename: self.filename,
         }
     }
 

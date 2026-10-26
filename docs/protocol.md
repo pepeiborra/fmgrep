@@ -54,7 +54,9 @@ response line each.
 | `globs` | [string] | [] | `-g`, in order; `!` excludes |
 | `iglobs` | [string] | [] | `--iglob`, after `globs` |
 | `glob_case_insensitive` | bool | false | `--glob-case-insensitive` |
-| `paths` | [string] | [] | PATH arguments, relative to the indexed root; `""` is the root |
+| `paths` | [{path, name}] | [] | PATH arguments: `path` relative to the indexed root (`""` the root), `name` as typed (`""`: the cwd of a search without PATH), which its files print under |
+| `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
+| `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 

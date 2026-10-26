@@ -11,11 +11,12 @@ mod print;
 mod serve;
 
 use crate::events::JsonSink;
+use crate::filter::SearchPath;
 use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
-use crate::sink::{Discard, MatchSink};
+use crate::sink::{Discard, MatchSink, Named};
 use crate::wire::{IndexSummary, OutputReport};
 use args::{Cli, Command, Search, ServeArgs};
 use locate::{Located, locate};
@@ -59,17 +60,17 @@ fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
     Ok((found, manifest))
 }
 
-/// `typed`, resolved from the cwd, relative to the indexed `tree`.
-fn rebase(typed: &[String], tree: Option<&Path>) -> Result<Vec<String>, String> {
+/// `typed`, resolved from the cwd, as `p`'s PATHs into the indexed `tree`.
+fn rebase(p: &mut QueryParams, typed: &[String], tree: Option<&Path>) -> Result<(), String> {
     if typed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let resolve = |p: &Path| {
         std::fs::canonicalize(p).map_err(|e| format!("error: cannot resolve {}: {e}", p.display()))
     };
     let tree = tree.ok_or("error: a PATH needs the indexed tree; this index records none")?;
     let root = resolve(tree)?;
-    typed
+    p.paths = typed
         .iter()
         .map(|t| {
             let path = Path::new(t);
@@ -88,11 +89,15 @@ fn rebase(typed: &[String], tree: Option<&Path>) -> Result<Vec<String>, String> 
             let rel = abs.strip_prefix(&root).map_err(|_| outside())?;
             let parts: Option<Vec<&str>> =
                 rel.components().map(|c| c.as_os_str().to_str()).collect();
-            parts
-                .map(|p| p.join("/"))
-                .ok_or_else(|| format!("error: {t} is not UTF-8"))
+            Ok(SearchPath {
+                path: parts
+                    .map(|p| p.join("/"))
+                    .ok_or_else(|| format!("error: {t} is not UTF-8"))?,
+                name: t.clone(),
+            })
         })
-        .collect()
+        .collect::<Result<_, String>>()?;
+    Ok(())
 }
 
 /// The tree a manifest's paths are relative to.
@@ -116,11 +121,17 @@ fn search(
         return serve::manage(addr, s.shutdown, out);
     }
     let mut p = s.params(input, printing, tty)?;
+    let typed = s.paths()?;
+    p.cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if let Some(addr) = &s.server {
-        return client(addr, p, s.json, out);
+        return client(addr, p, &typed, s.json, out);
     }
     let (found, manifest) = open_index(s.index.as_deref())?;
-    p.paths = rebase(&p.paths, tree_of(&found, &manifest).as_deref())?;
+    let tree = tree_of(&found, &manifest);
+    rebase(&mut p, &typed, tree.as_deref())?;
+    p.scope(tree.as_deref());
     let root = found.root.filter(|_| !manifest.store_docs);
     let req = p.request(&found.index_dir, &manifest, root.as_deref())?;
     render(&p, s.json, out, |sink| run_query(&req, sink)).map(Outcome::Query)
@@ -130,14 +141,14 @@ fn search(
 fn client(
     addr: &str,
     mut p: QueryParams,
+    typed: &[String],
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
-    let typed = std::mem::take(&mut p.paths);
     if !typed.is_empty() {
         let status = serve::status(addr)?;
         let root = Path::new(&status.root);
-        p.paths = rebase(&typed, served_tree(root, status.store_docs))?;
+        rebase(&mut p, typed, served_tree(root, status.store_docs))?;
     }
     run_client(addr, &p, json, out)
 }
@@ -215,7 +226,7 @@ fn render(
     Ok(match p.mode {
         Mode::JsonMatches => {
             let mut sink = JsonSink::new(out, p.json_config());
-            let report = run(&mut sink)?;
+            let report = run(&mut Named::new(&mut sink, p.filter()?.as_ref()))?;
             sink.finish()?;
             report
         }
@@ -231,7 +242,7 @@ fn render(
         }
         _ => {
             let mut writer = MatchWriter::new(out, p.output_config());
-            let report = run(&mut writer)?;
+            let report = run(&mut Named::new(&mut writer, p.filter()?.as_ref()))?;
             writer.finish()?;
             report
         }

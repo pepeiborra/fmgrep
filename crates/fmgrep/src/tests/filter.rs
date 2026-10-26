@@ -206,7 +206,7 @@ fn gone_files_are_not_searched() {
 }
 
 #[test]
-fn paths_rebase_onto_the_indexed_root() {
+fn absolute_paths_print_as_typed() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let (all, _) = trees(tmp.path(), store_docs);
@@ -218,15 +218,37 @@ fn paths_rebase_onto_the_indexed_root() {
                 .collect();
             printed(&all, &[flags, &["-l"]].concat(), &terms)
         };
-        assert_eq!(lists(&[], &[at("sub")]), "sub/c.c\nsub/d.h\n");
+        let lines = |paths: &[&str]| paths.iter().map(|p| at(p) + "\n").collect::<String>();
+        assert_eq!(lists(&[], &[at("sub")]), lines(&["sub/c.c", "sub/d.h"]));
         assert_eq!(
             lists(&["-g", "!*.h"], &[at("sub"), at("b.h")]),
-            "b.h\nsub/c.c\n"
+            lines(&["b.h", "sub/c.c"])
         );
-        assert_eq!(lists(&["-g", "!sub"], &[at("sub")]), "sub/c.c\nsub/d.h\n");
-        assert_eq!(lists(&[], &[at(".")]).lines().count(), 5);
+        assert_eq!(
+            lists(&["-g", "!sub"], &[at("sub")]),
+            lines(&["sub/c.c", "sub/d.h"])
+        );
+        assert_eq!(
+            lists(&[], &[at(".")]),
+            lines(&["./a.c", "./b.h", "./sub/c.c", "./sub/d.h", "./z.c"])
+        );
         let expr = printed(&all, &["-l", "--expr", "alpha", &at("sub")], &[]);
-        assert_eq!(expr, "sub/c.c\nsub/d.h\n");
+        assert_eq!(expr, lines(&["sub/c.c", "sub/d.h"]));
+    }
+}
+
+#[test]
+fn a_single_file_path_prints_no_file_name() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let (all, _) = trees(tmp.path(), store_docs);
+        let c = all.join("sub/c.c").display().to_string();
+        let one = |flags: &[&str]| printed(&all, flags, &["printk", &c]);
+        assert_eq!(one(&[]), "2:printk three alpha\n");
+        assert_eq!(one(&["-c"]), "1\n");
+        assert_eq!(one(&["-l"]), format!("{c}\n"));
+        let begin = timeless_lines(&one(&["--json", "--matches"]))[0].clone();
+        assert_eq!(begin["data"]["path"]["text"], c.as_str());
     }
 }
 

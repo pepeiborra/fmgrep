@@ -14,7 +14,9 @@ use crate::regex_pattern;
 const SEARCH_NOTE: &str = "\
 A search reads the .fmgrep of the nearest enclosing directory. Put -- first
 to search for a TERM named index or serve. Trailing TERMs naming files or
-directories are PATHs, as in rg; with --expr every argument is one.";
+directories are PATHs, as in rg; with --expr every argument is one. Without
+a PATH only the cwd's subtree is searched, as in rg; from outside the indexed
+tree, all of it.";
 
 const ENV: &str = "\
 Environment:
@@ -278,7 +280,7 @@ impl Search {
             globs: self.glob.clone(),
             iglobs: self.iglob.clone(),
             glob_case_insensitive: self.glob_case_insensitive,
-            paths,
+            filename: !matches!(&paths[..], [one] if !Path::new(one).is_dir()),
             ..QueryParams::default()
         };
         p.filter()?;
@@ -313,6 +315,11 @@ impl Search {
             };
         }
         Ok(p)
+    }
+
+    /// The PATHs, as typed.
+    pub fn paths(&self) -> Result<Vec<String>, String> {
+        Ok(self.split()?.1)
     }
 
     /// The positionals as TERMs and PATHs: under an expression all are

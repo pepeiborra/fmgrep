@@ -13,6 +13,7 @@ fn cfg(format: Format) -> OutputConfig {
         multiline: false,
         color: false,
         banner: false,
+        filename: true,
     }
 }
 

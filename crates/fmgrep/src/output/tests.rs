@@ -28,6 +28,7 @@ fn cfg(format: Format) -> OutputConfig {
         multiline: false,
         color: false,
         banner: false,
+        filename: true,
     }
 }
 
@@ -185,6 +186,51 @@ fn counts_modes_print_path_and_number() {
     assert_eq!(
         alpha(cfg(Format::FilesWithMatches), QueryOutput::FilesWithMatches),
         "a.txt\nsub/b.txt\n"
+    );
+}
+
+#[test]
+fn no_file_name_for_one_file_matches_rg() {
+    let one = |format: Format, heading: bool, output: QueryOutput| {
+        let c = OutputConfig {
+            heading,
+            context: output == context(1, 1),
+            filename: false,
+            ..cfg(format)
+        };
+        String::from_utf8(render(c, output, &FIXTURE[..1], &["alpha"])).unwrap()
+    };
+    // rg --heading -n alpha a.txt
+    assert_eq!(
+        one(Format::Lines, true, MATCHES),
+        "1:alpha one\n3:alpha two\n7:alpha and alpha\n"
+    );
+    // rg --no-heading -n -C1 alpha a.txt
+    assert_eq!(
+        one(Format::Lines, false, context(1, 1)),
+        "1:alpha one\n2-beta\n3:alpha two\n4-delta\n--\n6-zeta\n7:alpha and alpha\n8-eta\n"
+    );
+    // rg --heading -n -o alpha a.txt
+    assert_eq!(
+        one(Format::OnlyMatching, true, MATCHES),
+        "1:alpha\n3:alpha\n7:alpha\n7:alpha\n"
+    );
+    // rg -c alpha a.txt; rg --count-matches alpha a.txt; rg -l alpha a.txt
+    assert_eq!(
+        one(Format::CountLines, true, QueryOutput::CountLines),
+        "3\n"
+    );
+    assert_eq!(
+        one(Format::CountMatches, true, QueryOutput::CountMatches),
+        "4\n"
+    );
+    assert_eq!(
+        one(
+            Format::FilesWithMatches,
+            true,
+            QueryOutput::FilesWithMatches
+        ),
+        "a.txt\n"
     );
 }
 

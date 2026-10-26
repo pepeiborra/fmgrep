@@ -52,7 +52,10 @@ compiler/GHC/Driver/Main/Hsc.hs
 ```
 
 * The nearest enclosing `.fmgrep` index is used.
-* Paths are relative to the indexed root.
+* Without a PATH only the cwd's subtree is searched, and paths print and
+  `-g` globs match relative to the cwd, as in rg; from outside the indexed
+  tree the whole tree is searched, relative to its root. PATH arguments are
+  rg's: relative to the cwd, and their files print as rg prints them.
 * Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, PATH arguments); `fmgrep --help` lists them.
 
 For many searches in a row, keep the index loaded in a server:

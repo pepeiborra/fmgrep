@@ -382,41 +382,44 @@ fn glob_flags_reach_the_params() {
     );
 }
 
+/// The TERMs and PATHs of `words`.
+fn split(words: &[&str]) -> (Vec<String>, Vec<String>) {
+    let s = search(words);
+    (params(words).terms, s.paths().unwrap())
+}
+
 #[test]
 fn trailing_existing_paths_are_paths() {
-    let p = params(&["a", "b", "src", "Cargo.toml"]);
     assert_eq!(
-        (p.terms, p.paths),
+        split(&["a", "b", "src", "Cargo.toml"]),
         (
             vec!["a".into(), "b".into()],
             vec!["src".into(), "Cargo.toml".into()]
         )
     );
-    let p = params(&["a", "src", "b"]);
-    assert_eq!((p.terms.len(), p.paths.len()), (3, 0));
+    let (terms, paths) = split(&["a", "src", "b"]);
+    assert_eq!((terms.len(), paths.len()), (3, 0));
     assert!(!params(&["a", "src"]).output_config().banner);
 }
 
 #[test]
 fn the_first_positional_is_always_a_term() {
-    let p = params(&["src", "Cargo.toml"]);
     assert_eq!(
-        (p.terms, p.paths),
+        split(&["src", "Cargo.toml"]),
         (vec!["src".into()], vec!["Cargo.toml".into()])
     );
-    let p = params(&["a", "/src/"]);
-    assert_eq!((p.terms.len(), p.paths.len()), (2, 0));
+    let (terms, paths) = split(&["a", "/src/"]);
+    assert_eq!((terms.len(), paths.len()), (2, 0));
 }
 
 #[test]
 fn under_expr_every_positional_is_a_path() {
-    let p = params(&["--expr", AND_TEXT, "src", "Cargo.toml"]);
+    let (terms, paths) = split(&["--expr", AND_TEXT, "src", "Cargo.toml"]);
     assert_eq!(
-        (p.terms.len(), p.paths),
+        (terms.len(), paths),
         (0, vec!["src".into(), "Cargo.toml".into()])
     );
-    let p = params(&["--expr-json", AND_JSON, "--", "src"]);
-    assert_eq!(p.paths, ["src"]);
+    assert_eq!(split(&["--expr-json", AND_JSON, "--", "src"]).1, ["src"]);
     assert_eq!(
         err(&["--expr", AND_TEXT, "src", "x"]),
         "error: x: No such file or directory"
@@ -424,13 +427,21 @@ fn under_expr_every_positional_is_a_path() {
 }
 
 #[test]
+fn one_file_path_drops_the_file_name() {
+    let named = |words: &[&str]| params(words).filename;
+    assert!(!named(&["a", "Cargo.toml"]));
+    assert!(named(&["a", "src"]));
+    assert!(named(&["a", "Cargo.toml", "src"]));
+    assert!(named(&["a"]));
+    assert!(!named(&["--expr", AND_TEXT, "Cargo.toml"]));
+    assert!(!params(&["-l", "a", "Cargo.toml"]).output_config().filename);
+}
+
+#[test]
 fn and_or_count_terms_without_their_paths() {
     assert_eq!(
         params(&["--and", "a", "/b+/", "src"]),
-        QueryParams {
-            paths: vec!["src".into()],
-            ..params(&["--expr-json", AND_JSON, "src"])
-        }
+        params(&["--expr-json", AND_JSON, "src"])
     );
     assert_eq!(
         err(&["--or", "a", "src"]),

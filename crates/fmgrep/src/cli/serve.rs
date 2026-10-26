@@ -99,7 +99,8 @@ struct Served<'m> {
 }
 
 impl Served<'_> {
-    fn query(&mut self, p: &QueryParams) -> Result<Answer, RpcError> {
+    fn query(&mut self, p: &mut QueryParams) -> Result<Answer, RpcError> {
+        p.scope(super::served_tree(&self.root, self.manifest.store_docs));
         let req = p
             .request(self.index_dir, self.manifest, None)
             .map_err(|message| RpcError {
@@ -216,7 +217,7 @@ fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
         "query" => {
             let params = obj.get("params").cloned().unwrap_or(Value::Null);
             let has_terms = params.get("terms").is_some();
-            let p = match serde_json::from_value::<QueryParams>(params) {
+            let mut p = match serde_json::from_value::<QueryParams>(params) {
                 Ok(p) => p,
                 Err(e) => {
                     return (
@@ -238,7 +239,7 @@ fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
                     false,
                 );
             }
-            match session.query(&p) {
+            match session.query(&mut p) {
                 Ok(answer) => (success(id, answer), false),
                 Err(e) => (failure(id, e.code, e.message), false),
             }

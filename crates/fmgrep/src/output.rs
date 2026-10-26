@@ -41,6 +41,8 @@ pub struct OutputConfig {
     pub color: bool,
     /// Print a `== term ==` banner: set when the query has several terms.
     pub banner: bool,
+    /// False: rg's one file PATH, printed without its path but under `-l`.
+    pub filename: bool,
 }
 
 /// rg's default palette, raw ANSI. Every field opens with a reset, as rg
@@ -96,9 +98,13 @@ impl<W: Write> MatchWriter<W> {
 
     /// rg `-l` (no count) and `-c` / `--count-matches`.
     fn count_line(&mut self, path: &str, count: Option<u64>) -> Result<(), String> {
-        self.field(path.as_bytes(), PATH)?;
+        if self.cfg.filename || count.is_none() {
+            self.field(path.as_bytes(), PATH)?;
+        }
         if let Some(n) = count {
-            self.raw(b":")?;
+            if self.cfg.filename {
+                self.raw(b":")?;
+            }
             self.raw(n.to_string().as_bytes())?;
         }
         self.raw(b"\n")
@@ -116,7 +122,7 @@ impl<W: Write> MatchWriter<W> {
     /// context line.
     fn prefix(&mut self, path: &str, line: u64, matched: bool) -> Result<(), String> {
         let sep: &[u8] = if matched { b":" } else { b"-" };
-        if !self.cfg.heading {
+        if self.cfg.filename && !self.cfg.heading {
             self.field(path.as_bytes(), PATH)?;
             self.raw(sep)?;
         }
@@ -194,7 +200,7 @@ impl<W: Write> MatchSink for MatchWriter<W> {
             }
             Format::Lines | Format::OnlyMatching => {}
         }
-        if self.cfg.heading {
+        if self.cfg.heading && self.cfg.filename {
             self.heading(m.path)?;
         } else if self.cfg.context && self.wrote {
             // rg separates files too once context is on and headings are off.

@@ -117,13 +117,14 @@ fn missing_file_is_warned_once_and_excluded() {
 }
 
 /// `index` with no `--output` writes `.fmgrep`, which a search finds from
-/// any directory below, printing paths relative to the indexed folder.
+/// any directory below, searching that directory's subtree as rg does.
 #[test]
 fn index_defaults_to_a_dotdir_found_from_subdirectories() {
     for store_docs in [false, true] {
         let (_tmp, root) = stage();
         let sub = root.join("sub/deeper");
         std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("d.bin"), "printk deeper\n").unwrap();
         let index: &[&str] = if store_docs {
             &["index", "--store-docs", "--json"]
         } else {
@@ -136,7 +137,7 @@ fn index_defaults_to_a_dotdir_found_from_subdirectories() {
             summary["path"].as_str().unwrap().ends_with(".fmgrep"),
             "{summary}"
         );
-        assert_eq!(summary["num_files"], 3, "{store_docs}");
+        assert_eq!(summary["num_files"], 4, "{store_docs}");
         let dotdir = root.join(".fmgrep").display().to_string();
         let want = run(&["--index", &dotdir, "-l", "printk"]);
         assert!(
@@ -144,22 +145,26 @@ fn index_defaults_to_a_dotdir_found_from_subdirectories() {
             "{store_docs}"
         );
         let root_arg = root.display().to_string();
-        for (dir, args) in [
-            (sub.as_path(), &["-l", "printk"][..]),
-            (&root, &["-l", "printk"]),
-            (Path::new("/"), &["--index", &root_arg, "-l", "printk"]),
+        for (dir, args, want) in [
+            (sub.as_path(), &["-l", "printk"][..], &b"d.bin\n"[..]),
+            (&root, &["-l", "printk"], &want.stdout),
+            (
+                Path::new("/"),
+                &["--index", &root_arg, "-l", "printk"],
+                &want.stdout,
+            ),
         ] {
             let got = run_in(dir, args);
             let err = stderr(&got);
             assert_eq!(
                 (got.status.code(), got.stdout),
-                (Some(0), want.stdout.clone()),
+                (Some(0), want.to_vec()),
                 "{store_docs} from {}: {err}",
                 dir.display(),
             );
         }
         let out = run(&query_argv(&sub, false, &["printk"]));
-        assert_eq!(counts(&out.stdout), [(3, 2)], "{store_docs}");
+        assert_eq!(counts(&out.stdout), [(4, 3)], "{store_docs}");
     }
 }
 
@@ -339,21 +344,15 @@ fn paths_resolve_from_the_cwd() {
             String::from_utf8_lossy(&out.stdout).into_owned(),
         )
     };
-    assert_eq!(
-        lists(&["printk", "."]),
-        (Some(0), "sub/c.c\nsub/d.h\n".into())
-    );
+    assert_eq!(lists(&["printk", "."]), (Some(0), "./c.c\n./d.h\n".into()));
     assert_eq!(
         lists(&["printk", "../a.c", "."]),
-        (Some(0), "a.c\nsub/c.c\nsub/d.h\n".into())
+        (Some(0), "../a.c\n./c.c\n./d.h\n".into())
     );
-    assert_eq!(
-        lists(&["-g", "*.c", "printk"]),
-        (Some(0), "a.c\nsub/c.c\n".into())
-    );
+    assert_eq!(lists(&["-g", "*.c", "printk"]), (Some(0), "c.c\n".into()));
     assert_eq!(
         lists(&["-g", "*.c", "printk", ".."]),
-        (Some(0), "a.c\nsub/c.c\n".into())
+        (Some(0), "../a.c\n../sub/c.c\n".into())
     );
     let out = run_in(&sub, &["-g", "*.zz", "printk"]);
     assert_eq!(out.status.code(), Some(2));
@@ -368,5 +367,96 @@ fn paths_resolve_from_the_cwd() {
         stderr(&out).contains("is outside the indexed tree"),
         "{}",
         stderr(&out)
+    );
+}
+
+/// Each expectation is rg 15.2.0's from the same directory.
+#[test]
+fn no_path_searches_the_cwd_subtree_as_rg() {
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/c.c"), "printk c\n").unwrap();
+    std::fs::write(docs.join("sub/d.h"), "printk d\n").unwrap();
+    assert!(run_in(&docs, &["index"]).status.success());
+    let sub = docs.join("sub");
+    let found = |dir: &Path, args: &[&str]| {
+        let out = run_in(dir, args);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let ok = |s: &str| (Some(0), s.to_owned());
+    assert_eq!(found(&sub, &["-l", "printk"]), ok("c.c\nd.h\n"));
+    assert_eq!(
+        found(&sub, &["printk"]),
+        ok("c.c\n1:printk c\n\nd.h\n1:printk d\n")
+    );
+    assert_eq!(found(&sub, &["-c", "printk"]), ok("c.c:1\nd.h:1\n"));
+    assert_eq!(found(&sub, &["-l", "-g", "/c.c", "printk"]), ok("c.c\n"));
+    assert_eq!(found(&sub, &["-l", "-g", "!*.c", "printk"]), ok("d.h\n"));
+    let json = found(&sub, &["--json", "--matches", "printk"]).1;
+    let begin: serde_json::Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+    assert_eq!(begin["data"]["path"]["text"], "c.c", "{json}");
+    let empty = docs.join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    for (dir, args, why) in [
+        (
+            &sub,
+            &["-l", "-g", "sub/*", "printk"][..],
+            "the globs exclude every file",
+        ),
+        (&empty, &["printk"], "no indexed file is below the cwd"),
+    ] {
+        let out = run_in(dir, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(
+            stderr(&out),
+            format!("error: no files were searched: {why}\n"),
+            "{args:?}"
+        );
+    }
+}
+
+/// Each expectation is rg 15.2.0's from the same directory.
+#[test]
+fn paths_print_and_glob_as_rg_from_a_subdirectory() {
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/c.c"), "printk c\n").unwrap();
+    std::fs::write(docs.join("sub/d.h"), "printk d\n").unwrap();
+    assert!(run_in(&docs, &["index"]).status.success());
+    let sub = std::fs::canonicalize(docs.join("sub")).unwrap();
+    let found = |args: &[&str]| {
+        let out = run_in(&sub, args);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let ok = |s: &str| (Some(0), s.to_owned());
+    assert_eq!(found(&["-l", "-g", "/c.c", "printk", "."]), ok("./c.c\n"));
+    assert_eq!(
+        found(&["-l", "-g", "sub/*", "printk", ".."]),
+        (Some(1), String::new())
+    );
+    assert_eq!(
+        found(&["-l", "-g", "!sub", "printk", ".."]),
+        ok("../a.c\n../b.h\n")
+    );
+    assert_eq!(
+        found(&["-l", "-g", "!sub", "printk", "..", "."]),
+        ok("../a.c\n../b.h\n./c.c\n./d.h\n")
+    );
+    assert_eq!(
+        found(&["-l", "-g", "!*.c", "printk c", "..", "c.c"]),
+        ok("c.c\n")
+    );
+    assert_eq!(found(&["-N", "printk", "c.c"]), ok("printk c\n"));
+    assert_eq!(found(&["-c", "printk", "../a.c"]), ok("1\n"));
+    let abs = sub.to_str().unwrap();
+    assert_eq!(
+        found(&["-l", "-g", "/c.c", "printk", abs]),
+        ok(&format!("{abs}/c.c\n"))
     );
 }

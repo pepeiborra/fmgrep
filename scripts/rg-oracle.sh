@@ -3,10 +3,10 @@
 # scripts/rg-oracle.sh: byte-for-byte diff of fmgrep's output against rg.
 #
 # Stages a fixture tree, indexes it into its .fmgrep, then compares our stdout
-# (searching from a subdirectory, so the index is found by walking up) and
-# exit status with rg's for every output flag combination. Sibling names are
-# chosen so rg's per-directory DFS (`--sort path`) and our sorted relative
-# paths agree (`a.txt` vs `a/b.txt` would not).
+# (from the root; PATH and no-PATH cases from sub/, finding the index by
+# walking up) and exit status with rg's for every output flag combination.
+# Sibling names are chosen so rg's per-directory DFS (`--sort path`) and our
+# sorted relative paths agree (`a.txt` vs `a/b.txt` would not).
 #
 # Without --store-docs every case runs twice: on the indexed tree, backdated
 # so discovery prunes by directory stamp, then on a stale one (files edited,
@@ -21,7 +21,8 @@
 # -l, -c and --count-matches against rg over the manifest's files, the
 # served counts, --and / --or and --expr of the served label; then -g sets:
 # our -l of every line, local and served, against rg's walk with the same
-# globs over the manifest's files. Needs jq.
+# globs over the manifest's files; then, for the files layout, PATH and
+# no-PATH sets the same way from DIR/compiler. Needs jq.
 #
 # Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
 # `pass N / fail M` (plus the served count); exits 1 if any case
@@ -44,7 +45,7 @@ INDEX_FLAGS=()
 SERVE=false
 CORPUS_DIR=""
 usage() {
-    sed -n 's/^# \{0,1\}//; 28,29p' "${BASH_SOURCE[0]}" >&2
+    sed -n 's/^# \{0,1\}//; 31,32p' "${BASH_SOURCE[0]}" >&2
     exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -95,9 +96,12 @@ RG_COMMON=(--no-ignore --no-require-git -a --sort path)
 # --iglob: rg adds them after every -g, so a case's own globs cannot undo them.
 RG_SKIP=(--iglob '!k.dat')
 TERM=alpha
-# A case's PATHs: ours from sub/, rg's from the root; WANT overrides WARNINGS.
+# A case runs ours from $CORPUS$AT with PATHS, rg from the root over RG_PATHS
+# unless RG_HERE runs it beside us with PATHS; WANT overrides WARNINGS.
+AT=""
 PATHS=""
 RG_PATHS=.
+RG_HERE=""
 WANT=""
 FAIL=0
 PASS=""
@@ -113,7 +117,7 @@ served() {
     [[ -n "$ADDR" ]] || return 0
     local name="$1" rc=0
     shift
-    ( cd "$CORPUS/sub" && "$BIN" --server "$ADDR" "$@" ) > "$WORK/srv" 2> "$WORK/srv.err" || rc=$?
+    ( cd "$CORPUS$AT" && "$BIN" --server "$ADDR" "$@" ) > "$WORK/srv" 2> "$WORK/srv.err" || rc=$?
     if [[ "$rc" != "$RC" || ("$RC" != 2 && -s "$WORK/srv.err") ]]; then
         echo "FAIL srv $PASS$name  (exit $rc, want exit $RC and no stderr)"
         cat "$WORK/srv.err"
@@ -135,12 +139,18 @@ check() {
     local name="$1" mine="$2" theirs="$3" term="${4:-$TERM}" rgrc
     RC=0
     # shellcheck disable=SC2086
-    ( cd "$HERE" && "$BIN" $mine -- "$term" $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+    ( cd "$CORPUS$AT" && "$BIN" $mine -- "$term" $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
     set +e
-    # rg echoes the directory it was given; our paths are corpus-relative.
-    # shellcheck disable=SC2086
-    ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $RG_PATHS < /dev/null ) | sed 's|\./||g' > "$WORK/theirs"
-    rgrc="${PIPESTATUS[0]}"
+    if [[ -n "$RG_HERE" ]]; then
+        # shellcheck disable=SC2086
+        ( cd "$CORPUS$AT" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $PATHS < /dev/null ) > "$WORK/theirs"
+        rgrc=$?
+    else
+        # rg prints ./ before the paths of RG_PATHS=.; ours are root-relative.
+        # shellcheck disable=SC2086
+        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $RG_PATHS < /dev/null ) | sed 's|\./||g' > "$WORK/theirs"
+        rgrc="${PIPESTATUS[0]}"
+    fi
     set -e
     if [[ "$RC" != "$rgrc" ]]; then
         echo "FAIL $PASS$name  (exit $RC, rg exits $rgrc)"
@@ -165,17 +175,44 @@ check() {
     served "$name" $mine -- "$term" $PATHS
 }
 
-# A filter case in lines and -l: name, our flags, rg's flags, our PATHs, rg's
-# PATHs (default ., none when empty), and `tb` when it searches tb.txt, whose
-# read warns in the stale pass.
+# A filter case in lines and -l: name, our flags, rg's flags, rg's PATHs
+# (default ., none when empty), and `tb` when it searches tb.txt, whose read
+# warns in the stale pass.
 filtered() {
-    PATHS="${4:-}"
-    RG_PATHS="${5-.}"
-    [[ "${6:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    RG_PATHS="${4-.}"
+    [[ "${5:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
     check "$1 [lines]" "$2" "--heading -n $3"
     check "$1 [-l]" "$2 -l" "-l $3"
-    PATHS=""
     RG_PATHS=.
+    WANT=""
+}
+
+# A case from sub/ in lines and -l, rg beside us with the same PATHs: name,
+# flags (ours and rg's), PATHs (none when empty), then `tb` as for filtered.
+pathed() {
+    AT=/sub
+    PATHS="$3"
+    RG_HERE=1
+    [[ "${4:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    check "$1 [lines]" "$2" "--heading -n $2"
+    check "$1 [-l]" "$2 -l" "-l $2"
+    AT=""
+    PATHS=""
+    RG_HERE=""
+    WANT=""
+}
+
+# From sub/, rg beside us: name, our flags, rg's flags, our PATHs (default
+# one file, which rg prints no file name for).
+alone() {
+    AT=/sub
+    PATHS="${4-../a.txt}"
+    RG_HERE=1
+    WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    check "$1" "$2" "$3"
+    AT=""
+    PATHS=""
+    RG_HERE=""
     WANT=""
 }
 
@@ -299,7 +336,7 @@ check_expr() {
         esac
         RC=0
         # shellcheck disable=SC2086
-        ( cd "$HERE" && "$BIN" $mine "${argv[@]}" ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+        ( cd "$CORPUS" && "$BIN" $mine "${argv[@]}" ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
         if [[ "$RC" != "$rgrc" ]]; then
             echo "FAIL $PASS$name  (exit $RC, rg exits $rgrc)"
             cat "$WORK/err"
@@ -461,6 +498,71 @@ globbed() {
     fi
 }
 
+# One --corpus PATH set from compiler/: globs, then -- and the PATHs. A
+# single file PATH also compares -c.
+pathset() {
+    local globs=() rc=0 src=0 rgrc=0 fail="" p abs rel here="$CORPUS/compiler"
+    while [[ "$1" != -- ]]; do globs+=(-g "$1"); shift; done
+    shift
+    # The manifest's files below each PATH, spelled as printed; without, below here.
+    { [[ $# -gt 0 ]] || sed -n 's|^compiler/||p' "$WORK/files"
+    for p in "$@"; do
+        if [[ -d "$here/$p" ]]; then
+            abs="$(cd "$here/$p" && pwd -P)"
+        else
+            abs="$(cd "$here/$(dirname "$p")" && pwd -P)/$(basename "$p")"
+        fi
+        rel="${abs#"$(cd "$CORPUS" && pwd -P)"}"
+        awk -v r="${rel#/}" -v t="$p" 'BEGIN { s = t ~ /\/$/ ? t : t "/" }
+            r == "" { print s $0; next } $0 == r { print t; next }
+            index($0, r "/") == 1 { print s substr($0, length(r) + 2) }' "$WORK/files"
+    done; } | LC_ALL=C sort -u > "$WORK/spelled"
+    local args=(${globs[@]+"${globs[@]}"} --regex '^' "$@")
+    local rg_args=(${globs[@]+"${globs[@]}"} -- '^' "$@")
+    ( cd "$here" && "$BIN" --index "$IDX" -l "${args[@]}" ) > "$WORK/raw" 2> /dev/null || rc=$?
+    LC_ALL=C sort "$WORK/raw" > "$WORK/ours-p"
+    ( cd "$here" && "$BIN" --server "$ADDR" -l "${args[@]}" ) > "$WORK/raw" 2> /dev/null || src=$?
+    LC_ALL=C sort "$WORK/raw" > "$WORK/srv-p"
+    ( cd "$here" && rg --no-ignore --no-require-git -a -l "${rg_args[@]}" < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
+    LC_ALL=C sort "$WORK/raw" | LC_ALL=C comm -12 - "$WORK/spelled" > "$WORK/rg-p"
+    [[ "$rc" == "$rgrc" ]] || fail+=" exit=$rc/$rgrc"
+    [[ "$src" == "$rc" ]] || fail+=" served-exit=$src"
+    cmp -s "$WORK/ours-p" "$WORK/rg-p" || fail+=" files"
+    cmp -s "$WORK/ours-p" "$WORK/srv-p" || fail+=" served"
+    if [[ $# == 1 && -f "$here/$1" ]]; then
+        local count
+        count="$( cd "$here" && rg --no-ignore --no-require-git -a -c "${rg_args[@]}")"
+        [[ "$( cd "$here" && "$BIN" --index "$IDX" -c "${args[@]}")" == "$count" ]] || fail+=" -c"
+        [[ "$( cd "$here" && "$BIN" --server "$ADDR" -c "${args[@]}")" == "$count" ]] || fail+=" served-c"
+    fi
+    if [[ -z "$fail" ]]; then
+        echo "ok   path [${args[*]}] files=$(wc -l < "$WORK/ours-p" | tr -d ' ') exit=$rc"
+        OK=$((OK + 1))
+    else
+        echo "FAIL path [${args[*]}]:$fail"
+        diff "$WORK/rg-p" "$WORK/ours-p" | head -5 || true
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# An index with no tree: from DIR/compiler, -l "$@" local and served as from outside DIR.
+unscoped() {
+    local fail="" outside
+    outside="$("$BIN" --index "$IDX" -l "$@")"
+    [[ -n "$outside" ]] || fail+=" empty"
+    [[ "$( cd "$CORPUS/compiler" && "$BIN" --index "$IDX" -l "$@")" == "$outside" ]] || fail+=" local"
+    [[ "$( cd "$CORPUS/compiler" && "$BIN" --server "$ADDR" -l "$@")" == "$outside" ]] || fail+=" served"
+    if [[ -z "$fail" ]]; then
+        echo "ok   no tree [$*] files=$(wc -l <<< "$outside" | tr -d ' ')"
+        OK=$((OK + 1))
+    else
+        echo "FAIL no tree [$*]:$fail"
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+}
+
 if [[ -n "$CORPUS_DIR" ]]; then
     IDX="$WORK/index"
     "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} --output "$IDX" "$CORPUS" >&2
@@ -529,6 +631,26 @@ if [[ -n "$CORPUS_DIR" ]]; then
     GLOB_FLAGS=(--iglob '*.HS')
     globbed '!*Test*'
 
+    if [[ "$STORE_DOCS" == true ]]; then
+        echo "skip PATH sets: this index records no tree"
+        unscoped -g '*.cabal' --regex '^'
+    else
+        pathset 'GHC/*.hs' -- .
+        pathset -- GHC/Core
+        pathset 'GHC/Core/*.hs' -- ./GHC
+        pathset '*.cabal' -- ..
+        pathset 'compiler/**' -- ..
+        pathset '*.h' -- ../rts/
+        pathset -- GHC.hs
+        pathset '!GHC' -- .
+        pathset --
+        pathset 'GHC/*.hs' --
+        pathset '/GHC.hs' --
+        pathset '**/Core/*.hs' --
+        pathset '!GHC' --
+        pathset 'compiler/**' --
+    fi
+
     echo "pass $OK / fail $FAILED"
     exit "$FAIL"
 fi
@@ -566,8 +688,6 @@ find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
 
 ( cd "$CORPUS" && "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} ) >&2
 manifest_ok "$CORPUS/.fmgrep"
-# Our searches run below the corpus root and find the index by walking up.
-HERE="$CORPUS/sub"
 
 start_server() {
     spawn_serve "$CORPUS" serve SERVER ADDR
@@ -709,29 +829,55 @@ check_flags "flags-ci-lines [--and ALPHA one]"          "-i"    "--heading -n -i
 check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"           and t:ALPHA t:one
 check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "-U"    "--heading -n -U" or 'r:alpha one\nbeta' t:zz
 
-# -g, --iglob and PATHs; globs are relative to the root, PATHs to sub/.
-filtered "glob-txt      " "-g *.txt"                  "-g *.txt"                  "" . tb
-filtered "glob-not-sub  " "-g !sub"                   "-g !sub"                   "" . tb
+# -g, --iglob and PATHs; from the root, then from sub/ with and without PATHs.
+filtered "glob-txt      " "-g *.txt"                  "-g *.txt"                  . tb
+filtered "glob-not-sub  " "-g !sub"                   "-g !sub"                   . tb
 filtered "glob-sub-tree " "-g sub/**"                 "-g sub/**"
-filtered "glob-anchored " "-g /*.txt"                 "-g /*.txt"                 "" . tb
+filtered "glob-anchored " "-g /*.txt"                 "-g /*.txt"                 . tb
 filtered "glob-last-wins" "-g !*.txt -g a.txt"        "-g !*.txt -g a.txt"
-filtered "glob-none     " "-g a.txt -g !*.txt"        "-g a.txt -g !*.txt"        "" ""
+filtered "glob-none     " "-g a.txt -g !*.txt"        "-g a.txt -g !*.txt"        ""
 filtered "iglob         " "--iglob H.TXT"             "--iglob H.TXT"
 filtered "glob-ci       " "--glob-case-insensitive -g SUB/**" "--glob-case-insensitive -g SUB/**"
-filtered "iglob-last    " "--iglob *.TXT -g !*.txt"   "--iglob *.TXT -g !*.txt"   "" . tb
-filtered "glob-dir-only " "-g !mw/"                   "-g !mw/"                   "" . tb
-filtered "path-dot      " ""                          ""                          "."                 sub
-filtered "path-files    " ""                          ""                          "../a.txt ../h.txt" "a.txt h.txt"
-filtered "path-up       " ""                          ""                          ".."                .   tb
-filtered "path-glob-dir " "-g !sub"                   "-g !sub"                   "."                 sub
-filtered "path-file-glob" "-g !*.txt"                 "-g !*.txt"                 "../a.txt ../b.txt" "a.txt b.txt"
+filtered "iglob-last    " "--iglob *.TXT -g !*.txt"   "--iglob *.TXT -g !*.txt"   . tb
+filtered "glob-dir-only " "-g !mw/"                   "-g !mw/"                   . tb
+pathed "path-dot      " ""            "."
+pathed "path-files    " ""            "../a.txt ../h.txt"
+pathed "path-up       " ""            ".." tb
+pathed "path-glob-dir " "-g !sub"     "."
+pathed "path-file-glob" "-g !*.txt"   "../a.txt ../b.txt"
+pathed "path-file     " ""            "../a.txt"
+pathed "path-dot-slash" ""            "./"
+pathed "path-up-slash " ""            "../sub/"
+pathed "path-up-anchor" "-g sub/**"   ".."
+pathed "path-up-base  " "-g *.txt"    ".." tb
+pathed "path-up-no-sub" "-g !sub"     ".." tb
+pathed "path-dot-root " "-g /c.txt"   "."
+pathed "path-file-dir " ""            "../h.txt ."
+pathed "path-overlap  " "-g !../sub/*" "../sub ."
+pathed "path-ovl-file " "-g !*.txt"    "../sub c.txt"
+pathed "cwd-plain     " ""             ""
+pathed "cwd-glob-base " "-g *.txt"     ""
+pathed "cwd-glob-root " "-g /c.txt"    ""
+pathed "cwd-glob-up   " "-g sub/**"    ""
+pathed "cwd-not-c     " "-g !c.txt"    ""
+pathed "cwd-no-t      " "-g !t"        ""
+alone "one-file-count " "-c"              "-c"
+alone "one-file-countm" "--count-matches" "--count-matches"
+alone "one-file-flat  " "--no-heading"    "--no-heading -n"
+alone "one-file-ctx   " "-C 1"            "--heading -n -C 1"
+alone "one-file-only  " "-o"              "--heading -n -o"
+alone "cwd-count      " "-c"              "-c"                ""
+alone "cwd-countm     " "--count-matches" "--count-matches"   ""
+alone "cwd-flat       " "--no-heading"    "--no-heading -n"   ""
+alone "cwd-ctx        " "-C 1"            "--heading -n -C 1" ""
+alone "cwd-only       " "-o"              "--heading -n -o"   ""
 }
 
 # Under --serve, wait until the server's watch agrees with a local search.
 await_watch() {
     [[ -n "$ADDR" ]] || return 0
     local deadline=$((SECONDS + 10))
-    until [[ "$( cd "$HERE" && "$BIN" --server "$ADDR" -c -- alpha)" == "$( cd "$HERE" && "$BIN" -c -- alpha 2> /dev/null)" ]]; do
+    until [[ "$( cd "$CORPUS" && "$BIN" --server "$ADDR" -c -- alpha)" == "$( cd "$CORPUS" && "$BIN" -c -- alpha 2> /dev/null)" ]]; do
         if ((SECONDS >= deadline)); then
             echo "note: the watch missed the edits in 10 s; restarting serve"
             stop_server

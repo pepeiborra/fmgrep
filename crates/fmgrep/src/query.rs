@@ -169,7 +169,11 @@ pub fn answer(
             loaded.docs.is_gone(id)
         })
     {
-        return Err("error: no files were searched: the globs exclude every file".to_owned());
+        let why = match f.globs() {
+            true => "the globs exclude every file",
+            false => "no indexed file is below the cwd",
+        };
+        return Err(format!("error: no files were searched: {why}"));
     }
     Ok(report)
 }

@@ -20,8 +20,29 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+/// `(path, name)` pairs.
+fn named(paths: &[(&str, &str)]) -> Vec<SearchPath> {
+    paths
+        .iter()
+        .map(|&(path, name)| SearchPath {
+            path: path.into(),
+            name: name.into(),
+        })
+        .collect()
+}
+
+/// `paths` typed as their root-relative paths, from the root.
 fn filter(globs: &[&str], iglobs: &[&str], fold: bool, paths: &[&str]) -> PathFilter {
-    PathFilter::new(&strings(globs), &strings(iglobs), fold, &strings(paths))
+    let paths: Vec<_> = paths.iter().map(|&p| (p, p)).collect();
+    let paths = named(&paths);
+    PathFilter::new(&strings(globs), &strings(iglobs), fold, &paths, "/r")
+        .unwrap()
+        .unwrap()
+}
+
+/// `paths` typed in `cwd`.
+fn from(cwd: &str, globs: &[&str], paths: &[(&str, &str)]) -> PathFilter {
+    PathFilter::new(&strings(globs), &[], false, &named(paths), cwd)
         .unwrap()
         .unwrap()
 }
@@ -171,7 +192,7 @@ fn comments_and_blank_globs_are_ignored() {
     assert_eq!(globbed(&["\\#c.txt"]), ["#c.txt"]);
     assert_eq!(globbed(&["\\!n.txt"]), ["!n.txt"]);
     assert!(
-        PathFilter::new(&strings(&["#x", ""]), &[], false, &[])
+        PathFilter::new(&strings(&["#x", ""]), &[], false, &[], "")
             .unwrap()
             .is_none()
     );
@@ -179,7 +200,7 @@ fn comments_and_blank_globs_are_ignored() {
 
 #[test]
 fn an_invalid_glob_is_refused_with_its_text() {
-    let err = PathFilter::new(&strings(&["["]), &[], false, &[])
+    let err = PathFilter::new(&strings(&["["]), &[], false, &[], "")
         .err()
         .unwrap();
     assert_eq!(
@@ -220,4 +241,97 @@ fn directories_above_a_path_are_not_filtered() {
         kept(&filter(&["!deep"], &[], false, &["sub"])),
         ["sub/c.txt"]
     );
+}
+
+// rg 15.2.0 run in /r/sub, the tree at /r.
+
+#[test]
+fn globs_see_the_path_as_printed_below_the_cwd() {
+    let dot = [("sub", ".")];
+    assert_eq!(
+        kept(&from("/r/sub", &["deep/*"], &dot)),
+        ["sub/deep/d.txt", "sub/deep/e.rs"]
+    );
+    assert!(kept(&from("/r/sub", &["sub/**"], &dot)).is_empty());
+    assert_eq!(kept(&from("/r/sub", &["/c.txt"], &dot)), ["sub/c.txt"]);
+    let abs = [("sub", "/r/sub")];
+    assert_eq!(kept(&from("/r/sub", &["/c.txt"], &abs)), ["sub/c.txt"]);
+}
+
+#[test]
+fn globs_see_a_path_above_the_cwd_through_dot_dot() {
+    let up = [("", "..")];
+    assert!(kept(&from("/r/sub", &["sub/**"], &up)).is_empty());
+    assert_eq!(
+        kept(&from("/r/sub", &["*.rs"], &up)),
+        ["b.rs", "sub/deep/e.rs"]
+    );
+    assert_eq!(
+        kept(&from("/r/sub", &["!sub"], &up)),
+        [
+            "!n.txt",
+            "#c.txt",
+            "H.TXT",
+            "a.txt",
+            "b.rs",
+            "mw/m.txt",
+            "sub2/g.txt"
+        ]
+    );
+}
+
+#[test]
+fn the_cwd_is_stripped_from_an_absolute_path_as_bytes() {
+    let abs = [("", "/r")];
+    assert_eq!(kept(&from("/r/sub", &["/c.txt"], &abs)), ["sub/c.txt"]);
+    assert!(kept(&from("/r/sub", &["/a.txt"], &abs)).is_empty());
+    assert_eq!(kept(&from("/r/sub", &["/2/*"], &abs)), ["sub2/g.txt"]);
+    assert!(kept(&from("/r/sub", &["/r/a.txt"], &abs)).is_empty());
+    assert_eq!(kept(&from("/r/sub", &["**/r/a.txt"], &abs)), ["a.txt"]);
+}
+
+#[test]
+fn files_print_under_their_path_as_typed() {
+    let print =
+        |paths: &[(&str, &str)], path: &str| from("/r", &[], paths).printed(path).into_owned();
+    let none = PathFilter::new(&strings(&["*"]), &[], false, &[], "").unwrap();
+    assert_eq!(none.unwrap().printed("sub/c.txt"), "sub/c.txt");
+    assert_eq!(print(&[("sub", ".")], "sub/deep/d.txt"), "./deep/d.txt");
+    assert_eq!(print(&[("sub", "./")], "sub/c.txt"), "./c.txt");
+    assert_eq!(print(&[("sub", "sub/")], "sub/c.txt"), "sub/c.txt");
+    assert_eq!(print(&[("sub", "sub//")], "sub/c.txt"), "sub//c.txt");
+    assert_eq!(print(&[("", "..")], "a.txt"), "../a.txt");
+    assert_eq!(print(&[("a.txt", "../a.txt")], "a.txt"), "../a.txt");
+    assert_eq!(print(&[("", "/r/.")], "b.rs"), "/r/./b.rs");
+    assert_eq!(
+        print(&[("sub/deep", "deep"), ("sub", ".")], "sub/deep/e.rs"),
+        "deep/e.rs"
+    );
+}
+
+#[test]
+fn files_print_under_the_first_path_that_keeps_them() {
+    let both = [("", ".."), ("sub", ".")];
+    let print =
+        |globs: &[&str], path: &str| from("/r/sub", globs, &both).printed(path).into_owned();
+    assert_eq!(print(&[], "sub/c.txt"), "../sub/c.txt");
+    assert_eq!(print(&["!sub"], "sub/c.txt"), "./c.txt");
+    assert_eq!(print(&["!../sub/deep"], "sub/deep/d.txt"), "./deep/d.txt");
+    let file = [("", ".."), ("sub/c.txt", "c.txt")];
+    let f = from("/r/sub", &["!*.txt"], &file);
+    assert_eq!(f.printed("sub/c.txt"), "c.txt");
+}
+
+#[test]
+fn the_cwd_of_a_search_without_paths_is_an_unnamed_path() {
+    let cwd = |globs: &[&str]| from("/r/sub", globs, &[("sub", "")]);
+    assert_eq!(
+        kept(&cwd(&[])),
+        ["sub/c.txt", "sub/deep/d.txt", "sub/deep/e.rs"]
+    );
+    assert_eq!(cwd(&[]).printed("sub/deep/d.txt"), "deep/d.txt");
+    assert_eq!(kept(&cwd(&["/c.txt"])), ["sub/c.txt"]);
+    assert_eq!(kept(&cwd(&["deep/*"])), ["sub/deep/d.txt", "sub/deep/e.rs"]);
+    assert!(kept(&cwd(&["sub/**"])).is_empty());
+    assert!(!cwd(&[]).globs() && cwd(&["*"]).globs());
 }

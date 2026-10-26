@@ -158,7 +158,7 @@ fn a_client_ignores_local_indexes() {
     std::fs::write(docs.join("d.bin"), b"printk added\n").unwrap();
     assert_eq!(files(tmp.path(), &[]), want);
     assert_eq!(files(&docs, &[]), want);
-    assert_eq!(files(&index, &[]), want);
+    assert_eq!(files(&index, &[".."]), "../a.bin\n../b.bin\n");
     let other = tmp.path().join("other");
     std::fs::create_dir(&other).unwrap();
     std::fs::write(other.join("e.bin"), b"printk elsewhere\n").unwrap();
@@ -196,4 +196,67 @@ fn serve_without_its_documents_is_refused() {
     assert_eq!(out.status.code(), Some(2));
     let want = format!("error: {}/.fmgrep has no docs.stamps\n", copy.display());
     assert_eq!(stderr(&out), want);
+}
+
+#[test]
+fn served_paths_print_as_the_local_search() {
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/c.c"), "printk c\n").unwrap();
+    ok(&["index", &docs.display().to_string()]);
+    let mut server = Server::spawn(&["serve", &docs.display().to_string(), "--no-watch"]);
+    let addr = server.addr();
+    let sub = docs.join("sub");
+    for args in [
+        &["-l", "printk", ".", "../a.c"][..],
+        &["-g", "!*.h", "printk", ".."],
+        &["-c", "printk", "../a.c"],
+        &["-l", "printk"],
+        &["-g", "!*.h", "printk"],
+    ] {
+        let local = run_in(&sub, args);
+        assert_eq!(local.status.code(), Some(0), "{args:?}");
+        let served = run_in(&sub, &[&["--server", &addr][..], args].concat());
+        assert_eq!(
+            (served.status.code(), served.stdout),
+            (local.status.code(), local.stdout),
+            "{args:?}"
+        );
+    }
+    shutdown(&mut server, &addr);
+}
+
+/// The server scopes a search to the client's cwd.
+#[test]
+fn a_client_below_the_served_tree_searches_its_subtree() {
+    let (tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/c.c"), "printk c\n").unwrap();
+    std::fs::write(docs.join("sub/d.h"), "printk d\n").unwrap();
+    let index = do_index(&docs, false).display().to_string();
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let addr = server.addr();
+    let sub = docs.join("sub");
+    let found = |cwd: &Path, args: &[&str]| {
+        let out = run_in(cwd, args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(
+        found(&sub, &["--server", &addr, "-l", "printk"]),
+        "c.c\nd.h\n"
+    );
+    assert_eq!(
+        found(&sub, &["--index", &index, "-l", "printk"]),
+        "c.c\nd.h\n"
+    );
+    assert_eq!(
+        found(&sub, &["--server", &addr, "-l", "-g", "*.c", "printk"]),
+        "c.c\n"
+    );
+    assert_eq!(
+        found(tmp.path(), &["--server", &addr, "-l", "printk"]),
+        "a.c\nb.h\nsub/c.c\nsub/d.h\n"
+    );
+    shutdown(&mut server, &addr);
 }
