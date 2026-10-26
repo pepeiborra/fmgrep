@@ -60,7 +60,7 @@ fn tuning_names_every_env_knob_and_no_other() {
         let live = text.split("#[cfg(test)]").next().unwrap_or_default();
         code.extend(knobs(live));
     }
-    assert!(code.len() >= 10, "the scan found too few knobs: {code:?}");
+    assert!(code.len() >= 4, "the scan found too few knobs: {code:?}");
     let doc = knobs(&read(&repo().join("docs/tuning.md")));
     let undocumented: Vec<_> = code.difference(&doc).collect();
     let stale: Vec<_> = doc.difference(&code).collect();
@@ -116,17 +116,17 @@ fn manifest_fields_are_documented() {
     );
 }
 
-/// README's environment table lists exactly the knobs `fmgrep --help` does.
+/// README's environment table lists exactly the knobs `fmgrep index --help` does.
 #[test]
 fn readme_names_exactly_the_public_knobs() {
-    let src = read(&repo().join("crates/fmgrep/src/registry.rs"));
+    let src = read(&repo().join("crates/fmgrep/src/cli/args.rs"));
     let help = src
-        .split("\nEnvironment:\n")
+        .split("Environment:\n")
         .nth(1)
         .and_then(|s| s.split("\";").next())
-        .expect("the HELP text has an Environment: block");
+        .expect("the index help has an Environment: block");
     let public = knobs(help);
-    assert!(public.len() >= 3, "too few knobs parsed: {public:?}");
+    assert!(public.len() >= 2, "too few knobs parsed: {public:?}");
     let readme = read(&repo().join("README.md"));
     let table = readme
         .split("\n## Environment\n")
@@ -146,7 +146,6 @@ fn relative_links_resolve() {
         "CONTRIBUTING.md",
         "SECURITY.md",
         "AGENTS.md",
-        "CHANGELOG.md",
     ] {
         docs.push(repo().join(name));
     }
@@ -165,18 +164,4 @@ fn relative_links_resolve() {
         }
     }
     assert!(broken.is_empty(), "broken links: {broken:?}");
-}
-
-/// CHANGELOG.md has a section for the workspace version.
-#[test]
-fn changelog_has_a_section_for_the_crate_version() {
-    let heading = format!("## {}", env!("CARGO_PKG_VERSION"));
-    let dated = format!("{heading} - ");
-    let changelog = read(&repo().join("CHANGELOG.md"));
-    assert!(
-        changelog
-            .lines()
-            .any(|l| l == heading || l.starts_with(&dated)),
-        "CHANGELOG.md has no `{heading}` section"
-    );
 }

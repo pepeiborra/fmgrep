@@ -1,32 +1,5 @@
 use super::*;
-
-/// Deterministic xorshift, so failures replay.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: u64) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n) as usize
-    }
-}
-
-fn t(s: &str) -> Expr {
-    Expr::Term(s.to_owned())
-}
-
-fn re(s: &str) -> Expr {
-    Expr::Regex(s.to_owned())
-}
-
-fn and(v: Vec<Expr>) -> Expr {
-    Expr::And(v)
-}
-
-fn or(v: Vec<Expr>) -> Expr {
-    Expr::Or(v)
-}
+use crate::tests::support::{Rng, and, or, re, t};
 
 fn parsed(src: &str) -> Expr {
     src.parse()
@@ -238,7 +211,7 @@ const PIECES: [&str; 20] = [
 
 fn leaf_text(rng: &mut Rng) -> String {
     (0..rng.below(4))
-        .map(|_| PIECES[rng.below(PIECES.len() as u64)])
+        .map(|_| PIECES[rng.below(PIECES.len())])
         .collect()
 }
 

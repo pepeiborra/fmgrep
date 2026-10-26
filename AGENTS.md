@@ -17,11 +17,12 @@ fmgrep '/Dyn[A-Z]\w+/'          # /../ is a regex; --regex makes every TERM one
 fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)' -l
 ```
 
-For many counts in a row, keep the index loaded:
+For many searches in a row, keep the index loaded:
 
 ```sh
-fmgrep serve --listen 127.0.0.1:7777 &   # prints the address once ready
-fmgrep --server 127.0.0.1:7777 HscEnv    # HscEnv: N matches in M files
+fmgrep serve --listen 127.0.0.1:7777 &     # prints the address once ready
+fmgrep --server 127.0.0.1:7777 HscEnv      # the lines a local search prints
+fmgrep --server 127.0.0.1:7777 -l HscEnv   # any search flag
 fmgrep --server 127.0.0.1:7777 --shutdown
 ```
 
@@ -31,11 +32,9 @@ fmgrep --server 127.0.0.1:7777 --shutdown
   bytes `a.b`. Write `/a.b/` or pass `--regex` for a pattern.
 - Every search covers the **whole indexed tree**, and paths are relative to
   the directory holding `.fmgrep`, not the cwd.
-- **No match exits 0.** Read the output, not the exit code. Errors exit 2.
+- Exit status is rg's: 0 on a match, 1 on no match, 2 on an error.
 - `--json` alone prints a counts report. `--json --matches` gives rg's JSON
   event stream.
-- `--server` answers counts only. `-l`, `-c`, `-o`, context and line flags
-  are refused with it; search locally for lines.
 - `--and`, `--or` and `--expr` are **document-level**: `A AND B` picks files
   holding both, and then prints the lines of either. `AND` and `OR` must be
   capitals.
@@ -43,11 +42,11 @@ fmgrep --server 127.0.0.1:7777 --shutdown
 
 ## Freshness
 
-- An edited file is scanned in full by every search. Answers stay correct,
-  but each stale file costs a read per search, so re-index after many edits.
-- **New files are invisible** until you remove `.fmgrep` and re-index.
-- `fmgrep index --store-docs` keeps a copy of every file. Searches then
-  never read the tree, and answers are as of index time.
+An edited or new file is read in full by every search: answers stay
+correct, but each costs a read per search, so re-index after many edits.
+After `fmgrep index --store-docs` (faster on large trees, about 1.7 times
+the disk), searches never read the tree and answer as of index time.
+Details: [docs/index-format.md](docs/index-format.md#staleness).
 
 ## Troubleshooting
 

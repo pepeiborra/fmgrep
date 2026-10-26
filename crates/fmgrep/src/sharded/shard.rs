@@ -5,11 +5,11 @@ use std::ops::Range;
 
 use crate::Document;
 
-use crate::automaton::{DeferredPlan, RegexPlan, automaton_locate, min_anchor_count};
+use crate::automaton::{DeferredPlan, MIN_ANCHOR_COUNT, RegexPlan, automaton_locate};
 use crate::blobs::Blob;
 use crate::cursor::{BackwardCursor, LocatingCursor};
 use crate::fold::{FoldPlan, fold_locate};
-use crate::pattern::{PreparedPattern, anchor, deferred};
+use crate::pattern::{PreparedPattern, anchor, count_overlapping, deferred};
 use crate::plan::shard_label;
 
 /// One shard's docfm index. Separators are indexed text here, so the
@@ -35,15 +35,6 @@ impl LocatingCursor for docfm::Cursor<'_> {
 /// False only when `term` provably occurs nowhere in `structure`.
 fn may_contain(structure: &Structure, term: &[u8]) -> bool {
     term.iter().all(|&b| structure.contains_symbol(b))
-}
-
-/// One query's hits from the shards, appended in shard order.
-#[derive(Default)]
-pub struct Hits {
-    /// Ascending `(doc id, count)` the FM-index settles exactly.
-    pub exact: Vec<(usize, u64)>,
-    /// Occurrences attributed to no doc.
-    pub occurrences: u64,
 }
 
 /// A shard's doc-id bookkeeping. Doc ranges partition `0..num_docs`
@@ -112,21 +103,18 @@ impl ShardMeta {
         self.tally(subs)
     }
 
-    /// This shard's part of `term`'s occurrences: per doc if the shard holds
-    /// a doc of ascending `place`, else counted without a locate.
-    pub fn occurrences(
-        &self,
-        structure: &Structure,
-        term: &[u8],
-        place: &[usize],
-        hits: &mut Hits,
-    ) {
-        let first = place.partition_point(|&doc| doc < self.docs.start);
-        if place.get(first).is_some_and(|&doc| doc < self.docs.end) {
-            hits.exact.extend(self.counts(structure, term));
-        } else if may_contain(structure, term) {
-            hits.occurrences += structure.cursor().extend_front(term).count();
+    /// `term`'s occurrences in this shard, without a locate.
+    pub fn count(&self, structure: &Structure, term: &[u8]) -> u64 {
+        match may_contain(structure, term) {
+            true => structure.cursor().extend_front(term).count(),
+            false => 0,
         }
+    }
+
+    /// Whether this shard holds a doc of ascending disjoint `within`.
+    pub fn overlaps(&self, within: &[Range<usize>]) -> bool {
+        let first = within.partition_point(|r| r.end <= self.docs.start);
+        within.get(first).is_some_and(|r| r.start < self.docs.end)
     }
 
     /// Ascending `(global doc id, occurrences)` of located shard ordinals:
@@ -172,7 +160,7 @@ impl ShardMeta {
         if !may_contain(structure, term) {
             return Vec::new();
         }
-        let common = || structure.cursor().extend_front(term).count() >= min_anchor_count();
+        let common = || structure.cursor().extend_front(term).count() >= MIN_ANCHOR_COUNT;
         if let Some(plan) = deferred(pattern)
             .filter(|_| common())
             .and_then(DeferredPlan::plan)
@@ -235,7 +223,7 @@ impl ShardMeta {
     }
 
     /// Structure bytes, plus the shard text when the index stores the
-    /// documents: the wire size accounting.
+    /// documents.
     pub fn size_bytes(&self, structure: &Structure, store_docs: bool) -> u64 {
         let text = if store_docs { self.text_len as u64 } else { 0 };
         structure.heap_bytes() + text
@@ -303,7 +291,8 @@ pub fn sample_probes(kept: &[&Document]) -> Vec<Probe> {
                 let mut wants: Vec<(usize, u64)> = Vec::new();
                 for len in VERIFY_PROBE_LENS.map(|l| l.min(term.len())) {
                     if wants.last().is_none_or(|&(prev, _)| prev < len) {
-                        wants.push((len, crate::pattern::count_occurrences(hay, &term[..len])));
+                        let finder = memchr::memmem::Finder::new(&term[..len]);
+                        wants.push((len, count_overlapping(hay, &finder)));
                     }
                 }
                 probes.push(Probe { sub, term, wants });
@@ -315,7 +304,7 @@ pub fn sample_probes(kept: &[&Document]) -> Vec<Probe> {
 }
 
 /// Visits every occurrence of a term, in docfm's locate unit.
-pub type Locate<'a> = dyn Fn(&[u8], &mut dyn FnMut(usize)) + 'a;
+type Locate<'a> = dyn Fn(&[u8], &mut dyn FnMut(usize)) + 'a;
 
 /// Every probe, at its shortest prefix within [`VERIFY_MAX_HITS`], must
 /// `locate` its sampled count into its own document, as many hits as `count`

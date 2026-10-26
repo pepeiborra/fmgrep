@@ -14,32 +14,34 @@
 //! 1. `index` walks the tree, cuts it into shards and builds one docfm blob
 //!    per shard into `.fmgrep/blobs.shard`.
 //! 2. A search maps `blobs.shard` and, unless the index was built with
-//!    `--store-docs`, stats every file against its stamp.
+//!    `--store-docs`, stats every file against its stamp, and every
+//!    directory the index recorded, listing the changed ones for files added
+//!    since.
 //! 3. Each term probes every shard: a literal by backward search, `-i` by a
 //!    case-folding walk, a pattern by its required literal or a reversed-DFA
 //!    walk. The result is exact documents or candidates.
-//! 4. Candidates and changed files are read from the tree (or `docs.shard`),
-//!    verified by the regex crate and printed as rg prints them.
+//! 4. Candidates, changed and added files are read from the tree (or
+//!    `docs.shard`), verified by the regex crate and printed as rg prints
+//!    them.
 //!
 //! Reference, as paths in the repository:
 //!
 //! - `docs/index-format.md`: the on-disk layout, the walk and staleness.
 //! - `docs/protocol.md`: `serve`, `--server` and the `--json` shapes.
 //! - `docs/tuning.md`: the `FMGREP_*` environment variables.
-//! - `docs/design/`: the decisions and the measurements behind them.
 //! - `fmgrep --help`: the command line.
 //!
 //! The library items serve the binary and its benchmark harness; they are
 //! not a stable API.
 
 mod automaton;
+mod base64;
 mod binary;
 mod blobs;
-mod budget;
-mod bytes;
 mod cli;
 mod cursor;
 mod docs;
+mod env;
 mod events;
 mod expr;
 mod fetch;
@@ -52,7 +54,7 @@ mod pattern;
 mod plan;
 mod probe;
 mod query;
-mod registry;
+mod remote;
 mod sharded;
 mod sink;
 mod source;
@@ -65,13 +67,11 @@ mod verify;
 mod walk;
 mod wire;
 
-pub use cli::{Cli, Outcome, dispatch, run};
-pub use registry::cli_spec;
-pub use term::{RegexError, regex_pattern};
-pub use unified::{UNIFIED_SEPARATOR, UnifiedCorpus};
-pub use verbose::set_verbose;
-pub use walk::{Corpus, DocMeta, Document, Stamp, discover_index_docs, discover_index_meta};
-pub use wire::{IndexSummary, LeafReport, OutputReport, QueryReport};
+pub use cli::run;
+pub use term::regex_pattern;
+pub use walk::{DocMeta, discover_index_meta};
 
 use binary::is_binary_doc;
-use walk::{for_each_index_doc, read_stamped};
+use term::RegexError;
+use unified::UNIFIED_SEPARATOR;
+use walk::{Document, Stamp, for_each_index_doc};

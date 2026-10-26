@@ -1,26 +1,30 @@
 use super::*;
 
 use std::sync::Condvar;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use crate::sharded::build::{
-    build_plan, parse_knob, shard_threads, shard_threads_from, threads_from,
-};
+use crate::sharded::build::{build_plan, window_from};
 
-/// Plan `docs` at `cap` and build it with `threads` in flight, over an
-/// already-final cut source.
+/// Plan `docs` at `cap` and build it on a pool of `pool` threads holding
+/// `window` shards, over an already-final cut source.
 fn run<T: Send>(
     docs: &[Document],
     cap: u64,
-    threads: usize,
+    (pool, window): (usize, usize),
     build: &(dyn Fn(&Cut) -> Result<T, String> + Sync),
-    emit: &(dyn Fn(usize, T) -> Result<(), String> + Sync),
+    emit: &mut dyn FnMut(usize, T) -> Result<(), String>,
 ) -> Result<(), String> {
     let lens = doc_lens(docs);
     let paths: Vec<String> = docs.iter().map(|d| d.path.clone()).collect();
     let plan = plan_shards(&lens, cap);
     assert!(plan.len() > 2, "the fixture must plan more than two shards");
     let cuts = Cuts::closed(None, plan, &lens, &paths).unwrap();
-    build_plan(&cuts, threads, build, emit)
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(pool)
+        .build()
+        .unwrap();
+    build_plan(&pool, &cuts, window, build, emit)
 }
 
 /// Six two-byte documents: at cap 1 each is its own shard, so a slot index
@@ -58,44 +62,41 @@ fn emit_sees_slots_ascending_whatever_the_build_order() {
         ready: Condvar::new(),
         slots,
     };
-    let emitted = Mutex::new(Vec::new());
+    let mut emitted = Vec::new();
     run(
         &docs,
         1,
-        slots,
+        (slots, slots),
         &|cut| {
             reverse.wait(cut.docs.start);
             Ok(())
         },
-        &|slot, ()| {
-            emitted.lock().unwrap().push(slot);
+        &mut |slot, ()| {
+            emitted.push(slot);
             Ok(())
         },
     )
     .unwrap();
     let read_order = reverse.done.into_inner().unwrap().1;
     assert_eq!(read_order, (0..slots).rev().collect::<Vec<_>>());
-    assert_eq!(
-        emitted.into_inner().unwrap(),
-        (0..slots).collect::<Vec<_>>()
-    );
+    assert_eq!(emitted, (0..slots).collect::<Vec<_>>());
 }
 
 #[test]
-fn a_panicking_worker_fails_loudly_instead_of_hanging() {
+fn a_panicking_build_fails_loudly_instead_of_hanging() {
     let docs = many();
     let msg = panic_message(|| {
         let _ = run(
             &docs,
             1,
-            4,
+            (4, 4),
             &|cut| {
                 if cut.docs.start == 2 {
                     refuse("shard refuses to build".to_string());
                 }
                 Ok(())
             },
-            &|_slot, ()| Ok(()),
+            &mut |_slot, ()| Ok(()),
         );
     });
     assert!(msg.contains("shard refuses to build"), "got: {msg:?}");
@@ -103,116 +104,124 @@ fn a_panicking_worker_fails_loudly_instead_of_hanging() {
 }
 
 #[test]
-fn an_erroring_emit_stops_every_worker() {
+fn an_erroring_emit_stops_the_build() {
     let docs = many();
-    let emitted = Mutex::new(Vec::new());
-    let err = run(&docs, 1, 4, &|_cut| Ok(()), &|slot, ()| {
+    let mut emitted = Vec::new();
+    let err = run(&docs, 1, (4, 4), &|_cut| Ok(()), &mut |slot, ()| {
         if slot == 1 {
             return Err("emit refused".to_string());
         }
-        emitted.lock().unwrap().push(slot);
+        emitted.push(slot);
         Ok(())
     })
     .expect_err("an erroring emit must fail the build");
     assert_eq!(err, "emit refused");
     // Slot 0 went through, nothing above the failure did.
-    assert_eq!(emitted.into_inner().unwrap(), vec![0]);
+    assert_eq!(emitted, vec![0]);
 }
 
-/// The rule is plumbing, not arithmetic: a shard builds inside a pool that
-/// reports `shard_threads` to `rayon::current_num_threads()`.
+/// Every shard sees the whole pool, however few shards the window holds.
 #[test]
-fn a_shard_builds_inside_a_pool_of_that_size() {
+fn every_shard_builds_in_the_whole_pool() {
     let docs = many();
     let slots = plan_shards(&doc_lens(&docs), 1).len();
-    let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
     let seen = Mutex::new(Vec::new());
     run(
         &docs,
         1,
-        2,
+        (3, 2),
         &|_cut| {
             seen.lock().unwrap().push(rayon::current_num_threads());
             Ok(())
         },
-        &|_slot, ()| Ok(()),
+        &mut |_slot, ()| Ok(()),
     )
     .unwrap();
-    assert_eq!(
-        seen.into_inner().unwrap(),
-        vec![shard_threads(2, machine); slots]
-    );
+    assert_eq!(seen.into_inner().unwrap(), vec![3; slots]);
 }
 
-/// `(shards, machine, knob, budget, transient) -> shards in flight`.
+/// A built shard keeps its window place until emitted: with slot 1 built
+/// and slot 0 still building, a window of 2 claims no slot 2.
 #[test]
-fn build_threads_table() {
+fn a_finished_shard_holds_its_place_until_emitted() {
+    let docs = many();
+    let (built_tx, built_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (built_rx, started_rx) = (Mutex::new(built_rx), Mutex::new(started_rx));
+    let early = Mutex::new(None);
+    run(
+        &docs,
+        1,
+        (2, 2),
+        &|cut| {
+            match cut.docs.start {
+                0 => {
+                    built_rx.lock().unwrap().recv().unwrap();
+                    let started = started_rx.lock().unwrap();
+                    *early.lock().unwrap() = started.recv_timeout(Duration::from_millis(200)).ok();
+                }
+                1 => built_tx.send(()).unwrap(),
+                slot => started_tx.send(slot).unwrap(),
+            }
+            Ok(())
+        },
+        &mut |_slot, ()| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(early.into_inner().unwrap(), None);
+}
+
+/// A thread that waits inside one build, for work it split off, never
+/// starts a second build there.
+#[test]
+fn no_build_starts_inside_another() {
+    thread_local! {
+        static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    let texts: Vec<Vec<u8>> = (0..40).map(|i| format!("{i:02}").into_bytes()).collect();
+    let docs = docs_of(&texts.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let nested = AtomicUsize::new(0);
+    run(
+        &docs,
+        1,
+        (4, 4),
+        &|_cut| {
+            if INSIDE.replace(true) {
+                nested.fetch_add(1, Ordering::SeqCst);
+            }
+            (0..64).into_par_iter().for_each(|i| {
+                let until = std::time::Instant::now() + Duration::from_micros(20 + i % 7);
+                while std::time::Instant::now() < until {}
+            });
+            INSIDE.set(false);
+            Ok(())
+        },
+        &mut |_slot, ()| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(nested.into_inner(), 0);
+}
+
+/// `(pool, budget, transient) -> shards held at once`.
+#[test]
+fn window_table() {
     let gb = 1u64 << 30;
     let cases = [
-        // The knob is obeyed exactly, over and under machine parallelism.
-        ((8, 4, Some(7), 8 * gb, gb), 7),
-        ((8, 4, Some(1), 0, gb), 1),
-        // No knob: machine parallelism under the footprint budget.
-        ((8, 10, None, 8 * gb, gb), 8),
-        ((8, 4, None, 8 * gb, gb), 4),
-        ((8, 10, None, 8 * gb, 3 * gb), 2),
-        // The floor is one shard in flight, however tight the budget.
-        ((8, 10, None, 1, 100 * gb), 1),
-        ((8, 10, None, 0, 0), 1),
-        // Never more shards in flight than there are shards.
-        ((1, 10, None, 8 * gb, gb), 1),
-        ((3, 10, Some(9), 8 * gb, gb), 3),
-        ((0, 10, None, 8 * gb, gb), 1),
-        // A live stream bounds the flight by this machine, so an outsized
-        // knob is clamped instead of spawning one worker per request.
-        ((10, 10, Some(1000), 8 * gb, gb), 10),
-        ((10, 10, None, 8 * gb, 3 * gb), 2),
+        // The pool under the budget.
+        ((10, 8 * gb, gb), 8),
+        ((4, 8 * gb, gb), 4),
+        ((10, 8 * gb, 3 * gb), 2),
+        ((10, 8 * gb, 8 * (100 << 20)), 10),
+        // The floor is one shard, however tight the budget.
+        ((10, 1, 100 * gb), 1),
+        ((10, 0, 0), 1),
+        ((0, 8 * gb, gb), 1),
     ];
-    for ((shards, machine, knob, budget, transient), want) in cases {
+    for ((pool, budget, transient), want) in cases {
         assert_eq!(
-            threads_from(shards, machine, knob, budget, transient),
+            window_from(pool, budget, transient),
             want,
-            "shards={shards} machine={machine} knob={knob:?} budget={budget} transient={transient}"
+            "pool={pool} budget={budget} transient={transient}"
         );
     }
-}
-
-/// `(shards in flight, machine, knob) -> threads inside one shard`:
-/// integer division, floor 1, never oversubscribing.
-#[test]
-fn shard_threads_table() {
-    let cases = [
-        ((1, 10, None), 10),
-        ((2, 10, None), 5),
-        ((3, 10, None), 3),
-        ((4, 10, None), 2),
-        ((8, 10, None), 1),
-        ((16, 10, None), 1),
-        ((0, 10, None), 10),
-        // The knob is obeyed exactly, over and under machine parallelism.
-        ((8, 10, Some(4)), 4),
-        ((1, 10, Some(16)), 16),
-        // Junk and zero are no knob, so the rule decides.
-        ((2, 10, parse_knob(Some("0"))), 5),
-        ((2, 10, parse_knob(Some("nonsense"))), 5),
-    ];
-    for ((in_flight, machine, knob), want) in cases {
-        assert_eq!(
-            shard_threads_from(in_flight, machine, knob),
-            want,
-            "in_flight={in_flight} machine={machine} knob={knob:?}"
-        );
-    }
-}
-
-/// Junk and zero are no knob, so the budget — not machine parallelism —
-/// decides: a machine of 4 under a 1-shard budget runs 1 shard in flight.
-#[test]
-fn unusable_knobs_take_the_budget_path() {
-    for raw in [Some("nonsense"), Some("0"), Some("-1"), Some(""), None] {
-        assert_eq!(parse_knob(raw), None, "{raw:?}");
-    }
-    assert_eq!(parse_knob(Some(" 3 ")), Some(3));
-    let gb = 1u64 << 30;
-    assert_eq!(threads_from(8, 4, parse_knob(Some("nonsense")), gb, gb), 1);
 }

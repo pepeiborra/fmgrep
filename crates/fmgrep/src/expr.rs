@@ -48,14 +48,6 @@ impl Expr {
         }
     }
 
-    pub fn has_and(&self) -> bool {
-        match self {
-            Expr::Term(_) | Expr::Regex(_) => false,
-            Expr::And(_) => true,
-            Expr::Or(v) => v.iter().any(Expr::has_and),
-        }
-    }
-
     /// The tree's truth given each leaf's, by leaf index. Every leaf is
     /// asked, in order.
     pub fn eval(&self, leaf: &mut impl FnMut(usize) -> bool) -> bool {

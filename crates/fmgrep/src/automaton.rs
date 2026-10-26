@@ -15,19 +15,9 @@ use regex_automata::util::syntax;
 use regex_automata::{Anchored, MatchKind};
 use regex_syntax::hir::{Class, ClassBytesRange, ClassUnicode, Hir, HirKind};
 
-use crate::budget;
 use crate::cursor::{BackwardCursor, LocatingCursor};
 use crate::matching::MatchMode;
 use crate::pattern::required_literal;
-
-const AUTOMATON_VAR: &str = "FMGREP_AUTOMATON";
-const MAX_LIVE_VAR: &str = "FMGREP_AUTOMATON_MAX_LIVE";
-const MAX_DEPTH_VAR: &str = "FMGREP_AUTOMATON_MAX_DEPTH";
-const MAX_NODES_VAR: &str = "FMGREP_AUTOMATON_MAX_NODES";
-const CLASS_BYTES_VAR: &str = "FMGREP_AUTOMATON_CLASS_BYTES";
-const DFA_BYTES_VAR: &str = "FMGREP_AUTOMATON_DFA_BYTES";
-const MAX_ANCHOR_VAR: &str = "FMGREP_AUTOMATON_MAX_ANCHOR";
-const MIN_ANCHOR_COUNT_VAR: &str = "FMGREP_AUTOMATON_MIN_ANCHOR_COUNT";
 
 /// What a walk may spend before it gives up and widens.
 struct Caps {
@@ -41,41 +31,21 @@ struct Caps {
     class_bytes: usize,
 }
 
-/// The process's budgets, read from the environment once.
-fn caps() -> &'static Caps {
-    static CAPS: OnceLock<Caps> = OnceLock::new();
-    CAPS.get_or_init(|| Caps {
-        live: budget::count(MAX_LIVE_VAR, 256),
-        depth: budget::count(MAX_DEPTH_VAR, 64),
-        nodes: budget::count(MAX_NODES_VAR, 20_000),
-        class_bytes: budget::count(CLASS_BYTES_VAR, 64),
-    })
-}
+const CAPS: Caps = Caps {
+    live: 256,
+    depth: 64,
+    nodes: 20_000,
+    class_bytes: 64,
+};
 
-/// Whether a pattern may plan a walk at all; `FMGREP_AUTOMATON=off` is the
-/// measurement's control arm.
-fn planning_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !budget::flag(AUTOMATON_VAR, "off"))
-}
-
-fn dfa_bytes() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| budget::count(DFA_BYTES_VAR, 8 << 20))
-}
+const DFA_BYTES: usize = 8 << 20;
 
 /// Longest required literal whose pattern plans its walk at prepare time.
-pub fn max_anchor() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| budget::count(MAX_ANCHOR_VAR, 3))
-}
+pub const MAX_ANCHOR: usize = 3;
 
-/// Shard-wide anchor occurrences at which a longer anchor's pattern walks
-/// its [`DeferredPlan`] instead of locating the anchor.
-pub fn min_anchor_count() -> u64 {
-    static MIN: OnceLock<u64> = OnceLock::new();
-    *MIN.get_or_init(|| budget::count(MIN_ANCHOR_COUNT_VAR, 256) as u64)
-}
+/// Shard-wide anchor occurrences at which a longer anchor's pattern
+/// walks its [`DeferredPlan`] instead of locating the anchor.
+pub const MIN_ANCHOR_COUNT: u64 = 256;
 
 /// A regex as a branching backward search: a reversed, anchored byte DFA
 /// stepped while the FM interval is extended front-to-back.
@@ -113,16 +83,16 @@ fn accepts(dfa: &dense::DFA<Vec<u32>>, sid: StateID) -> bool {
 /// compiles with; a plan built from other flags could prune away a real
 /// match.
 ///
-/// `None` — prune with the required literal instead — when planning is off,
-/// the pattern carries look-around (the walk sees no surrounding context) or
-/// can match NUL, the DFA has no universal anchored start or exceeds its
-/// size limit, the pattern matches the empty string, or its first step is
-/// wider than the byte cap and so would widen on every document.
+/// `None` — prune with the required literal instead — when the pattern
+/// carries look-around (the walk sees no surrounding context) or can match
+/// NUL, the DFA has no universal anchored start or exceeds its size limit,
+/// the pattern matches the empty string, or its first step is wider than the
+/// byte cap and so would widen on every document.
 pub fn regex_plan(src: &str, hir: &Hir, mode: MatchMode) -> Option<RegexPlan> {
-    if !planning_enabled() || !hir.properties().look_set().is_empty() || can_match_nul(hir) {
+    if !hir.properties().look_set().is_empty() || can_match_nul(hir) {
         return None;
     }
-    plan_capped(src, mode, dfa_bytes())
+    plan_capped(src, mode, DFA_BYTES)
 }
 
 fn dense_config(dfa_bytes: usize) -> dense::Config {
@@ -181,7 +151,7 @@ fn checked(dfa: dense::DFA<Vec<u32>>) -> Option<RegexPlan> {
         &dfa,
         dfa.byte_classes(),
         start,
-        caps().class_bytes,
+        CAPS.class_bytes,
         &mut Vec::new(),
     )?;
     Some(RegexPlan { dfa, start })
@@ -195,13 +165,10 @@ pub struct DeferredPlan {
 }
 
 impl DeferredPlan {
-    /// `None` when planning is off or `hir` has no [`core()`] holding `anchor`.
+    /// `None` when `hir` has no [`core()`] holding `anchor`.
     pub fn new(hir: &Hir, anchor: &[u8]) -> Option<Self> {
-        if !planning_enabled() {
-            return None;
-        }
         Some(Self {
-            core: core(hir, anchor, caps().class_bytes)?,
+            core: core(hir, anchor, CAPS.class_bytes)?,
             plan: OnceLock::new(),
         })
     }
@@ -209,7 +176,7 @@ impl DeferredPlan {
     /// The plan, compiled at most once.
     pub fn plan(&self) -> Option<&RegexPlan> {
         self.plan
-            .get_or_init(|| plan_hir(&self.core, dfa_bytes()))
+            .get_or_init(|| plan_hir(&self.core, DFA_BYTES))
             .as_ref()
     }
 
@@ -448,7 +415,7 @@ fn any_capped<C: BackwardCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Opti
 /// stops at the shortest accepting suffix), so the hits' documents are a
 /// superset of the matching documents.
 pub fn automaton_locate<C: LocatingCursor>(root: C, plan: &RegexPlan) -> Option<Vec<usize>> {
-    locate_capped(root, plan, caps())
+    locate_capped(root, plan, &CAPS)
 }
 
 fn locate_capped<C: LocatingCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Option<Vec<usize>> {

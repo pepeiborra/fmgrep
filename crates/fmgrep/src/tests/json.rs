@@ -2,32 +2,6 @@
 
 use super::*;
 
-use crate::cli::dispatch_to;
-
-fn staged(tmp: &Path, store_docs: bool) -> PathBuf {
-    let folder = stage_corpus(
-        tmp,
-        &[
-            ("a.c", b"printk one\nnothing\nprintk two printk\n"),
-            ("b.c", b"aaaa\ntail printk"),
-        ],
-    );
-    let output = tmp.join(format!("idx-{store_docs}"));
-    index_it(&folder, &output, store_docs);
-    output
-}
-
-/// `<flags> -- <terms>` through the printing dispatcher.
-fn printed(index: &Path, flags: &[&str], terms: &[&str]) -> String {
-    let mut words = argv(&["--index", &index.display().to_string()]);
-    words.extend(flags.iter().map(|f| f.to_string()));
-    words.push("--".into());
-    words.extend(terms.iter().map(|t| t.to_string()));
-    let mut buf: Vec<u8> = Vec::new();
-    dispatch_to(&cli_spec(), &words, &mut &b""[..], &mut buf, false).unwrap();
-    String::from_utf8(buf).unwrap()
-}
-
 /// `(event type, path, line_number)` of every event but the summary.
 fn events(stream: &str) -> Vec<(String, String, Option<u64>)> {
     stream
@@ -132,7 +106,7 @@ fn json_matches_mode_prints_no_wire_report() {
         let index = staged(tmp.path(), store_docs);
         let got = printed(&index, &["--json", "--matches"], &["printk"]);
         assert!(
-            !got.contains("index_name"),
+            !got.contains("index_time_us"),
             "store_docs={store_docs}: {got}"
         );
         let last: serde_json::Value =
@@ -192,29 +166,6 @@ fn human_approx_counts_prints_a_line_per_term() {
         assert_eq!(
             printed(&index, &["--approx-counts"], &["printk", "aa"]),
             "printk: 4 matches in 2 files\naa: 3 matches in 1 file\n",
-            "store_docs={store_docs}"
-        );
-    }
-}
-
-#[test]
-fn human_occurrences_prints_a_line_per_term() {
-    for store_docs in LAYOUTS {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = staged(tmp.path(), store_docs);
-        assert_eq!(
-            printed(&index, &["--occurrences"], &["printk", "aaaa", "missing"]),
-            "printk: 4 occurrences\naaaa: 1 occurrence\nmissing: 0 occurrences\n",
-            "store_docs={store_docs}"
-        );
-        let got = printed(&index, &["--json", "--occurrences"], &["printk"]);
-        let v: serde_json::Value = serde_json::from_str(got.trim_end()).unwrap();
-        assert_eq!(
-            v["queries"][0]["total_matches"], 4,
-            "store_docs={store_docs}"
-        );
-        assert!(
-            v["queries"][0].get("docs_matched").is_none(),
             "store_docs={store_docs}"
         );
     }

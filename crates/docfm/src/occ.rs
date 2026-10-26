@@ -7,8 +7,8 @@
 //! A rank reads one super, one block count and at most `BLOCK / 2` positions
 //! of one block.
 
+use crate::build::each;
 use crate::layout::{HEADER_BYTES, Header};
-use crate::par;
 
 pub const BLOCK: usize = 4096;
 /// Bounded by the u16 block counts.
@@ -112,78 +112,49 @@ fn matches_n<const BITS: usize>(planes: &[u8], code: usize, from: usize, to: usi
 }
 
 /// Writes the supers and blocks of `codes` (all below `sigma`) into the
-/// zeroed blob `out`, on up to `threads` threads.
-pub fn write_occ(codes: &[u8], h: &Header, out: &mut [u8], threads: usize) {
-    let sigma = h.sigma.max(1);
+/// zeroed blob `out`, one super per unit on the current rayon pool.
+pub fn write_occ(codes: &[u8], h: &Header, out: &mut [u8]) {
     let supers = h.n / SUPER + 1;
-    let per = par::chunk_len(supers, threads);
-    // The last range's counts are never needed.
-    let heads = codes.chunks(per * SUPER).take(supers.div_ceil(per) - 1);
-    let counts = par::map(heads.collect(), |chunk| {
-        let mut count = vec![0u32; sigma];
-        for &code in chunk {
-            count[usize::from(code)] += 1;
-        }
-        count
-    });
     let (head, tail) = out.split_at_mut(h.blocks_at);
     let supers_out = &mut head[HEADER_BYTES..][..supers * h.super_stride];
     let blocks_out = &mut tail[..(h.n / BLOCK + 1) * h.block_stride];
-    let mut before = vec![0u32; sigma];
-    let mut ranges = Vec::new();
-    for (i, (sup, blocks)) in supers_out
-        .chunks_mut(per * h.super_stride)
-        .zip(blocks_out.chunks_mut(per * SUPER / BLOCK * h.block_stride))
-        .enumerate()
-    {
-        ranges.push((i * per * SUPER, before.clone(), sup, blocks));
-        for (b, c) in before.iter_mut().zip(counts.get(i).into_iter().flatten()) {
-            *b += c;
+    let mut totals = vec![Vec::new(); supers];
+    let units = blocks_out.chunks_mut(SUPER / BLOCK * h.block_stride);
+    each(
+        units.zip(&mut totals).enumerate(),
+        |(i, (blocks, total))| {
+            *total = write_super(codes, h, i * SUPER, blocks);
+        },
+    );
+    let mut before = vec![0u32; h.sigma.max(1)];
+    for (dst, total) in supers_out.chunks_mut(h.super_stride).zip(&totals) {
+        for (d, v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&before) {
+            d.copy_from_slice(&v.to_le_bytes());
+        }
+        for (b, t) in before.iter_mut().zip(total) {
+            *b += t;
         }
     }
-    par::map(ranges, |(start, before, sup, blocks)| {
-        write_range(codes, h, start, before, sup, blocks)
-    });
 }
 
-/// Supers and blocks from position `start`, a multiple of `SUPER`, with
-/// `before` the occurrences in `0..start`.
-fn write_range(
-    codes: &[u8],
-    h: &Header,
-    start: usize,
-    mut before: Vec<u32>,
-    sup: &mut [u8],
-    blocks: &mut [u8],
-) {
+/// The blocks of the super at `start`, a multiple of `SUPER`; returns its
+/// occurrences of each code.
+fn write_super(codes: &[u8], h: &Header, start: usize, blocks: &mut [u8]) -> Vec<u32> {
     let bits = h.bits;
-    let mut at_super = before.clone();
+    let mut seen = vec![0u32; h.sigma.max(1)];
     for (k, block) in blocks.chunks_mut(h.block_stride).enumerate() {
         let pos = start + k * BLOCK;
-        if pos.is_multiple_of(SUPER) {
-            at_super.copy_from_slice(&before);
-            let dst = &mut sup[k * BLOCK / SUPER * h.super_stride..][..h.super_stride];
-            for (d, v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(&before) {
-                d.copy_from_slice(&v.to_le_bytes());
-            }
-        }
         let (counts, planes) = block.split_at_mut(h.counts_bytes);
         for g in 0..BLOCK / 64 {
             if g == BLOCK / 128 {
-                for ((d, b), s) in counts
-                    .as_chunks_mut::<2>()
-                    .0
-                    .iter_mut()
-                    .zip(&before)
-                    .zip(&at_super)
-                {
-                    d.copy_from_slice(&((b - s) as u16).to_le_bytes());
+                for (d, s) in counts.as_chunks_mut::<2>().0.iter_mut().zip(&seen) {
+                    d.copy_from_slice(&(*s as u16).to_le_bytes());
                 }
             }
             let mut words = [0u64; 8];
             for bit in 0..64 {
                 let code = codes.get(pos + g * 64 + bit).copied().unwrap_or(0);
-                before[usize::from(code)] += 1;
+                seen[usize::from(code)] += 1;
                 for (j, w) in words.iter_mut().enumerate().take(bits) {
                     *w |= u64::from(code >> j & 1) << bit;
                 }
@@ -194,4 +165,5 @@ fn write_range(
             }
         }
     }
+    seen
 }

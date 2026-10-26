@@ -34,12 +34,6 @@ pub enum CutSource {
     Files(PathBuf),
 }
 
-/// Whether the corpus closed exactly one slot; known before the stream ends.
-pub enum Shape {
-    One,
-    Many,
-}
-
 struct Live {
     docs: usize,
     cuts: Vec<Cut>,
@@ -133,21 +127,7 @@ impl Cuts {
         live.cuts.get(slot).cloned()
     }
 
-    /// Blocks until the first slot closes. `None`: the corpus closed no slot.
-    /// A slot closed before the stream ended is never the last one.
-    pub fn shape(&self) -> Option<Shape> {
-        let mut live = self.feed.lock();
-        while live.cuts.is_empty() && !live.ended && !self.feed.aborted() {
-            live = self.feed.wait(live);
-        }
-        match (live.cuts.len(), live.ended) {
-            (0, _) => None,
-            (1, true) => Some(Shape::One),
-            _ => Some(Shape::Many),
-        }
-    }
-
-    /// Why the stream stopped short, once `get` or `shape` returned `None`.
+    /// Why the stream stopped short, once `get` returned `None`.
     pub fn error(&self) -> Option<String> {
         self.feed.lock().error.clone()
     }
@@ -210,7 +190,7 @@ pub struct Tables {
 }
 
 /// The feed's error when the stream left without calling [`Writer::end`].
-pub const BROKEN: &str = "error: the document stream stopped without reporting an error";
+const BROKEN: &str = "error: the document stream stopped without reporting an error";
 
 /// A live feed plus the writer filling it.
 pub fn feed(source: CutSource) -> (Cuts, Writer) {

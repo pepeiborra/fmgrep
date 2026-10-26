@@ -1,15 +1,20 @@
-//! Document-level AND / OR: one probe pass, a set-algebra prune, then
-//! verification of the undecided documents only.
+//! Document-level AND / OR: a count pass, one probe pass, a set-algebra
+//! prune, then verification of the undecided documents only.
+
+mod demote;
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::time::Instant;
 
-use super::{Loaded, QueryRequest, Term, answer_terms, line_matcher, path_of, prepare};
+use super::{Loaded, QueryRequest, in_index, line_matcher, path_of, prepare};
+use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
-use crate::fetch::{fetch_stream_parallel, fetch_threads};
+use crate::fetch::{Paths, fetch_stream_parallel, fetch_threads};
 use crate::matching::{self, DocOutcome, LineMatcher, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Query, candidate_docs};
+use crate::sharded::DocfmIndex;
 use crate::sink::{DocMatches, MatchSink};
 use crate::verify::{self, LeafSet};
 use crate::wire::{LeafReport, OutputReport, QueryReport};
@@ -113,34 +118,66 @@ fn difference(a: &[usize], b: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// A leaf as the prune sees it.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Tri(&'a Tri),
+    /// A demoted leaf: unknown on these ranges and on stale docs, absent
+    /// elsewhere. Only an AND with a [`Part::Tri`] operand holds one.
+    Unknown(&'a [Range<usize>]),
+}
+
 /// `expr`'s documents from its leaves', consumed in leaf order.
-fn prune(expr: &Expr, tris: &[Tri], next: &mut usize) -> Tri {
-    let parts = match expr {
+fn prune(expr: &Expr, parts: &[Part<'_>], stale: &[usize], next: &mut usize) -> Tri {
+    let v = match expr {
         Expr::Term(_) | Expr::Regex(_) => {
             *next += 1;
-            return tris[*next - 1].clone();
+            let Part::Tri(t) = parts[*next - 1] else {
+                unreachable!("a demoted leaf is pruned by its AND")
+            };
+            return t.clone();
         }
-        Expr::And(v) | Expr::Or(v) => v.iter().map(|e| prune(e, tris, next)).collect::<Vec<_>>(),
+        Expr::And(v) | Expr::Or(v) => v,
     };
+    let and = matches!(expr, Expr::And(_));
+    let (mut tris, mut unknown) = (Vec::new(), Vec::new());
+    for e in v {
+        match (e, parts[*next]) {
+            (Expr::Term(_) | Expr::Regex(_), Part::Unknown(r)) if and => {
+                *next += 1;
+                unknown.push(r);
+            }
+            _ => tris.push(prune(e, parts, stale, next)),
+        }
+    }
     let fold = |f: fn(&[usize], &[usize]) -> Vec<usize>, sets: Vec<Vec<usize>>| {
         sets.into_iter()
             .reduce(|a, b| f(&a, &b))
             .unwrap_or_default()
     };
-    let yes_sets = parts.iter().map(|p| p.yes.clone()).collect();
-    if matches!(expr, Expr::And(_)) {
+    let yes_sets = tris.iter().map(|p| p.yes.clone()).collect();
+    if and {
         let yes = fold(intersect, yes_sets);
-        let all = fold(
+        let mut all = fold(
             intersect,
-            parts.iter().map(|p| union(&p.yes, &p.maybe)).collect(),
+            tris.iter().map(|p| union(&p.yes, &p.maybe)).collect(),
         );
+        if !unknown.is_empty() {
+            all.retain(|&d| {
+                stale.binary_search(&d).is_ok() || unknown.iter().all(|r| demote::contains(r, d))
+            });
+            return Tri {
+                yes: Vec::new(),
+                maybe: all,
+            };
+        }
         Tri {
             maybe: difference(&all, &yes),
             yes,
         }
     } else {
         let yes = fold(union, yes_sets);
-        let maybe = fold(union, parts.iter().map(|p| p.maybe.clone()).collect());
+        let maybe = fold(union, tris.iter().map(|p| p.maybe.clone()).collect());
         Tri {
             maybe: difference(&maybe, &yes),
             yes,
@@ -180,64 +217,21 @@ fn refuse(req: &QueryRequest<'_>, expr: &Expr) -> Result<(), String> {
         return Err(format!("error: {REGEX_REFUSAL}"));
     }
     expr.check().map_err(|e| format!("error: {e}"))?;
-    if req.output == QueryOutput::Occurrences && expr.has_and() {
-        return Err(
-            "error: --occurrences places no match in a document, so it cannot answer AND"
-                .to_owned(),
-        );
-    }
     Ok(())
-}
-
-/// `--occurrences` over a pure OR: each leaf's occurrences, summed.
-fn occurrences(
-    loaded: &mut Loaded,
-    req: &QueryRequest<'_>,
-    expr: &Expr,
-    leaves: &[Leaf<'_>],
-    sink: &mut dyn MatchSink,
-) -> Result<OutputReport, String> {
-    let terms: Vec<Term<'_>> = leaves
-        .iter()
-        .map(|l| Term {
-            name: Cow::Borrowed(&l.name),
-            literal: l.src.as_bytes(),
-            pattern: l.pattern.clone(),
-        })
-        .collect();
-    let mut out = answer_terms(loaded, req, &terms, sink)?;
-    let report = QueryReport {
-        term: expr.to_string(),
-        latency_us: out.queries.iter().map(|q| q.latency_us).sum(),
-        total_matches: out.queries.iter().map(|q| q.total_matches).sum(),
-        docs_matched: None,
-        counts_exact: sum_is_exact(leaves),
-        leaves: out
-            .queries
-            .iter()
-            .map(|q| LeafReport {
-                term: q.term.clone(),
-                total_matches: q.total_matches,
-            })
-            .collect(),
-    };
-    out.queries = vec![report];
-    Ok(out)
 }
 
 /// Answer `expr` as one query. The documents satisfying it are decided by
 /// the FM-index where they can be; only the rest are fetched and scanned.
 pub fn answer_expr(
+    index: &DocfmIndex,
     loaded: &mut Loaded,
     req: &QueryRequest<'_>,
     expr: &Expr,
     sink: &mut dyn MatchSink,
 ) -> Result<OutputReport, String> {
     refuse(req, expr)?;
+    let ratio = demote::ratio()?;
     let leaves = leaves(expr, req)?;
-    if req.output == QueryOutput::Occurrences {
-        return occurrences(loaded, req, expr, &leaves, sink);
-    }
     let emit = req.output != QueryOutput::Counts;
     // Lines print and count by the alternation of every leaf, as rg -e a -e b.
     let alternation = match req.output {
@@ -247,13 +241,20 @@ pub fn answer_expr(
     let manifest = req.manifest;
     let num_docs = manifest.files.len();
     loaded.docs.begin();
-    let (index, docs) = (&loaded.index, &mut loaded.docs);
+    let docs = &mut loaded.docs;
 
+    let plan = demote::plan(index, expr, &leaves, ratio);
     let probes: Vec<Query<'_>> = leaves
         .iter()
-        .filter_map(|l| match (&l.probe, &l.prep) {
+        .zip(&plan.within)
+        .enumerate()
+        .filter_map(|(i, (l, within))| match (&l.probe, &l.prep) {
+            _ if plan.demoted[i] => None,
             (Probe::Never, _) => None,
-            (Probe::Literal(lit), _) => Some(Query::Literal(lit)),
+            (Probe::Literal(term), _) => Some(match within {
+                Some(within) => Query::LiteralWithin { term, within },
+                None => Query::Literal(term),
+            }),
             (Probe::Regex, Some(p)) => Some(Query::Regex(p)),
             (Probe::Regex, None) => unreachable!("a regex leaf holds its pattern"),
         })
@@ -262,17 +263,19 @@ pub fn answer_expr(
     debug_assert_eq!(answers.len(), probes.len());
     drop(probes);
     let start = Instant::now();
-    let mut probe_us = 0;
+    let mut probe_us = plan.probe_us;
     let mut answers = answers.into_iter();
     let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
-    for l in &leaves {
-        if matches!(l.probe, Probe::Never) {
+    for (i, l) in leaves.iter().enumerate() {
+        if matches!(l.probe, Probe::Never) || plan.demoted[i] {
             hits.push((Vec::new(), Vec::new()));
             continue;
         }
         let a = answers.next().expect("one answer per probe");
         probe_us += a.probe_us;
-        hits.push((a.exact, candidate_docs(a.candidates, num_docs)));
+        let (exact, candidates) = (a.exact, candidate_docs(a.candidates, num_docs));
+        in_index(&exact, &candidates, num_docs)?;
+        hits.push((exact, candidates));
     }
     // One snapshot of the changed docs for every leaf.
     loop {
@@ -285,6 +288,7 @@ pub fn answer_expr(
         }
     }
     let stale = docs.stale().to_vec();
+    let paths = docs.paths(&manifest.files);
     let mut tris = Vec::with_capacity(leaves.len());
     for (l, (exact, candidates)) in leaves.iter().zip(&hits) {
         tris.push(match l.probe {
@@ -306,7 +310,16 @@ pub fn answer_expr(
             },
         });
     }
-    let root = prune(expr, &tris, &mut 0);
+    let parts: Vec<Part<'_>> = tris
+        .iter()
+        .zip(&plan.unsettled)
+        .enumerate()
+        .map(|(i, (t, u))| match plan.demoted[i] {
+            true => Part::Unknown(u),
+            false => Part::Tri(t),
+        })
+        .collect();
+    let root = prune(expr, &parts, &stale, &mut 0);
 
     let vleaves: Vec<verify::Leaf<'_>> = leaves
         .iter()
@@ -327,6 +340,7 @@ pub fn answer_expr(
         tris: &tris,
         exact: &exact,
         stale: &stale,
+        unsettled: &plan.unsettled,
         set: &set,
         yes: &root.yes,
     };
@@ -335,7 +349,7 @@ pub fn answer_expr(
         term: expr.to_string(),
         latency_us: 0,
         total_matches: 0,
-        docs_matched: Some(0),
+        docs_matched: 0,
         counts_exact: req.output != QueryOutput::FilesWithMatches,
         leaves: Vec::new(),
     };
@@ -347,19 +361,31 @@ pub fn answer_expr(
     let mut leaf_totals = vec![0u64; leaves.len()];
     match (req.output, alternation.as_ref()) {
         (QueryOutput::Counts, _) => {
-            // Members a regex leaf still has to count are fetched too.
+            // Members a regex or unsettled leaf still has to count are
+            // fetched too.
             let regex_maybe = tris
                 .iter()
                 .zip(&leaves)
                 .filter(|(_, l)| matches!(l.probe, Probe::Regex))
                 .fold(Vec::new(), |acc, (t, _)| union(&acc, &t.maybe));
-            let fetch = union(&root.maybe, &intersect(&root.yes, &regex_maybe));
+            let unsure: Vec<usize> = root
+                .yes
+                .iter()
+                .copied()
+                .filter(|&d| {
+                    regex_maybe.binary_search(&d).is_ok()
+                        || plan.unsettled.iter().any(|u| demote::contains(u, d))
+                })
+                .collect();
+            let fetch = union(&root.maybe, &unsure);
+            let mut order = fetch.clone();
+            paths.sort(&mut order);
             let map =
                 |doc: usize, raw: &[u8]| judge.member(doc, raw).then(|| judge.counts(doc, raw));
             fetch_stream_parallel(
                 docs,
                 &manifest.files,
-                &fetch,
+                &order,
                 fetch_threads(),
                 &map,
                 &mut |_, _, counts| {
@@ -390,32 +416,39 @@ pub fn answer_expr(
         (QueryOutput::FilesWithMatches, _) => {
             let map = |doc: usize, raw: &[u8]| judge.member(doc, raw);
             let mut next_yes = 0usize;
-            let mut emit_yes =
-                |sink: &mut dyn MatchSink, below: usize, n: &mut usize| -> Result<(), String> {
-                    while *n < root.yes.len() && root.yes[*n] < below {
-                        listed(sink, manifest, root.yes[*n], &[])?;
-                        *n += 1;
-                        docs_matched += 1;
-                    }
-                    Ok(())
-                };
+            // The decided members before `below` (all when `None`), in path order.
+            let mut emit_yes = |sink: &mut dyn MatchSink,
+                                below: Option<usize>,
+                                n: &mut usize|
+             -> Result<(), String> {
+                while *n < root.yes.len()
+                    && below.is_none_or(|b| paths.cmp(root.yes[*n], b).is_lt())
+                {
+                    listed(sink, &paths, root.yes[*n], &[])?;
+                    *n += 1;
+                    docs_matched += 1;
+                }
+                Ok(())
+            };
             let mut members = 0usize;
+            let mut maybe = root.maybe.clone();
+            paths.sort(&mut maybe);
             fetch_stream_parallel(
                 docs,
                 &manifest.files,
-                &root.maybe,
+                &maybe,
                 fetch_threads(),
                 &map,
                 &mut |doc, bytes, member| {
-                    emit_yes(sink, doc, &mut next_yes)?;
+                    emit_yes(sink, Some(doc), &mut next_yes)?;
                     if member {
                         members += 1;
-                        listed(sink, manifest, doc, matching::strip_bom(bytes))?;
+                        listed(sink, &paths, doc, matching::strip_bom(bytes))?;
                     }
                     Ok(())
                 },
             )?;
-            emit_yes(sink, usize::MAX, &mut next_yes)?;
+            emit_yes(sink, None, &mut next_yes)?;
             docs_matched += members;
         }
         (_, None) => {}
@@ -424,7 +457,8 @@ pub fn answer_expr(
                 req.output,
                 QueryOutput::CountLines | QueryOutput::CountMatches
             );
-            let fetch = union(&root.yes, &root.maybe);
+            let mut fetch = union(&root.yes, &root.maybe);
+            paths.sort(&mut fetch);
             let output = req.output;
             let map = |doc: usize, raw: &[u8]| {
                 if !judge.member(doc, raw) {
@@ -461,8 +495,7 @@ pub fn answer_expr(
                         .zip(counts)
                         .for_each(|(t, c)| *t += c);
                     sink.doc(DocMatches {
-                        doc,
-                        path: path_of(manifest, doc)?,
+                        path: path_of(&paths, doc)?,
                         raw: matching::strip_bom(bytes),
                         outcome: &o,
                     })
@@ -470,7 +503,7 @@ pub fn answer_expr(
             )?;
         }
     }
-    report.docs_matched = Some(docs_matched);
+    report.docs_matched = docs_matched;
     report.total_matches = match req.output {
         QueryOutput::Counts => leaf_totals.iter().sum(),
         QueryOutput::FilesWithMatches => docs_matched as u64,
@@ -494,12 +527,17 @@ pub fn answer_expr(
         sink.term_end(&report)?;
     }
     Ok(OutputReport {
-        index_name: crate::manifest::NAME.to_owned(),
         index_time_us: loaded.load_wall.as_micros() as u64,
-        index_size_bytes: loaded.index.index_size_bytes(),
-        num_files_indexed: loaded.index.num_files_indexed(),
+        index_size_bytes: manifest.index_size_bytes,
+        num_files_indexed: manifest.num_docs,
         queries: vec![report],
     })
+}
+
+/// A literal whose containment in the BOM-stripped text is exactly a
+/// nonzero index count: no separator, no first byte of a BOM.
+fn demotable(lit: &[u8]) -> bool {
+    !lit.contains(&UNIFIED_SEPARATOR) && !matches!(lit.first(), None | Some(0xEF | 0xBB | 0xBF))
 }
 
 /// `(?:p1)|(?:p2)|..` over the leaves that can match; `None` when none can.
@@ -526,7 +564,7 @@ fn alternation_of(
 /// A `-l` line: membership only.
 fn listed(
     sink: &mut dyn MatchSink,
-    manifest: &crate::manifest::Manifest,
+    paths: &Paths<'_>,
     doc: usize,
     raw: &[u8],
 ) -> Result<(), String> {
@@ -539,8 +577,7 @@ fn listed(
         spans: Vec::new(),
     };
     sink.doc(DocMatches {
-        doc,
-        path: path_of(manifest, doc)?,
+        path: path_of(paths, doc)?,
         raw,
         outcome: &outcome,
     })
@@ -554,6 +591,7 @@ struct Judge<'a> {
     /// Each leaf's screened exact counts.
     exact: &'a [&'a [(usize, u64)]],
     stale: &'a [usize],
+    unsettled: &'a [Vec<Range<usize>>],
     set: &'a LeafSet<'a>,
     /// The root's decided members.
     yes: &'a [usize],
@@ -562,6 +600,11 @@ struct Judge<'a> {
 impl Judge<'_> {
     fn is_stale(&self, doc: usize) -> bool {
         self.stale.binary_search(&doc).is_ok()
+    }
+
+    /// Whether leaf `i`'s exact counts are `doc`'s.
+    fn settled(&self, i: usize, doc: usize, stale: bool) -> bool {
+        !stale && !demote::contains(&self.unsettled[i], doc)
     }
 
     /// Whether `doc` satisfies the expression: the index decides a fresh
@@ -575,9 +618,12 @@ impl Judge<'_> {
             .leaves
             .iter()
             .zip(self.tris)
-            .map(|(l, t)| match l.probe {
+            .enumerate()
+            .map(|(i, (l, t))| match l.probe {
                 Probe::Never => Some(false),
-                Probe::Literal(_) if !stale => Some(t.yes.binary_search(&doc).is_ok()),
+                Probe::Literal(_) if self.settled(i, doc, stale) => {
+                    Some(t.yes.binary_search(&doc).is_ok())
+                }
                 Probe::Regex if t.maybe.binary_search(&doc).is_err() => Some(false),
                 _ => None,
             })
@@ -595,10 +641,11 @@ impl Judge<'_> {
             .iter()
             .zip(self.tris)
             .zip(self.exact)
-            .map(|((l, t), exact)| match (&l.probe, &l.prep) {
+            .enumerate()
+            .map(|(i, ((l, t), exact))| match (&l.probe, &l.prep) {
                 (Probe::Never, _) => 0,
-                (Probe::Literal(_), Some(p)) if stale => p.count(bytes),
-                (Probe::Literal(lit), None) if stale => {
+                (Probe::Literal(_), Some(p)) if !self.settled(i, doc, stale) => p.count(bytes),
+                (Probe::Literal(lit), None) if !self.settled(i, doc, stale) => {
                     count_overlapping(raw, &memchr::memmem::Finder::new(lit))
                 }
                 (Probe::Literal(_), _) => exact

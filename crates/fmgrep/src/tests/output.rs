@@ -16,21 +16,8 @@ fn cfg(format: Format) -> OutputConfig {
     }
 }
 
-fn staged(tmp: &Path, store_docs: bool) -> PathBuf {
-    let folder = stage_corpus(
-        tmp,
-        &[
-            ("a.c", b"printk one\nnothing\nprintk two printk\n"),
-            ("b.c", b"aaaa\ntail printk"),
-        ],
-    );
-    let output = tmp.join(format!("idx-{store_docs}"));
-    index_it(&folder, &output, store_docs);
-    output
-}
-
 /// Print one query through the drive.
-fn printed(index: &Path, terms: &[&str], output: QueryOutput, cfg: OutputConfig) -> String {
+fn written(index: &Path, terms: &[&str], output: QueryOutput, cfg: OutputConfig) -> String {
     let manifest = read_manifest(index).unwrap();
     let terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
     let mut buf: Vec<u8> = Vec::new();
@@ -51,12 +38,12 @@ fn matches_mode_prints_every_matched_line() {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
         assert_eq!(
-            printed(&index, &["printk"], MATCHES, cfg(Format::Lines)),
+            written(&index, &["printk"], MATCHES, cfg(Format::Lines)),
             "a.c:1:printk one\na.c:3:printk two printk\nb.c:2:tail printk\n",
             "store_docs={store_docs}"
         );
         assert_eq!(
-            printed(&index, &["printk"], MATCHES, cfg(Format::OnlyMatching)),
+            written(&index, &["printk"], MATCHES, cfg(Format::OnlyMatching)),
             "a.c:1:printk\na.c:3:printk\na.c:3:printk\nb.c:2:printk\n",
             "store_docs={store_docs}"
         );
@@ -77,7 +64,7 @@ fn streamed_output_is_ascending_by_path() {
         let index = tmp.path().join(format!("idx-{store_docs}"));
         index_it(&folder, &index, store_docs);
         assert_eq!(
-            printed(&index, &["printk"], MATCHES, cfg(Format::Lines)),
+            written(&index, &["printk"], MATCHES, cfg(Format::Lines)),
             "deep/er/x.c:1:printk\nmid.c:1:printk\ntop.c:1:printk\n",
             "store_docs={store_docs}"
         );
@@ -92,7 +79,7 @@ fn probe_only_documents_still_print_counts() {
     let index = staged(tmp.path(), true);
     std::fs::remove_file(index.join(DOCS_SHARD)).unwrap();
     assert_eq!(
-        printed(
+        written(
             &index,
             &["printk"],
             QueryOutput::FilesWithMatches,
@@ -101,7 +88,7 @@ fn probe_only_documents_still_print_counts() {
         "a.c\nb.c\n"
     );
     assert_eq!(
-        printed(
+        written(
             &index,
             &["printk"],
             QueryOutput::CountMatches,
@@ -117,7 +104,7 @@ fn count_lines_prints_rgs_line_counts() {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
         assert_eq!(
-            printed(
+            written(
                 &index,
                 &["printk"],
                 QueryOutput::CountLines,
@@ -146,7 +133,7 @@ fn the_wire_report_carries_counts_only() {
         assert!(!buf.is_empty(), "store_docs={store_docs}");
         assert_eq!(
             (out.queries[0].total_matches, out.queries[0].docs_matched),
-            (4, Some(2)),
+            (4, 2),
             "store_docs={store_docs}"
         );
     }

@@ -1,19 +1,19 @@
 use super::*;
 
 mod build;
+mod count;
 mod docfm;
-mod occurrences;
 mod walk;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::blobs::{create_sink, finish_sink};
-use crate::docs::Shape;
 use crate::manifest::BLOBS_SHARD;
 use crate::matching::MatchMode;
 use crate::plan::plan_shards;
 use crate::probe::candidate_docs;
-use crate::sharded::build::threads_from;
+use crate::sharded::build::build_plan;
 use crate::sharded::shard::Probe;
 
 /// rg's `-i` mode, the one every fold plan is built under.
@@ -27,13 +27,11 @@ fn ci() -> MatchMode {
 /// Live built items, so a build's residency can be asserted.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static MAX_LIVE: AtomicUsize = AtomicUsize::new(0);
-/// Widest rayon pool a build ran in.
-static POOL: AtomicUsize = AtomicUsize::new(0);
 /// The counters are global: every test that reads them runs alone.
 static COUNTER: Mutex<()> = Mutex::new(());
 /// One-shot: the first N builds to arrive release each other, proving N
 /// really overlap with no sleep; every later build passes straight through,
-/// so more shards than workers cannot hang the suite. Unset outside the
+/// so more shards than the window cannot hang the suite. Unset outside the
 /// tests that arm it.
 static BARRIER: Mutex<Option<std::sync::Arc<Arrivals>>> = Mutex::new(None);
 
@@ -83,12 +81,10 @@ fn wait_at_barrier() {
 struct Counted;
 
 impl Counted {
-    /// Counts itself live, records the pool it runs in, then waits at the
-    /// barrier.
+    /// Counts itself live, then waits at the barrier.
     fn build(_cut: &Cut) -> Result<Self, String> {
         let live = LIVE.fetch_add(1, Ordering::SeqCst) + 1;
         MAX_LIVE.fetch_max(live, Ordering::SeqCst);
-        POOL.fetch_max(rayon::current_num_threads(), Ordering::SeqCst);
         wait_at_barrier();
         Ok(Self)
     }
@@ -160,15 +156,14 @@ fn load_from(
     labels: &[String],
     lens: &[u64],
     doc_lens: &[u64],
-    store_docs: bool,
 ) -> Result<DocfmIndex, String> {
-    DocfmIndex::load(&BlobSlots::open(dir, labels, lens)?, doc_lens, store_docs)
+    DocfmIndex::load(&BlobSlots::open(dir, labels, lens)?, doc_lens)
 }
 
 /// Persist every slot into a real `blobs.shard` and load it back.
 fn round_trip(index: &DocfmIndex, dir: &Path, docs: &[Document]) -> DocfmIndex {
     let (labels, lens) = persist(index, dir);
-    load_from(dir, &labels, &lens, &doc_lens(docs), index.store_docs).unwrap()
+    load_from(dir, &labels, &lens, &doc_lens(docs)).unwrap()
 }
 
 /// Literals, an anchored pattern, an anchorless one and two folded ones.
@@ -230,10 +225,10 @@ fn candidates(index: &DocfmIndex, pattern: &str, num_docs: usize) -> Vec<usize> 
 #[test]
 fn counts_are_shard_count_invariant() {
     let docs = fixture();
-    let whole = DocfmIndex::build_with_cap(&docs, 1 << 20, false);
+    let whole = DocfmIndex::build_with_cap(&docs, 1 << 20);
     assert_eq!(whole.blob_slots(), 1);
     for cap in [1u64, 5, 12, 19, 40, 1 << 20] {
-        let index = DocfmIndex::build_with_cap(&docs, cap, false);
+        let index = DocfmIndex::build_with_cap(&docs, cap);
         for term in ["printk", "aa", "a", "missing", "tail", "g h"] {
             assert_eq!(hits(&index, term), hits(&whole, term), "cap={cap} {term:?}");
         }
@@ -254,7 +249,7 @@ fn counts_are_shard_count_invariant() {
 #[test]
 fn merged_hits_are_ascending_and_disjoint() {
     let docs = fixture();
-    let index = DocfmIndex::build_with_cap(&docs, 6, false);
+    let index = DocfmIndex::build_with_cap(&docs, 6);
     assert!(index.blob_slots() > 1);
     let merged = hits(&index, "a");
     let mut seen: Option<usize> = None;
@@ -269,9 +264,39 @@ fn merged_hits_are_ascending_and_disjoint() {
 }
 
 #[test]
+fn probes_do_not_depend_on_the_pool_size() {
+    let docs = fixture();
+    let index = DocfmIndex::build_with_cap(&docs, 6);
+    assert!(index.blob_slots() > 1);
+    let probe = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let hits: Vec<_> = ["printk", "aa", "a", "tail"]
+                .map(|t| hits(&index, t))
+                .into();
+            let candidates: Vec<_> = ["printk", "a+", "pr[i1]ntk", "[a-z]+"]
+                .map(|p| candidates(&index, p, docs.len()))
+                .into();
+            (hits, candidates)
+        })
+    };
+    let one = probe(1);
+    assert_eq!(probe(4), one);
+    for h in &one.0 {
+        assert!(h.windows(2).all(|w| w[0].0 < w[1].0), "{h:?}");
+    }
+    for c in &one.1 {
+        assert!(c.windows(2).all(|w| w[0] < w[1]), "{c:?}");
+    }
+}
+
+#[test]
 fn empty_docs_partition_out_within_their_shard() {
     let docs = fixture();
-    let index = DocfmIndex::build_with_cap(&docs, 6, false);
+    let index = DocfmIndex::build_with_cap(&docs, 6);
     // Empty docs keep their ids and never take a hit.
     for (doc, _) in hits(&index, "a") {
         assert!(!docs[doc].bytes.is_empty());
@@ -284,7 +309,7 @@ fn empty_docs_partition_out_within_their_shard() {
 #[test]
 fn empty_and_separator_terms_match_nothing() {
     let docs = fixture();
-    let index = DocfmIndex::build_with_cap(&docs, 6, false);
+    let index = DocfmIndex::build_with_cap(&docs, 6);
     for term in ["", "\0", "a\0", "\0printk"] {
         assert!(hits(&index, term).is_empty(), "term={term:?}");
     }
@@ -294,7 +319,7 @@ fn empty_and_separator_terms_match_nothing() {
 fn load_rebuilds_the_plan_from_labels_and_doc_lens() {
     let docs = fixture();
     let dir = tempfile::tempdir().unwrap();
-    let built = DocfmIndex::build_with_cap(&docs, 12, false);
+    let built = DocfmIndex::build_with_cap(&docs, 12);
     assert!(built.blob_slots() > 1);
     // No environment at load: the plan comes from the labels alone.
     let back = round_trip(&built, dir.path(), &docs);
@@ -314,7 +339,7 @@ fn load_rebuilds_the_plan_from_labels_and_doc_lens() {
 fn missing_or_skewed_shard_blob_rejected_loudly() {
     let docs = fixture();
     let dir = tempfile::tempdir().unwrap();
-    let built = DocfmIndex::build_with_cap(&docs, 12, false);
+    let built = DocfmIndex::build_with_cap(&docs, 12);
     let (labels, lens) = persist(&built, dir.path());
     assert!(lens.len() > 1);
     let doc_lens = doc_lens(&docs);
@@ -323,7 +348,7 @@ fn missing_or_skewed_shard_blob_rejected_loudly() {
     let mut short = std::fs::read(&shard_path).unwrap();
     short.truncate(short.len() - 1);
     std::fs::write(&shard_path, &short).unwrap();
-    let err = load_from(dir.path(), &labels, &lens, &doc_lens, false)
+    let err = load_from(dir.path(), &labels, &lens, &doc_lens)
         .err()
         .expect("a short blob shard must be refused");
     assert!(err.contains("tampered"), "got: {err}");
@@ -332,7 +357,7 @@ fn missing_or_skewed_shard_blob_rejected_loudly() {
     std::fs::write(&shard_path, b"").unwrap();
     for bad in [vec!["index.bin".to_string()], Vec::new()] {
         let zeros = vec![0u64; bad.len()];
-        let err = load_from(dir.path(), &bad, &zeros, &doc_lens, false)
+        let err = load_from(dir.path(), &bad, &zeros, &doc_lens)
             .err()
             .unwrap_or_else(|| panic!("labels {bad:?} must be refused"));
         assert!(
@@ -349,7 +374,7 @@ fn mapped_load_keeps_the_plan_refusal() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(BLOBS_SHARD), b"").unwrap();
     let labels = ["shard-00000000-00000003.bin".to_string()];
-    let err = load_from(dir.path(), &labels, &[0], &doc_lens(&docs), false)
+    let err = load_from(dir.path(), &labels, &[0], &doc_lens(&docs))
         .err()
         .expect("must refuse");
     assert!(err.contains("cover 3 of 6 doc(s)"), "got: {err}");
@@ -359,14 +384,14 @@ fn mapped_load_keeps_the_plan_refusal() {
 fn a_view_error_names_the_slot() {
     let docs = docs_of(&[b"good", b"also good"]);
     let dir = tempfile::tempdir().unwrap();
-    let (labels, lens) = persist(&DocfmIndex::build_with_cap(&docs, 5, false), dir.path());
+    let (labels, lens) = persist(&DocfmIndex::build_with_cap(&docs, 5), dir.path());
     assert_eq!(labels.len(), 2);
     let shard_path = dir.path().join(BLOBS_SHARD);
     let mut bytes = std::fs::read(&shard_path).unwrap();
     let second = lens[0] as usize;
     bytes[second..second + 8].copy_from_slice(b"XXXXXXXX");
     std::fs::write(&shard_path, &bytes).unwrap();
-    let err = load_from(dir.path(), &labels, &lens, &doc_lens(&docs), false)
+    let err = load_from(dir.path(), &labels, &lens, &doc_lens(&docs))
         .err()
         .expect("must refuse");
     assert!(
@@ -392,7 +417,7 @@ impl Scan {
     }
 
     fn count(&self, term: &[u8]) -> u64 {
-        crate::pattern::count_occurrences(&self.text, term)
+        crate::pattern::count_overlapping(&self.text, &memchr::memmem::Finder::new(term))
     }
 
     fn locate(&self, term: &[u8], visit: &mut dyn FnMut(usize)) {
@@ -464,7 +489,7 @@ fn common_probes_locate_within_budget() {
         assert!(hits <= 1024, "{hits} hits located for {t:?}");
     };
     assert!(self_check(&count, &bounded, docs.len(), &probes_of(&docs)));
-    DocfmIndex::build_with_cap(&docs, 1 << 20, false);
+    DocfmIndex::build_with_cap(&docs, 1 << 20);
 }
 
 /// At most two probes per document and never two at the same offset, so a
@@ -485,11 +510,11 @@ fn degenerate_corpora_refuse_loudly() {
         (docs_of(&[b"has\0nul"]), "separator byte"),
     ];
     // Every case here is one shard; a refusal with shards in flight is
-    // `build::a_panicking_worker_fails_loudly_instead_of_hanging`.
+    // `build::a_panicking_build_fails_loudly_instead_of_hanging`.
     type Entry<'a> = (&'a str, &'a dyn Fn(&[Document]));
     let entries: [Entry; 2] = [
         ("build_with_cap", &|docs: &[Document]| {
-            DocfmIndex::build_with_cap(docs, 1 << 20, false);
+            DocfmIndex::build_with_cap(docs, 1 << 20);
         }),
         ("build_into", &|docs: &[Document]| {
             let dir = tempfile::tempdir().unwrap();
@@ -545,8 +570,7 @@ fn over_limit_shard_is_refused_before_its_own_construction() {
     .unwrap();
     let mut sink = create_sink(synthetic.path()).unwrap();
     let err = DocfmIndex::build_into(&huge, u64::MAX, None, false, &mut sink)
-        .err()
-        .expect("an over-limit shard must be refused");
+        .expect_err("an over-limit shard must be refused");
     for want in [
         "docfm build".to_string(),
         "2147483649 text bytes".to_string(),
@@ -561,22 +585,21 @@ fn over_limit_shard_is_refused_before_its_own_construction() {
 #[test]
 fn build_into_matches_the_resident_persist_path() {
     let docs = fixture();
-    for (cap, threads) in [1u64, 5, 12, 19, 40, 1 << 20]
+    for (cap, window) in [1u64, 5, 12, 19, 40, 1 << 20]
         .into_iter()
         .flat_map(|cap| [1usize, 2, 4].map(|t| (cap, t)))
     {
         let woven = tempfile::tempdir().unwrap();
         let staged = stage(woven.path(), &docs, cap);
         let mut sink = create_sink(woven.path()).unwrap();
-        let outcome =
-            DocfmIndex::build_into(&staged, cap, Some(threads), false, &mut sink).unwrap();
+        let size = DocfmIndex::build_into(&staged, cap, Some(window), false, &mut sink).unwrap();
         let (labels, lens) = finish_sink(sink).unwrap();
 
-        let resident = DocfmIndex::build_with_cap(&docs, cap, false);
+        let resident = DocfmIndex::build_with_cap(&docs, cap);
         let plain = tempfile::tempdir().unwrap();
         let (want_labels, want_lens) = persist(&resident, plain.path());
 
-        let at = format!("cap={cap} threads={threads}");
+        let at = format!("cap={cap} window={window}");
         assert_eq!(labels, want_labels, "{at}");
         assert_eq!(lens, want_lens, "{at}");
         assert_eq!(
@@ -584,88 +607,56 @@ fn build_into_matches_the_resident_persist_path() {
             std::fs::read(plain.path().join(BLOBS_SHARD)).unwrap(),
             "{at}"
         );
-        assert_eq!(
-            outcome.num_files_indexed,
-            resident.num_files_indexed(),
-            "{at}"
-        );
-        assert_eq!(
-            outcome.index_size_bytes,
-            resident.index_size_bytes(),
-            "{at}"
-        );
-        let back = load_from(woven.path(), &labels, &lens, &doc_lens(&docs), false).unwrap();
+        assert_eq!(size, resident.index_size_bytes(), "{at}");
+        let back = load_from(woven.path(), &labels, &lens, &doc_lens(&docs)).unwrap();
         for term in ["printk", "aa", "a", "missing", "tail"] {
             assert_eq!(hits(&back, term), hits(&resident, term), "{at} {term:?}");
         }
     }
 }
 
-/// The scheduler holds at most `threads` built items, and really builds that
+/// The scheduler holds at most `window` built items, and really builds that
 /// many at once: the one-shot gate inside `build` only opens when
-/// `min(threads, shards)` builds are inside it.
+/// `min(window, shards)` builds are inside it.
 #[test]
-fn structures_in_flight_stay_within_threads() {
+fn shards_in_flight_stay_within_the_window() {
     let _lock = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
     let docs = fixture();
-    for threads in [1usize, 4] {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    for window in [1usize, 4] {
         LIVE.store(0, Ordering::SeqCst);
         MAX_LIVE.store(0, Ordering::SeqCst);
         let cuts = resident_cuts(&docs, 6);
         let shards = plan_shards(&doc_lens(&docs), 6).len();
         assert!(shards > 1);
-        set_barrier(threads.min(shards));
-        let emitted = AtomicUsize::new(0);
-        build_shards(&cuts, 6, Some(threads), &Counted::build, &|_slot, built| {
-            drop(built);
-            emitted.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
+        set_barrier(window.min(shards));
+        let mut emitted = 0;
+        build_plan(
+            &pool,
+            &cuts,
+            window,
+            &Counted::build,
+            &mut |_slot, built| {
+                drop(built);
+                emitted += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         clear_barrier();
-        assert_eq!(emitted.into_inner(), shards);
-        assert!(
-            MAX_LIVE.load(Ordering::SeqCst) <= threads,
-            "threads={threads}"
-        );
-        assert_eq!(LIVE.load(Ordering::SeqCst), 0, "threads={threads}");
-    }
-}
-
-/// A one-shard corpus keeps its single build in the caller's whole rayon
-/// pool: with the shard count unknown when the workers spawn, only
-/// [`Cuts::shape`] can decide that, and a per-worker 1-thread pool would cost
-/// the build its internal parallelism.
-#[test]
-fn one_shard_builds_in_the_whole_rayon_pool() {
-    let _lock = COUNTER.lock().unwrap_or_else(|e| e.into_inner());
-    let whole = rayon::current_num_threads();
-    assert!(whole > 1, "this box cannot show the difference");
-    let docs = fixture();
-    for (cap, one) in [(1u64 << 20, true), (6, false)] {
-        let cuts = resident_cuts(&docs, cap);
-        let shape = cuts.shape().expect("the fixture cuts at least one shard");
-        assert_eq!(matches!(shape, Shape::One), one, "cap={cap}");
-        // One shard means one worker whatever the knob asks for.
-        let bound = match shape {
-            Shape::One => 1,
-            Shape::Many => usize::MAX,
-        };
-        for knob in [1usize, 4, 8] {
-            let threads = threads_from(bound, whole, Some(knob), 8 << 30, 1);
-            assert_eq!(threads, if one { 1 } else { knob }, "cap={cap} knob={knob}");
-        }
-        POOL.store(0, Ordering::SeqCst);
-        let cuts = resident_cuts(&docs, cap);
-        build_shards(&cuts, cap, None, &Counted::build, &|_slot, _built| Ok(())).unwrap();
-        assert_eq!(POOL.load(Ordering::SeqCst) == whole, one, "cap={cap}");
+        assert_eq!(emitted, shards);
+        assert!(MAX_LIVE.load(Ordering::SeqCst) <= window, "window={window}");
+        assert_eq!(LIVE.load(Ordering::SeqCst), 0, "window={window}");
     }
 }
 
 #[test]
 fn out_of_range_slot_refuses() {
     let docs = fixture();
-    let index = DocfmIndex::build_with_cap(&docs, 1 << 20, false);
+    let index = DocfmIndex::build_with_cap(&docs, 1 << 20);
     let err = index
         .encode_into(index.blob_slots(), &mut Vec::new())
         .expect_err("an out-of-range slot must refuse");
@@ -674,47 +665,43 @@ fn out_of_range_slot_refuses() {
 
 /// The build is called exactly once per planned shard, with that shard's
 /// range: no call spans two shards, so the documents in flight are one
-/// shard's per worker. At one thread the calls are the plan, in order.
+/// shard's per task. At a window of one the calls are the plan, in order.
 #[test]
 fn one_shard_of_documents_resident_at_a_time() {
     let docs = fixture();
     let plan = plan_shards(&doc_lens(&docs), 6);
     assert!(plan.len() > 1);
-    for threads in [1usize, 4] {
+    for window in [1usize, 4] {
         let ranges = Mutex::new(Vec::new());
-        let emitted = Mutex::new(Vec::new());
+        let mut emitted = Vec::new();
         let cuts = resident_cuts(&docs, 6);
         build_shards(
             &cuts,
             6,
-            Some(threads),
+            Some(window),
             &|cut| {
                 ranges.lock().unwrap().push(cut.docs.clone());
                 Ok(())
             },
-            &|slot, ()| {
-                emitted.lock().unwrap().push(slot);
+            &mut |slot, ()| {
+                emitted.push(slot);
                 Ok(())
             },
         )
         .unwrap();
         let mut got = ranges.into_inner().unwrap();
-        if threads > 1 {
+        if window > 1 {
             got.sort_by_key(|r| r.start);
         }
-        assert_eq!(got, plan, "threads={threads}");
+        assert_eq!(got, plan, "window={window}");
         let want: Vec<usize> = (0..plan.len()).collect();
-        assert_eq!(emitted.into_inner().unwrap(), want, "threads={threads}");
+        assert_eq!(emitted, want, "window={window}");
     }
 }
 
 /// Four docs in one shard, the second empty.
 fn walk_fixture() -> DocfmIndex {
-    DocfmIndex::build_with_cap(
-        &docs_of(&[b"kkkk", b"", b"kKk kk", b"xxxx"]),
-        1 << 20,
-        false,
-    )
+    DocfmIndex::build_with_cap(&docs_of(&[b"kkkk", b"", b"kKk kk", b"xxxx"]), 1 << 20)
 }
 
 /// A walk that gave up keeps every doc id the shard answers for, empties
@@ -736,42 +723,12 @@ fn a_walk_that_gave_up_falls_back_to_the_anchor() {
     assert_eq!(meta.docs_at(shard, None, Some(b"zz")), Vec::<usize>::new());
 }
 
-#[test]
-fn stored_docs_add_the_text_to_the_index_size() {
-    let docs = fixture();
-    let stored = DocfmIndex::build_with_cap(&docs, 16, true);
-    let files = DocfmIndex::build_with_cap(&docs, 16, false);
-    // Every non-empty document plus its separator.
-    let text: u64 = doc_lens(&docs)
-        .iter()
-        .filter(|&&l| l > 0)
-        .map(|l| l + 1)
-        .sum();
-    assert_eq!(stored.index_size_bytes(), files.index_size_bytes() + text);
-    assert!(files.index_size_bytes() > 0);
-}
-
-#[test]
-fn loaded_size_follows_the_manifest_store_docs() {
-    let docs = fixture();
-    let built = DocfmIndex::build_with_cap(&docs, 16, false);
-    let dir = tempfile::tempdir().unwrap();
-    let (labels, lens) = persist(&built, dir.path());
-    let load =
-        |store_docs| load_from(dir.path(), &labels, &lens, &doc_lens(&docs), store_docs).unwrap();
-    assert_eq!(load(false).index_size_bytes(), built.index_size_bytes());
-    assert_eq!(
-        load(true).index_size_bytes(),
-        DocfmIndex::build_with_cap(&docs, 16, true).index_size_bytes()
-    );
-}
-
 /// One pass answers every query as the per-query probes do.
 #[test]
 fn probe_all_matches_per_query_probes() {
     let docs = fixture();
     let dir = tempfile::tempdir().unwrap();
-    let built = DocfmIndex::build_with_cap(&docs, 6, false);
+    let built = DocfmIndex::build_with_cap(&docs, 6);
     let patterns = prepared();
     let qs = queries(&patterns);
     for index in [round_trip(&built, dir.path(), &docs), built] {
@@ -783,7 +740,7 @@ fn probe_all_matches_per_query_probes() {
                     Vec::new(),
                     candidate_docs(index.regex_candidates(p), docs.len()),
                 ),
-                Query::Occurrences { .. } => unreachable!("not queried"),
+                Query::Count(_) | Query::LiteralWithin { .. } => unreachable!("not queried"),
             })
             .collect();
         assert_eq!(answers_of(&index, &qs), want);

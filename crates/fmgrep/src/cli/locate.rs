@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::index::INDEX_DIR;
-use crate::manifest::BLOBS_SHARD;
+use crate::manifest::{BLOBS_SHARD, MANIFEST_JSON};
 
 pub struct Located {
     pub index_dir: PathBuf,
@@ -32,7 +32,7 @@ pub fn locate(start: &Path) -> Result<Located, String> {
             root: Some(dir.to_path_buf()),
         })
         .ok_or_else(|| {
-            if abs.join("manifest.json").is_file() {
+            if abs.join(MANIFEST_JSON).is_file() {
                 return format!("error: {} has no {BLOBS_SHARD}", abs.display());
             }
             format!(
@@ -44,7 +44,7 @@ pub fn locate(start: &Path) -> Result<Located, String> {
 
 /// A manifest alone could be a corpus file; the blob shard makes it an index.
 fn is_index(dir: &Path) -> bool {
-    dir.join("manifest.json").is_file() && dir.join(BLOBS_SHARD).is_file()
+    dir.join(MANIFEST_JSON).is_file() && dir.join(BLOBS_SHARD).is_file()
 }
 
 #[cfg(test)]

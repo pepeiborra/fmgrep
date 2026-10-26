@@ -1,19 +1,12 @@
 use super::*;
-
-fn term(t: &str) -> Expr {
-    Expr::Term(t.to_owned())
-}
-
-fn re(r: &str) -> Expr {
-    Expr::Regex(r.to_owned())
-}
+use crate::tests::support::{re, t};
 
 #[test]
 fn expr_json_shape_round_trips() {
     let e = Expr::Or(vec![
-        Expr::And(vec![term("HscEnv"), re("pr[i1]ntk")]),
-        term("a b"),
-        Expr::Or(vec![Expr::And(vec![term("x")])]),
+        Expr::And(vec![t("HscEnv"), re("pr[i1]ntk")]),
+        t("a b"),
+        Expr::Or(vec![Expr::And(vec![t("x")])]),
     ]);
     let json = serde_json::to_string(&e).unwrap();
     assert_eq!(
@@ -42,55 +35,52 @@ fn expr_json_refuses_unknown_keys_and_empty_operands() {
             "{empty}"
         );
     }
-    assert!(Expr::And(vec![term("a")]).check().is_ok());
+    assert!(Expr::And(vec![t("a")]).check().is_ok());
 }
 
 #[test]
 fn expr_display_quotes_and_parenthesizes() {
     let cases = [
-        (Expr::And(vec![term("a"), term("b")]), "a AND b"),
+        (Expr::And(vec![t("a"), t("b")]), "a AND b"),
         (
-            Expr::Or(vec![Expr::And(vec![term("a"), term("b")]), term("c")]),
+            Expr::Or(vec![Expr::And(vec![t("a"), t("b")]), t("c")]),
             "a AND b OR c",
         ),
         (
-            Expr::And(vec![Expr::Or(vec![term("a"), term("b")]), re("c+")]),
+            Expr::And(vec![Expr::Or(vec![t("a"), t("b")]), re("c+")]),
             "(a OR b) AND /c+/",
         ),
         (
-            Expr::Or(vec![term("a"), Expr::Or(vec![term("b"), term("c")])]),
+            Expr::Or(vec![t("a"), Expr::Or(vec![t("b"), t("c")])]),
             "a OR (b OR c)",
         ),
         (
-            Expr::And(vec![term("a"), Expr::And(vec![term("b"), term("c")])]),
+            Expr::And(vec![t("a"), Expr::And(vec![t("b"), t("c")])]),
             "a AND (b AND c)",
         ),
         (
-            Expr::And(vec![
-                term("x"),
-                Expr::Or(vec![Expr::Or(vec![term("a"), term("b")])]),
-            ]),
+            Expr::And(vec![t("x"), Expr::Or(vec![Expr::Or(vec![t("a"), t("b")])])]),
             "x AND (a OR b)",
         ),
-        (Expr::Or(vec![term("only")]), "only"),
+        (Expr::Or(vec![t("only")]), "only"),
         (
             Expr::Or(vec![
-                term(""),
-                term("AND"),
-                term("OR"),
-                term("/x/"),
-                term("a b"),
-                term("q\"\\"),
-                term("(p)"),
+                t(""),
+                t("AND"),
+                t("OR"),
+                t("/x/"),
+                t("a b"),
+                t("q\"\\"),
+                t("(p)"),
             ]),
             r#""" OR "AND" OR "OR" OR "/x/" OR "a b" OR "q\"\\" OR "(p)""#,
         ),
         (
-            Expr::And(vec![term("and"), term("a/b"), term("StgClosure*")]),
+            Expr::And(vec![t("and"), t("a/b"), t("StgClosure*")]),
             "and AND a/b AND StgClosure*",
         ),
         (
-            Expr::Or(vec![term("it's"), re("a/b"), re(r"a\/b"), re(r"a\\/b")]),
+            Expr::Or(vec![t("it's"), re("a/b"), re(r"a\/b"), re(r"a\\/b")]),
             r#""it's" OR /a\/b/ OR /a\/b/ OR /a\\\/b/"#,
         ),
     ];
@@ -102,12 +92,10 @@ fn expr_display_quotes_and_parenthesizes() {
 #[test]
 fn expr_eval_follows_and_or() {
     let e = Expr::Or(vec![
-        Expr::And(vec![term("a"), term("b")]),
-        Expr::And(vec![term("c"), Expr::Or(vec![term("d")])]),
+        Expr::And(vec![t("a"), t("b")]),
+        Expr::And(vec![t("c"), Expr::Or(vec![t("d")])]),
     ]);
     assert_eq!(e.leaves().len(), 4);
-    assert!(e.has_and());
-    assert!(!Expr::Or(vec![term("a"), Expr::Or(vec![re("b")])]).has_and());
     for bits in 0u32..16 {
         let mut asked = Vec::new();
         let got = e.eval(&mut |i| {

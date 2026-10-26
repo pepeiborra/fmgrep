@@ -19,9 +19,7 @@ Once, before the first release:
 
 1. Version. Set `workspace.package.version` in `Cargo.toml` and the
    `version` of fmgrep's `docfm` dependency to the same value. Check
-   `workspace.package.repository`. Date the version's section in
-   `CHANGELOG.md` as `## <version> - YYYY-MM-DD`; the docs tests fail if
-   the section is missing.
+   `workspace.package.repository`.
 
 2. Gates, all clean:
 

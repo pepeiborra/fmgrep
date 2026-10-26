@@ -27,6 +27,15 @@ fn naive_docs(text: &[u8], pattern: &[u8]) -> Vec<usize> {
 
 type Built = FmIndex<Vec<u8>>;
 
+/// `f` inside a rayon pool of `threads` threads.
+fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(f)
+}
+
 fn located<D: AsRef<[u8]>>(index: &FmIndex<D>, pattern: &[u8]) -> Vec<usize> {
     let mut got = Vec::new();
     index.locate(pattern, &mut |p| got.push(p));
@@ -124,7 +133,7 @@ fn patterns(text: &[u8]) -> Vec<Vec<u8>> {
 fn counts_match_naive() {
     for threads in [1, 3] {
         for text in texts() {
-            let index = Built::build(text.clone(), 16, threads).unwrap();
+            let index = in_pool(threads, || Built::build(text.clone(), 16)).unwrap();
             assert_eq!(count(&index, b""), text.len() as u64 + 1);
             for pattern in patterns(&text) {
                 let want = naive_positions(&text, &pattern).len() as u64;
@@ -149,7 +158,7 @@ fn locate_visits_each_occurrence_doc() {
             .collect();
         for threads in [1, 3] {
             for rate in [1, 3, 4, 12, 32, 64] {
-                let index = Built::build(text.clone(), rate, threads).unwrap();
+                let index = in_pool(threads, || Built::build(text.clone(), rate)).unwrap();
                 assert_eq!(index.num_docs(), docs);
                 for (pattern, docs) in &want {
                     assert_eq!(
@@ -163,7 +172,7 @@ fn locate_visits_each_occurrence_doc() {
     }
 }
 
-/// About 1 MiB of documents: past the one-thread cutoff, over several supers.
+/// About 1 MiB of documents: over several supers.
 fn large_text() -> Vec<u8> {
     let mut rng = Rng(17);
     let mut text = Vec::new();
@@ -184,12 +193,11 @@ fn large_text() -> Vec<u8> {
 #[test]
 fn threads_do_not_change_the_blob() {
     for text in texts().into_iter().chain([large_text()]) {
-        let one = Built::build(text.clone(), 32, 1).unwrap().into_bytes();
-        for threads in [3, 8] {
-            let many = Built::build(text.clone(), 32, threads)
-                .unwrap()
-                .into_bytes();
-            assert!(one == many, "threads {threads} len {}", text.len());
+        let build = || Built::build(text.clone(), 32).unwrap().into_bytes();
+        let outside = build();
+        for threads in [1, 3, 8] {
+            let inside = in_pool(threads, build);
+            assert!(inside == outside, "threads {threads} len {}", text.len());
         }
     }
 }
@@ -199,7 +207,7 @@ fn threads_do_not_change_the_blob() {
 fn samples_match_suffix_order() {
     for rate in [1, 3, 4, 32, 64, 128] {
         for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-            let index = Built::build(text.clone(), rate, 1).unwrap();
+            let index = Built::build(text.clone(), rate).unwrap();
             let mut rows: Vec<usize> = (0..=text.len()).collect();
             rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
             let doc_of: Vec<usize> = text
@@ -237,7 +245,7 @@ fn one_byte_docs_build() {
     let text: Vec<u8> = (0..40_000)
         .flat_map(|_| [b'a' + rng.below(3) as u8, DOC_END])
         .collect();
-    let index = Built::build(text.clone(), 32, 1).unwrap();
+    let index = Built::build(text.clone(), 32).unwrap();
     for pattern in [b"a".as_slice(), b"b\0c", b"\0a\0", b"c\0c\0c"] {
         assert_eq!(
             located(&index, pattern),
@@ -245,14 +253,15 @@ fn one_byte_docs_build() {
             "pattern {pattern:?}"
         );
     }
-    assert!(Built::build(text, 32, 4).unwrap().into_bytes() == index.into_bytes());
+    let again = in_pool(4, || Built::build(text, 32)).unwrap();
+    assert!(again.into_bytes() == index.into_bytes());
 }
 
 #[test]
 fn samples_are_rate_multiples_and_doc_starts() {
     for rate in [1, 4, 32, 64] {
         for text in texts() {
-            let index = Built::build(text.clone(), rate, 1).unwrap();
+            let index = Built::build(text.clone(), rate).unwrap();
             let want = (0..text.len())
                 .filter(|&p| p % rate as usize == 0 || text[p - 1] == DOC_END)
                 .count();
@@ -269,7 +278,7 @@ fn samples_are_rate_multiples_and_doc_starts() {
 #[test]
 fn bwt_matches_naive_rotation_sort() {
     for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-        let index = Built::build(text.clone(), 4, 1).unwrap();
+        let index = Built::build(text.clone(), 4).unwrap();
         let mut rows: Vec<usize> = (0..=text.len()).collect();
         rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
         let want: Vec<Option<u8>> = rows
@@ -295,7 +304,7 @@ fn bwt_matches_naive_rotation_sort() {
 
 #[test]
 fn cursor_composes() {
-    let index = Built::build(b"abracadabra\0".to_vec(), 4, 1).unwrap();
+    let index = Built::build(b"abracadabra\0".to_vec(), 4).unwrap();
     let root = index.cursor();
     assert_eq!(root.count(), 13);
     let mut visited = 0;
@@ -316,7 +325,7 @@ fn cursor_composes() {
 
 #[test]
 fn out_of_alphabet_is_dead() {
-    let index = Built::build(b"abc\0".to_vec(), 2, 1).unwrap();
+    let index = Built::build(b"abc\0".to_vec(), 2).unwrap();
     assert!(!index.contains_symbol(b'z'));
     let dead = index.cursor().extend_front(b"z");
     assert_eq!(dead.count(), 0);
@@ -328,7 +337,7 @@ fn out_of_alphabet_is_dead() {
 
 #[test]
 fn empty_text_builds_and_matches_nothing() {
-    let index = Built::build(Vec::new(), 16, 1).unwrap();
+    let index = Built::build(Vec::new(), 16).unwrap();
     assert_eq!(count(&index, b""), 1);
     assert_eq!(count(&index, b"a"), 0);
     assert!(located(&index, b"a").is_empty());
@@ -345,7 +354,7 @@ fn encode<D: AsRef<[u8]>>(index: &FmIndex<D>) -> Vec<u8> {
 #[test]
 fn view_of_encoded_bytes_matches_built() {
     for text in texts() {
-        let index = Built::build(text.clone(), 8, 1).unwrap();
+        let index = Built::build(text.clone(), 8).unwrap();
         let blob = encode(&index);
         let mut shifted = vec![0u8; blob.len() + 1];
         shifted[1..].copy_from_slice(&blob);
@@ -365,7 +374,7 @@ fn view_of_encoded_bytes_matches_built() {
 
 #[test]
 fn foreign_or_truncated_blob_is_refused() {
-    let index = Built::build(b"printk hello printk\0".to_vec(), 4, 1).unwrap();
+    let index = Built::build(b"printk hello printk\0".to_vec(), 4).unwrap();
     let blob = encode(&index);
     let refuse = |bytes: &[u8], want: &str| {
         let Err(err) = FmIndex::view(bytes) else {
@@ -479,7 +488,7 @@ fn foreign_or_truncated_blob_is_refused() {
 fn heap_bytes_is_the_blob_plus_header() {
     let mut rng = Rng(11);
     let text: Vec<u8> = (0..200_000).map(|_| b'a' + rng.below(26) as u8).collect();
-    let index = Built::build(terminated(text), 16, 1).unwrap();
+    let index = Built::build(terminated(text), 16).unwrap();
     let blob = encode(&index).len();
     assert_eq!(
         index.heap_bytes(),
@@ -490,7 +499,7 @@ fn heap_bytes_is_the_blob_plus_header() {
 #[test]
 fn blob_is_page_aligned() {
     for text in texts() {
-        let index = Built::build(text, 16, 1).unwrap();
+        let index = Built::build(text, 16).unwrap();
         let h = &index.header;
         assert_eq!(
             (h.blocks_at % layout::PAGE, h.blob_len % layout::PAGE),
@@ -515,7 +524,7 @@ fn rank_overhead_is_bounded() {
     let text: Vec<u8> = (0..100_000).map(|_| rng.below(256) as u8).collect();
     let text = terminated(text);
     let n = text.len() as f64;
-    let index = Built::build(text, 16, 1).unwrap();
+    let index = Built::build(text, 16).unwrap();
     let h = &index.header;
     let raw = (h.bits as f64 * n + 16.0 * h.sigma as f64 * n / occ::BLOCK as f64) / 8.0;
     let supers = 4.0 * h.sigma as f64 * (n / occ::SUPER as f64 + 1.0);
@@ -561,9 +570,9 @@ fn occ_rank_matches_naive_across_block_boundaries() {
             }
             let h = layout::Header::new(n, 0, 16, alphabet, [0; 257], 0, 0);
             let mut blob = vec![0u8; h.blob_len];
-            occ::write_occ(&codes, &h, &mut blob, 1);
+            in_pool(1, || occ::write_occ(&codes, &h, &mut blob));
             let mut threaded = vec![0u8; h.blob_len];
-            occ::write_occ(&codes, &h, &mut threaded, 3);
+            in_pool(3, || occ::write_occ(&codes, &h, &mut threaded));
             assert!(blob == threaded, "n {n} sigma {sigma}");
             let bwt = Occ::new(&blob, &h);
             let mut edges: Vec<usize> = (0..=n / BLOCK + 1)
@@ -653,15 +662,15 @@ fn text_too_long_is_refused() {
     let err = build::check_len(i32::MAX as usize + 1).unwrap_err();
     assert!(matches!(err, Error::TextTooLong(_)), "{err}");
     assert!(matches!(
-        Built::build(b"a\0".to_vec(), 0, 1),
+        Built::build(b"a\0".to_vec(), 0),
         Err(Error::ZeroSampleRate)
     ));
     assert!(matches!(
-        Built::build(b"a".to_vec(), 4, 1),
+        Built::build(b"a".to_vec(), 4),
         Err(Error::Unterminated)
     ));
     assert!(matches!(
-        Built::build(b"a\0b".to_vec(), 4, 1),
+        Built::build(b"a\0b".to_vec(), 4),
         Err(Error::Unterminated)
     ));
 }
@@ -671,7 +680,7 @@ fn text_too_long_is_refused() {
 fn interleaved_locate_equals_rowwise() {
     for rate in [1, 3, 4, 32] {
         for text in texts() {
-            let index = Built::build(text.clone(), rate, 1).unwrap();
+            let index = Built::build(text.clone(), rate).unwrap();
             for pattern in patterns(&text) {
                 let cursor = index.cursor().extend_front(&pattern);
                 let mut rowwise: Vec<usize> =

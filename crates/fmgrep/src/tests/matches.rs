@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::matching::MatchMode;
+use crate::query::QueryRequest;
 use crate::sink::DocMatches;
 use crate::sink::MatchSink;
 use crate::wire::QueryReport;
@@ -14,7 +15,6 @@ const MATCHES: QueryOutput = QueryOutput::Matches {
 /// text)` per emitted line.
 #[derive(Debug)]
 struct Seen {
-    doc: usize,
     path: String,
     matched_lines: u64,
     matched_spans: u64,
@@ -42,7 +42,6 @@ impl MatchSink for Recorder {
     }
     fn doc(&mut self, m: DocMatches<'_>) -> Result<(), String> {
         self.seen.push(Seen {
-            doc: m.doc,
             path: m.path.to_owned(),
             matched_lines: m.outcome.matched_lines,
             matched_spans: m.outcome.matched_spans,
@@ -110,19 +109,6 @@ fn query_out(
 
 fn ok(index: &Path, regex: bool, terms: &[&str], output: QueryOutput) -> (OutputReport, Recorder) {
     query_out(index, regex, terms, output).unwrap()
-}
-
-fn staged(tmp: &Path, store_docs: bool) -> PathBuf {
-    let folder = stage_corpus(
-        tmp,
-        &[
-            ("a.c", b"printk one\nnothing\nprintk two printk\n"),
-            ("b.c", b"aaaa\ntail printk"),
-        ],
-    );
-    let output = tmp.join(format!("idx-{store_docs}"));
-    index_it(&folder, &output, store_docs);
-    output
 }
 
 #[test]
@@ -199,7 +185,7 @@ fn files_with_matches_needs_no_fetch_for_probe_exact_literals() {
         vec![("a.c".to_string(), 0, 0), ("b.c".to_string(), 0, 0)]
     );
     assert_eq!(out.queries[0].total_matches, 2);
-    assert_eq!(out.queries[0].docs_matched, Some(2));
+    assert_eq!(out.queries[0].docs_matched, 2);
     assert!(!out.queries[0].counts_exact);
 }
 
@@ -211,11 +197,7 @@ fn count_matches_total_is_the_matching_pass() {
         // `aa` in `aaaa`: the probe counts 3 overlapping, rg counts 2.
         let (out, rec) = ok(&index, false, &["aa"], QueryOutput::CountMatches);
         assert_eq!(out.queries[0].total_matches, 2, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(1),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 1, "store_docs={store_docs}");
         assert!(out.queries[0].counts_exact, "store_docs={store_docs}");
         assert_eq!(
             rec.shape(),
@@ -242,11 +224,7 @@ fn count_lines_counts_matched_lines_not_matches() {
             .collect();
         assert_eq!(got, vec![(2, 3), (1, 1)], "store_docs={store_docs}");
         assert_eq!(out.queries[0].total_matches, 4, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(2),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
         assert!(rec.emitted().is_empty(), "store_docs={store_docs}");
     }
 }
@@ -311,11 +289,7 @@ fn matches_mode_counts_are_the_matching_pass() {
         let index = staged(tmp.path(), store_docs);
         let (out, rec) = ok(&index, true, &["^tail"], MATCHES);
         assert_eq!(out.queries[0].total_matches, 1, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(1),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 1, "store_docs={store_docs}");
         assert!(out.queries[0].counts_exact, "store_docs={store_docs}");
         assert_eq!(
             rec.emitted(),
@@ -358,8 +332,8 @@ fn sink_sees_every_matching_doc_once_ascending() {
         let index = staged(tmp.path(), store_docs);
         for output in OUTPUTS {
             let (_, rec) = ok(&index, false, &["printk"], output);
-            let ids: Vec<usize> = rec.seen.iter().map(|s| s.doc).collect();
-            assert_eq!(ids, vec![0, 1], "store_docs={store_docs} {output:?}");
+            let paths: Vec<&str> = rec.seen.iter().map(|s| s.path.as_str()).collect();
+            assert_eq!(paths, ["a.c", "b.c"], "store_docs={store_docs} {output:?}");
             assert_eq!(
                 rec.terms,
                 vec!["printk".to_string()],
@@ -400,8 +374,8 @@ fn probe_exact_and_stale_docs_merge_into_one_ascending_stream() {
     for output in OUTPUTS {
         let mut rec = Recorder::default();
         run_query(&request(&index, &manifest, &terms, output), &mut rec).unwrap();
-        let ids: Vec<usize> = rec.seen.iter().map(|s| s.doc).collect();
-        assert_eq!(ids, vec![0, 1, 2, 3, 4], "{output:?}");
+        let paths: Vec<&str> = rec.seen.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["0.c", "1.c", "2.c", "3.c", "4.c"], "{output:?}");
     }
     // Count-matches keeps the probe's count for an unfetched doc and rg's
     // count of the current bytes for a stale one.
@@ -423,7 +397,7 @@ fn counts_mode_never_touches_the_sink() {
             panic!("counts mode started term {term:?}")
         }
         fn doc(&mut self, m: DocMatches<'_>) -> Result<(), String> {
-            panic!("counts mode emitted doc {}", m.doc)
+            panic!("counts mode emitted doc {}", m.path)
         }
         fn term_end(&mut self, _: &QueryReport) -> Result<(), String> {
             panic!("counts mode ended a term")
@@ -490,11 +464,7 @@ fn ignore_case_lines_are_the_folded_ones() {
         let mut rec = Recorder::default();
         let out = run_query(&req, &mut rec).unwrap();
         assert_eq!(out.queries[0].total_matches, 3, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(2),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
         assert_eq!(
             rec.emitted(),
             vec![

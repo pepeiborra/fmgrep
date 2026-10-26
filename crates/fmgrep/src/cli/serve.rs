@@ -1,22 +1,23 @@
 //! `serve` and `--server`: newline-delimited JSON-RPC 2.0 over one loaded index.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::Outcome;
-use super::args::{ClientAction, ClientArgs};
-use super::print;
-use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
-use crate::manifest::Manifest;
-use crate::matching::{MatchMode, QueryOutput};
+use super::params::{Mode, QueryParams};
+use super::{Outcome, print, render};
+use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
+use crate::manifest::{DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
-use crate::query::{Loaded, QueryRequest, answer, load};
-use crate::sink::Discard;
+use crate::query::{Loaded, answer, load};
+use crate::remote::{Conn, RpcError};
+use crate::sharded::DocfmIndex;
+use crate::sink::{Discard, MatchSink};
+use crate::source::DOCS_STAMPS;
 use crate::wire::OutputReport;
 
 const PARSE_ERROR: i64 = -32700;
@@ -25,63 +26,57 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const QUERY_FAILED: i64 = -32000;
 
-/// `query` params: the `--json --approx-counts|--occurrences` flags.
-/// `terms` may be omitted only when `expr` is given.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueryParams {
-    #[serde(default)]
-    pub terms: Vec<String>,
-    /// Exclusive with non-empty `terms` and with `regex`.
+/// A rendering mode's result: the local stdout, as `text` when it is UTF-8
+/// and standard base64 `bytes` otherwise.
+#[derive(Serialize, Deserialize)]
+struct Rendered {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expr: Option<Expr>,
-    #[serde(default)]
-    pub regex: bool,
-    #[serde(default)]
-    pub ignore_case: bool,
-    #[serde(default)]
-    pub multiline: bool,
-    #[serde(default)]
-    pub dotall: bool,
-    /// Only the counts drive is served; false is refused.
-    #[serde(default = "yes")]
-    pub approx_counts: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub occurrences: bool,
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<String>,
+    report: OutputReport,
 }
 
-fn yes() -> bool {
-    true
-}
-
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-impl Default for QueryParams {
-    fn default() -> Self {
+impl Rendered {
+    fn new(out: Vec<u8>, report: OutputReport) -> Self {
+        let (text, bytes) = match String::from_utf8(out) {
+            Ok(t) => (Some(t), None),
+            Err(e) => (None, Some(crate::base64::encode(e.as_bytes()))),
+        };
         Self {
-            terms: Vec::new(),
-            expr: None,
-            regex: false,
-            ignore_case: false,
-            multiline: false,
-            dotall: false,
-            approx_counts: true,
-            occurrences: false,
+            text,
+            bytes,
+            report,
         }
     }
+
+    fn into_parts(self) -> Result<(Vec<u8>, OutputReport), String> {
+        let out = match (self.text, self.bytes) {
+            (Some(t), None) => t.into_bytes(),
+            (None, Some(b)) => crate::base64::decode(&b)?,
+            _ => return Err("want exactly one of text and bytes".to_owned()),
+        };
+        Ok((out, self.report))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Answer {
+    Report(OutputReport),
+    Rendered(Rendered),
 }
 
 /// `status` result.
 #[derive(Serialize, Deserialize)]
-struct ServeStatus {
-    index_name: String,
+pub struct ServeStatus {
     store_docs: bool,
     files: usize,
     num_bytes: u64,
     index_size_bytes: u64,
     load_us: u64,
+    /// The documents' directory: the tree, or the index directory holding `docs.shard`.
+    root: String,
 }
 
 /// What `serve` serves.
@@ -95,54 +90,42 @@ pub struct ServeRequest<'a> {
     pub watch: bool,
 }
 
-/// One loaded index and what it was loaded from.
 struct Served<'m> {
-    loaded: Loaded,
+    index: DocfmIndex,
+    docs: Loaded,
     manifest: &'m Manifest,
     index_dir: &'m Path,
+    root: PathBuf,
 }
 
 impl Served<'_> {
-    fn query(&mut self, p: &QueryParams) -> Result<OutputReport, String> {
-        let req = QueryRequest {
-            index_dir: self.index_dir,
-            manifest: self.manifest,
-            corpus_root: None,
-            regex: p.regex,
-            mode: MatchMode {
-                multiline: p.multiline,
-                dotall: p.dotall,
-                ignore_case: p.ignore_case,
-            },
-            terms: &p.terms,
-            expr: p.expr.as_ref(),
-            output: if p.occurrences {
-                QueryOutput::Occurrences
-            } else {
-                QueryOutput::Counts
-            },
+    fn query(&mut self, p: &QueryParams) -> Result<Answer, RpcError> {
+        let req = p.request(self.index_dir, self.manifest, None);
+        let (index, loaded) = (&self.index, &mut self.docs);
+        let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
+        let answered = match p.mode {
+            Mode::Counts => run(&mut Discard).map(Answer::Report),
+            _ => {
+                let mut out = Vec::new();
+                render(p, false, &mut out, run).map(|r| Answer::Rendered(Rendered::new(out, r)))
+            }
         };
-        answer(&mut self.loaded, &req, &mut Discard)
+        answered.map_err(|message| RpcError {
+            code: QUERY_FAILED,
+            message,
+        })
     }
 
     fn status(&self) -> ServeStatus {
         ServeStatus {
-            index_name: crate::manifest::NAME.to_owned(),
             store_docs: self.manifest.store_docs,
-            files: self.loaded.index.num_files_indexed(),
+            files: self.manifest.num_docs,
             num_bytes: self.manifest.num_bytes,
-            index_size_bytes: self.loaded.index.index_size_bytes(),
-            load_us: self.loaded.load_wall.as_micros() as u64,
+            index_size_bytes: self.manifest.index_size_bytes,
+            load_us: self.docs.load_wall.as_micros() as u64,
+            root: self.root.display().to_string(),
         }
     }
-}
-
-#[derive(Serialize)]
-struct Request<'a, P> {
-    jsonrpc: &'static str,
-    id: u64,
-    method: &'a str,
-    params: P,
 }
 
 #[derive(Serialize)]
@@ -150,12 +133,6 @@ struct Success<'a, T> {
     jsonrpc: &'static str,
     id: &'a Value,
     result: T,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RpcError {
-    code: i64,
-    message: String,
 }
 
 #[derive(Serialize)]
@@ -235,11 +212,7 @@ fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
             let params = obj.get("params").cloned().unwrap_or(Value::Null);
             let has_terms = params.get("terms").is_some();
             let p = match serde_json::from_value::<QueryParams>(params) {
-                Ok(p) if p.approx_counts => p,
-                Ok(_) => {
-                    let msg = "invalid params: approx_counts must be true";
-                    return (failure(id, INVALID_PARAMS, msg.to_owned()), false);
-                }
+                Ok(p) => p,
                 Err(e) => {
                     return (
                         failure(id, INVALID_PARAMS, format!("invalid params: {e}")),
@@ -261,8 +234,8 @@ fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
                 );
             }
             match session.query(&p) {
-                Ok(report) => (success(id, report), false),
-                Err(e) => (failure(id, QUERY_FAILED, e), false),
+                Ok(answer) => (success(id, answer), false),
+                Err(e) => (failure(id, e.code, e.message), false),
             }
         }
         "status" => (success(id, session.status()), false),
@@ -329,6 +302,49 @@ fn serve_tcp(session: &mut Served<'_>, listener: TcpListener) -> Result<(), Stri
     Ok(())
 }
 
+/// The tree, or the index dir holding `docs.shard`; else why they are missing.
+fn docs_root(req: &ServeRequest<'_>) -> Result<PathBuf, String> {
+    let dir = req.index_dir.display();
+    if req.manifest.store_docs {
+        return match req.index_dir.join(DOCS_SHARD).is_file() {
+            true => Ok(req.index_dir.to_path_buf()),
+            false => Err(format!("error: {dir} has no {DOCS_SHARD}")),
+        };
+    }
+    let tree = req.manifest.tree(req.corpus_root);
+    if !tree.is_dir() {
+        return Err(format!("error: {} is not a directory", tree.display()));
+    }
+    match req.index_dir.join(DOCS_STAMPS).is_file() {
+        true => Ok(tree),
+        false => Err(format!("error: {dir} has no {DOCS_STAMPS}")),
+    }
+}
+
+/// `req`'s index and documents; refused when over half the files are gone.
+fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
+    let root = docs_root(req)?;
+    let root = std::fs::canonicalize(&root)
+        .map_err(|e| format!("error: cannot resolve {}: {e}", root.display()))?;
+    let (index, docs) = load(
+        req.index_dir,
+        req.manifest,
+        req.corpus_root,
+        req.watch,
+        true,
+    )?;
+    if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
+        return Err(format!("error: {why} under {}", root.display()));
+    }
+    Ok(Served {
+        index,
+        docs,
+        manifest: req.manifest,
+        index_dir: req.index_dir,
+        root,
+    })
+}
+
 /// Load once, then serve. Over TCP the bound address is printed on `out` as
 /// the readiness line.
 pub fn run_serve(
@@ -336,11 +352,7 @@ pub fn run_serve(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let mut session = Served {
-        loaded: load(req.index_dir, req.manifest, req.corpus_root, req.watch)?,
-        manifest: req.manifest,
-        index_dir: req.index_dir,
-    };
+    let mut session = hold(req)?;
     let listener = match req.listen {
         None => None,
         Some(addr) => {
@@ -355,12 +367,16 @@ pub fn run_serve(
             Some(listener)
         }
     };
-    let watch = session.loaded.take_watch();
+    let (watch, discovery) = (session.docs.take_watch(), session.docs.take_discovery());
     let stop = AtomicBool::new(false);
+    // Plain threads: they live as long as the session.
     std::thread::scope(|scope| {
+        let (stop, files, lens) = (&stop, &req.manifest.files, &req.manifest.doc_lens);
         if let Some(watch) = watch {
-            let (stop, files, lens) = (&stop, &req.manifest.files, &req.manifest.doc_lens);
             scope.spawn(move || watch.run(files, lens, stop));
+        }
+        if let Some(discovery) = discovery {
+            scope.spawn(move || discovery.run(files, stop));
         }
         let served = match listener {
             None => serve_lines(&mut session, input, out).map(|_| ()),
@@ -371,63 +387,66 @@ pub fn run_serve(
     })
 }
 
+/// `--status` (printed) or `--shutdown`.
+pub fn manage(addr: &str, shutdown: bool, out: &mut dyn Write) -> Result<Outcome, String> {
+    if shutdown {
+        ask::<Value>(addr, "shutdown")?;
+    } else {
+        let status = serde_json::to_string(&status(addr)?)
+            .map_err(|e| format!("error: {addr}: unexpected result: {e}"))?;
+        print::line(out, &status)?;
+    }
+    Ok(Outcome::Done)
+}
+
+/// One method without params; `Err` is printable.
+fn ask<T: serde::de::DeserializeOwned>(addr: &str, method: &str) -> Result<T, String> {
+    let mut conn = Conn::open(addr).map_err(|e| format!("error: {e}"))?;
+    let result = conn.call(method, serde_json::json!({}));
+    result
+        .and_then(|r| conn.decode(r))
+        .map_err(|e| format!("error: {e}"))
+}
+
+pub fn status(addr: &str) -> Result<ServeStatus, String> {
+    ask(addr, "status")
+}
+
 /// Send one request to a server and print its result as a search would.
-pub fn run_client(args: &ClientArgs, out: &mut dyn Write) -> Result<Outcome, String> {
-    let (method, params) = match &args.action {
-        ClientAction::Query { params, .. } => ("query", serde_json::to_value(params)),
-        ClientAction::Status => ("status", Ok(serde_json::json!({}))),
-        ClientAction::Shutdown => ("shutdown", Ok(serde_json::json!({}))),
+pub fn run_client(
+    addr: &str,
+    p: &QueryParams,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<Outcome, String> {
+    let sent =
+        serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
+    let mut conn = Conn::open(addr).map_err(|e| format!("error: {e}"))?;
+    let result = conn
+        .call("query", sent)
+        .map_err(|e| format!("error: {e}"))?;
+    print_result(out, json, p, &conn, result).map(Outcome::Query)
+}
+
+/// A `query` result as the local search prints it.
+fn print_result(
+    out: &mut dyn Write,
+    json: bool,
+    p: &QueryParams,
+    conn: &Conn,
+    result: Value,
+) -> Result<OutputReport, String> {
+    let bad = |e: String| format!("error: {e}");
+    let report = if p.mode == Mode::Counts {
+        conn.decode(result).map_err(bad)?
+    } else {
+        let rendered: Rendered = conn.decode(result).map_err(bad)?;
+        let (stdout, report) = rendered.into_parts().map_err(|e| conn.unexpected(&e))?;
+        if !json || p.mode == Mode::JsonMatches {
+            print::bytes(out, &stdout)?;
+            return Ok(report);
+        }
+        report
     };
-    let params = params.map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let request = serde_json::to_string(&Request {
-        jsonrpc: "2.0",
-        id: 1,
-        method,
-        params,
-    })
-    .map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let connect = &args.server;
-    let io = |e: std::io::Error| format!("error: {connect}: {e}");
-    let mut stream = TcpStream::connect(connect).map_err(io)?;
-    stream.set_nodelay(true).map_err(io)?;
-    stream
-        .write_all(format!("{request}\n").as_bytes())
-        .map_err(io)?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).map_err(io)?;
-    if line.is_empty() {
-        return Err(format!(
-            "error: {connect}: connection closed without a response"
-        ));
-    }
-    let mut response: Value = serde_json::from_str(&line)
-        .map_err(|e| format!("error: {connect}: unparsable response: {e}"))?;
-    if let Some(err) = response.get_mut("error") {
-        let err: RpcError = serde_json::from_value(err.take())
-            .map_err(|e| format!("error: {connect}: unparsable error: {e}"))?;
-        let msg = err.message.strip_prefix("error: ").unwrap_or(&err.message);
-        return Err(format!("error: server: {msg}"));
-    }
-    let result = response
-        .get_mut("result")
-        .map(Value::take)
-        .unwrap_or(Value::Null);
-    let bad = |e: serde_json::Error| format!("error: {connect}: unexpected result: {e}");
-    match &args.action {
-        ClientAction::Query { json, .. } => {
-            let report: OutputReport = serde_json::from_value(result).map_err(bad)?;
-            if *json {
-                print::query_report(out, &report)?;
-            } else {
-                print::counts_summary(out, &report)?;
-            }
-            Ok(Outcome::Query(report))
-        }
-        ClientAction::Status => {
-            let status: ServeStatus = serde_json::from_value(result).map_err(bad)?;
-            print::line(out, &serde_json::to_string(&status).map_err(bad)?)?;
-            Ok(Outcome::Done)
-        }
-        ClientAction::Shutdown => Ok(Outcome::Done),
-    }
+    render(p, json, out, |_| Ok(report))
 }

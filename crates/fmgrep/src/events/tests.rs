@@ -69,14 +69,13 @@ fn render(docs: &[(&str, &[u8])], terms: &[&str], output: QueryOutput, cfg: Json
     for term in terms {
         sink.term_start(term).unwrap();
         let matcher = matcher_for(term, mode);
-        for (doc, (path, raw)) in docs.iter().enumerate() {
+        for (path, raw) in docs {
             let raw = &strip_bom(raw);
             let outcome = matcher.scan(raw, output);
             if outcome.matched_lines == 0 {
                 continue;
             }
             sink.doc(DocMatches {
-                doc,
                 path,
                 raw,
                 outcome: &outcome,
@@ -87,7 +86,7 @@ fn render(docs: &[(&str, &[u8])], terms: &[&str], output: QueryOutput, cfg: Json
             term: (*term).to_owned(),
             latency_us: 0,
             total_matches: 0,
-            docs_matched: Some(0),
+            docs_matched: 0,
             counts_exact: true,
             leaves: Vec::new(),
         })
@@ -267,7 +266,7 @@ fn a_leading_bom_leaves_the_stream_unshifted() {
 
 #[test]
 fn a_term_with_no_match_emits_only_the_summary() {
-    // rg --json zzz xs.txt (which exits 1; we exit 0)
+    // rg --json zzz xs.txt
     assert_eq!(
         render(&[("xs.txt", b"ab\n")], &["zzz"], MATCHES, cfg()),
         stream(&[
@@ -345,7 +344,6 @@ fn broken_pipe_is_not_an_error() {
     let matcher = matcher_for("alpha", MatchMode::default());
     let outcome = matcher.scan(A.1, MATCHES);
     sink.doc(DocMatches {
-        doc: 0,
         path: A.0,
         raw: A.1,
         outcome: &outcome,
@@ -355,29 +353,12 @@ fn broken_pipe_is_not_an_error() {
         term: "alpha".to_owned(),
         latency_us: 0,
         total_matches: 0,
-        docs_matched: Some(0),
+        docs_matched: 0,
         counts_exact: true,
         leaves: Vec::new(),
     })
     .unwrap();
     sink.finish().unwrap();
-}
-
-#[test]
-fn base64_matches_known_vectors() {
-    // RFC 4648 section 10.
-    for (raw, want) in [
-        ("", ""),
-        ("f", "Zg=="),
-        ("fo", "Zm8="),
-        ("foo", "Zm9v"),
-        ("foob", "Zm9vYg=="),
-        ("fooba", "Zm9vYmE="),
-        ("foobar", "Zm9vYmFy"),
-    ] {
-        assert_eq!(schema::base64(raw.as_bytes()), want, "raw={raw:?}");
-    }
-    assert_eq!(schema::base64(&[0xfb, 0xff, 0xbe]), "+/++");
 }
 
 /// rg `-U`.

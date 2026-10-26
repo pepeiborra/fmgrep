@@ -24,7 +24,7 @@ fn hits(idx: &DocfmIndex, term: &[u8]) -> Vec<(usize, u64)> {
 }
 
 fn build(docs: &[Document], cap: u64) -> DocfmIndex {
-    DocfmIndex::build_with_cap(docs, cap, false)
+    DocfmIndex::build_with_cap(docs, cap)
 }
 
 fn naive_oracle(docs: &[Document], term: &[u8]) -> Vec<(usize, u64)> {
@@ -43,15 +43,6 @@ fn naive_oracle(docs: &[Document], term: &[u8]) -> Vec<(usize, u64)> {
             (n > 0).then_some((i, n))
         })
         .collect()
-}
-
-fn load_staged(
-    dir: &std::path::Path,
-    labels: &[String],
-    lens: &[u64],
-    doc_lens: &[u64],
-) -> Result<DocfmIndex, String> {
-    load_from(dir, labels, lens, doc_lens, false)
 }
 
 fn reload(index: &DocfmIndex, docs: &[Document]) -> DocfmIndex {
@@ -126,24 +117,6 @@ fn uniform_run_builds_exactly() {
 }
 
 #[test]
-fn store_docs_persists_the_same_blobs() {
-    let docs = docs();
-    for cap in [1u64 << 20, 1] {
-        let (files, shard) = (
-            DocfmIndex::build_with_cap(&docs, cap, false),
-            DocfmIndex::build_with_cap(&docs, cap, true),
-        );
-        assert_eq!(files.blob_slots(), shard.blob_slots(), "cap={cap}");
-        for slot in 0..files.blob_slots() {
-            let (mut a, mut b) = (Vec::new(), Vec::new());
-            let la = files.encode_into(slot, &mut a).expect("encode");
-            let lb = shard.encode_into(slot, &mut b).expect("encode");
-            assert_eq!((la, a), (lb, b), "cap={cap} slot={slot}");
-        }
-    }
-}
-
-#[test]
 #[should_panic(expected = "no indexable bytes")]
 fn empty_corpus_fails_loudly() {
     let _ = build(&[], 1 << 20);
@@ -171,10 +144,10 @@ fn regex_candidates_prune_via_locate() {
     let docs = docs();
     let idx = build(&docs, 1 << 20);
     let nullable = PreparedPattern::prepare("a*").unwrap();
-    assert!(matches!(idx.regex_candidates(&nullable), Candidates::All));
+    assert!(idx.regex_candidates(&nullable).is_none());
     for pattern in ["printk", "aa", "missing", "pr[i1]ntk", "[ap]+"] {
         let prepared = PreparedPattern::prepare(pattern).unwrap();
-        let Candidates::Docs(got) = idx.regex_candidates(&prepared) else {
+        let Some(got) = idx.regex_candidates(&prepared) else {
             panic!("{pattern} narrows");
         };
         for (i, d) in docs.iter().enumerate() {
@@ -185,7 +158,7 @@ fn regex_candidates_prune_via_locate() {
         }
     }
     let absent = PreparedPattern::prepare("\u{00fe}+z").unwrap();
-    assert!(matches!(idx.regex_candidates(&absent), Candidates::Docs(d) if d.is_empty()));
+    assert_eq!(idx.regex_candidates(&absent), Some(Vec::new()));
 }
 
 #[test]
@@ -212,7 +185,7 @@ fn fold_candidates_are_exact() {
         ] {
             let prepared = PreparedPattern::prepare_with(pattern, ci).unwrap();
             assert!(prepared.fold().is_some(), "{pattern:?} must plan");
-            let Candidates::Docs(got) = idx.regex_candidates(&prepared) else {
+            let Some(got) = idx.regex_candidates(&prepared) else {
                 panic!("{pattern} has a fold plan");
             };
             assert_eq!(got, want, "cap={cap} pattern={pattern:?}");
@@ -229,7 +202,7 @@ fn size_is_the_structure_alone() {
         .filter(|d| !d.bytes.is_empty())
         .flat_map(|d| d.bytes.iter().copied().chain([crate::UNIFIED_SEPARATOR]))
         .collect();
-    let structure = ::docfm::FmIndex::build(text, DOC_SAMPLE_RATE, 1).unwrap();
+    let structure = ::docfm::FmIndex::build(text, DOC_SAMPLE_RATE).unwrap();
     assert_eq!(idx.index_size_bytes(), structure.heap_bytes());
 }
 
@@ -263,7 +236,7 @@ fn blob_round_trips_and_load_refusals() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("blobs.shard"), &blob).unwrap();
         let lens = vec![blob.len() as u64];
-        let err = load_staged(dir.path(), &labels, &lens, &doc_lens)
+        let err = load_from(dir.path(), &labels, &lens, &doc_lens)
             .err()
             .expect("must refuse");
         assert!(err.contains(want), "got: {err}");
@@ -271,7 +244,7 @@ fn blob_round_trips_and_load_refusals() {
     // A real blob over a manifest with one non-empty doc fewer.
     let dir = tempfile::tempdir().unwrap();
     let (labels, lens) = persist(&idx, dir.path());
-    let err = load_staged(dir.path(), &labels, &lens, &[0, 19, 0])
+    let err = load_from(dir.path(), &labels, &lens, &[0, 19, 0])
         .err()
         .expect("must refuse");
     assert!(

@@ -21,15 +21,19 @@ response line each.
 - `--stdio`: requests on stdin, responses on stdout, ending at EOF.
 - A load that fails (no index, an old format, a damaged index) exits 2
   before the readiness line, with the message a search would print.
-- `serve` watches the tree for changed files unless `--no-watch` is given
-  (see `docs/index-format.md`).
+- `serve` watches the tree for changed and added files unless `--no-watch`
+  is given ([Staleness](index-format.md#staleness)). Its first answer waits
+  for the walk that finds files added before it started.
+- `serve` needs its documents: `docs.shard`, or the tree with
+  `docs.stamps` and at most half the indexed files. Otherwise it exits 2
+  before the readiness line.
 
 ## Methods
 
 | method | params | result |
 |---|---|---|
-| `query` | below | an `OutputReport` |
-| `status` | none | `{index_name, store_docs, files, num_bytes, index_size_bytes, load_us}` |
+| `query` | below | an `OutputReport`, or `{text, report}` |
+| `status` | none | `{store_docs, files, num_bytes, index_size_bytes, load_us, root}` |
 | `shutdown` | none | `{"status":"shutting down"}`, then the server exits 0 |
 
 `query` params; unknown fields are refused:
@@ -42,17 +46,37 @@ response line each.
 | `ignore_case` | bool | false | `-i` |
 | `multiline` | bool | false | `-U` |
 | `dotall` | bool | false | `--multiline-dotall` |
-| `approx_counts` | bool | true | must be true: only counts are served |
-| `occurrences` | bool | false | `--occurrences` totals instead |
+| `mode` | string | `counts` | what to answer, below |
+| `context` | `{before, after}` | 0, 0 | `-B`, `-A` |
+| `line_numbers` | bool | true | false: `-N` |
+| `heading` | bool | true | false: `--no-heading` |
+| `color` | string | `never` | `always`: `--color always` |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
+`mode` is `counts` (`--json --approx-counts`), `lines` (a plain search),
+`files` (`-l`), `count` (`-c`), `count_matches`, `only` (`-o`) or
+`json_matches` (`--json --matches`). `counts` answers the bare
+`OutputReport`.
+Every other mode answers `{"text", "report"}`: `text` is what the local
+search prints, byte for byte, and `report` its `OutputReport`. When that
+output is not UTF-8, `bytes` (standard base64) replaces `text`. The whole
+output is built in memory and sent as one line; other connections wait for
+it.
+
 ```text
 > {"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["greet","/hel+o/"]}}
-< {"jsonrpc":"2.0","id":1,"result":{"index_name":"fmgrep","index_time_us":1268,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":11,"total_matches":3,"docs_matched":1},{"term":"/hel+o/","latency_us":270,"total_matches":3,"docs_matched":2,"counts_exact":false}]}}
-> {"jsonrpc":"2.0","id":4,"method":"status"}
-< {"jsonrpc":"2.0","id":4,"result":{"index_name":"fmgrep","store_docs":false,"files":3,"num_bytes":228,"index_size_bytes":34448,"load_us":1268}}
+< {"jsonrpc":"2.0","id":1,"result":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":11,"total_matches":7,"docs_matched":3},{"term":"/hel+o/","latency_us":81,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}
+> {"jsonrpc":"2.0","id":3,"method":"query","params":{"terms":["hello"],"mode":"lines"}}
+< {"jsonrpc":"2.0","id":3,"result":{"text":"README.md\n3:Say hello with greet.\n\nsrc/Lib.hs\n4:greet name = \"hello \" ++ name\n","report":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":47,"total_matches":2,"docs_matched":2}]}}}
+> {"jsonrpc":"2.0","id":4,"method":"query","params":{"terms":["greet"],"mode":"files"}}
+< {"jsonrpc":"2.0","id":4,"result":{"text":"README.md\napp/Main.hs\nsrc/Lib.hs\n","report":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":6,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}}
+> {"jsonrpc":"2.0","id":5,"method":"status"}
+< {"jsonrpc":"2.0","id":5,"result":{"store_docs":false,"files":3,"num_bytes":208,"index_size_bytes":34448,"load_us":801,"root":"/src/demo"}}
 ```
+
+`root` is where the server reads the documents: the tree, or the index
+directory holding `docs.shard`.
 
 ## Expressions
 
@@ -67,7 +91,7 @@ caps nesting at 60.
 
 ```text
 > {"jsonrpc":"2.0","id":2,"method":"query","params":{"expr":{"and":[{"term":"greet"},{"or":[{"term":"hello"},{"regex":"sort[A-Z]"}]}]}}}
-< {"jsonrpc":"2.0","id":2,"result":{"index_name":"fmgrep","index_time_us":1268,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet AND (hello OR /sort[A-Z]/)","latency_us":84,"total_matches":5,"docs_matched":1,"counts_exact":false,"leaves":[{"term":"greet","total_matches":3},{"term":"hello","total_matches":2},{"term":"/sort[A-Z]/","total_matches":0}]}]}}
+< {"jsonrpc":"2.0","id":2,"result":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet AND (hello OR /sort[A-Z]/)","latency_us":45,"total_matches":7,"docs_matched":2,"counts_exact":false,"leaves":[{"term":"greet","total_matches":5},{"term":"hello","total_matches":2},{"term":"/sort[A-Z]/","total_matches":0}]}]}}
 ```
 
 ## Reports
@@ -76,7 +100,6 @@ caps nesting at 60.
 
 | field | meaning |
 |---|---|
-| `index_name` | `"fmgrep"` |
 | `index_time_us` | the search's index load wall; not the manifest's `build_time_us` |
 | `index_size_bytes` | as in the manifest |
 | `num_files_indexed` | documents in the index |
@@ -89,19 +112,16 @@ caps nesting at 60.
 | `term` | the term as given, or the expression's text form |
 | `latency_us` | this term's probe and fetch |
 | `total_matches` | matches (see below) |
-| `docs_matched` | documents matched; absent under `occurrences` |
+| `docs_matched` | documents matched |
 | `counts_exact` | present, as `false`, only when the counts may differ from rg's |
 | `leaves` | expressions only, in counting modes: `[{term, total_matches}]` per leaf |
 
 Counting semantics:
 
-- **`--approx-counts`**, which is also all that serve answers, gives the
-  index's own numbers: document-wide, with overlapping literal matches,
-  and a pattern may match across lines. `counts_exact` is false for every
-  pattern, and for a literal that is empty, overlaps itself or holds `\n`.
-- **`--occurrences`** gives the same `total_matches` with no
-  `docs_matched`. A literal is counted from the index alone. AND is
-  refused; an OR sums its leaves.
+- **`--approx-counts`** (serve's `counts` mode) gives the index's own
+  numbers: document-wide, with overlapping literal matches, and a pattern
+  may match across lines. `counts_exact` is false for every pattern, and
+  for a literal that is empty, overlaps itself or holds `\n`.
 - **`-c`, `--count-matches` and `-l`** with `--json` print the report
   with rg's counts, line-anchored and non-overlapping. `-l` proves
   membership only, so its `counts_exact` is false.
@@ -116,23 +136,20 @@ Counting semantics:
 | -32700 | the line is not JSON (or is nested too deep) | `parse error: expected ident at line 1 column 2` |
 | -32600 | a batch, a notification (no id), or a bad `jsonrpc` / `method` | `batch requests are not supported` |
 | -32601 | unknown method | `unknown method "nope"` |
-| -32602 | bad params | `invalid params: approx_counts must be true` |
-| -32000 | the search failed | `error: --occurrences places no match in a document, so it cannot answer AND` |
+| -32602 | bad params | `` invalid params: missing field `terms` `` |
+| -32000 | the search failed | `` error: invalid regex pattern "(": regex parse error: ... `` |
 
 The `id` is echoed, or null when the request has none that can be read.
 Serving continues after any error.
 
 ## --server
 
-`fmgrep --server ADDR TERM...` sends one `query` (all terms, or the
-expression from `--expr` / `--and` / `--or` / `--expr-json`) and prints the
-result as `--approx-counts` (or `--occurrences`) would locally: one
-`<term>: N matches in M files` line per term, or the report with `--json`.
-`--status` prints the status object and `--shutdown` stops the server.
-Flags only a local search honours are refused with exit 2: `--index`,
-`--color`, context and line-number flags, heading flags, `--matches`, `-o`,
-`-c`, `--count-matches` and `-l`. An error response exits 2, as
-`error: server: <message>`.
+`fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
+`--index` and prints what the local search prints. It sends one `query`
+(all terms, or the expression). `--json` alone and `--approx-counts` send
+`mode` `counts`. `--color auto` follows the client's stdout. `--status`
+prints the status object and `--shutdown` stops the server. An error
+response exits 2, as `error: server: <message>`.
 
 ## CLI --json
 
@@ -142,12 +159,12 @@ Flags only a local search honours are refused with exit 2: `--index`,
 | a search with `--json`, alone or with a counting mode | one `OutputReport` line |
 | a search with `--json --matches` or `--json -o` | rg's JSON event stream |
 
-`IndexSummary` is `{index_name, store_docs, path, num_files, num_bytes,
-index_size_bytes, build_time_us}`:
+`IndexSummary` is `{store_docs, path, num_files, num_bytes, index_size_bytes,
+build_time_us}`:
 
 ```text
 $ fmgrep index --json
-{"index_name":"fmgrep","store_docs":false,"path":"./.fmgrep","num_files":3,"num_bytes":228,"index_size_bytes":34448,"build_time_us":840}
+{"store_docs":false,"path":"./.fmgrep","num_files":3,"num_bytes":208,"index_size_bytes":34448,"build_time_us":2060}
 ```
 
 The event stream is rg 15.2.0's, byte for byte: `begin`, one `match` or
@@ -170,7 +187,7 @@ deliberate:
 5. `path` is always `{"text": ...}`, because manifest paths are UTF-8.
 6. `-c`, `--count-matches` and `-l` with `--json` print the report; rg
    ignores `--json` there and prints plain counts.
-7. No match still exits 0, and no terms prints nothing.
+7. No terms prints nothing.
 
 Under `-U`, a term matched over the whole document reports one `match`
 event per block of consecutive matched lines, and its submatches are the

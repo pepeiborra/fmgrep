@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
 #
-# scripts/rg-oracle.sh: byte-for-byte diff of fmgrep's human output against rg.
+# scripts/rg-oracle.sh: byte-for-byte diff of fmgrep's output against rg.
 #
 # Stages a fixture tree, indexes it into its .fmgrep, then compares our stdout
-# (searching from a subdirectory, so the index is found by walking up) with
-# rg's for every output flag combination. Sibling names are chosen so rg's
-# per-directory DFS (`--sort path`) and our global sort of relative paths
-# agree; a file and a sibling directory sharing a prefix (`a.txt` vs
-# `a/b.txt`) would order differently and is out of scope here.
+# (searching from a subdirectory, so the index is found by walking up) and
+# exit status with rg's for every output flag combination. Sibling names are
+# chosen so rg's per-directory DFS (`--sort path`) and our sorted relative
+# paths agree (`a.txt` vs `a/b.txt` would not).
 #
-# Without --store-docs every case runs twice: on the indexed tree, then on a
-# stale one (files edited and deleted after index), where each search must
-# print exactly one warning, for the deleted file. With --store-docs the index
-# holds the documents, so there is no stale pass.
+# Without --store-docs every case runs twice: on the indexed tree, backdated
+# so discovery prunes by directory stamp, then on a stale one (files edited,
+# deleted, renamed and added after index), where each search must print
+# exactly three warnings: the deleted file, the one moved with its directory,
+# and the one turned binary.
 #
-# Needs `rg` on PATH and builds the release binary, so it is not part of
-# scripts/check.sh. Ends with a `pass N / fail M` line; exits 1 if any case
+# --serve repeats every case through `--server` (lines `srv`): same stdout and
+# exit status, empty stderr.
+#
+# --corpus DIR indexes DIR instead and checks AND / OR pairs of GHC terms:
+# -l, -c and --count-matches against rg over the manifest's files, the
+# served counts, --and / --or, --expr of the served label, and
+# FMGREP_AND_LOCATE_RATIO=0. Needs jq.
+#
+# Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
+# `pass N / fail M` (plus the served count); exits 1 if any case
 # differs, 2 on a usage error or an index whose manifest contradicts the flag.
 #
-# Usage: scripts/rg-oracle.sh [--store-docs]
+# Usage: scripts/rg-oracle.sh [--store-docs] [--serve]
+#        scripts/rg-oracle.sh --corpus DIR [--store-docs]
 
 set -euo pipefail
 
@@ -29,66 +38,107 @@ command -v rg >/dev/null || { echo "rg is not on PATH"; exit 2; }
 
 STORE_DOCS=false
 INDEX_FLAGS=()
-for arg in "$@"; do
-    case "$arg" in
+SERVE=false
+CORPUS_DIR=""
+usage() {
+    sed -n 's/^# \{0,1\}//; 29,30p' "${BASH_SOURCE[0]}" >&2
+    exit 2
+}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
     --store-docs) STORE_DOCS=true; INDEX_FLAGS=(--store-docs) ;;
-    *) echo "usage: scripts/rg-oracle.sh [--store-docs]" >&2; exit 2 ;;
+    --serve) SERVE=true ;;
+    --corpus) [[ $# -ge 2 ]] || usage; CORPUS_DIR="$2"; shift ;;
+    *) usage ;;
     esac
+    shift
 done
+if [[ -n "$CORPUS_DIR" && "$SERVE" == true ]]; then usage; fi
+if [[ -n "$CORPUS_DIR" ]]; then
+    command -v jq >/dev/null || { echo "jq is not on PATH"; exit 2; }
+    CORPUS="$(cd "$CORPUS_DIR" && pwd)" || exit 2
+fi
 
-cargo build --release -p fmgrep >&2
+cargo build --release --locked -p fmgrep >&2
 BIN="$ROOT/target/release/fmgrep"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-CORPUS="$WORK/corpus"
-mkdir -p "$CORPUS/sub"
-printf 'alpha one\nbeta\nalpha two\ndelta\nepsilon\nzeta\nalpha and alpha\neta\n' > "$CORPUS/a.txt"
-printf 'no hits here\n' > "$CORPUS/b.txt"
-printf 'first\nalpha in sub\nthird\n' > "$CORPUS/sub/c.txt"
-# No trailing newline: rg reports a zero-width match on the last line.
-printf 'head\nalpha last' > "$CORPUS/d.txt"
-# Mixed case plus the Unicode fold hazards: `-i` on `k` also matches U+212A
-# KELVIN SIGN, on `s` also U+017F LATIN SMALL LETTER LONG S.
-printf 'Alpha up\nALPHA shout\nalpha down\n' > "$CORPUS/h.txt"
-printf 'printk here\nPRINTK there\nprint\xe2\x84\xaa kelvin\ncla\xc5\xbfs longs\n' > "$CORPUS/g.txt"
-# Mixed case ACROSS a terminator: the -i x -U cross product.
-printf 'Alpha One\nBETA\nalpha one\nbeta\n' > "$CORPUS/i.txt"
-# Leading UTF-8 BOM: rg strips it before searching. Three shapes: a BOM
-# alone (an empty file to rg), BOM + one line, BOM + CRLF lines.
-printf '\xef\xbb\xbf' > "$CORPUS/e1.txt"
-printf '\xef\xbb\xbfalpha bom\nsecond line\n' > "$CORPUS/e2.txt"
-printf '\xef\xbb\xbfalpha crlf\r\nbeta\r\n' > "$CORPUS/e3.txt"
-# Consecutive matching lines: under -U rg prints one block per RUN of them.
-printf 'alpha 1\nalpha 2\nzz\nalpha 3\n' > "$CORPUS/f.txt"
+SERVER=""
+ADDR=""
+stop_server() {
+    if [[ -n "$SERVER" ]]; then
+        "$BIN" --server "$ADDR" --shutdown > /dev/null 2>&1 || kill "$SERVER" 2> /dev/null || true
+        wait "$SERVER" 2> /dev/null || true
+    fi
+    SERVER=""
+    ADDR=""
+}
+trap 'stop_server; rm -rf "$WORK"' EXIT
+# `serve $1` in the background (`$2` in errors): pid into `$3`, address into `$4`.
+spawn_serve() {
+    local ready="$WORK/ready.$3"
+    : > "$ready"
+    "$BIN" serve "$1" > "$ready" 2>> "$WORK/serve.err" &
+    printf -v "$3" %s "$!"
+    for _ in $(seq 300); do
+        [[ -s "$ready" ]] && break
+        sleep 0.1
+    done
+    printf -v "$4" %s "$(head -n1 "$ready")"
+    [[ -n "${!4}" ]] || { echo "$2 did not become ready"; cat "$WORK/serve.err"; exit 2; }
+}
 
-( cd "$CORPUS" && "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} ) >&2
-if ! grep -q "\"store_docs\": *$STORE_DOCS[,}]" "$CORPUS/.fmgrep/manifest.json"; then
-    echo "the index manifest does not record store_docs=$STORE_DOCS" >&2
-    exit 2
-fi
-# Our searches run below the corpus root and find the index by walking up.
-HERE="$CORPUS/sub"
-
-RG_COMMON=(--no-ignore --no-require-git -a --sort path)
+RG_COMMON=(--no-ignore --no-require-git -a --sort path -g '!k.dat')
 TERM=alpha
 FAIL=0
 PASS=""
 WARNINGS=0
 OK=0
 FAILED=0
+SERVED=0
+RC=0
+
+# The case just run, again through the `--serve` server: no stderr, and the
+# local search's exit status, RC.
+served() {
+    [[ -n "$ADDR" ]] || return 0
+    local name="$1" rc=0
+    shift
+    ( cd "$CORPUS/sub" && "$BIN" --server "$ADDR" "$@" ) > "$WORK/srv" 2> "$WORK/srv.err" || rc=$?
+    if [[ "$rc" != "$RC" || -s "$WORK/srv.err" ]]; then
+        echo "FAIL srv $PASS$name  (exit $rc, want exit $RC and no stderr)"
+        cat "$WORK/srv.err"
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    elif cmp -s "$WORK/ours" "$WORK/srv"; then
+        echo "srv $PASS$name"
+        SERVED=$((SERVED + 1))
+    else
+        echo "FAIL srv $PASS$name  (differs from the local search)"
+        diff -u "$WORK/ours" "$WORK/srv" || true
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+}
 
 # One case: name, our flags, rg's flags (both space-separated), term.
 check() {
-    local name="$1" mine="$2" theirs="$3" term="${4:-$TERM}"
+    local name="$1" mine="$2" theirs="$3" term="${4:-$TERM}" rgrc
+    RC=0
     # shellcheck disable=SC2086
-    ( cd "$HERE" && "$BIN" $mine -- "$term" ) > "$WORK/ours" 2> "$WORK/err"
+    ( cd "$HERE" && "$BIN" $mine -- "$term" ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
     set +e
     # rg echoes the directory it was given; our paths are corpus-relative.
     # shellcheck disable=SC2086
     ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs -- "$term" . ) | sed 's|\./||g' > "$WORK/theirs"
+    rgrc="${PIPESTATUS[0]}"
     set -e
-    if [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
+    if [[ "$RC" != "$rgrc" ]]; then
+        echo "FAIL $PASS$name  (exit $RC, rg exits $rgrc)"
+        cat "$WORK/err"
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    elif [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
         echo "FAIL $PASS$name  (want $WARNINGS warning line(s))"
         cat "$WORK/err"
         FAIL=1
@@ -102,6 +152,8 @@ check() {
         FAIL=1
         FAILED=$((FAILED + 1))
     fi
+    # shellcheck disable=SC2086
+    served "$name" $mine -- "$term"
 }
 
 # Expressions (--expr-json, then the same tree as --expr text). Tokens:
@@ -170,13 +222,27 @@ node() {
         JSON+="{\"$key\":$(json_str "$val")}"
         if [[ "$key" == term ]]; then TEXT+="$(json_str "$val")"; else TEXT+="$(re_text "$val")"; fi
         RGE+=(-e "$pat")
-        set +e
-        # shellcheck disable=SC2086
-        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $MFLAGS -l -e "$pat" . ) | sed 's|^\./||' | LC_ALL=C sort > "$out"
-        set -e
+        if [[ -n "$CORPUS_DIR" ]]; then
+            rg_list "$WORK/all0" -l -e "$pat" | LC_ALL=C sort > "$out"
+        else
+            set +e
+            # shellcheck disable=SC2086
+            ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $MFLAGS -l -e "$pat" . ) | sed 's|^\./||' | LC_ALL=C sort > "$out"
+            set -e
+        fi
         ;;
     *) echo "bad expression token $tok" >&2; exit 2 ;;
     esac
+}
+
+# Parse the tokens into JSON, TEXT and RGE; write their sorted files to $WORK/members.
+parse() {
+    TOK=("$@")
+    POS=0
+    JSON=""
+    TEXT=""
+    RGE=()
+    node "$WORK/members"
 }
 
 # One expression case: name, our flags, rg's flags, then the tokens. Runs
@@ -184,23 +250,20 @@ node() {
 check_expr() {
     local name="$1" mine="$2" theirs="$3" w form
     shift 3
-    TOK=("$@")
-    POS=0
-    JSON=""
-    TEXT=""
-    RGE=()
     MFLAGS=""
     for w in $theirs; do
         case "$w" in -i | -U | --multiline-dotall) MFLAGS+=" $w" ;; esac
     done
-    node "$WORK/members"
+    parse "$@"
     : > "$WORK/theirs"
+    local rgrc=1
     if [[ -s "$WORK/members" ]]; then
         local files=()
         while IFS= read -r w; do files+=("$w"); done < "$WORK/members"
         set +e
         # shellcheck disable=SC2086
         ( cd "$CORPUS" && rg "${RG_COMMON[@]}" -H $theirs "${RGE[@]}" -- "${files[@]}" ) > "$WORK/theirs"
+        rgrc=$?
         set -e
     fi
     local forms=(json text) argv
@@ -211,9 +274,15 @@ check_expr() {
         text) name="${name/expr-/expr-text-}"; argv=(--expr "$TEXT") ;;
         flags) argv=("${OURS[@]}") ;;
         esac
+        RC=0
         # shellcheck disable=SC2086
-        ( cd "$HERE" && "$BIN" $mine "${argv[@]}" ) > "$WORK/ours" 2> "$WORK/err"
-        if [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
+        ( cd "$HERE" && "$BIN" $mine "${argv[@]}" ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+        if [[ "$RC" != "$rgrc" ]]; then
+            echo "FAIL $PASS$name  (exit $RC, rg exits $rgrc)"
+            cat "$WORK/err"
+            FAIL=1
+            FAILED=$((FAILED + 1))
+        elif [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
             echo "FAIL $PASS$name  (want $WARNINGS warning line(s))"
             cat "$WORK/err"
             FAIL=1
@@ -227,15 +296,16 @@ check_expr() {
             FAIL=1
             FAILED=$((FAILED + 1))
         fi
+        # shellcheck disable=SC2086
+        served "$name" $mine "${argv[@]}"
     done
     OURS=()
 }
 
-# `--and` / `--or` over the leaves as terms: `r:x` spelled /x/, or x under
-# --regex. The truth is check_expr's for the same node.
-check_flags() {
-    local name="$1" mine="$2" theirs="$3" op="$4" tok
-    shift 4
+# OURS: `--$1` over the leaves as terms, `r:x` spelled /x/, or x if our flags $2 hold --regex.
+terms() {
+    local op="$1" mine="$2" tok
+    shift 2
     OURS=("--$op" --)
     for tok in "$@"; do
         case "$tok" in
@@ -243,6 +313,13 @@ check_flags() {
         r:*) if [[ " $mine " == *" --regex "* ]]; then OURS+=("${tok#r:}"); else OURS+=("/${tok#r:}/"); fi ;;
         esac
     done
+}
+
+# `--and` / `--or` over the leaves; the truth is check_expr's for the same node.
+check_flags() {
+    local name="$1" mine="$2" theirs="$3" op="$4"
+    shift 4
+    terms "$op" "$mine" "$@"
     check_expr "$name" "$mine" "$theirs" "$op{" "$@" '}'
 }
 
@@ -269,6 +346,156 @@ expr_cases() {
     check_expr "expr-only      [$label]" "-o"              "--heading -n -o"   "$@"
     check_expr "expr-context   [$label]" "-C 1"            "--heading -n -C 1" "$@"
 }
+
+# Exits 2 unless the manifest in index dir $1 records STORE_DOCS.
+manifest_ok() {
+    grep -q "\"store_docs\": *$STORE_DOCS[,}]" "$1/manifest.json" ||
+        { echo "the index manifest does not record store_docs=$STORE_DOCS" >&2; exit 2; }
+}
+
+# rg over the NUL-separated file list $1 from the corpus root; any rg error exits 2.
+rg_list() {
+    local list="$1"
+    shift
+    [[ -s "$list" ]] || return 0
+    ( cd "$CORPUS" && xargs -0 rg --no-ignore --no-require-git -a -H "$@" -- < "$list" 2> "$WORK/rgerr" ) || true
+    [[ ! -s "$WORK/rgerr" ]] || { cat "$WORK/rgerr" >&2; exit 2; }
+}
+
+# Our sorted output for "$@" into $1; exit 1 (no match) is no error.
+ours() {
+    local out="$1"
+    shift
+    { "$BIN" --index "$IDX" "$@" 2> /dev/null || [[ $? == 1 ]]; } | LC_ALL=C sort > "$out"
+}
+
+# One --corpus pair: and|or, then two leaves.
+pair() {
+    local op="$1" fail="" untimed='del(.index_time_us, .queries[].latency_us)' name flag docs sum served rc=0 exact total label
+    name="$(tr '[:lower:]' '[:upper:]' <<< "$op")"
+    MFLAGS=""
+    parse "$op{" "$2" "$3" '}'
+    terms "$op" "" "$2" "$3"
+    tr '\n' '\0' < "$WORK/members" > "$WORK/members0"
+    cp "$WORK/members" "$WORK/theirs-l"
+    for flag in -l -c --count-matches; do
+        if [[ "$flag" != -l ]]; then
+            rg_list "$WORK/members0" "$flag" "${RGE[@]}" | LC_ALL=C sort > "$WORK/theirs$flag"
+        fi
+        ours "$WORK/ours$flag" "$flag" --expr-json "$JSON"
+        ours "$WORK/flags$flag" "$flag" "${OURS[@]}"
+        FMGREP_AND_LOCATE_RATIO=0 ours "$WORK/k0$flag" "$flag" --expr-json "$JSON"
+        cmp -s "$WORK/theirs$flag" "$WORK/ours$flag" || fail+=" $flag"
+        cmp -s "$WORK/ours$flag" "$WORK/flags$flag" || fail+=" flags$flag"
+        cmp -s "$WORK/ours$flag" "$WORK/k0$flag" || fail+=" k0$flag"
+    done
+    docs="$(wc -l < "$WORK/members" | tr -d ' ')"
+    sum="$(awk -F: '{ s += $NF } END { print s + 0 }' "$WORK/theirs--count-matches")"
+    served="$("$BIN" --server "$ADDR" --json --expr-json "$JSON")" || rc=$?
+    [[ "$rc" == "$((docs == 0))" ]] || fail+=" exit=$rc"
+    [[ "$(jq '.queries[0].docs_matched' <<< "$served")" == "$docs" ]] || fail+=" docs_matched"
+    exact="$(jq '.queries[0] | if has("counts_exact") then .counts_exact else true end' <<< "$served")"
+    total="$(jq '.queries[0].total_matches' <<< "$served")"
+    [[ "$exact" != true || "$total" == "$sum" ]] || fail+=" total_matches"
+    [[ "$("$BIN" --server "$ADDR" --json "${OURS[@]}" | jq -c "$untimed")" == "$(jq -c "$untimed" <<< "$served")" ]] || fail+=" flags-server"
+    label="$(jq -r '.queries[0].term' <<< "$served")"
+    ours "$WORK/text-l" -l --expr "$label"
+    cmp -s "$WORK/ours-l" "$WORK/text-l" || fail+=" text"
+    [[ "$(FMGREP_AND_LOCATE_RATIO=0 "$BIN" --index "$IDX" --json --approx-counts --expr-json "$JSON" 2> /dev/null | jq -c "$untimed")" \
+        == "$("$BIN" --index "$IDX" --json --approx-counts --expr-json "$JSON" 2> /dev/null | jq -c "$untimed")" ]] || fail+=" k0-json"
+    OURS=()
+    if [[ -z "$fail" ]]; then
+        echo "ok   $name [$label] docs=$docs rg_matches=$sum served_total=$total exact=$exact text=ok k0=ok"
+        OK=$((OK + 1))
+    else
+        echo "FAIL $name [$label]:$fail (docs=$docs rg_matches=$sum served=$served)"
+        for flag in -l -c --count-matches; do diff "$WORK/theirs$flag" "$WORK/ours$flag" | head -5 || true; done
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+if [[ -n "$CORPUS_DIR" ]]; then
+    IDX="$WORK/index"
+    "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} --output "$IDX" "$CORPUS" >&2
+    manifest_ok "$IDX"
+    jq -r '.files[]' "$IDX/manifest.json" | tr '\n' '\0' > "$WORK/all0"
+    echo "corpus=$CORPUS store_docs=$STORE_DOCS files=$(jq '.files | length' "$IDX/manifest.json")"
+    spawn_serve "$IDX" serve SERVER ADDR
+
+    pair and t:HscEnv t:DynFlags
+    pair and t:StgTSO 't:StgClosure *'
+    pair and 't:StgClosure *' 't:Capability *cap'
+    pair and t:pprPanic t:assertPpr
+    pair and 't:instance Outputable' 't:import GHC.Types.Name'
+    pair and t:mkTyConApp 'r:pprPanic "[^"\n]*"'
+    pair and 'r:\{-# INLINE \w+ #-\}' 'r:import GHC\.(Core|Stg|Cmm)\.[\w.]+'
+    pair and t:StgToCmm 'r:import GHC\.(Core|Stg|Cmm)\.[\w.]+'
+    pair and 't:foreign import ccall' 'r:foreign import ccall (unsafe|safe)'
+    pair and t:allocateMightFail 't:instance Outputable'
+    pair or t:HscEnv t:DynFlags
+    pair or t:zonkTcType t:tcLookupGlobal
+    pair or t:debugBelch t:ACQUIRE_LOCK
+    pair or t:StgRhsClosure t:StgToCmm
+    pair or t:CmmGraph t:StgTSO
+    pair or t:pprPanic 'r:pprPanic "[^"\n]*"'
+    pair or 'r:stg_\w+_info' 't:StgClosure *'
+    pair or t:unsafePerformIO t:HasCallStack
+    pair or t:throwGhcException t:pprPanic
+    pair or 'r:foreign import ccall (unsafe|safe)' 'r:\{-# INLINE \w+ #-\}'
+    # common AND rare
+    pair and t:import t:zonkTcType
+    pair and t:zonkTcType t:import
+    pair and t:the t:tcLookupGlobal
+    pair and 'r:-- \|' t:simplifyTop
+    pair and t:import 'r:zonkTc\w+'
+    pair and t:where t:simplifyTop
+    pair and t:module t:tcLookupGlobal
+
+    echo "pass $OK / fail $FAILED"
+    exit "$FAIL"
+fi
+
+CORPUS="$WORK/corpus"
+mkdir -p "$CORPUS/sub"
+printf 'alpha one\nbeta\nalpha two\ndelta\nepsilon\nzeta\nalpha and alpha\neta\n' > "$CORPUS/a.txt"
+printf 'no hits here\n' > "$CORPUS/b.txt"
+printf 'first\nalpha in sub\nthird\n' > "$CORPUS/sub/c.txt"
+# No trailing newline: rg reports a zero-width match on the last line.
+printf 'head\nalpha last' > "$CORPUS/d.txt"
+# Mixed case plus the Unicode fold hazards: `-i` on `k` also matches U+212A
+# KELVIN SIGN, on `s` also U+017F LATIN SMALL LETTER LONG S.
+printf 'Alpha up\nALPHA shout\nalpha down\n' > "$CORPUS/h.txt"
+printf 'printk here\nPRINTK there\nprint\xe2\x84\xaa kelvin\ncla\xc5\xbfs longs\n' > "$CORPUS/g.txt"
+# Mixed case ACROSS a terminator: the -i x -U cross product.
+printf 'Alpha One\nBETA\nalpha one\nbeta\n' > "$CORPUS/i.txt"
+# Leading UTF-8 BOM: rg strips it before searching. Three shapes: a BOM
+# alone (an empty file to rg), BOM + one line, BOM + CRLF lines.
+printf '\xef\xbb\xbf' > "$CORPUS/e1.txt"
+printf '\xef\xbb\xbfalpha bom\nsecond line\n' > "$CORPUS/e2.txt"
+printf '\xef\xbb\xbfalpha crlf\r\nbeta\r\n' > "$CORPUS/e3.txt"
+# Consecutive matching lines: under -U rg prints one block per RUN of them.
+printf 'alpha 1\nalpha 2\nzz\nalpha 3\n' > "$CORPUS/f.txt"
+# For the stale pass: a skipped binary alone in its directory (replaced by
+# text, found once its directory is listed), a directory to rename, a text
+# file to turn binary, and a tree to copy in with its mtimes.
+mkdir -p "$CORPUS/kb" "$CORPUS/mw" "$WORK/tree/t/deep"
+printf 'alpha\0binary\n' > "$CORPUS/kb/k.dat"
+printf 'alpha moved\nbeta\n' > "$CORPUS/mw/m.txt"
+printf 'alpha text\n' > "$CORPUS/tb.txt"
+printf 'alpha deep tree\n' > "$WORK/tree/t/deep/x.txt"
+printf 'beta\nalpha y\n' > "$WORK/tree/t/y.txt"
+find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
+
+( cd "$CORPUS" && "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} ) >&2
+manifest_ok "$CORPUS/.fmgrep"
+# Our searches run below the corpus root and find the index by walking up.
+HERE="$CORPUS/sub"
+
+start_server() {
+    spawn_serve "$CORPUS" serve SERVER ADDR
+}
+[[ "$SERVE" == true ]] && start_server
 
 cases() {
 
@@ -406,15 +633,51 @@ check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"         
 check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "-U"    "--heading -n -U" or 'r:alpha one\nbeta' t:zz
 }
 
+# Under --serve, wait until the server's watch agrees with a local search.
+await_watch() {
+    [[ -n "$ADDR" ]] || return 0
+    local deadline=$((SECONDS + 10))
+    until [[ "$( cd "$HERE" && "$BIN" --server "$ADDR" -c -- alpha)" == "$( cd "$HERE" && "$BIN" -c -- alpha 2> /dev/null)" ]]; do
+        if ((SECONDS >= deadline)); then
+            echo "note: the watch missed the edits in 10 s; restarting serve"
+            stop_server
+            start_server
+            return 0
+        fi
+        sleep 0.1
+    done
+}
+
 cases
 if [[ "$STORE_DOCS" == false ]]; then
     PASS="[stale] "
-    WARNINGS=1
+    WARNINGS=3
     printf 'alpha new\nbeta\nalpha two alpha\nalpha\nzeta\n' > "$CORPUS/a.txt"
     printf 'no hits here\nbut alpha now\n' > "$CORPUS/b.txt"
     rm -f "$CORPUS/d.txt"
+    # Added files: at the root, in a new directory, one binary (skipped;
+    # rg runs with -a, so it is excluded there), and one deleted again.
+    printf 'alpha added\nbeta\nalpha and alpha\n' > "$CORPUS/ab.txt"
+    mkdir -p "$CORPUS/new/deep"
+    printf 'first\nalpha deep\n' > "$CORPUS/new/deep/n.txt"
+    printf 'alpha\0binary\n' > "$CORPUS/bin.dat"
+    printf 'alpha gone\n' > "$CORPUS/gone.txt"
+    # tb.txt turned binary: excluded, warned.
+    printf 'alpha new sub\n' > "$CORPUS/sub/new.txt"
+    cp -Rp "$WORK/tree/t" "$CORPUS/sub/t"
+    printf 'alpha now text\n' > "$CORPUS/kb/k.tmp" && mv -f "$CORPUS/kb/k.tmp" "$CORPUS/kb/k.dat"
+    printf 'alpha\0now binary\n' > "$CORPUS/tb.txt"
+    mv "$CORPUS/mw" "$CORPUS/mv2"
+    RG_COMMON=(--no-ignore --no-require-git -a --sort path -g '!bin.dat' -g '!tb.txt')
+    await_watch
+    rm -f "$CORPUS/gone.txt"
+    await_watch
     cases
 fi
 
-echo "pass $OK / fail $FAILED"
+if [[ "$SERVE" == true ]]; then
+    echo "pass $OK / fail $FAILED / served $SERVED"
+else
+    echo "pass $OK / fail $FAILED"
+fi
 exit "$FAIL"

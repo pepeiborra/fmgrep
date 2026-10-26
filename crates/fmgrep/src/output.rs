@@ -13,15 +13,6 @@ use writer::Pipe;
 /// a write failure at exit 1 instead of the argv exit 2.
 pub const WRITE_FAILED: &str = "error: failed to write";
 
-/// rg's `--color`. `Auto` is resolved against the real stdout by
-/// [`crate::run`]; every other entry point is not a terminal.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ColorMode {
-    Auto,
-    Always,
-    Never,
-}
-
 /// What each matching document prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
@@ -62,8 +53,8 @@ const RESET: &str = "\x1b[0m";
 /// Streams one query's matches in rg's formats.
 ///
 /// Relies on the [`MatchSink`] contract that each document arrives exactly
-/// once, ascending: every `doc` call is a new file, so no current-file state
-/// is needed.
+/// once, ascending by path: every `doc` call is a new file, so no
+/// current-file state is needed.
 pub struct MatchWriter<W: Write> {
     pipe: Pipe<W>,
     cfg: OutputConfig,

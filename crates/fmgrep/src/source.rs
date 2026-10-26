@@ -1,14 +1,23 @@
-//! What the files layout knows of each indexed file since indexing: fresh,
-//! stale (scanned in full) or gone (excluded).
+//! What the files layout knows of each file since indexing: fresh, stale
+//! (scanned in full), gone (excluded) or added (not in the manifest; scanned
+//! in full).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+
+use rayon::prelude::*;
 
 use crate::Stamp;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+
+mod added;
+mod recorded;
+
+pub use added::Discovery;
+pub use recorded::{Recorded, write_walk};
 
 /// Per-doc mtimes of a files-layout index, at the index root.
 pub const DOCS_STAMPS: &str = "docs.stamps";
@@ -52,8 +61,16 @@ impl Stamps {
 
     pub fn get(&self, doc: usize) -> i64 {
         let at = doc * 8;
-        let bytes: [u8; 8] = self.map[at..at + 8].try_into().expect("8-byte slot");
-        i64::from_le_bytes(bytes)
+        i64::from_le_bytes(self.map[at..at + 8].try_into().expect("8-byte slot"))
+    }
+
+    /// Whether `meta` still matches doc `doc` of recorded length `len`.
+    fn holds(&self, doc: usize, meta: &std::fs::Metadata, len: u64) -> bool {
+        Stamp::of(meta)
+            == Stamp {
+                len,
+                mtime_ns: self.get(doc),
+            }
     }
 }
 
@@ -79,8 +96,16 @@ struct Known {
     state: Vec<AtomicU8>,
     /// Docs not [`FRESH`].
     changed: AtomicUsize,
-    /// Bumped on every change of kind.
+    /// Bumped on every change of kind, and of the added set.
     epoch: AtomicUsize,
+    /// The index dir, canonical: never an added file.
+    exclude: Option<PathBuf>,
+    added: Mutex<added::Added>,
+    latch: added::Latch,
+    /// Whether discovery found the manifest ascending, which added files
+    /// need.
+    sorted: AtomicBool,
+    recorded: Option<Recorded>,
 }
 
 impl Known {
@@ -120,20 +145,10 @@ impl Known {
 
     /// Stat `id` against its stamp: why it is gone, if it is.
     fn stat(&self, id: usize, files: &[String], lens: &[u64]) -> Option<String> {
-        let want = Stamp {
-            len: lens[id],
-            mtime_ns: self.stamps.get(id),
-        };
         match std::fs::metadata(self.root.join(&files[id])) {
             Ok(meta) => {
-                self.set(
-                    id,
-                    if Stamp::of(&meta) == want {
-                        FRESH
-                    } else {
-                        STALE
-                    },
-                );
+                let fresh = self.stamps.holds(id, &meta, lens[id]);
+                self.set(id, if fresh { FRESH } else { STALE });
                 None
             }
             Err(e) => {
@@ -146,38 +161,56 @@ impl Known {
         }
     }
 
-    /// Stat `ids` (ascending) on up to `threads` threads, then warn about the
-    /// gone ones in order.
-    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64], threads: usize) {
-        let stat = |part: &[usize]| -> Vec<(usize, String)> {
-            part.iter()
-                .filter_map(|&id| self.stat(id, files, lens).map(|why| (id, why)))
-                .collect()
-        };
-        let gone = if ids.len() <= PARALLEL_STAT_MIN || threads <= 1 {
-            stat(ids)
-        } else {
-            let chunk = ids.len().div_ceil(threads);
-            std::thread::scope(|scope| {
-                let workers: Vec<_> = ids
-                    .chunks(chunk)
-                    .map(|part| scope.spawn(move || stat(part)))
-                    .collect();
-                workers
-                    .into_iter()
-                    .flat_map(|w| w.join().expect("stat worker panicked"))
-                    .collect()
-            })
-        };
-        for (id, why) in gone {
-            self.exclude(id, &self.root.join(&files[id]), &why);
+    /// Stat `ids` (ascending), then warn about the gone ones in order, or
+    /// once when over half the docs are.
+    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64]) {
+        let gone = parallel(ids, |&id| self.stat(id, files, lens));
+        let n = gone.iter().flatten().count();
+        if n * 2 > self.state.len() {
+            eprintln!(
+                "warning: excluding {n} of {} indexed files, missing under {}",
+                self.state.len(),
+                self.root.display()
+            );
+        }
+        for (&id, why) in ids.iter().zip(gone) {
+            match why {
+                Some(_) if n * 2 > self.state.len() => {
+                    self.state[id].fetch_or(WARNED, Ordering::AcqRel);
+                }
+                Some(why) => self.exclude(id, &self.root.join(&files[id]), &why),
+                None => {}
+            }
         }
     }
 
     fn stat_all(&self, files: &[String], lens: &[u64]) {
         let ids: Vec<usize> = (0..self.state.len()).collect();
-        self.stat_ids(&ids, files, lens, STAT_THREADS);
+        self.stat_ids(&ids, files, lens);
     }
+}
+
+/// `f` of each item, in order; on a pool of [`STAT_THREADS`] above [`PARALLEL_STAT_MIN`] items.
+fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() > PARALLEL_STAT_MIN
+        && let Ok(pool) = rayon::ThreadPoolBuilder::new()
+            .num_threads(STAT_THREADS)
+            .build()
+    {
+        return pool.install(|| items.par_iter().map(&f).collect());
+    }
+    items.iter().map(f).collect()
+}
+
+/// Docs a query treats apart from the index's answer, each ascending.
+#[derive(Debug, Default, PartialEq)]
+pub struct Snapshot {
+    pub stale: Vec<usize>,
+    pub gone: Vec<usize>,
+    /// Live added docs: `num_docs + slot`.
+    pub added: Vec<usize>,
+    /// Every added slot's path.
+    pub names: Arc<[String]>,
 }
 
 /// The files source: root plus the recorded stamps, and what is known of
@@ -202,8 +235,31 @@ impl Files {
                 state: (0..num_docs).map(|_| AtomicU8::new(FRESH)).collect(),
                 changed: AtomicUsize::new(0),
                 epoch: AtomicUsize::new(0),
+                exclude: None,
+                added: Mutex::default(),
+                latch: added::Latch::default(),
+                sorted: AtomicBool::new(false),
+                recorded: None,
             }),
         })
+    }
+
+    /// Never take `index_dir` for an added file. Before any watch or
+    /// discovery.
+    pub fn exclude(&mut self, index_dir: &Path) {
+        let known = Arc::get_mut(&mut self.known).expect("exclude precedes sharing");
+        known.exclude = index_dir.canonicalize().ok();
+    }
+
+    /// Discover added files from what `index` recorded, not a full walk.
+    /// Before any watch or discovery.
+    pub fn record(&mut self, recorded: Recorded) {
+        let known = Arc::get_mut(&mut self.known).expect("record precedes sharing");
+        known.recorded = Some(recorded);
+    }
+
+    pub fn wait_discovered(&self) {
+        self.known.latch.wait(None);
     }
 
     /// Stat every doc; each newly gone one warns, in doc order.
@@ -221,19 +277,28 @@ impl Files {
         self.known.epoch.load(Ordering::Acquire)
     }
 
-    /// The stale and the gone docs, each ascending.
-    pub fn snapshot(&self) -> (Vec<usize>, Vec<usize>) {
-        let (mut stale, mut gone) = (Vec::new(), Vec::new());
+    pub fn snapshot(&self) -> Snapshot {
+        let mut snap = Snapshot::default();
+        let num_docs = self.known.state.len();
         if self.changed() {
-            for id in 0..self.known.state.len() {
+            for id in 0..num_docs {
                 match self.known.kind(id) {
-                    STALE => stale.push(id),
-                    GONE => gone.push(id),
+                    STALE => snap.stale.push(id),
+                    GONE => snap.gone.push(id),
                     _ => {}
                 }
             }
         }
-        (stale, gone)
+        let mut added = self.known.added();
+        snap.added = added.live().map(|slot| num_docs + slot).collect();
+        snap.names = added.names();
+        snap
+    }
+
+    /// Added doc `doc`'s whole bytes; one now missing, unreadable or binary
+    /// is dropped silently: `None`.
+    pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {
+        self.known.read_added(doc)
     }
 
     /// Doc `doc`'s current bytes: `buf` (its recorded length) filled while
@@ -255,11 +320,7 @@ impl Files {
             Ok(m) => m,
             Err(e) => return failed(e),
         };
-        let want = Stamp {
-            len: buf.len() as u64,
-            mtime_ns: known.stamps.get(doc),
-        };
-        if Stamp::of(&meta) == want {
+        if known.stamps.holds(doc, &meta, buf.len() as u64) {
             return match file.read_exact(&mut buf) {
                 Ok(()) => Some(buf),
                 Err(e) => failed(e),
@@ -299,7 +360,7 @@ impl Files {
     }
 }
 
-/// Filesystem events on the corpus root, re-statting the docs they name.
+/// Filesystem events on the corpus root, re-checking the paths they name.
 pub struct Watch {
     known: Arc<Known>,
     /// Canonical, as events name paths.
@@ -309,9 +370,12 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Re-stat the docs each burst of events names until `stop`; a watcher
-    /// error or overflow re-stats every doc.
+    /// Once discovery is done, re-stat and re-check for added files what each
+    /// burst names, until `stop`; an error, overflow or root event redoes all.
     pub fn run(self, files: &[String], lens: &[u64], stop: &AtomicBool) {
+        if !self.known.latch.wait(Some(stop)) {
+            return;
+        }
         let mut by_path: Vec<usize> = (0..files.len()).collect();
         by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
         while !stop.load(Ordering::Relaxed) {
@@ -323,13 +387,15 @@ impl Watch {
             std::thread::sleep(WATCH_SETTLE);
             let mut all = false;
             let mut ids = Vec::new();
+            let mut named = Vec::new();
             for event in std::iter::once(first).chain(self.events.try_iter()) {
                 match event {
                     Ok(e) if e.need_rescan() => all = true,
                     Ok(e) if matches!(e.kind, EventKind::Access(_)) => {}
                     Ok(e) => {
-                        for path in &e.paths {
-                            all |= self.docs_at(path, files, &by_path, &mut ids);
+                        for path in e.paths {
+                            all |= self.docs_at(&path, files, &by_path, &mut ids);
+                            named.push(path);
                         }
                     }
                     Err(_) => all = true,
@@ -337,10 +403,18 @@ impl Watch {
             }
             if all {
                 self.known.stat_all(files, lens);
+                if self.known.sorted.load(Ordering::Acquire) {
+                    self.known.discover(&self.root, &self.root, files);
+                }
             } else {
                 ids.sort_unstable();
                 ids.dedup();
-                self.known.stat_ids(&ids, files, lens, STAT_THREADS);
+                self.known.stat_ids(&ids, files, lens);
+                named.sort_unstable();
+                named.dedup();
+                for path in &named {
+                    self.known.reconcile_path(&self.root, path, files);
+                }
             }
         }
     }
@@ -379,6 +453,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parallel_keeps_item_order_and_runs_each_item_once() {
+        for len in [0, PARALLEL_STAT_MIN, PARALLEL_STAT_MIN + 1, 1000] {
+            let items: Vec<usize> = (0..len).collect();
+            let runs = AtomicUsize::new(0);
+            let got = parallel(&items, |&i| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                i * 3
+            });
+            assert_eq!(
+                got,
+                items.iter().map(|i| i * 3).collect::<Vec<_>>(),
+                "len={len}"
+            );
+            assert_eq!(runs.into_inner(), len, "len={len}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "boom")]
+    fn a_parallel_panic_resumes_on_the_caller() {
+        let items: Vec<usize> = (0..100).collect();
+        parallel(&items, |&i| assert!(i != 42, "boom"));
+    }
+
+    #[test]
     fn stamps_round_trip_and_size_skew_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         write_stamps(tmp.path(), &[1, -2, i64::MAX]).unwrap();
@@ -397,14 +496,14 @@ mod tests {
     }
 
     /// One file per doc under `<dir>/corpus`, stamped into `<dir>`.
-    struct Fix {
-        path: PathBuf,
+    pub(super) struct Fix {
+        pub(super) path: PathBuf,
         index: PathBuf,
-        files: Vec<String>,
-        lens: Vec<u64>,
+        pub(super) files: Vec<String>,
+        pub(super) lens: Vec<u64>,
     }
 
-    fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
+    pub(super) fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
         let path = dir.join("corpus");
         std::fs::create_dir_all(&path).unwrap();
         let files: Vec<String> = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
@@ -422,7 +521,7 @@ mod tests {
         }
     }
 
-    fn open_files(fix: &Fix) -> Files {
+    pub(super) fn open_files(fix: &Fix) -> Files {
         let stamps = Stamps::open(&fix.index, fix.lens.len()).unwrap();
         Files::open(fix.path.clone(), stamps, fix.lens.len()).unwrap()
     }
@@ -439,6 +538,11 @@ mod tests {
         }
     }
 
+    fn stale_gone(files: &Files) -> (Vec<usize>, Vec<usize>) {
+        let snap = files.snapshot();
+        (snap.stale, snap.gone)
+    }
+
     #[test]
     fn stat_all_finds_stale_and_gone_and_warns_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -449,7 +553,7 @@ mod tests {
         assert!(!files.changed(), "nothing is statted at open");
         files.stat_all(&fix.files, &fix.lens);
         assert_eq!(files.kinds(), [FRESH, STALE, GONE]);
-        assert_eq!(files.snapshot(), (vec![1], vec![2]));
+        assert_eq!(stale_gone(&files), (vec![1], vec![2]));
         assert!(files.changed() && files.warned(2) && !files.warned(1));
     }
 
@@ -466,7 +570,7 @@ mod tests {
         std::fs::write(path(150), b"changed!!").unwrap();
         std::fs::remove_file(path(7)).unwrap();
         files.stat_all(&fix.files, &fix.lens);
-        assert_eq!(files.snapshot(), (vec![150], vec![7]));
+        assert_eq!(stale_gone(&files), (vec![150], vec![7]));
         // A reappearing file is stale; one matching its stamp again is fresh.
         std::fs::write(path(7), b"back").unwrap();
         let old = std::fs::File::options()
@@ -481,7 +585,7 @@ mod tests {
         )
         .unwrap();
         files.stat_all(&fix.files, &fix.lens);
-        assert_eq!(files.snapshot(), (vec![7], vec![]));
+        assert_eq!(stale_gone(&files), (vec![7], vec![]));
         assert_eq!(files.known.changed.load(Ordering::Acquire), 1);
     }
 
@@ -504,7 +608,7 @@ mod tests {
     }
 
     /// Wait up to 60 s for `done`: a loaded box can hold events that long.
-    fn eventually(done: impl Fn() -> bool) -> bool {
+    pub(super) fn eventually(done: impl Fn() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while std::time::Instant::now() < deadline {
             if done() {
@@ -517,7 +621,7 @@ mod tests {
 
     /// Stops the watcher when dropped, so a failed assertion inside the
     /// scope fails instead of joining the watcher forever.
-    struct StopOnDrop<'a>(&'a AtomicBool);
+    pub(super) struct StopOnDrop<'a>(pub(super) &'a AtomicBool);
 
     impl Drop for StopOnDrop<'_> {
         fn drop(&mut self) {
@@ -542,11 +646,11 @@ mod tests {
             // the write repeats until one is seen.
             let changed = || {
                 std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
-                files.snapshot().0 == [1]
+                files.snapshot().stale == [1]
             };
             assert!(eventually(changed), "{}", saw());
             std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
-            assert!(eventually(|| files.snapshot().1 == [2]), "{}", saw());
+            assert!(eventually(|| files.snapshot().gone == [2]), "{}", saw());
         });
     }
 

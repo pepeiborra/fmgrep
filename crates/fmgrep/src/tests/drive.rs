@@ -18,11 +18,7 @@ fn regex_marker_runs_every_term_as_pattern_verbatim() {
         assert_eq!(out.queries[1].total_matches, 2, "store_docs={store_docs}");
         // Non-overlapping: `aa` on `aaaa` is 2.
         assert_eq!(out.queries[2].total_matches, 2, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[2].docs_matched,
-            Some(1),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[2].docs_matched, 1, "store_docs={store_docs}");
     }
 }
 
@@ -82,7 +78,7 @@ fn literal_query_needs_no_raw_bytes() {
         ],
         [2, 0, 1]
     );
-    assert_eq!(out.queries[0].docs_matched, Some(1));
+    assert_eq!(out.queries[0].docs_matched, 1);
     assert_eq!(out.num_files_indexed, 2);
     std::fs::rename(output.join(DOCS_SHARD), output.join("hidden")).unwrap();
     assert_eq!(
@@ -108,7 +104,7 @@ fn regex_fetches_only_unpruned_candidates() {
     index_it(&folder, &output, true);
     let out = query_it(&output, true, &["printk", "pr[i1]ntk", "missing"]);
     assert_eq!(out.queries[0].total_matches, 2);
-    assert_eq!(out.queries[0].docs_matched, Some(1));
+    assert_eq!(out.queries[0].docs_matched, 1);
     assert_eq!(out.queries[1].total_matches, 2);
     assert_eq!(out.queries[2].total_matches, 0);
     std::fs::rename(output.join(DOCS_SHARD), output.join("hidden")).unwrap();
@@ -174,10 +170,7 @@ fn literal_pattern_counts_without_fetch() {
     let out = query_it(&output, false, &["/printk\\(/"]);
     let q = &out.queries[0];
     assert_eq!(q.total_matches, per_doc.iter().sum::<u64>());
-    assert_eq!(
-        q.docs_matched,
-        Some(per_doc.iter().filter(|&&c| c > 0).count())
-    );
+    assert_eq!(q.docs_matched, per_doc.iter().filter(|&&c| c > 0).count());
     assert!(!q.counts_exact);
     // A stored-docs index keeps reading its live docs.shard.
     std::fs::rename(shard.join(DOCS_SHARD), shard.join("hidden")).unwrap();
@@ -197,10 +190,7 @@ fn non_literal_patterns_still_fetch() {
             "{term:?}"
         );
     }
-    let words = argv(&["--index", &output.display().to_string(), "-i", "--", "caf"]);
-    let Ok(Outcome::Query(out)) = dispatch(&cli_spec(), &words) else {
-        panic!("expected a query report");
-    };
+    let out = query(&output, &["-i"], &["caf"]).unwrap();
     assert_eq!(out.queries[0].total_matches, 0, "-i must fetch");
 }
 
@@ -226,7 +216,7 @@ fn empty_docs_index_and_query_exactly() {
             "store_docs={store_docs}"
         );
         let manifest = read_manifest(&output).unwrap();
-        assert_eq!(manifest.num_files_indexed, 4, "store_docs={store_docs}");
+        assert_eq!(manifest.num_docs, 4, "store_docs={store_docs}");
         // Discovery sorts by relative path: the empties land at slots 2-3.
         assert_eq!(
             manifest.doc_lens,
@@ -240,11 +230,7 @@ fn empty_docs_index_and_query_exactly() {
         );
         let out = query_it(&output, false, &["printk", "missing"]);
         assert_eq!(out.queries[0].total_matches, 2, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(1),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 1, "store_docs={store_docs}");
         assert_eq!(out.queries[1].total_matches, 0, "store_docs={store_docs}");
         assert_eq!(out.num_files_indexed, 4, "store_docs={store_docs}");
         let out = query_it(&output, true, &["pr[i1]ntk"]);
@@ -297,21 +283,21 @@ fn coverage_skew_refuses_to_report() {
     let path = output.join("manifest.json");
     let mut v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    v["num_files_indexed"] = serde_json::json!(7);
+    v["num_docs"] = serde_json::json!(7);
     std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
     let err = query_it_err(&output, false, &["hello"]);
     assert!(err.contains("refusing to report skew"), "got: {err}");
 }
 
 #[test]
-fn foreign_engine_manifest_is_refused_by_name() {
+fn old_format_manifest_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("manifest.json"),
         serde_json::to_string(&serde_json::json!({
-            "format": crate::manifest::MANIFEST_FORMAT,
-            "engine": "other", "store_docs": true,
-            "index_name": "other", "num_docs": 0, "num_files_indexed": 0,
+            "format": 1,
+            "engine": "fmgrep", "store_docs": true,
+            "index_name": "fmgrep", "num_docs": 0, "num_files_indexed": 0,
             "num_bytes": 0, "bom_bytes": 0, "index_size_bytes": 0,
             "build_time_us": 0, "files": [], "blobs": [], "doc_lens": [],
             "blob_lens": [],
@@ -322,7 +308,7 @@ fn foreign_engine_manifest_is_refused_by_name() {
     std::fs::write(tmp.path().join(BLOBS_SHARD), b"").unwrap();
     let err = query_it_err(tmp.path(), false, &["printk"]);
     assert!(
-        err.contains("was written by \"other\", not fmgrep"),
+        err.contains("unsupported manifest format 1") && err.contains("re-run `index`"),
         "got: {err}"
     );
 }
@@ -386,8 +372,7 @@ fn batch_drive_matches_per_term_answers() {
                 "store_docs={store_docs} {term}"
             );
             assert_eq!(
-                out.queries[i].docs_matched,
-                Some(docs),
+                out.queries[i].docs_matched, docs,
                 "store_docs={store_docs} {term}"
             );
         }
@@ -407,17 +392,9 @@ fn ignore_case_runs_every_term_as_a_pattern() {
         );
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let mut words = argv(&["--index", &output.display().to_string(), "-i", "--"]);
-        words.extend(["hscenv", "h.c"].iter().map(|t| t.to_string()));
-        let Outcome::Query(out) = dispatch(&cli_spec(), &words).unwrap() else {
-            panic!("expected a query report");
-        };
+        let out = query(&output, &["-i"], &["hscenv", "h.c"]).unwrap();
         assert_eq!(out.queries[0].total_matches, 3, "store_docs={store_docs}");
-        assert_eq!(
-            out.queries[0].docs_matched,
-            Some(2),
-            "store_docs={store_docs}"
-        );
+        assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
         // `.` stays literal, so `h.c` matches the text `h.c` only.
         assert_eq!(out.queries[1].total_matches, 1, "store_docs={store_docs}");
         // Counts under `-i` are the regex's, never the FM-index's literal
@@ -427,20 +404,15 @@ fn ignore_case_runs_every_term_as_a_pattern() {
 }
 
 /// `-i` must not change which argv is accepted: the empty bare term still
-/// matches nothing and exits 0, as it does without `-i`.
+/// matches nothing, as it does without `-i`.
 #[test]
 fn ignore_case_keeps_the_empty_term_matching_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(tmp.path(), &[("a.c", b"HscEnv\n")]);
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    for flags in [vec!["--"], vec!["-i", "--"]] {
-        let mut words = argv(&["--index", &output.display().to_string()]);
-        words.extend(flags.iter().map(|f| f.to_string()));
-        words.push(String::new());
-        let Outcome::Query(out) = dispatch(&cli_spec(), &words).unwrap() else {
-            panic!("expected a query report");
-        };
+    for flags in [&[][..], &["-i"]] {
+        let out = query(&output, flags, &[""]).unwrap();
         assert_eq!(out.queries[0].total_matches, 0, "flags={flags:?}");
     }
 }
@@ -456,21 +428,10 @@ fn files_index(tmp: &Path) -> (PathBuf, PathBuf) {
     (folder, output)
 }
 
-/// `<flags> -- <terms>` as the CLI prints it.
-fn printed(index: &Path, flags: &[&str], terms: &[&str]) -> String {
-    let mut words = argv(&["--index", &index.display().to_string()]);
-    words.extend(argv(flags));
-    words.push("--".into());
-    words.extend(argv(terms));
-    let mut out = Vec::new();
-    crate::cli::dispatch_to(&cli_spec(), &words, &mut &b""[..], &mut out, false).unwrap();
-    String::from_utf8(out).unwrap()
-}
-
 fn totals(r: &OutputReport) -> Vec<(u64, usize, bool)> {
     r.queries
         .iter()
-        .map(|q| (q.total_matches, q.docs_matched.unwrap(), q.counts_exact))
+        .map(|q| (q.total_matches, q.docs_matched, q.counts_exact))
         .collect()
 }
 
@@ -562,6 +523,152 @@ fn stale_tree_answers_like_a_fresh_index() {
 }
 
 #[test]
+fn added_tree_answers_like_a_fresh_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[
+            ("a.c", b"printk one\n"),
+            ("c.c", b"aaaa printk\n"),
+            ("d.c", b"printk gone\n"),
+            ("e.c", b"printk kept\naaa\n"),
+        ],
+    );
+    let stale = tmp.path().join("idx");
+    index_it(&folder, &stale, false);
+    std::fs::write(folder.join("b.c"), b"printk added\nprintk printk aa\n").unwrap();
+    std::fs::create_dir_all(folder.join("new/deep")).unwrap();
+    std::fs::write(folder.join("new/deep/n.c"), b"deep printk\n").unwrap();
+    std::fs::write(folder.join("bin.dat"), b"printk\0").unwrap();
+    std::fs::write(folder.join("gone.c"), b"printk\n").unwrap();
+    std::fs::remove_file(folder.join("gone.c")).unwrap();
+    std::fs::remove_file(folder.join("d.c")).unwrap();
+    std::fs::write(folder.join("d.c"), b"back printk printk\n").unwrap();
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
+    assert_eq!(
+        totals(&query_it(&stale, false, &terms)),
+        totals(&query_it(&fresh, false, &terms))
+    );
+    for flags in [
+        &["-c"][..],
+        &["--count-matches"],
+        &["-l"],
+        &["--matches"],
+        &["-o", "-C", "1"],
+    ] {
+        for term in ["printk", "/pr[i1]ntk/", "aa"] {
+            assert_eq!(
+                printed(&stale, flags, &[term]),
+                printed(&fresh, flags, &[term]),
+                "{flags:?} {term}"
+            );
+        }
+    }
+    assert_eq!(
+        printed(&stale, &["-l"], &["printk"]),
+        "a.c\nb.c\nc.c\nd.c\ne.c\nnew/deep/n.c\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pruned_added_tree_answers_like_a_fresh_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    let put = |root: &Path, rel: &str, bytes: &[u8]| {
+        std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(root.join(rel), bytes).unwrap();
+    };
+    for (rel, bytes) in [
+        ("a.c", &b"printk one\n"[..]),
+        ("d.c", b"printk gone\n"),
+        ("kb/k.dat", b"printk\0binary"),
+        ("mw/m.c", b"printk moved\n"),
+        ("sub/c.c", b"aaaa printk\n"),
+        ("tb.c", b"printk text\n"),
+    ] {
+        put(&folder, rel, bytes);
+    }
+    let tree = tmp.path().join("tree");
+    put(&tree, "t/deep/x.c", b"deep printk\n");
+    put(&tree, "t/y.c", b"printk aa\n");
+    backdate(&folder);
+    backdate(&tree);
+    let stale = tmp.path().join("idx");
+    index_it(&folder, &stale, false);
+    let recorded = crate::source::Recorded::open(&stale).unwrap();
+    assert!(recorded.is_some_and(|r| r.is_dir("kb")));
+    put(&folder, "sub/new.c", b"printk new\n");
+    put(&folder, "b.c", b"printk added\nprintk printk aa\n");
+    put(&folder, "new/deep/n.c", b"deep printk\n");
+    std::fs::rename(tree.join("t"), folder.join("sub/t")).unwrap();
+    std::fs::write(folder.join("kb/k.dat"), b"printk text now\n").unwrap();
+    set_mtime(&folder.join("kb"), T0 + std::time::Duration::from_secs(1));
+    std::fs::write(folder.join("tb.c"), b"printk\0now binary").unwrap();
+    std::fs::rename(folder.join("mw"), folder.join("mv2")).unwrap();
+    put(&folder, "gone.c", b"printk\n");
+    std::fs::remove_file(folder.join("gone.c")).unwrap();
+    std::fs::remove_file(folder.join("d.c")).unwrap();
+    let want = "a.c\nb.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nsub/c.c\nsub/new.c\nsub/t/deep/x.c\nsub/t/y.c\n";
+    assert_eq!(
+        printed(&stale, &["-l"], &["printk"]),
+        want,
+        "kb/k.dat, turned text, is found"
+    );
+    std::fs::write(folder.join("kb/k.dat"), b"printk\0binary").unwrap();
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
+    assert_eq!(
+        totals(&query_it(&stale, false, &terms)),
+        totals(&query_it(&fresh, false, &terms))
+    );
+    for flags in [
+        &["-c"][..],
+        &["--count-matches"],
+        &["-l"],
+        &["--matches"],
+        &["-o", "-C", "1"],
+    ] {
+        for term in ["printk", "/pr[i1]ntk/", "aa", "deep", "now"] {
+            assert_eq!(
+                printed(&stale, flags, &[term]),
+                printed(&fresh, flags, &[term]),
+                "{flags:?} {term}"
+            );
+        }
+    }
+}
+
+#[test]
+fn walk_record_missing_falls_back_and_malformed_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (folder, output) = files_index(tmp.path());
+    std::fs::create_dir(folder.join("sub")).unwrap();
+    std::fs::write(folder.join("sub/x.c"), b"printk added").unwrap();
+    std::fs::remove_file(output.join("dirs.stamps")).unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nsub/x.c\n");
+    std::fs::write(output.join("dirs.stamps"), b"fmdirs\0\x01\x01").unwrap();
+    let err = query_it_err(&output, false, &["printk"]);
+    assert!(
+        err.contains("dirs.stamps") && err.contains("tampered"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn index_dir_under_root_is_not_an_added_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &[("a.c", b"printk\n")]);
+    let output = folder.join("idx");
+    index_it(&folder, &output, false);
+    let got = totals(&query_it(&output, false, &["corpus_root", "printk"]));
+    assert_eq!(got.iter().map(|t| t.1).collect::<Vec<_>>(), [0, 1]);
+}
+
+#[test]
 fn files_index_answers_like_the_stored_docs_index() {
     let tmp = tempfile::tempdir().unwrap();
     let (folder, output) = files_index(tmp.path());
@@ -578,6 +685,8 @@ fn files_index_answers_like_the_stored_docs_index() {
         counts(query_it(&output, false, &terms)),
         counts(query_it(&shard, false, &terms))
     );
+    let blobs = |dir: &Path| std::fs::read(dir.join(BLOBS_SHARD)).unwrap();
+    assert_eq!(blobs(&output), blobs(&shard));
 }
 
 #[test]

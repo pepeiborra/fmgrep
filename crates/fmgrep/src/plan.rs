@@ -14,7 +14,11 @@ const DEFAULT_SHARD_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Shard cap for `index`, from `FMGREP_SHARD_BYTES`.
 pub fn shard_bytes() -> Result<u64, String> {
-    crate::bytes::env_bytes(SHARD_BYTES_VAR, DEFAULT_SHARD_BYTES)
+    #[cfg(test)]
+    if let Some(cap) = crate::tests::SHARD_BYTES.get() {
+        return Ok(cap);
+    }
+    crate::env::bytes(SHARD_BYTES_VAR, DEFAULT_SHARD_BYTES)
 }
 
 /// The split, one document at a time: [`Cutter::push`] closes a shard the

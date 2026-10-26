@@ -5,12 +5,9 @@
 //! included. Every alternative is a whole byte string, so no branch is a
 //! partial UTF-8 sequence. Budgets widen as in [`crate::automaton`].
 
-use std::sync::OnceLock;
-
 use crate::UNIFIED_SEPARATOR;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
-use crate::budget;
 use crate::cursor::{BackwardCursor, LocatingCursor};
 
 /// Widest fold class one position may carry. Anything wider is not a
@@ -21,22 +18,7 @@ const MAX_STEP_ALTS: usize = 8;
 const MAX_STEPS: usize = 64;
 
 /// Live intervals a walk holds before it gives up and widens.
-const DEFAULT_MAX_LIVE: usize = 256;
-
-const FOLD_VAR: &str = "FMGREP_FOLD";
-const MAX_LIVE_VAR: &str = "FMGREP_FOLD_MAX_LIVE";
-
-/// Whether `-i` may plan a fold search at all; `FMGREP_FOLD=off` is the
-/// measurement's control arm.
-fn planning_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| !budget::flag(FOLD_VAR, "off"))
-}
-
-fn max_live() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| budget::count(MAX_LIVE_VAR, DEFAULT_MAX_LIVE))
-}
+const MAX_LIVE: usize = 256;
 
 /// A case-folded term as a branching backward search: one step per pattern
 /// position, in text order, each step the byte strings a match may carry
@@ -109,9 +91,6 @@ fn collect(hir: &Hir, steps: &mut Vec<Vec<Box<[u8]>>>) -> Option<()> {
 /// and small classes; `None` for any other shape, an over-wide class, an
 /// over-long term, or any alternative holding [`UNIFIED_SEPARATOR`].
 pub fn fold_plan(hir: &Hir) -> Option<FoldPlan> {
-    if !planning_enabled() {
-        return None;
-    }
     let mut steps = Vec::new();
     collect(hir, &mut steps)?;
     if steps.is_empty() || steps.len() > MAX_STEPS {
@@ -178,7 +157,7 @@ fn fold_any_capped<C: BackwardCursor>(root: C, plan: &FoldPlan, cap: usize) -> O
 /// was hit. Each surviving interval is a whole match, so no term is searched
 /// a second time.
 pub fn fold_locate<C: LocatingCursor>(root: C, plan: &FoldPlan) -> Option<Vec<usize>> {
-    fold_locate_capped(root, plan, max_live())
+    fold_locate_capped(root, plan, MAX_LIVE)
 }
 
 fn fold_locate_capped<C: LocatingCursor>(

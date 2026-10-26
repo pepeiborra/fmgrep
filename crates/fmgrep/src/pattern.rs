@@ -1,40 +1,10 @@
 use crate::{RegexError, UNIFIED_SEPARATOR};
 
-use crate::automaton::{DeferredPlan, RegexPlan, max_anchor, regex_plan};
+use crate::automaton::{DeferredPlan, MAX_ANCHOR, RegexPlan, regex_plan};
 use crate::fold::{FoldPlan, fold_plan};
 use crate::matching::MatchMode;
 
-/// Count (possibly overlapping) occurrences of `needle` in `haystack`.
-///
-/// Used where the FM-index cannot answer (NUL-containing literal terms) and
-/// by build-time locate self-checks.
-pub fn count_occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return 0;
-    }
-    if needle.len() == 1 {
-        return memchr::memchr_iter(needle[0], haystack).count() as u64;
-    }
-    let mut count = 0u64;
-    let mut start = 0usize;
-    while start + needle.len() <= haystack.len() {
-        let Some(rel) = memchr::memchr(needle[0], &haystack[start..]) else {
-            break;
-        };
-        let pos = start + rel;
-        if pos + needle.len() > haystack.len() {
-            break;
-        }
-        if &haystack[pos..pos + needle.len()] == needle {
-            count += 1;
-        }
-        // Advance by 1: overlapping, so `aa` in `aaaa` counts 3.
-        start = pos + 1;
-    }
-    count
-}
-
-/// [`count_occurrences`] of `finder`'s needle, by SIMD search.
+/// Overlapping occurrences of `finder`'s needle; an empty needle counts 0.
 pub fn count_overlapping(haystack: &[u8], finder: &memchr::memmem::Finder<'_>) -> u64 {
     if finder.needle().is_empty() {
         return 0;
@@ -192,7 +162,7 @@ impl PreparedPattern {
             .as_ref()
             .filter(|_| mode.ignore_case)
             .and_then(fold_plan);
-        let short = anchor.as_ref().map_or(0, Vec::len) <= max_anchor();
+        let short = anchor.as_ref().map_or(0, Vec::len) <= MAX_ANCHOR;
         let automaton = hir
             .as_ref()
             .filter(|_| fold.is_none() && short)
@@ -218,7 +188,7 @@ impl PreparedPattern {
     }
 
     /// The plan every shard walks: built at prepare time for an anchor of at
-    /// most [`max_anchor`] bytes.
+    /// most [`MAX_ANCHOR`] bytes.
     pub fn automaton(&self) -> Option<&RegexPlan> {
         self.automaton.as_ref()
     }
@@ -458,34 +428,15 @@ mod tests {
     fn count_is_non_overlapping_while_occurrences_overlap() {
         let prepared = PreparedPattern::prepare("aa").unwrap();
         assert_eq!(prepared.count(b"aaaa"), 2);
-        assert_eq!(count_occurrences(b"aaaa", b"aa"), 3);
-        assert_eq!(count_occurrences(b"aaaa", b"a"), 4);
-        assert_eq!(count_occurrences(b"", b"a"), 0);
-        assert_eq!(count_occurrences(b"a", b""), 0);
-        assert_eq!(count_occurrences(b"ab", b"abc"), 0);
-    }
-
-    #[test]
-    fn count_overlapping_equals_count_occurrences() {
-        let hay = b"aaaa abab aba printk\nprintkprintk\0a";
-        for needle in [
-            &b"aa"[..],
-            b"a",
-            b"",
-            b"aba",
-            b"printk",
-            b"kp",
-            b"\0a",
-            b"missing",
-            hay,
-        ] {
-            let finder = memchr::memmem::Finder::new(needle);
-            assert_eq!(
-                count_overlapping(hay, &finder),
-                count_occurrences(hay, needle),
-                "{needle:?}"
-            );
-            assert_eq!(count_overlapping(b"", &finder), 0);
-        }
+        let n = |hay: &[u8], needle: &[u8]| {
+            count_overlapping(hay, &memchr::memmem::Finder::new(needle))
+        };
+        assert_eq!(n(b"aaaa", b"aa"), 3);
+        assert_eq!(n(b"aaaa", b"a"), 4);
+        assert_eq!(n(b"", b"a"), 0);
+        assert_eq!(n(b"a", b""), 0);
+        assert_eq!(n(b"ab", b"abc"), 0);
+        assert_eq!(n(b"printk\nprintkprintk\0a", b"kp"), 1);
+        assert_eq!(n(b"aba\0a\0a", b"\0a"), 2);
     }
 }

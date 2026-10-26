@@ -528,6 +528,22 @@ fn emit_error_aborts_the_query_loudly() {
 }
 
 #[test]
+#[should_panic(expected = "boom")]
+fn a_map_panic_resumes_on_the_caller() {
+    let n = 2 * FETCH_STREAM_BATCH;
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_many(tmp.path(), n);
+    let ids: Vec<usize> = (0..n).collect();
+    let mut shard = reader(&fix);
+    let _ = fetch_map_parallel(&mut shard, &fix, &ids, 8, |doc, raw| {
+        if doc == FETCH_STREAM_BATCH + 7 {
+            panic!("boom");
+        }
+        raw.len()
+    });
+}
+
+#[test]
 fn cached_empty_and_ranged_docs_emit_in_doc_order() {
     // Docs 1 and 4 are empty, doc 0 and 3 are pre-cached: a plan mixing all
     // three slot kinds emits ascending and leaves a pure-range run's state.
@@ -689,4 +705,99 @@ fn empty_recorded_doc_that_grew_is_read() {
     std::fs::write(fix.path.join(&fix.files[0]), b"printk").unwrap();
     let mut store = loaded(&fix);
     assert_eq!(bytes_of(&mut store, &fix, &[0]).unwrap(), [b"printk"]);
+}
+
+/// A files-source store with `added` written under the root and discovered.
+fn discovered(fix: &Fix, added: &[(&str, &[u8])]) -> DocStore {
+    for (rel, bytes) in added {
+        std::fs::write(fix.path.join(rel), bytes).unwrap();
+    }
+    let mut store = reader(fix);
+    store.stat_all(&fix.files);
+    store
+        .discovery()
+        .unwrap()
+        .run(&fix.files, &std::sync::atomic::AtomicBool::new(false));
+    store.begin();
+    store
+}
+
+#[test]
+fn added_docs_stream_in_path_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"zero", b"one", b"two"]);
+    let added: [(&str, &[u8]); 4] = [
+        ("a.c", b"A"),
+        ("d0000a.c", b"between"),
+        ("e.c", b"last"),
+        ("bin.c", b"\0"),
+    ];
+    let mut store = discovered(&fix, &added);
+    assert_eq!(store.stale(), [3, 4, 5]);
+    assert!(
+        store.changed().is_empty(),
+        "the screen never sees an added doc"
+    );
+    let mut ids = vec![0, 1, 2, 3, 4, 5];
+    store.paths(&fix.files).sort(&mut ids);
+    assert_eq!(ids, [3, 0, 4, 1, 2, 5]);
+    let got = bytes_of(&mut store, &fix, &ids).unwrap();
+    assert_eq!(
+        got,
+        [&b"A"[..], b"zero", b"between", b"one", b"two", b"last"]
+    );
+}
+
+#[test]
+fn added_doc_is_read_whole_and_cached_across_terms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    let mut store = discovered(&fix, &[("e.c", b"added printk")]);
+    store.max_cached_bytes = 0;
+    for _ in 0..3 {
+        assert_eq!(
+            bytes_of(&mut store, &fix, &[0, 1]).unwrap(),
+            [&b"printk"[..], b"added printk"]
+        );
+    }
+    assert_eq!(
+        (store.fetches(), store.hits()),
+        (4, 2),
+        "doc 0 re-read per term, doc 1 once"
+    );
+    std::fs::remove_file(fix.path.join("e.c")).unwrap();
+    store.begin();
+    assert_eq!(
+        bytes_of(&mut store, &fix, &[0, 1]).unwrap(),
+        [b"printk"],
+        "a missing added doc is skipped"
+    );
+    store.begin();
+    assert!(store.stale().is_empty());
+    assert!(
+        bytes_of(&mut store, &fix, &[1])
+            .unwrap_err()
+            .contains("out of range")
+    );
+}
+
+#[test]
+fn paths_cmp_orders_added_ids_among_manifest_ids() {
+    let files: Vec<String> = ["b", "d"].map(String::from).to_vec();
+    let paths = Paths {
+        files: &files,
+        added: ["a", "c", "e"].map(String::from).into(),
+    };
+    assert_eq!(
+        [paths.path(1), paths.path(2), paths.path(4), paths.path(5)],
+        [Some("d"), Some("a"), Some("e"), None]
+    );
+    assert!(paths.cmp(0, 1).is_lt() && paths.cmp(2, 0).is_lt());
+    assert!(paths.cmp(3, 1).is_lt() && paths.cmp(4, 1).is_gt());
+    let mut ids = vec![0, 1, 2, 3, 4];
+    paths.sort(&mut ids);
+    assert_eq!(ids, [2, 0, 3, 1, 4]);
+    let mut manifest_only = vec![0, 1];
+    paths.sort(&mut manifest_only);
+    assert_eq!(manifest_only, [0, 1]);
 }

@@ -2,8 +2,9 @@
 
 A stand-alone byte-alphabet FM-index for document search: counts by backward
 search, the document of each occurrence from doc ids sampled per row. Its
-one dependency is `libsais`, for BWT construction with aux rows; libsais
-runs single-threaded and the other build phases use std threads.
+dependencies are `libsais`, for BWT construction with aux rows, and
+`rayon`: libsais runs single-threaded and the other build phases run on the
+caller's rayon pool.
 
 The text is documents, each followed by one `DOC_END` (0x00). A row is
 sampled when its text position is a multiple of the sample rate or starts a

@@ -2,14 +2,28 @@ use libsais::BwtConstruction;
 use libsais::bwt::AuxIndicesSamplingRate;
 
 use crate::layout::{HEADER_BYTES, Header};
-use crate::occ::write_occ;
-use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks, par};
-
-/// Texts below this build on one thread.
-const PAR_MIN_BYTES: usize = 1 << 16;
+use crate::occ::{SUPER, write_occ};
+use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks};
 
 /// Bounds the LF steps from an aux row to a sampled position.
 const MAX_AUX_RATE: usize = 64;
+
+/// `f` of every item, one job per item on the current rayon pool; a lone
+/// item runs inline. `f` runs no parallel work, so no thread ever waits
+/// inside a job.
+pub fn each<I: Send>(items: impl IntoIterator<Item = I>, f: impl Fn(I) + Sync) {
+    let mut items = items.into_iter().peekable();
+    let Some(first) = items.next() else { return };
+    if items.peek().is_none() {
+        return f(first);
+    }
+    let f = &f;
+    rayon::in_place_scope(|scope| {
+        for item in std::iter::once(first).chain(items) {
+            scope.spawn(move |_| f(item));
+        }
+    });
+}
 
 pub fn check_len(len: usize) -> Result<(), Error> {
     if len as u64 > MAX_TEXT_BYTES {
@@ -18,11 +32,11 @@ pub fn check_len(len: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// The blob of `text`, independent of `threads`: libsais runs on one thread,
-/// the other phases on up to `threads`. Peak live heap: the text (replaced
-/// by the BWT), libsais's `i32` temporary array and the aux rows. Each
-/// document start costs fewer than the aux rate in LF steps.
-pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<u8>, Error> {
+/// The blob of `text`: libsais runs on one thread, the other phases in
+/// `SUPER`-byte units on the current rayon pool. Peak live heap: the text
+/// (replaced by the BWT), libsais's `i32` temporary array and the aux rows.
+/// Each document start costs fewer than the aux rate in LF steps.
+pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
     check_len(text.len())?;
     if sample_rate == 0 {
         return Err(Error::ZeroSampleRate);
@@ -31,7 +45,6 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<
         return Err(Error::Unterminated);
     }
     let n = text.len();
-    let threads = if n < PAR_MIN_BYTES { 1 } else { threads.max(1) };
     let mut counts = [0usize; 256];
     let mut starts = if n == 0 { vec![] } else { vec![0u32] };
     for (p, &b) in text.iter().enumerate() {
@@ -55,9 +68,8 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<
         }
     }
     c[sigma] = row as u32;
-    let per = par::chunk_len(n, threads);
     // Order-preserving, so the suffix order is the original text's.
-    par::map(text.chunks_mut(per).collect(), |chunk| {
+    each(text.chunks_mut(SUPER), |chunk| {
         for b in chunk {
             *b = code_of[usize::from(*b)];
         }
@@ -87,7 +99,7 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<
         num_samples,
     );
     let mut out = vec![0u8; header.blob_len];
-    write_occ(&text, &header, &mut out, threads);
+    write_occ(&text, &header, &mut out);
     drop(text);
 
     let view = View {
@@ -103,12 +115,9 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<
         }
         row as u64
     };
-    let spans: Vec<_> = (0..n)
-        .step_by(per)
-        .map(|lo| lo..(lo + per).min(n))
-        .collect();
-    // `row << 32 | doc` for each sampled position.
-    let found = par::map(spans, |span| {
+    // `row << 32 | doc` for each sampled position of unit `i`.
+    let sampled = |i: usize| {
+        let span = i * SUPER..(i * SUPER + SUPER).min(n);
         let first = starts.partition_point(|&s| s as usize <= span.start) - 1;
         let mut found = Vec::with_capacity(span.len() / rate + 1);
         for (doc, &s) in starts.iter().enumerate().skip(first) {
@@ -128,9 +137,11 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Vec<
             );
         }
         found
-    });
+    };
+    let mut units = vec![Vec::new(); n.div_ceil(SUPER)];
+    each(units.iter_mut().enumerate(), |(i, unit)| *unit = sampled(i));
+    let mut found = units.concat();
     drop(aux);
-    let mut found: Vec<u64> = found.into_iter().flatten().collect();
     found.sort_unstable();
     debug_assert_eq!(found.len(), num_samples);
 

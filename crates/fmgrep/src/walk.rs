@@ -2,8 +2,9 @@
 //! the bench harness.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
+
+use rayon::prelude::*;
 
 use crate::binary::is_binary_doc;
 use crate::unified::UNIFIED_SEPARATOR;
@@ -13,19 +14,16 @@ use crate::verbose::verbose;
 /// of huge files cannot raise the walk's peak.
 const READ_BATCH_DOCS: usize = 64;
 const READ_BATCH_BYTES: u64 = 32 << 20;
-/// Reads are latency-bound, not CPU-bound, so the default is capped low.
+/// Reads are latency-bound, not CPU-bound, so the count is capped low.
 const MAX_READ_THREADS: usize = 8;
-const READ_THREADS_VAR: &str = "FMGREP_READ_THREADS";
 
-/// Document reads in flight, from `FMGREP_READ_THREADS`; junk or zero takes
-/// the default.
-fn read_threads() -> usize {
-    let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
-    std::env::var(READ_THREADS_VAR)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| machine.min(MAX_READ_THREADS))
+/// A pool of up to [`MAX_READ_THREADS`] threads for document reads.
+pub fn read_pool() -> Result<rayon::ThreadPool, String> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_READ_THREADS));
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|e| format!("error: cannot start read threads: {e}"))
 }
 
 /// An indexable document and its bytes.
@@ -74,7 +72,7 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Bytes-free descriptor of one indexable document; its id is its position
-/// in [`Corpus::docs`].
+/// in [`discover_index_meta`]'s list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocMeta {
     /// `/`-separated path relative to the corpus root, lossy-decoded. The
@@ -84,28 +82,12 @@ pub struct DocMeta {
     pub len: u64,
 }
 
-/// A corpus the runner describes but never holds: root plus descriptors.
-#[derive(Debug, Clone, Copy)]
-pub struct Corpus<'a> {
-    pub root: &'a Path,
-    pub docs: &'a [DocMeta],
-}
-
-impl Corpus<'_> {
-    pub fn num_docs(&self) -> usize {
-        self.docs.len()
-    }
-
-    /// Sum of [`DocMeta::len`]: the corpus-size line and the throughput
-    /// denominator.
-    pub fn total_bytes(&self) -> u64 {
-        self.docs.iter().map(|d| d.len).sum()
-    }
-
-    /// Absolute path of document `id`; `None` out of range.
-    pub fn doc_path(&self, id: usize) -> Option<PathBuf> {
-        self.docs.get(id).map(|d| self.root.join(&d.path))
-    }
+/// What the walk saw besides documents; every list ascending, root-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalkNotes {
+    /// Every listed directory, `""` the root, stamped before listing; `None`
+    /// when unstattable or holding a symlink to no file.
+    pub dirs: Vec<(String, Option<Stamp>)>,
 }
 
 /// The definition of "indexable": every file under `root`, sorted by relative
@@ -113,82 +95,66 @@ impl Corpus<'_> {
 /// are included, `.`-prefixed names are pruned, NUL-bearing and
 /// [`is_binary_doc`] files are skipped: one [`skip_summary`] line by default,
 /// a `warning:` each under [`verbose`]. An unreadable root or an all-skipped
-/// tree is `Err`. `f` takes `(id, rel path, bytes, stamp)`, so the
-/// bytes-holding and bytes-free enumerations cannot diverge; its `Err` stops
-/// the walk at once and is returned verbatim.
+/// tree is `Err`. `f` takes `(rel path, bytes, stamp)`, the stamp being the
+/// read handle's fstat before the read; its `Err` stops the walk at once and
+/// is returned verbatim.
 ///
 /// `exclude` is a directory that is never descended: an index dir written
 /// under `root` is output, not input.
 ///
-/// Documents are read in batches on `FMGREP_READ_THREADS` threads and handed
-/// to `f` in path order, so parallelism changes neither the ids nor the order
-/// of the skip lines.
-fn for_each_indexable(
+/// Documents are read in parallel batches and handed to `f` in path order, so
+/// parallelism changes neither the ids nor the order of the skip lines.
+pub fn for_each_index_doc(
     root: &Path,
     exclude: Option<&Path>,
-    mut f: impl FnMut(usize, &str, Vec<u8>, Stamp) -> Result<(), String>,
-) -> Result<usize, String> {
+    mut f: impl FnMut(&str, Vec<u8>, Stamp) -> Result<(), String>,
+) -> Result<WalkNotes, String> {
     let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
     let mut stack = vec![root.to_path_buf()];
     // Length per document, for the batch byte bound alone.
     let mut rels: Vec<(String, u64)> = Vec::new();
+    let mut dirs = Vec::new();
     while let Some(dir) = stack.pop() {
+        let meta = if dir == root {
+            std::fs::metadata(&dir)
+        } else {
+            std::fs::symlink_metadata(&dir)
+        };
+        let mut stamp = meta.ok().map(|m| Stamp::of(&m));
         let entries = std::fs::read_dir(&dir)
             .map_err(|e| format!("error: cannot list folder {}: {e}", dir.display()))?;
         for entry in entries {
             let entry =
                 entry.map_err(|e| format!("error: cannot list folder {}: {e}", dir.display()))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if file_type.is_symlink() {
-                let meta = std::fs::metadata(&path).ok().filter(|m| m.is_file());
-                if let Some(meta) = meta {
-                    rels.push((relative_path(root, &path), meta.len()));
+            match classify(&entry, exclude.as_deref()) {
+                Entry::Link(len) => rels.push((relative_path(root, &entry.path()), len)),
+                Entry::File => {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    rels.push((relative_path(root, &entry.path()), len));
                 }
-                continue;
-            }
-            if file_type.is_dir() {
-                let excluded = exclude
-                    .as_ref()
-                    .is_some_and(|x| std::fs::canonicalize(&path).is_ok_and(|p| &p == x));
-                if !excluded {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if file_type.is_file() {
-                let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                rels.push((relative_path(root, &path), len));
+                Entry::Dir => stack.push(entry.path()),
+                Entry::Unresolved => stamp = None,
+                Entry::Skip => {}
             }
         }
+        dirs.push((relative_path(root, &dir), stamp));
     }
     rels.sort();
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
     if rels.is_empty() {
         return Err(format!(
             "error: no indexable files in {} (want regular non-hidden files)",
             root.display()
         ));
     }
-    let threads = read_threads();
+    let pool = read_pool()?;
     let mut kept = 0usize;
     let mut skipped = 0usize;
     let mut at = 0usize;
     while at < rels.len() {
         let end = batch_end(&rels, at);
         let batch = &rels[at..end];
-        let read = read_batch(
-            root,
-            batch,
-            &|(rel, _): &(String, u64)| rel.as_str(),
-            threads,
-        )?;
+        let read = read_batch(&pool, root, batch, &|(rel, _): &(String, u64)| rel.as_str())?;
         for ((rel, _), (bytes, stamp)) in batch.iter().zip(read) {
             if bytes.contains(&UNIFIED_SEPARATOR) {
                 skipped += 1;
@@ -206,7 +172,7 @@ fn for_each_indexable(
                 }
                 continue;
             }
-            f(kept, rel, bytes, stamp)?;
+            f(rel, bytes, stamp)?;
             kept += 1;
         }
         at = end;
@@ -220,7 +186,114 @@ fn for_each_indexable(
     if skipped > 0 {
         eprintln!("{}", skip_summary(skipped));
     }
-    Ok(kept)
+    Ok(WalkNotes { dirs })
+}
+
+/// What the walk makes of one directory entry.
+enum Entry {
+    File,
+    /// A symlink to a file, with the target's length.
+    Link(u64),
+    Dir,
+    /// A symlink to no file: skipped, but a new target can make it one.
+    Unresolved,
+    Skip,
+}
+
+/// `.`-prefixed names are pruned, a symlink is taken only to a file (never
+/// descended), and `exclude` (canonical) is never entered.
+fn classify(entry: &std::fs::DirEntry, exclude: Option<&Path>) -> Entry {
+    if entry.file_name().as_encoded_bytes().starts_with(b".") {
+        return Entry::Skip;
+    }
+    let Ok(file_type) = entry.file_type() else {
+        return Entry::Skip;
+    };
+    if file_type.is_symlink() {
+        return match std::fs::metadata(entry.path()) {
+            Ok(meta) if meta.is_file() => Entry::Link(meta.len()),
+            _ => Entry::Unresolved,
+        };
+    }
+    if file_type.is_dir() {
+        let excluded = exclude.is_some_and(|x| {
+            x.file_name() == Some(entry.file_name().as_os_str())
+                && std::fs::canonicalize(entry.path()).is_ok_and(|p| p == x)
+        });
+        return if excluded { Entry::Skip } else { Entry::Dir };
+    }
+    if file_type.is_file() {
+        Entry::File
+    } else {
+        Entry::Skip
+    }
+}
+
+/// Paths relative to `root`, sorted, of every file under `under` the index
+/// walk lists before its text check. An unreadable directory is skipped.
+pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Vec<String> {
+    walk_changed(root, vec![under.to_path_buf()], exclude, &|_| false)
+}
+
+/// [`walk_paths`] under each of `dirs`, never descending into a directory
+/// whose relative path `recorded` holds.
+pub fn walk_changed(
+    root: &Path,
+    dirs: Vec<PathBuf>,
+    exclude: Option<&Path>,
+    recorded: &(dyn Fn(&str) -> bool + Sync),
+) -> Vec<String> {
+    if dirs.is_empty() {
+        return Vec::new();
+    }
+    let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
+    let walk = Walk {
+        root,
+        exclude: exclude.as_deref(),
+        recorded,
+        found: Mutex::new(Vec::new()),
+    };
+    rayon::scope(|scope| {
+        for dir in dirs {
+            let walk = &walk;
+            scope.spawn(move |scope| walk.list(scope, dir));
+        }
+    });
+    let mut found = walk
+        .found
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    found.sort_unstable();
+    found
+}
+
+struct Walk<'a> {
+    root: &'a Path,
+    exclude: Option<&'a Path>,
+    recorded: &'a (dyn Fn(&str) -> bool + Sync),
+    found: Mutex<Vec<String>>,
+}
+
+impl<'a> Walk<'a> {
+    fn list(&'a self, scope: &rayon::Scope<'a>, dir: PathBuf) {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            match classify(&entry, self.exclude) {
+                Entry::File | Entry::Link(_) => files.push(relative_path(self.root, &entry.path())),
+                Entry::Dir => {
+                    let path = entry.path();
+                    if !(self.recorded)(&relative_path(self.root, &path)) {
+                        scope.spawn(move |scope| self.list(scope, path));
+                    }
+                }
+                Entry::Unresolved | Entry::Skip => {}
+            }
+        }
+        self.found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(files);
+    }
 }
 
 /// The walk's one default-verbosity line: what the per-file `warning:` lines
@@ -250,9 +323,6 @@ fn batch_end(rels: &[(String, u64)], at: usize) -> usize {
 /// A document's bytes and the stamp its handle had before the read.
 type Read = (Vec<u8>, Stamp);
 
-/// One batch's reads, each tagged with its position in the batch.
-type BatchReads = Vec<(usize, Result<Read, String>)>;
-
 /// `fs::read`'s syscalls, with the fstat kept as the stamp.
 fn read_doc(root: &Path, rel: &str) -> Result<Read, String> {
     use std::io::Read as _;
@@ -265,91 +335,38 @@ fn read_doc(root: &Path, rel: &str) -> Result<Read, String> {
     Ok((bytes, stamp))
 }
 
-/// `batch`'s documents in `batch` order, read on up to `threads` threads.
-///
-/// Slots are handed out ascending and every handed-out read completes, so the
-/// lowest-index failure is reported — the one the sequential walk hit first.
-fn read_batch<T: Sync>(
+/// `batch`'s documents in `batch` order, read on `pool`; the lowest-index
+/// failure wins.
+pub fn read_batch<T: Sync>(
+    pool: &rayon::ThreadPool,
     root: &Path,
     batch: &[T],
     rel: &(dyn Fn(&T) -> &str + Sync),
-    threads: usize,
 ) -> Result<Vec<Read>, String> {
-    if threads <= 1 || batch.len() <= 1 {
-        return batch.iter().map(|t| read_doc(root, rel(t))).collect();
-    }
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let done: Mutex<BatchReads> = Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        for _ in 0..threads.min(batch.len()) {
-            scope.spawn(|| {
-                loop {
-                    // Check before claiming: a claimed slot is always read, so
-                    // the lowest failing slot cannot be skipped.
-                    if failed.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let at = next.fetch_add(1, Ordering::Relaxed);
-                    if at >= batch.len() {
-                        break;
-                    }
-                    let got = read_doc(root, rel(&batch[at]));
-                    failed.fetch_or(got.is_err(), Ordering::Relaxed);
-                    done.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((at, got));
-                }
-            });
-        }
-    });
-    let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
-    done.sort_by_key(|&(at, _)| at);
-    done.into_iter().map(|(_, bytes)| bytes).collect()
+    let read: Vec<_> = pool.install(|| batch.par_iter().map(|t| read_doc(root, rel(t))).collect());
+    read.into_iter().collect()
 }
 
-/// Hand every indexable document under `root` to `f`, one at a time, and
-/// return the count: the streaming form of [`discover_index_docs`], so an
-/// indexer holds one document instead of the corpus. `f`'s `Err` stops the
-/// walk. `exclude` is the [`for_each_indexable`] one. The stamp is the read
-/// handle's fstat, taken before the read.
-pub fn for_each_index_doc(
-    root: &Path,
-    exclude: Option<&Path>,
-    mut f: impl FnMut(Document, Stamp) -> Result<(), String>,
-) -> Result<usize, String> {
-    for_each_indexable(root, exclude, |id, path, bytes, stamp| {
-        let doc = Document {
-            id,
-            path: path.to_owned(),
-            bytes,
-        };
-        f(doc, stamp)
-    })
-}
-
-/// `rels` under `root` with their stamps, in order, read as the walk reads
-/// (`FMGREP_READ_THREADS`); the lowest failing read is the error.
-pub fn read_stamped(root: &Path, rels: &[String]) -> Result<Vec<(Vec<u8>, Stamp)>, String> {
-    read_batch(root, rels, &|rel: &String| rel.as_str(), read_threads())
-}
-
-/// The indexable documents under `root`, bytes included, as
-/// `for_each_indexable` defines them.
+/// The indexable documents under `root`, bytes included.
+#[cfg(test)]
 pub fn discover_index_docs(root: &Path) -> Result<Vec<Document>, String> {
     let mut docs = Vec::new();
-    for_each_index_doc(root, None, |doc, _| {
-        docs.push(doc);
+    for_each_index_doc(root, None, |path, bytes, _| {
+        docs.push(Document {
+            id: docs.len(),
+            path: path.to_owned(),
+            bytes,
+        });
         Ok(())
     })?;
     Ok(docs)
 }
 
-/// Bytes-free twin of [`discover_index_docs`]: same walk, same skips, same
-/// order, peak memory one file instead of the corpus.
+/// The indexable documents under `root` without their bytes: the
+/// [`for_each_index_doc`] walk, peak memory one file instead of the corpus.
 pub fn discover_index_meta(root: &Path) -> Result<Vec<DocMeta>, String> {
     let mut metas = Vec::new();
-    for_each_indexable(root, None, |_id, path, bytes, _| {
+    for_each_index_doc(root, None, |path, bytes, _| {
         metas.push(DocMeta {
             path: path.to_owned(),
             len: bytes.len() as u64,
@@ -384,6 +401,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -620,8 +644,8 @@ mod tests {
         fn rel((r, _): &(String, u64)) -> &str {
             r
         }
-        let one = read_batch(&dir, &rels, &rel, 1).unwrap();
-        let many = read_batch(&dir, &rels, &rel, 4).unwrap();
+        let one = read_batch(&pool(1), &dir, &rels, &rel).unwrap();
+        let many = read_batch(&pool(4), &dir, &rels, &rel).unwrap();
         assert_eq!(one, many);
         let docs = discover_index_docs(&dir).unwrap();
         assert_eq!(docs.len(), n);
@@ -638,39 +662,38 @@ mod tests {
     #[test]
     fn a_batch_reports_its_lowest_read_failure() {
         let dir = scratch_dir("read-failure");
-        std::fs::write(dir.join("a.c"), b"fine").unwrap();
-        let rels: Vec<(String, u64)> = ["a.c", "gone-1.c", "also-gone-2.c", "gone-3.c"]
-            .iter()
-            .map(|r| ((*r).to_string(), 4))
-            .collect();
+        std::fs::write(dir.join("big.c"), vec![b'x'; 8 << 20]).unwrap();
+        let mut rels = vec!["big.c".to_string()];
+        rels.extend((1..64).map(|i| format!("gone-{i:02}.c")));
         for threads in [1usize, 4] {
-            let err = read_batch(&dir, &rels, &|(r, _): &(String, u64)| r.as_str(), threads)
+            let err = read_batch(&pool(threads), &dir, &rels, &String::as_str)
                 .expect_err("missing files must fail");
-            assert!(err.contains("gone-1.c"), "threads={threads} got: {err}");
+            assert!(err.contains("gone-01.c"), "threads={threads} got: {err}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn stamp_matches_metadata_and_read_stamped_agrees_with_walk() {
+    fn stamp_matches_metadata_and_a_reread_agrees_with_walk() {
         let dir = scratch_dir("stamps");
         std::fs::write(dir.join("a.c"), b"printk").unwrap();
         std::fs::write(dir.join("b.c"), b"").unwrap();
         let mut walked = Vec::new();
-        for_each_index_doc(&dir, None, |doc, stamp| {
-            let meta = std::fs::metadata(dir.join(&doc.path)).unwrap();
-            assert_eq!(stamp, Stamp::of(&meta), "{}", doc.path);
-            assert_eq!(stamp.len, doc.bytes.len() as u64);
-            walked.push((doc.path, doc.bytes, stamp));
+        for_each_index_doc(&dir, None, |path, bytes, stamp| {
+            let meta = std::fs::metadata(dir.join(path)).unwrap();
+            assert_eq!(stamp, Stamp::of(&meta), "{path}");
+            assert_eq!(stamp.len, bytes.len() as u64);
+            walked.push((path.to_owned(), bytes, stamp));
             Ok(())
         })
         .unwrap();
         let rels: Vec<String> = walked.iter().map(|(p, _, _)| p.clone()).collect();
-        let reread = read_stamped(&dir, &rels).unwrap();
+        let reread = read_batch(&read_pool().unwrap(), &dir, &rels, &String::as_str).unwrap();
         for ((_, bytes, stamp), got) in walked.iter().zip(&reread) {
             assert_eq!((bytes, stamp), (&got.0, &got.1));
         }
-        let err = read_stamped(&dir, &["gone.c".to_string()]).unwrap_err();
+        let gone = ["gone.c".to_string()];
+        let err = read_batch(&read_pool().unwrap(), &dir, &gone, &String::as_str).unwrap_err();
         assert!(err.contains("gone.c"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -681,18 +704,141 @@ mod tests {
         std::fs::write(dir.join("a.c"), vec![b'x'; 4096]).unwrap();
         std::fs::write(dir.join("b.c"), b"").unwrap();
         let metas = discover_index_meta(&dir).unwrap();
-        let corpus = Corpus {
-            root: &dir,
-            docs: &metas,
-        };
+        assert_eq!(metas.len(), 2);
         for m in &metas {
             let on_disk = std::fs::metadata(dir.join(&m.path)).unwrap().len();
             assert_eq!(m.len, on_disk, "{}", m.path);
         }
-        assert_eq!(corpus.num_docs(), 2);
-        assert_eq!(corpus.total_bytes(), 4096);
-        assert_eq!(corpus.doc_path(0), Some(dir.join("a.c")));
-        assert_eq!(corpus.doc_path(2), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Minus its binary files, the free walk lists what the index walk
+    /// indexes, in order, whatever the thread count.
+    #[test]
+    fn walk_paths_equals_the_index_walk_before_its_text_check() {
+        let dir = scratch_dir("walk-paths");
+        std::fs::write(dir.join("a.c"), b"printk").unwrap();
+        std::fs::write(dir.join("nul.bin"), b"has\x00nul").unwrap();
+        std::fs::write(dir.join(".hidden.c"), b"printk").unwrap();
+        std::fs::create_dir_all(dir.join(".hdir")).unwrap();
+        std::fs::write(dir.join(".hdir").join("x.c"), b"pruned").unwrap();
+        std::fs::create_dir_all(dir.join("sub").join("nested")).unwrap();
+        std::fs::write(dir.join("sub").join("b.c"), b"kmalloc").unwrap();
+        std::fs::write(dir.join("sub").join("nested").join("d.c"), b"deep").unwrap();
+        std::fs::create_dir_all(dir.join("idx")).unwrap();
+        std::fs::write(dir.join("idx").join("manifest.json"), b"{}").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("sub"), dir.join("linkdir")).unwrap();
+            std::os::unix::fs::symlink(dir.join("a.c"), dir.join("alias.c")).unwrap();
+        }
+        let exclude = dir.join("idx");
+        let mut indexed = Vec::new();
+        for_each_index_doc(&dir, Some(&exclude), |path, _, _| {
+            indexed.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        for threads in [1, 4] {
+            let (walked, sub) = pool(threads).install(|| {
+                let sub = walk_paths(&dir, &dir.join("sub"), None);
+                (walk_paths(&dir, &dir, Some(&exclude)), sub)
+            });
+            let text: Vec<String> = walked
+                .iter()
+                .filter(|p| !p.ends_with(".bin"))
+                .cloned()
+                .collect();
+            assert_eq!(text, indexed, "threads={threads}");
+            assert!(walked.contains(&"nul.bin".to_string()), "threads={threads}");
+            assert_eq!(sub, ["sub/b.c", "sub/nested/d.c"], "threads={threads}");
+        }
+        assert!(walk_paths(&dir, &dir.join("missing"), None).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_notes_record_dirs_and_skip_non_text_files() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch_dir("walk-dirs");
+        for (rel, bytes) in [
+            ("a.c", &b"keep"[..]),
+            ("nul.bin", b"has\x00nul"),
+            (
+                "soup.bin",
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0e\x7fabc",
+            ),
+            ("sub/b.c", b"keep"),
+            ("sub/deep/c.c", b"keep"),
+            (".hdir/x.c", b"pruned"),
+            ("idx/manifest.json", b"{}"),
+            ("links/l.c", b"keep"),
+        ] {
+            std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(rel), bytes).unwrap();
+        }
+        symlink(dir.join("sub"), dir.join("links/linkdir")).unwrap();
+        symlink(dir.join("nul.bin"), dir.join("bin-alias.o")).unwrap();
+        let mut kept = Vec::new();
+        let notes = for_each_index_doc(&dir, Some(&dir.join("idx")), |rel, _, _| {
+            kept.push(rel.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let stamp = |rel: &str| {
+            Some(Stamp::of(
+                &std::fs::symlink_metadata(dir.join(rel)).unwrap(),
+            ))
+        };
+        let want = [
+            ("", stamp("")),
+            ("links", None),
+            ("sub", stamp("sub")),
+            ("sub/deep", stamp("sub/deep")),
+        ];
+        assert_eq!(notes.dirs, want.map(|(r, s)| (r.to_string(), s)));
+        assert_eq!(kept, ["a.c", "links/l.c", "sub/b.c", "sub/deep/c.c"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_changed_descends_only_unrecorded_dirs() {
+        let dir = scratch_dir("walk-changed");
+        for rel in [
+            "top.c",
+            "sub/a.c",
+            "sub/old/o.c",
+            "sub/new/n.c",
+            "sub/new/deep/d.c",
+            "sub/idx/m.json",
+        ] {
+            std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(rel), b"text").unwrap();
+        }
+        let old = |rel: &str| rel == "sub/old";
+        let exclude = dir.join("sub/idx");
+        for threads in [1, 4] {
+            pool(threads).install(|| {
+                let got = walk_changed(&dir, vec![dir.join("sub")], Some(&exclude), &old);
+                assert_eq!(
+                    got,
+                    ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c"],
+                    "threads={threads}"
+                );
+                let seeds = vec![dir.join("sub/old"), dir.join("sub")];
+                let got = walk_changed(&dir, seeds, Some(&exclude), &old);
+                assert_eq!(
+                    got,
+                    ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c", "sub/old/o.c"],
+                    "threads={threads}"
+                );
+                let all = walk_changed(&dir, vec![dir.clone()], None, &|_| false);
+                assert_eq!(all, walk_paths(&dir, &dir, None), "threads={threads}");
+                assert_eq!(all.len(), 6, "threads={threads}");
+            });
+        }
+        assert!(walk_changed(&dir, Vec::new(), None, &|_| false).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

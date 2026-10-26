@@ -7,7 +7,7 @@
 //! sentinel ending the text below every byte; row 0 is the empty suffix.
 //!
 //! ```
-//! let index = docfm::FmIndex::build(b"hello world\0say hello\0".to_vec(), 32, 1)?;
+//! let index = docfm::FmIndex::build(b"hello world\0say hello\0".to_vec(), 32)?;
 //! assert_eq!(index.cursor().extend_front(b"hello").count(), 2);
 //!
 //! let mut docs = Vec::new();
@@ -29,7 +29,6 @@ mod build;
 mod layout;
 mod marks;
 mod occ;
-mod par;
 #[cfg(test)]
 mod tests;
 
@@ -90,10 +89,10 @@ impl FmIndex<Vec<u8>> {
     /// `text` is documents, each followed by one [`DOC_END`]. Samples the doc
     /// id of every row whose text position is a multiple of `sample_rate` or
     /// starts a document, so a locate walks fewer than `sample_rate` LF steps
-    /// per occurrence. Uses up to `threads` threads; the blob does not depend
-    /// on `threads`.
-    pub fn build(text: Vec<u8>, sample_rate: u32, threads: usize) -> Result<Self, Error> {
-        Self::view(build::build(text, sample_rate, threads)?)
+    /// per occurrence. Runs on the current rayon pool; the blob does not
+    /// depend on it.
+    pub fn build(text: Vec<u8>, sample_rate: u32) -> Result<Self, Error> {
+        Self::view(build::build(text, sample_rate)?)
     }
 
     /// The blob, for storing and a later [`FmIndex::view`].

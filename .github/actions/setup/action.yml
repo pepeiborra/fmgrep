@@ -1,0 +1,21 @@
+name: Setup
+description: Stable Rust with rustfmt and clippy, the cargo cache and ripgrep.
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal -c rustfmt,clippy --no-self-update
+        rustup default stable
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+    - name: Install ripgrep
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = Linux ]; then
+          sudo apt-get update -q
+          sudo apt-get install -y -q ripgrep
+        else
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
+        fi
+        rg --version

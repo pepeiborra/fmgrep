@@ -1,29 +1,24 @@
 //! What the query drive asks the index, and what it answers.
 
+use std::ops::Range;
+
 use crate::pattern::PreparedPattern;
 
-/// Regex candidate set. `All` means `0..num_docs` without materializing it.
-pub enum Candidates {
-    All,
-    Docs(Vec<usize>),
-}
-
-/// `All` expanded against the corpus size.
-pub fn candidate_docs(candidates: Candidates, num_docs: usize) -> Vec<usize> {
-    match candidates {
-        Candidates::All => (0..num_docs).collect(),
-        Candidates::Docs(ids) => ids,
-    }
+/// [`Answer::candidates`] with `None` expanded against the corpus size.
+pub fn candidate_docs(candidates: Option<Vec<usize>>, num_docs: usize) -> Vec<usize> {
+    candidates.unwrap_or_else(|| (0..num_docs).collect())
 }
 
 /// One term as the query drive hands it to the index.
 pub enum Query<'a> {
     Literal(&'a [u8]),
-    /// A literal's occurrences: [`Answer::exact`] holds at least every doc
-    /// of ascending `place`, [`Answer::occurrences`] the rest.
-    Occurrences {
+    /// A literal's per-shard counts, no locate: [`Answer::counts`].
+    Count(&'a [u8]),
+    /// [`Query::Literal`], exact on at least the docs of ascending disjoint
+    /// `within`.
+    LiteralWithin {
         term: &'a [u8],
-        place: &'a [usize],
+        within: &'a [Range<usize>],
     },
     Regex(&'a PreparedPattern),
 }
@@ -33,8 +28,10 @@ pub enum Query<'a> {
 /// literal).
 pub struct Answer {
     pub exact: Vec<(usize, u64)>,
-    pub candidates: Candidates,
+    /// Regex candidates; `None` is every doc.
+    pub candidates: Option<Vec<usize>>,
     pub probe_us: u64,
-    /// Occurrences attributed to no doc; 0 unless [`Query::Occurrences`].
-    pub occurrences: u64,
+    /// Ascending disjoint doc ranges with their nonzero counts; empty unless
+    /// [`Query::Count`].
+    pub counts: Vec<(Range<usize>, u64)>,
 }

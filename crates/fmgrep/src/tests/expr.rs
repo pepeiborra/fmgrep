@@ -1,8 +1,9 @@
 //! `--expr-json` / `--expr` over both layouts against a per-document oracle.
 
+mod demote;
+
 use super::*;
 
-use crate::cli::dispatch_to;
 use crate::expr::Expr;
 use crate::matching::{LineMatcher, MatchMode, QueryOutput, strip_bom};
 use crate::wire::QueryReport;
@@ -16,22 +17,6 @@ const FILES: [(&str, &[u8]); 7] = [
     ("f.c", b"beta only\nBETA\nprint k\n"),
     ("g.c", b"alpha\r\nprintk\r\n"),
 ];
-
-fn t(s: &str) -> Expr {
-    Expr::Term(s.to_owned())
-}
-
-fn re(s: &str) -> Expr {
-    Expr::Regex(s.to_owned())
-}
-
-fn and(v: Vec<Expr>) -> Expr {
-    Expr::And(v)
-}
-
-fn or(v: Vec<Expr>) -> Expr {
-    Expr::Or(v)
-}
 
 fn trees() -> Vec<Expr> {
     vec![
@@ -59,53 +44,21 @@ fn stage(tmp: &Path, store_docs: bool) -> PathBuf {
     index
 }
 
-fn words(index: &Path, flags: &[&str], expr: &Expr) -> Vec<String> {
-    let mut w = argv(&["--index", &index.display().to_string()]);
-    w.extend(argv(flags));
-    w.push("--expr-json".into());
-    w.push(serde_json::to_string(expr).unwrap());
-    w
+fn expr_words(index: &Path, flags: &[&str], expr: &Expr) -> Vec<String> {
+    let json = serde_json::to_string(expr).unwrap();
+    let flags = [flags, &["--expr-json", &json]].concat();
+    words(&["--index", &index.display().to_string()], &flags, &[])
 }
 
-fn printed(index: &Path, flags: &[&str], expr: &Expr) -> Result<String, String> {
-    let mut out = Vec::new();
-    dispatch_to(
-        &cli_spec(),
-        &words(index, flags, expr),
-        &mut &b""[..],
-        &mut out,
-        false,
-    )?;
-    Ok(String::from_utf8(out).unwrap())
+fn printed_expr(index: &Path, flags: &[&str], expr: &Expr) -> Result<String, String> {
+    output(&expr_words(index, flags, expr), false).map(|o| String::from_utf8(o).unwrap())
 }
 
 fn report(index: &Path, flags: &[&str], expr: &Expr) -> Result<QueryReport, String> {
-    match dispatch(&cli_spec(), &words(index, flags, expr))? {
+    match dispatch(expr_words(index, flags, expr))? {
         Outcome::Query(mut r) => Ok(r.queries.remove(0)),
         _ => panic!("expected a query report"),
     }
-}
-
-/// `words` with the tree as `--expr` text.
-fn text_words(index: &Path, flags: &[&str], expr: &Expr) -> Vec<String> {
-    let mut w = words(index, flags, expr);
-    w.truncate(w.len() - 2);
-    w.extend(["--expr".into(), expr.to_string()]);
-    w
-}
-
-/// `<flags> -- <terms>`, printed.
-fn printed_terms(index: &Path, flags: &[&str], terms: &[&str]) -> Result<String, String> {
-    let w = [
-        argv(&["--index", &index.display().to_string()]),
-        argv(flags),
-        argv(&["--"]),
-        argv(terms),
-    ]
-    .concat();
-    let mut out = Vec::new();
-    dispatch_to(&cli_spec(), &w, &mut &b""[..], &mut out, false)?;
-    Ok(String::from_utf8(out).unwrap())
 }
 
 fn leaf_pattern(leaf: &Expr, mode: MatchMode) -> Option<String> {
@@ -166,7 +119,9 @@ fn leaf_totals(
                     (_, Some(p)) => PreparedPattern::prepare_with(&p, mode)
                         .unwrap()
                         .count(strip_bom(raw)),
-                    (Expr::Term(s), None) => count_occurrences(raw, s.as_bytes()),
+                    (Expr::Term(s), None) => {
+                        count_overlapping(raw, &memchr::memmem::Finder::new(s.as_bytes()))
+                    }
                     _ => unreachable!(),
                 })
                 .sum()
@@ -215,13 +170,13 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 let m = members(&FILES, &expr, mode);
                 let listed: String = m.iter().map(|p| format!("{p}\n")).collect();
                 assert_eq!(
-                    printed(&index, &[flag, &["-l"]].concat(), &expr).unwrap(),
+                    printed_expr(&index, &[flag, &["-l"]].concat(), &expr).unwrap(),
                     listed,
                     "{ctx}"
                 );
                 let r = report(&index, flag, &expr).unwrap();
                 assert_eq!(r.term, expr.to_string(), "{ctx}");
-                assert_eq!(r.docs_matched, Some(m.len()), "{ctx}");
+                assert_eq!(r.docs_matched, m.len(), "{ctx}");
                 let totals: Vec<u64> = r.leaves.iter().map(|l| l.total_matches).collect();
                 let want = leaf_totals(&FILES, &expr, mode, &m);
                 assert_eq!(totals, want, "{ctx}");
@@ -234,7 +189,7 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                         l.counts_exact,
                         l.leaves.len()
                     ),
-                    (Some(m.len()), m.len() as u64, false, 0),
+                    (m.len(), m.len() as u64, false, 0),
                     "{ctx}"
                 );
                 let alt = alternation(&expr, mode);
@@ -251,11 +206,10 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 ] {
                     let flags = [flag, mode_flags].concat();
                     let want = only(
-                        &printed_terms(&index, &[&flags[..], &["--regex"]].concat(), &[&alt])
-                            .unwrap(),
+                        &printed(&index, &[&flags[..], &["--regex"]].concat(), &[&alt]),
                         &m,
                     );
-                    let got = printed(&index, &flags, &expr).unwrap();
+                    let got = printed_expr(&index, &flags, &expr).unwrap();
                     if mode_flags.contains(&"-C") {
                         // Context lines of non-members interleave; compare members' lines only.
                         assert_eq!(only(&got, &m), want, "{ctx} {mode_flags:?}");
@@ -265,12 +219,11 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 }
                 let c = report(&index, &[flag, &["--count-matches"]].concat(), &expr).unwrap();
                 let per_file: u64 = only(
-                    &printed_terms(
+                    &printed(
                         &index,
                         &[flag, &["--count-matches", "--regex"]].concat(),
                         &[&alt],
-                    )
-                    .unwrap(),
+                    ),
                     &m,
                 )
                 .lines()
@@ -278,13 +231,13 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 .sum();
                 assert_eq!(
                     (c.total_matches, c.docs_matched, c.counts_exact),
-                    (per_file, Some(m.len()), true),
+                    (per_file, m.len(), true),
                     "{ctx}"
                 );
                 assert_eq!(c.leaves.len(), expr.leaves().len(), "{ctx}");
                 // One rg event stream, whose summary counts only members.
-                let json =
-                    printed(&index, &[flag, &["--matches", "--json"]].concat(), &expr).unwrap();
+                let json = printed_expr(&index, &[flag, &["--matches", "--json"]].concat(), &expr)
+                    .unwrap();
                 let begins = json
                     .lines()
                     .filter(|l| l.contains(r#""type":"begin""#))
@@ -321,8 +274,8 @@ fn expr_single_leaf_equals_its_term() {
                 &["-i", "-c"],
             ] {
                 assert_eq!(
-                    printed(&index, flags, &leaf).unwrap(),
-                    printed_terms(&index, flags, &[term]).unwrap(),
+                    printed_expr(&index, flags, &leaf).unwrap(),
+                    printed(&index, flags, &[term]),
                     "store_docs={store_docs} {term} {flags:?}"
                 );
             }
@@ -366,14 +319,14 @@ fn expr_literal_only_fetches_nothing() {
         or(vec![t("alpha"), and(vec![t("printk"), t("x")])]),
     ] {
         let r = report(&index, &[], &expr).unwrap();
-        assert!(r.docs_matched.unwrap() > 0, "{expr}");
+        assert!(r.docs_matched > 0, "{expr}");
         assert!(
-            !printed(&index, &["-l"], &expr).unwrap().is_empty(),
+            !printed_expr(&index, &["-l"], &expr).unwrap().is_empty(),
             "{expr}"
         );
         // Lines need the bytes.
         assert!(
-            printed(&index, &["-c"], &expr)
+            printed_expr(&index, &["-c"], &expr)
                 .unwrap_err()
                 .contains("cannot read"),
             "{expr}"
@@ -384,7 +337,7 @@ fn expr_literal_only_fetches_nothing() {
         report(&index, &[], &and(vec![re("printk"), t("x")]))
             .unwrap()
             .docs_matched,
-        Some(1)
+        1
     );
 }
 
@@ -394,11 +347,8 @@ fn expr_verifies_only_the_intersection() {
     let index = blind_index(tmp.path(), &[("a.c", b"alpha x"), ("b.c", b"beta y")]);
     // No document holds both the literal and the regex's anchor.
     let disjoint = and(vec![t("alpha"), re("be+ta")]);
-    assert_eq!(
-        report(&index, &[], &disjoint).unwrap().docs_matched,
-        Some(0)
-    );
-    assert_eq!(printed(&index, &["-l"], &disjoint).unwrap(), "");
+    assert_eq!(report(&index, &[], &disjoint).unwrap().docs_matched, 0);
+    assert_eq!(printed_expr(&index, &["-l"], &disjoint).unwrap(), "");
     // a.c is in both, so it must be read.
     let err = report(&index, &[], &and(vec![t("alpha"), re("al+pha")])).unwrap_err();
     assert!(err.contains("cannot read"), "{err}");
@@ -442,16 +392,65 @@ fn expr_stale_docs_are_scanned_for_every_leaf() {
             for mode in [&["-l"][..], &["-c"], &["--count-matches"], &["--matches"]] {
                 let flags = [flags, mode].concat();
                 assert_eq!(
-                    printed(&stale, &flags, &expr).unwrap(),
-                    printed(&fresh, &flags, &expr).unwrap(),
+                    printed_expr(&stale, &flags, &expr).unwrap(),
+                    printed_expr(&fresh, &flags, &expr).unwrap(),
                     "{expr} {flags:?}"
                 );
             }
         }
     }
     assert_eq!(
-        printed(&stale, &["-l"], &and(vec![t("printk"), t("alpha")])).unwrap(),
+        printed_expr(&stale, &["-l"], &and(vec![t("printk"), t("alpha")])).unwrap(),
         "a.c\n"
+    );
+}
+
+#[test]
+fn expr_added_docs_are_scanned_for_every_leaf() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"printk only\n"),
+        ("c.c", b"alpha printk\n"),
+        ("e.c", b"alpha beta\n"),
+    ];
+    let folder = stage_corpus(tmp.path(), &files);
+    let stale = tmp.path().join("idx");
+    index_it(&folder, &stale, false);
+    std::fs::write(folder.join("b.c"), b"printk alpha, beeta\n").unwrap();
+    std::fs::create_dir_all(folder.join("new")).unwrap();
+    std::fs::write(folder.join("new/n.c"), b"alpha beta printk\n").unwrap();
+    std::fs::write(folder.join("d.c"), b"beta\n").unwrap();
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    for expr in [
+        and(vec![t("printk"), t("alpha")]),
+        and(vec![t("printk"), re("be+ta")]),
+        or(vec![and(vec![t("alpha"), re("be+ta")]), t("printk")]),
+        or(vec![t("beta"), t("only")]),
+    ] {
+        for flags in [&[][..], &["-i"]] {
+            let (s, f) = (
+                report(&stale, flags, &expr).unwrap(),
+                report(&fresh, flags, &expr).unwrap(),
+            );
+            assert_eq!(
+                (s.docs_matched, s.total_matches, &s.leaves),
+                (f.docs_matched, f.total_matches, &f.leaves),
+                "{expr} {flags:?}"
+            );
+            for mode in [&["-l"][..], &["-c"], &["--count-matches"], &["--matches"]] {
+                let flags = [flags, mode].concat();
+                assert_eq!(
+                    printed_expr(&stale, &flags, &expr).unwrap(),
+                    printed_expr(&fresh, &flags, &expr).unwrap(),
+                    "{expr} {flags:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        printed_expr(&stale, &["-l"], &and(vec![t("printk"), t("alpha")])).unwrap(),
+        "b.c\nc.c\nnew/n.c\n"
     );
 }
 
@@ -462,7 +461,7 @@ fn expr_counts_exact_only_for_disjoint_exact_literals() {
     let exact = |flags: &[&str], e: &Expr| report(&index, flags, e).unwrap().counts_exact;
     let pair = and(vec![t("printk"), t("tail")]);
     assert!(exact(&[], &pair));
-    assert_eq!(report(&index, &[], &pair).unwrap().docs_matched, Some(1));
+    assert_eq!(report(&index, &[], &pair).unwrap().docs_matched, 1);
     // The exact sum is rg's alternation count within the members.
     assert_eq!(
         report(&index, &[], &pair).unwrap().total_matches,
@@ -485,74 +484,6 @@ fn expr_counts_exact_only_for_disjoint_exact_literals() {
 }
 
 #[test]
-fn expr_occurrences_refuses_and_and_sums_or() {
-    for store_docs in LAYOUTS {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = stage(tmp.path(), store_docs);
-        let err = report(
-            &index,
-            &["--occurrences"],
-            &or(vec![t("a"), and(vec![t("b")])]),
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("--occurrences") && err.contains("AND"),
-            "{err}"
-        );
-        let terms = ["printk", "/be+ta/", "alpha"];
-        let expr = or(vec![t("printk"), or(vec![re("be+ta"), t("alpha")])]);
-        for flags in [&[][..], &["-i"]] {
-            let per_term = dispatch(
-                &cli_spec(),
-                &[
-                    argv(&["--index", &index.display().to_string(), "--occurrences"]),
-                    argv(flags),
-                    argv(&["--"]),
-                    argv(&terms),
-                ]
-                .concat(),
-            )
-            .unwrap();
-            let Outcome::Query(per_term) = per_term else {
-                panic!()
-            };
-            let r = report(&index, &[&["--occurrences"][..], flags].concat(), &expr).unwrap();
-            assert_eq!(r.docs_matched, None);
-            assert_eq!(
-                r.total_matches,
-                per_term
-                    .queries
-                    .iter()
-                    .map(|q| q.total_matches)
-                    .sum::<u64>(),
-                "store_docs={store_docs} {flags:?}"
-            );
-            let leaves: Vec<(String, u64)> = r
-                .leaves
-                .iter()
-                .map(|l| (l.term.clone(), l.total_matches))
-                .collect();
-            let want: Vec<(String, u64)> = per_term
-                .queries
-                .iter()
-                .map(|q| (q.term.clone(), q.total_matches))
-                .collect();
-            assert_eq!(leaves, want, "store_docs={store_docs} {flags:?}");
-            assert!(!r.counts_exact);
-        }
-        assert!(
-            report(
-                &index,
-                &["--occurrences"],
-                &or(vec![t("printk"), t("tail")])
-            )
-            .unwrap()
-            .counts_exact
-        );
-    }
-}
-
-#[test]
 fn expr_refusals_are_loud_and_before_io() {
     let tmp = tempfile::tempdir().unwrap();
     let index = blind_index(tmp.path(), &[("a.c", b"alpha\nbeta")]);
@@ -565,168 +496,34 @@ fn expr_refusals_are_loud_and_before_io() {
             "is not allowed",
         ),
         (&["--matches"], or(vec![re("a\\nb")]), "is not allowed"),
-        (
-            &["--occurrences"],
-            and(vec![t("alpha"), t("beta")]),
-            "cannot answer AND",
-        ),
     ] {
-        let err = printed(&index, flags, &expr).unwrap_err();
+        let err = printed_expr(&index, flags, &expr).unwrap_err();
         assert!(
             err.contains(want) && !err.contains("cannot read"),
             "{flags:?} {expr}: {err}"
         );
     }
-    let err = printed(&index, &[], &and(vec![])).unwrap_err();
+    let err = printed_expr(&index, &[], &and(vec![])).unwrap_err();
     assert!(err.contains("at least one operand"), "{err}");
     // -U lifts the terminator refusal, as for a term.
     assert!(
-        printed(&index, &["-U", "-c"], &and(vec![t("alpha\nbeta")]))
+        printed_expr(&index, &["-U", "-c"], &and(vec![t("alpha\nbeta")]))
             .unwrap_err()
             .contains("cannot read")
     );
-}
-
-/// Shared flags, flags of the term form only, the terms, their leaves.
-type FlagCase = (
-    &'static [&'static str],
-    &'static [&'static str],
-    &'static [&'static str],
-    Vec<Expr>,
-);
-
-#[test]
-fn and_or_flags_equal_their_expression() {
-    let lists: [FlagCase; 5] = [
-        (
-            &[],
-            &[],
-            &["printk", "alpha"],
-            vec![t("printk"), t("alpha")],
-        ),
-        (
-            &[],
-            &[],
-            &["printk", "/a{3}/", "alpha"],
-            vec![t("printk"), re("a{3}"), t("alpha")],
-        ),
-        (
-            &["-i"],
-            &[],
-            &["PRINTK", "/alpha\\s*$/"],
-            vec![t("PRINTK"), re("alpha\\s*$")],
-        ),
-        (
-            &[],
-            &["--regex"],
-            &["be+ta", "p.intk"],
-            vec![re("be+ta"), re("p.intk")],
-        ),
-        (&[], &[], &["printk", ""], vec![t("printk"), t("")]),
-    ];
-    let modes: [&[&str]; 8] = [
-        &["-l"],
-        &["-c"],
-        &["--count-matches"],
-        &["--matches"],
-        &["-o", "-n"],
-        &["-C", "1"],
-        &["--json", "--matches"],
-        &["--approx-counts"],
-    ];
-    for store_docs in LAYOUTS {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = stage(tmp.path(), store_docs);
-        for (common, only_flags, terms, leaves) in &lists {
-            for (op, expr) in [("--and", and(leaves.clone())), ("--or", or(leaves.clone()))] {
-                let mut modes: Vec<&[&str]> = modes.to_vec();
-                if op == "--or" {
-                    modes.push(&["--occurrences"]);
-                }
-                for mode in modes
-                    .iter()
-                    .chain([&["--json", "--approx-counts"][..]].iter())
-                {
-                    let flags = [common, *mode].concat();
-                    let got =
-                        printed_terms(&index, &[&flags[..], only_flags, &[op]].concat(), terms)
-                            .unwrap();
-                    let want = printed(&index, &flags, &expr).unwrap();
-                    let ctx = format!("store_docs={store_docs} {op} {terms:?} {flags:?}");
-                    if flags.contains(&"--json") {
-                        assert_eq!(timeless_lines(&got), timeless_lines(&want), "{ctx}");
-                    } else {
-                        assert_eq!(got, want, "{ctx}");
-                    }
-                }
-            }
-        }
-        let err =
-            printed_terms(&index, &["--occurrences", "--and"], &["printk", "alpha"]).unwrap_err();
-        assert!(
-            err.contains("cannot answer AND"),
-            "store_docs={store_docs}: {err}"
-        );
-    }
 }
 
 #[test]
 fn expr_counts_summary_lists_leaves() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage(tmp.path(), true);
-    let and_flags =
-        printed_terms(&index, &["--approx-counts", "--and"], &["printk", "alpha"]).unwrap();
+    let and_flags = printed(&index, &["--approx-counts", "--and"], &["printk", "alpha"]);
     assert_eq!(
         and_flags,
         "printk AND alpha: 2 matches in 1 file\n  printk: 1 match\n  alpha: 1 match\n"
     );
-    let or_occ = printed_terms(&index, &["--occurrences", "--or"], &["tail", "/a{3}/"]).unwrap();
     assert_eq!(
-        or_occ,
-        "tail OR /a{3}/: 2 occurrences\n  tail: 1 occurrence\n  /a{3}/: 1 occurrence\n"
-    );
-    assert_eq!(
-        printed_terms(&index, &["--approx-counts"], &["tail", "alpha"]).unwrap(),
+        printed(&index, &["--approx-counts"], &["tail", "alpha"]),
         "tail: 1 match in 1 file\nalpha: 4 matches in 3 files\n"
     );
-}
-
-#[test]
-fn expr_text_equals_expr_json_on_both_layouts() {
-    let run = |w: Vec<String>| {
-        let mut out = Vec::new();
-        dispatch_to(&cli_spec(), &w, &mut &b""[..], &mut out, false).unwrap();
-        String::from_utf8(out).unwrap()
-    };
-    let latency =
-        regex::Regex::new(r#""(latency_us|index_time_us)":\d+|"elapsed(_total)?":\{[^}]*\}"#)
-            .unwrap();
-    for store_docs in LAYOUTS {
-        let tmp = tempfile::tempdir().unwrap();
-        let index = stage(tmp.path(), store_docs);
-        for expr in trees() {
-            for flags in [
-                &["-l"][..],
-                &["-c"],
-                &["--count-matches"],
-                &["--no-heading"],
-                &["-o"],
-                &["-C", "1"],
-                &["--json"],
-                &["--matches", "--json"],
-                &["-i", "-l"],
-            ] {
-                let (text, json) = (
-                    run(text_words(&index, flags, &expr)),
-                    run(words(&index, flags, &expr)),
-                );
-                let timeless = |s: &str| latency.replace_all(s, "0").into_owned();
-                assert_eq!(
-                    timeless(&text),
-                    timeless(&json),
-                    "store_docs={store_docs} {expr} {flags:?}"
-                );
-            }
-        }
-    }
 }

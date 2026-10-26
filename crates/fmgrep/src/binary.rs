@@ -22,6 +22,17 @@ pub fn is_binary_doc(bytes: &[u8]) -> bool {
     portable_is_binary(bytes)
 }
 
+/// [`is_binary_doc`] of the file's first [`BINARY_SNIFF_PREFIX`] bytes: true
+/// implies it of the whole file.
+pub fn sniff_binary(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let mut prefix = Vec::with_capacity(BINARY_SNIFF_PREFIX);
+    std::fs::File::open(path)?
+        .take(BINARY_SNIFF_PREFIX as u64)
+        .read_to_end(&mut prefix)?;
+    Ok(is_binary_doc(&prefix))
+}
+
 /// Native object magic: `Some(true)` on a hit, `None` = inconclusive, which
 /// defers to [`portable_is_binary`] and never means "text".
 #[cfg(target_os = "macos")]
@@ -151,5 +162,24 @@ mod tests {
         assert!(!portable_is_binary(&header));
         assert_eq!(platform_is_binary(&header), Some(true));
         assert!(is_binary_doc(&header));
+    }
+
+    #[test]
+    fn sniff_binary_implies_a_binary_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let sniff = |name: &str, bytes: &[u8]| {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+            sniff_binary(&dir.path().join(name)).unwrap()
+        };
+        let mut late = vec![b'x'; BINARY_SNIFF_PREFIX + 10];
+        late[BINARY_SNIFF_PREFIX + 1] = 0;
+        assert!(
+            !sniff("late.c", &late) && is_binary_doc(&late),
+            "a NUL past the prefix is found on read"
+        );
+        assert!(sniff("nul.c", b"alpha\0beta"));
+        assert!(sniff("gz.c", b"\x1f\x8btext"));
+        assert!(!sniff("text.c", b"alpha\n") && !sniff("empty.c", b""));
+        assert!(sniff_binary(&dir.path().join("missing.c")).is_err());
     }
 }

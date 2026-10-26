@@ -4,13 +4,12 @@
 #
 # Without --repo-path, shallow-clones the commit the corpus's query set is
 # pinned to into BENCH_DIR/<corpus> (default target/bench), reusing a clean
-# clone. Builds release, runs the harness with --verify over rows rg and
-# fmgrep, and prints the markdown results (default BENCH_DIR/results-<corpus>.md).
-# Exits non-zero when the rows disagree. The corpus is only read.
+# clone. Builds release, runs the harness over its default rows, and prints
+# the markdown results (default BENCH_DIR/results-<corpus>.md). Exits
+# non-zero when the rows disagree. The corpus is only read.
 #
 # Usage: scripts/bench.sh [--corpus ghc|linux|chromium] [--repo-path DIR]
-#                         [--results FILE] [--bench-dir DIR] [--skip-build]
-#                         [-- HARNESS_ARGS...]
+#                         [--results FILE] [--bench-dir DIR] [-- HARNESS_ARGS...]
 
 set -euo pipefail
 
@@ -19,10 +18,9 @@ CORPUS=ghc
 REPO_PATH=""
 RESULTS=""
 BENCH_DIR="$ROOT/target/bench"
-SKIP_BUILD=0
 PASSTHROUGH=()
 
-usage() { sed -n 's/^# \{0,1\}//; 11,13p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n 's/^# \{0,1\}//; 11,12p' "${BASH_SOURCE[0]}"; }
 die() { echo "error: $2" >&2; exit "$1"; }
 
 while [[ $# -gt 0 ]]; do
@@ -37,7 +35,6 @@ while [[ $# -gt 0 ]]; do
         esac
         shift 2
         ;;
-    --skip-build) SKIP_BUILD=1; shift ;;
     --) shift; PASSTHROUGH=("$@"); break ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die 2 "unknown argument $1" ;;
@@ -48,24 +45,15 @@ ghc | linux | chromium) ;;
 *) die 2 "--corpus must be ghc, linux or chromium, not $CORPUS" ;;
 esac
 
-for tool in rg git; do
+for tool in rg git cargo; do
     command -v "$tool" >/dev/null || die 2 "$tool is not on PATH"
 done
-if [[ "$SKIP_BUILD" == 0 ]]; then
-    command -v cargo >/dev/null || die 2 "cargo is not on PATH"
-    ( cd "$ROOT" && cargo build --release --locked -p fmgrep -p bench ) >&2
-fi
+( cd "$ROOT" && cargo build --release --locked -p fmgrep -p bench ) >&2
 BENCH="${CARGO_TARGET_DIR:-$ROOT/target}/release/bench"
-[[ -x "$BENCH" ]] || die 2 "$BENCH is missing; run without --skip-build"
-if [[ "$SKIP_BUILD" == 1 ]]; then
-    STALE="$(find "$ROOT/crates/bench/src" "$ROOT/crates/bench/queries" "$ROOT/Cargo.lock" \
-        -type f -newer "$BENCH" -print -quit)"
-    [[ -z "$STALE" ]] || die 2 "$BENCH is older than $STALE; run without --skip-build"
-fi
 
-SOURCE="$("$BENCH" --corpus "$CORPUS" --print-source)"
-URL="${SOURCE% *}"
-COMMIT="${SOURCE#* }"
+QUERIES="$ROOT/crates/bench/queries/$CORPUS.json"
+URL="$(sed -n 's/.*"repo_url": *"\([^"]*\)".*/\1/p' "$QUERIES")"
+COMMIT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$QUERIES")"
 
 mkdir -p "$BENCH_DIR"
 BENCH_DIR="$(cd "$BENCH_DIR" && pwd)"
@@ -112,11 +100,11 @@ mkdir -p "$(dirname "$RESULTS")"
 rm -f "$RESULTS"
 VAR="FMGREP_CORPUS_$(printf '%s' "$CORPUS" | tr '[:lower:]' '[:upper:]')"
 set +e
-env "$VAR=$DIR" "$BENCH" --corpus "$CORPUS" --verify --results "$RESULTS" \
-    --trace "$BENCH_DIR/trace-$CORPUS.jsonl" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+env "$VAR=$DIR" "$BENCH" --corpus "$CORPUS" --trace "$BENCH_DIR/trace-$CORPUS.jsonl" \
+    ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} >"$RESULTS"
 STATUS=$?
 set -e
-if [[ -f "$RESULTS" ]]; then
+if [[ -s "$RESULTS" ]]; then
     echo
     cat "$RESULTS"
 fi

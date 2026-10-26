@@ -9,8 +9,8 @@ fn one_cut(shard: &Path, docs: &Docs, range: Range<usize>) -> Result<Vec<Documen
     let cuts = Cuts::closed(
         Some(shard.to_path_buf()),
         vec![range.clone()],
-        lens(docs),
-        paths(docs),
+        &docs.lens,
+        &docs.paths,
     )?;
     let cut = cuts.get(0).expect("a one-slot plan closes slot 0");
     cuts.read(&cut)
@@ -45,10 +45,10 @@ fn stream_writes_the_shard_and_the_tables() {
     let shard = tmp.path().join("idx");
     let docs = stream(&folder, &shard);
 
-    let oracle = crate::discover_index_docs(&folder).unwrap();
+    let oracle = crate::walk::discover_index_docs(&folder).unwrap();
     assert_eq!(docs.num_docs(), oracle.len());
     assert_eq!(
-        lens(&docs),
+        docs.lens,
         oracle
             .iter()
             .map(|d| d.bytes.len() as u64)
@@ -60,7 +60,7 @@ fn stream_writes_the_shard_and_the_tables() {
     );
     let want: Vec<u8> = oracle.iter().flat_map(|d| d.bytes.clone()).collect();
     assert_eq!(std::fs::read(shard.join(DOCS_SHARD)).unwrap(), want);
-    assert_eq!(total_bytes(&docs), want.len() as u64);
+    assert_eq!(docs.num_bytes, want.len() as u64);
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn read_returns_global_ids_and_paths_for_a_range() {
     stage_corpus(&folder);
     let idx = tmp.path().join("idx");
     let docs = stream(&folder, &idx);
-    let all = crate::discover_index_docs(&folder).unwrap();
+    let all = crate::walk::discover_index_docs(&folder).unwrap();
     for start in 0..=all.len() {
         for end in start..=all.len() {
             let got = one_cut(&idx.join(DOCS_SHARD), &docs, start..end).unwrap();
@@ -186,12 +186,12 @@ fn files_stream_writes_no_docs_shard_and_records_stamps() {
     let (docs, _) = stream_files(&folder, &idx).unwrap();
     assert_eq!(std::fs::read_dir(&idx).unwrap().count(), 0, "no docs.shard");
     let root = std::fs::canonicalize(&folder).unwrap();
-    assert_eq!(super::root(&docs), root.to_str());
-    for (i, path) in paths(&docs).iter().enumerate() {
+    assert_eq!(docs.root.as_deref(), root.to_str());
+    for (i, path) in docs.paths.iter().enumerate() {
         let meta = std::fs::metadata(folder.join(path)).unwrap();
         let want = crate::Stamp::of(&meta);
         assert_eq!(
-            (lens(&docs)[i], mtimes(&docs)[i]),
+            (docs.lens[i], docs.mtimes[i]),
             (want.len, want.mtime_ns),
             "{path}"
         );
@@ -205,7 +205,7 @@ fn files_cut_reads_back_the_walk_bytes() {
     std::fs::create_dir_all(&folder).unwrap();
     stage_corpus(&folder);
     let (_, read) = stream_files(&folder, &tmp.path().join("idx")).unwrap();
-    let oracle = crate::discover_index_docs(&folder).unwrap();
+    let oracle = crate::walk::discover_index_docs(&folder).unwrap();
     assert_eq!(read.len(), oracle.len());
     for (got, want) in read.iter().zip(&oracle) {
         assert_eq!(

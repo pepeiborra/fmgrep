@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 /// `index --json` stdout summary.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexSummary {
-    pub index_name: String,
     /// The index keeps a copy of the documents (`index --store-docs`).
     pub store_docs: bool,
     pub path: String,
@@ -23,9 +22,7 @@ pub struct QueryReport {
     pub term: String,
     pub latency_us: u64,
     pub total_matches: u64,
-    /// Absent under `--occurrences`, which places no match in a doc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub docs_matched: Option<usize>,
+    pub docs_matched: usize,
     /// False when the counts above can differ from rg's: in counts mode any
     /// pattern, and a literal that is empty, self-overlapping or holds `\n`;
     /// under `-l`, which proves membership only. Absent on the wire when
@@ -58,7 +55,6 @@ fn is_yes(v: &bool) -> bool {
 /// canonical `build_time_us`.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OutputReport {
-    pub index_name: String,
     pub index_time_us: u64,
     pub index_size_bytes: u64,
     pub num_files_indexed: usize,
@@ -72,7 +68,6 @@ mod tests {
     #[test]
     fn report_round_trips_through_wire_schema() {
         let out = OutputReport {
-            index_name: "fmgrep".into(),
             index_time_us: 12,
             index_size_bytes: 345,
             num_files_indexed: 1,
@@ -80,7 +75,7 @@ mod tests {
                 term: "printk".into(),
                 latency_us: 3,
                 total_matches: 2,
-                docs_matched: Some(1),
+                docs_matched: 1,
                 counts_exact: true,
                 leaves: Vec::new(),
             }],
@@ -95,7 +90,6 @@ mod tests {
         assert_eq!(back, out);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         for key in [
-            "index_name",
             "index_time_us",
             "index_size_bytes",
             "num_files_indexed",
@@ -103,6 +97,7 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "missing top-level key {key}");
         }
+        assert_eq!(v.as_object().unwrap().len(), 4, "{json}");
         for key in ["term", "latency_us", "total_matches", "docs_matched"] {
             assert!(
                 v["queries"][0].get(key).is_some(),
@@ -123,35 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn occurrences_report_omits_docs_matched() {
-        let mut q = QueryReport {
-            term: "printk".into(),
-            latency_us: 3,
-            total_matches: 2,
-            docs_matched: None,
-            counts_exact: true,
-            leaves: Vec::new(),
-        };
-        let json = serde_json::to_string(&q).unwrap();
-        assert_eq!(
-            json,
-            r#"{"term":"printk","latency_us":3,"total_matches":2}"#
-        );
-        assert_eq!(serde_json::from_str::<QueryReport>(&json).unwrap(), q);
-        q.docs_matched = Some(1);
-        assert_eq!(
-            serde_json::to_string(&q).unwrap(),
-            r#"{"term":"printk","latency_us":3,"total_matches":2,"docs_matched":1}"#
-        );
-    }
-
-    #[test]
     fn leaves_stay_off_the_default_wire() {
         let mut q = QueryReport {
             term: "a AND b".into(),
             latency_us: 3,
             total_matches: 5,
-            docs_matched: Some(2),
+            docs_matched: 2,
             counts_exact: true,
             leaves: Vec::new(),
         };
@@ -179,7 +151,6 @@ mod tests {
     #[test]
     fn index_summary_round_trips_through_wire_schema() {
         let s = IndexSummary {
-            index_name: "fmgrep".into(),
             store_docs: true,
             path: "/tmp/idx".into(),
             num_files: 3,
@@ -191,7 +162,6 @@ mod tests {
         assert_eq!(serde_json::from_str::<IndexSummary>(&json).unwrap(), s);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         for key in [
-            "index_name",
             "store_docs",
             "path",
             "num_files",
@@ -201,5 +171,6 @@ mod tests {
         ] {
             assert!(v.get(key).is_some(), "missing key {key}");
         }
+        assert_eq!(v.as_object().unwrap().len(), 6, "{json}");
     }
 }

@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 1): what each
+The on-disk layout `fmgrep index` writes (manifest format 2): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -15,6 +15,7 @@ directory.
 | `manifest.json` | always | the document list, length tables and blob inventory |
 | `blobs.shard` | always | one docfm blob per shard, concatenated |
 | `docs.stamps` | default | one mtime per document |
+| `dirs.stamps` | default | every walked directory's `(size, mtime)` |
 | `docs.shard` | `--store-docs` | the documents, concatenated |
 
 A search opens the index at `--index PATH` (default: the current
@@ -30,12 +31,9 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `1` |
-| `engine` | string | `"fmgrep"` |
+| `format` | u32 | `2` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
-| `index_name` | string | `"fmgrep"`; reports carry it |
 | `num_docs` | usize | documents indexed |
-| `num_files_indexed` | usize | equal to `num_docs` |
 | `num_bytes` | u64 | sum of `doc_lens` |
 | `bom_bytes` | u64 | leading UTF-8 BOM bytes over all documents |
 | `index_size_bytes` | u64 | the structures' size, plus the document text with `store_docs`; an accounting figure, not a file size |
@@ -51,8 +49,8 @@ tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 1, or an `engine` other than `fmgrep`, naming the
-  remedy: re-run `fmgrep index`. Old indexes are refused, never upgraded;
+- a `format` other than 2, naming the remedy: re-run `fmgrep index`. Old
+  indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
 - `bom_bytes > num_bytes`;
@@ -67,7 +65,7 @@ The walk under PATH defines the document set:
 - every regular file, sorted by relative path; ids are positions in that
   order;
 - names starting with `.` are pruned, files and directories alike, so
-  `.git` and `.fmgrep` are never read;
+  `.git`, `.sl` and `.fmgrep` are never read;
 - symlinked directories are not descended; symlinked files are included;
 - files holding a NUL byte, or that look binary (a known binary magic
   number, or over 5% control bytes in the first 8 KiB), are skipped, with
@@ -75,7 +73,35 @@ The walk under PATH defines the document set:
 - paths are stored as UTF-8, with `/` separators; a non-UTF-8 name is
   converted lossily.
 
-Files added after `index` are not searched until the next `index`.
+## Staleness
+
+A files-layout index answers over the tree as it is now. Before the first
+answer, a load stats every document against its `(size, mtime)` stamp:
+
+- a changed file is scanned in full by every search, so answers equal a
+  fresh index of the current tree;
+- a missing, unreadable or now-binary file is excluded, with one warning
+  per process;
+- a file the walk's rules find that the index does not list is added:
+  scanned in full and printed in path order among the indexed files, with
+  no warning. The load stats the directories in `dirs.stamps`, lists only
+  those whose stamp moved, and walks new directories below them in full;
+- a file the walk skipped as non-text is sniffed again whenever its
+  directory is listed: one rewritten in place as text is found once its
+  directory's stamp moves, or when `serve`'s watch names it.
+
+`serve` watches the tree, following new files and directories; with
+`--no-watch` it misses files added after its first answer. On a filesystem
+with 1-second mtimes, a same-size edit within that second goes unnoticed.
+The directory check relies on the filesystem updating a directory's mtime
+when an entry is created, removed or renamed, as POSIX requires; on one
+that does not, delete `dirs.stamps` to make every load walk the tree.
+Re-index after many edits.
+
+A `--store-docs` index never reads the tree: it answers as of index time,
+and edits, new files and deletions show up only after the next `index`;
+`serve` neither stats nor watches the tree. Written with `--output`, it has
+no tree: a PATH is refused and the cwd does not narrow the search.
 
 ## Shards
 
@@ -101,7 +127,7 @@ Blob version 6, little-endian. The code-side contract is the table in
 
 | section | holds |
 |---|---|
-| header, 2176 bytes | magic `DOCFM\0\x06\0`; text bytes `n`; sentinel row; sample rate (32); alphabet bitmap and size; `c` (first row per byte code); `num_docs`, `num_samples` |
+| header, 2176 bytes | magic `DOCFM\0\x06\0`; text bytes `n`; sentinel row; sample rate (default 16); alphabet bitmap and size; `c` (first row per byte code); `num_docs`, `num_samples` |
 | supers | per 65536 BWT positions: u32 counts per code, padded to 64 bytes |
 | occurrence blocks | from the next 16 KiB boundary; per 4096 positions: u16 counts at the block midpoint, then the code bits of each 64 positions as bit planes |
 | marks | a u32 count per 4096 rows, then a u16 in-bucket offset per sampled row |
@@ -109,28 +135,52 @@ Blob version 6, little-endian. The code-side contract is the table in
 
 A row is sampled iff its text position is a multiple of the sample rate or
 starts a document. A locate walks LF to the nearest sampled row, in fewer
-than 32 steps, without leaving its document. The load checks the header,
-each code's total against the last block, the marks total and the sentinel
-row's sample. A blob that passes these checks but is corrupt elsewhere can
-miscount or panic, but never reads out of bounds.
+steps than the sample rate, without leaving its document. The load checks
+the header, each code's total against the last block, the marks total and
+the sentinel row's sample. A blob that passes these checks but is corrupt
+elsewhere can miscount or panic, but never reads out of bounds.
 
 ## docs.stamps
 
 `8 x num_docs` bytes: the mtime of each document at index time, as a
 little-endian i64 in nanoseconds since the epoch, by id. With `doc_lens` it
-forms the `(size, mtime)` stamp that a load checks every file against. A
-changed file is scanned in full; a missing, unreadable or now-binary one is
-excluded, with a warning.
+forms the `(size, mtime)` stamp that a load checks every file against.
+
+## dirs.stamps
+
+Optional: an index without it walks the whole tree for added files at
+every load. An 8-byte magic, `fmdirs\0\x01`, then records to the end of
+the file, strictly ascending by path:
+
+| bytes | holds |
+|---|---|
+| 8 | `len`, u64 LE: the size |
+| 8 | `mtime_ns`, i64 LE: nanoseconds since the epoch |
+| 4 | `n`, u32 LE |
+| `n` | the corpus-relative path, UTF-8, `/`-separated |
+
+`dirs.stamps` starts with the root, the empty path. Each directory is
+stamped before it is listed, so any later change to its entries moves its
+stamp. The stamp `len = u64::MAX, mtime_ns = i64::MIN` matches no stat, so
+its directory is listed at every load. It is written for a directory
+stamped within 2 s of the index start (a change in the same timestamp tick
+would not move it; writing `.fmgrep` makes the root of a default index
+one), one that could not be statted, one holding a symlink to no file, and
+a path that collides once decoded lossily, which is written once.
+
+A file with another magic or version is ignored, as if absent. One with
+the right magic that is truncated, not ascending, not UTF-8 or not rooted
+is refused with exit 2, like a damaged `docs.stamps`. A `docs.skipped`
+left by an older `fmgrep` is ignored.
 
 ## docs.shard
 
 The documents concatenated, by id, with no separators; `doc_lens` slices
-them. They are stored as read, BOMs included. A `--store-docs` index never
-reads the tree, so its answers are as of index time.
+them. They are stored as read, BOMs included.
 
 ## Determinism
 
 The same tree and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and
-`docs.shard` bytes, whatever the thread counts. `docs.stamps` follows the
-mtimes. Only `build_time_us` differs in the manifest, and `corpus_root`
-when the tree moves.
+`docs.shard` bytes, whatever the thread counts. `docs.stamps` and
+`dirs.stamps` follow the mtimes. Only `build_time_us`
+differs in the manifest, besides `corpus_root` when the tree moves.

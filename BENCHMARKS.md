@@ -4,22 +4,30 @@ fmgrep against ripgrep on three pinned source trees, on one machine.
 
 ## Method
 
-Every run is `scripts/bench.sh` with `--verify`; [docs/benchmark.md](docs/benchmark.md)
-explains how to run it and what each column means. In short:
+Every run is `scripts/bench.sh` ([docs/benchmark.md](docs/benchmark.md)).
+Every row searches the same staged copy of the corpus, one query at a time,
+and a run fails unless all rows agree on every query's match and file
+counts.
 
-- Both rows search the same staged copy of the corpus, one query at a time.
-  rg runs one `rg --count-matches` process per query. fmgrep builds its
-  index, starts one `fmgrep serve`, and runs one `fmgrep --server` process
-  per query. Latency is spawn to exit, process start-up included.
-- `--verify` passed on every run: all rows agreed on every query's match
-  and file counts.
-- `p50` is the lower median over the queries. Each cell below is the
-  median of 3 runs (chromium: 1 run). MB and GB are 2^20 and 2^30 bytes.
-- Each run started with load1 below 3 and no other build or benchmark
-  running, except where noted. rg keeps every core busy, so the rows after
-  it start at a load1 of 4 to 12; `load1` lists each run's start and end.
-- The linux checkout sits on a case-insensitive file system, where 13 files
-  of the pinned tree collide; both rows see the same 95540 files.
+- **rg**: one `rg --count-matches` process per query.
+- **fmgrep**: an index (`index build`, `index size`), one `fmgrep serve`
+  (`ready`), then one `fmgrep --server` process per query.
+- **tgrep**, when installed: `tgrep index`, one `tgrep serve --no-watch`,
+  then one `tgrep --count-matches` client per query.
+
+Latency is spawn to exit, process start-up included. `p50` is the lower
+median over the literal or the regex queries, beside their mean. `query
+footprint` is the peak anonymous memory of the process answering (the
+server, or each rg); `index peak RSS` is the index build's peak resident
+memory. `load1` is the 1-minute load average at the row's start and end
+(the harness marks 4 or more with `!`). Each cell is the median of 3 runs
+(chromium: 1 run). MB and GB are 2^20 and 2^30 bytes.
+
+Each run started with load1 below 3 and no other build or benchmark
+running, except where noted; rg keeps every core busy, so the rows after it
+start at a load1 of 4 to 12. The linux checkout sits on a case-insensitive
+file system, where 13 files of the pinned tree collide; every row sees the
+same 95540 files.
 
 Machine: Apple M5, 10 cores (4P + 6E), 16 GiB, macOS 26.5.1. fmgrep 0.1.0
 (release build), ripgrep 15.2.0. Measured 2026-09-24 (UTC).
@@ -73,36 +81,22 @@ these reads for about 2.84 GB more index (not measured here).
 
 ## tgrep
 
-[tgrep](https://github.com/microsoft/tgrep) (a trigram-index grep, at
-commit `b1d0fc2`) is not a harness row. These figures were measured
-locally with an earlier version of the harness, not in CI: Apple M5,
-2026-09-24, quiet box, median of 3. p50 is per query; `fp` is the query
-footprint; `idx` is index bytes over text bytes. The fmgrep index then
-kept a copy of the documents, as `--store-docs` does now, and `idx`
-includes it.
+[tgrep](https://github.com/microsoft/tgrep), a trigram-index grep, is an
+optional row ([Method](#method); install:
+[docs/benchmark.md](docs/benchmark.md)). Same machine, tgrep 1.0.8 (commit
+`b1d0fc2`), measured 2026-09-25 (UTC) on a shared box, so treat the timings
+as indicative. The fmgrep rows are from the same runs.
 
-| row | GHC p50 / fp / idx | linux p50 / fp / idx / ready | chromium p50 / fp / idx / ready / build |
-|---|---|---|---|
-| fmgrep | 2.37 ms / 13 MB / 2.33x | 4.24 ms / 25 MB / 2.24x / 10 ms | 34.0 ms / 68 MB / 2.31x / 38 ms / 71 s |
-| tgrep | 5.70 ms / 114 MB / 1.03x | 14.9 ms / 1.35 GB / 0.67x / 0.59 s | 451 ms / 3.9 GB / 0.95x / 9.6 s / 47 s |
+GHC, median of 3 runs:
 
-Other FM-index engines measured the same way are in
-[docs/design/history.md](docs/design/history.md).
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fmgrep | 2.02 s | 112.66 MB | 36.1 ms | 2.87 ms | 3.11 ms | 13.3 ms | 11.9 ms | 13.05 MB | 710.98 MB | 6.72->6.72, 6.92->6.77, 6.36->6.33 |
+| tgrep | 1.34 s | 87.62 MB | 159 ms | 5.53 ms | 6.57 ms | 12.3 ms | 20.1 ms | 109.44 MB | 126.38 MB | 6.72->6.72, 6.77->6.77, 6.33->6.33 |
 
-## Projection to 100x chromium
+linux, single run:
 
-Not measured: a linear extrapolation of the chromium run above to a tree
-of 284 GB (305 x 10^9 bytes) in 46 million files, assuming each figure scales
-with the quantity named.
-
-| figure | scales with | projection |
-|---|---|---|
-| index size | text | 373 GB, or 657 GB with `--store-docs` |
-| index build | text (40 MB/s here) | about 2 hours |
-| serve footprint | files (a stamp and a path each) | about 6.1 GB |
-| serve ready | files (one stat each) | about 4 minutes |
-| rg per query | text; a lower bound, as 284 GB is not cached | about 21 minutes |
-
-Search latency is not projected: every term probes every shard, so
-per-term work grows with the shard count, and verification grows with the
-candidate files each query reads.
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fmgrep | 15.84 s | 1.89 GB | 70.4 ms | 4.49 ms | 12.1 ms | 5.17 ms | 22.2 ms | 21.38 MB | 5.32 GB | 6.50->7.69 |
+| tgrep | 12.10 s | 1.02 GB | 537 ms | 17.3 ms | 24.3 ms | 26.0 ms | 32.9 ms | 1.25 GB | 266.48 MB | 7.69->6.87 |

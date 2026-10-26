@@ -1,37 +1,33 @@
+use std::ffi::OsString;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
+
 mod args;
 mod locate;
+mod params;
 mod print;
 mod serve;
 
 use crate::events::JsonSink;
 use crate::index::{IndexRequest, run_index};
-use crate::manifest::{Manifest, NAME, read_manifest};
+use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
-use crate::query::{QueryRequest, run_query};
+use crate::query::run_query;
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
-use args::{ClientAction, ClientArgs, Command, Parsed, ServeArgs, parse_args};
+use args::{Cli, Command, Search, ServeArgs};
 use locate::locate;
+use params::{Mode, QueryParams};
 use serve::{ServeRequest, run_client, run_serve};
-
-/// The binary's whole CLI text.
-pub struct Cli {
-    /// One-line usage, quoted verbatim inside argv errors.
-    pub usage: &'static str,
-    /// `--help` body, printed verbatim.
-    pub help: &'static str,
-}
 
 /// What a successful dispatch produced.
 pub enum Outcome {
-    Help,
-    Version,
-    Index(IndexSummary),
+    Index(#[cfg_attr(not(test), allow(dead_code))] IndexSummary),
     Query(OutputReport),
-    /// `serve` ended, or `--server` with `--status|--shutdown` answered.
+    /// `serve` ended, help or the version printed, or `--status|--shutdown`
+    /// answered.
     Done,
 }
 
@@ -41,7 +37,7 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
         index_dir: &index_dir,
         manifest: &manifest,
         corpus_root: root.as_deref(),
-        listen: a.listen,
+        listen: (!a.stdio).then_some(a.listen),
         watch: !a.no_watch,
     };
     run_serve(&req, input, out)?;
@@ -53,164 +49,143 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
 /// tree it sits in.
 fn open_index(start: Option<&Path>) -> Result<(PathBuf, Manifest, Option<PathBuf>), String> {
     let found = locate(start.unwrap_or(Path::new(".")))?;
+    if !found.index_dir.join(BLOBS_SHARD).is_file() {
+        return Err(format!(
+            "error: {} has no {BLOBS_SHARD}",
+            found.index_dir.display()
+        ));
+    }
     let manifest = read_manifest(&found.index_dir)?;
     let root = found.root.filter(|_| !manifest.store_docs);
     Ok((found.index_dir, manifest, root))
 }
 
-/// `printing` widens a search with no mode flag from wire counts to matched
-/// lines.
-fn execute(cmd: &Command, printing: bool, sink: &mut dyn MatchSink) -> Result<Outcome, String> {
-    match cmd {
-        Command::Index(a) => {
-            crate::set_verbose(a.verbose);
-            run_index(&IndexRequest {
-                folder: &a.folder,
-                output: a.output.as_deref(),
-                store_docs: a.store_docs,
-            })
-            .map(Outcome::Index)
-        }
-        Command::Query(a) => {
-            let (index_dir, manifest, root) = open_index(a.index.as_deref())?;
-            run_query(
-                &QueryRequest {
-                    index_dir: &index_dir,
-                    manifest: &manifest,
-                    corpus_root: root.as_deref(),
-                    regex: a.regex,
-                    mode: a.mode(),
-                    terms: &a.terms,
-                    expr: a.expr.as_ref(),
-                    output: a.output(printing),
-                },
-                sink,
-            )
-            .map(Outcome::Query)
-        }
-        Command::Serve(a) if a.listen.is_some() => Err(
-            "error: serve over TCP needs dispatch_to (its readiness line would be discarded)"
-                .to_owned(),
-        ),
-        Command::Serve(a) => serve(a, &mut std::io::empty(), &mut std::io::sink()),
-        Command::Client(a) => run_client(a, &mut std::io::sink()),
+fn search(
+    s: &Search,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    tty: bool,
+    printing: bool,
+) -> Result<Outcome, String> {
+    if let Some(addr) = &s.server
+        && (s.status || s.shutdown)
+    {
+        return serve::manage(addr, s.shutdown, out);
     }
-}
-
-/// Parse and run `args` against `cli`, DISCARDING match output: the outcome
-/// carries the counting report only. The test seam behind `dispatch_to`:
-/// same parsing, same dispatch, no printing and no `exit`; `serve --stdio`
-/// reads no requests and TCP `serve` is refused.
-pub fn dispatch(cli: &Cli, args: &[String]) -> Result<Outcome, String> {
-    match parse_args(cli, args)? {
-        Parsed::Help => Ok(Outcome::Help),
-        Parsed::Version => Ok(Outcome::Version),
-        Parsed::Cmd(mut cmd) => {
-            read_expr(&mut cmd, &mut std::io::empty())?;
-            execute(&cmd, false, &mut Discard)
-        }
+    let p = s.params(input, printing, tty)?;
+    if let Some(addr) = &s.server {
+        return run_client(addr, &p, s.json, out);
     }
+    let (index_dir, manifest, root) = open_index(s.index.as_deref())?;
+    let req = p.request(&index_dir, &manifest, root.as_deref());
+    render(&p, s.json, out, |sink| run_query(&req, sink)).map(Outcome::Query)
 }
 
-/// Fill a `--expr-json -` expression from `input`.
-fn read_expr(cmd: &mut Command, input: &mut dyn BufRead) -> Result<(), String> {
-    let slot = match cmd {
-        Command::Query(a) if a.expr_stdin => &mut a.expr,
-        Command::Client(ClientArgs {
-            action:
-                ClientAction::Query {
-                    params,
-                    expr_stdin: true,
-                    ..
-                },
-            ..
-        }) => &mut params.expr,
-        _ => return Ok(()),
-    };
-    let mut json = String::new();
-    input
-        .read_to_string(&mut json)
-        .map_err(|e| format!("error: cannot read --expr-json from stdin: {e}"))?;
-    *slot = Some(args::parse_expr(&json)?);
-    Ok(())
-}
-
-/// Parse and run `args`, writing output to `out`: matches in rg's human
-/// format (a per-term counts summary under `--approx-counts` and
-/// `--occurrences`), or under `--json` either rg's event stream (matches
-/// mode) or the wire report.
-/// `serve --stdio` reads its requests from `input`. `tty` resolves `--color
-/// auto`. The seam [`run`] uses over locked stdin and stdout.
+/// Parse and run `args` (argv without the binary name), writing output to
+/// `out`. `serve --stdio` and `--expr-json -` read `input`; `tty` resolves
+/// `--color auto`.
 pub fn dispatch_to(
-    cli: &Cli,
-    args: &[String],
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
 ) -> Result<Outcome, String> {
-    let mut cmd = match parse_args(cli, args)? {
-        Parsed::Help => {
-            print::line(out, cli.help)?;
-            return Ok(Outcome::Help);
+    dispatch_in(args, input, out, tty, true)
+}
+
+/// [`dispatch_to`] with empty input, discarded output, and a search with no
+/// mode flag driving counts.
+#[cfg(test)]
+pub fn dispatch(
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+) -> Result<Outcome, String> {
+    let (mut input, mut out) = (std::io::empty(), std::io::sink());
+    dispatch_in(args, &mut input, &mut out, false, false)
+}
+
+fn dispatch_in(
+    args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    tty: bool,
+    printing: bool,
+) -> Result<Outcome, String> {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) if !e.use_stderr() => {
+            print::line(out, e.to_string().trim_end())?;
+            return Ok(Outcome::Done);
         }
-        Parsed::Version => {
-            print::line(out, &format!("{NAME} {}", env!("CARGO_PKG_VERSION")))?;
-            return Ok(Outcome::Version);
-        }
-        Parsed::Cmd(cmd) => cmd,
+        Err(e) => return Err(e.to_string().trim_end().to_owned()),
     };
-    read_expr(&mut cmd, input)?;
-    match &cmd {
-        Command::Serve(a) => serve(a, input, out),
-        Command::Client(a) => run_client(a, out),
-        Command::Index(a) => {
-            let outcome = execute(&cmd, false, &mut Discard)?;
-            if let Outcome::Index(summary) = &outcome {
-                print::index_summary(out, a.json, summary)?;
-            }
-            Ok(outcome)
+    let verbose = matches!(&cli.command, Some(Command::Index(a)) if a.verbose);
+    crate::verbose::set_verbose(verbose).map_err(|e| format!("error: {e}"))?;
+    match &cli.command {
+        Some(Command::Index(a)) => {
+            let summary = run_index(&IndexRequest {
+                folder: &a.path,
+                output: a.output.as_deref(),
+                store_docs: a.store_docs,
+            })?;
+            print::index_summary(out, a.json, &summary)?;
+            Ok(Outcome::Index(summary))
         }
-        Command::Query(a) if a.json && a.emits_events() => {
-            let mut sink = JsonSink::new(out, a.json_config());
-            let outcome = execute(&cmd, false, &mut sink)?;
-            sink.finish()?;
-            Ok(outcome)
-        }
-        Command::Query(a) if a.json => {
-            let outcome = execute(&cmd, false, &mut Discard)?;
-            if let Outcome::Query(report) = &outcome {
-                print::query_report(out, report)?;
-            }
-            Ok(outcome)
-        }
-        // Human `--approx-counts` / `--occurrences`: no matches to print, so
-        // print the report's FM numbers instead of nothing.
-        Command::Query(a) if a.approx_counts || a.occurrences => {
-            let outcome = execute(&cmd, true, &mut Discard)?;
-            if let Outcome::Query(report) = &outcome {
-                print::counts_summary(out, report)?;
-            }
-            Ok(outcome)
-        }
-        Command::Query(a) => {
-            let mut writer = MatchWriter::new(out, a.config(tty));
-            let outcome = execute(&cmd, true, &mut writer)?;
-            writer.finish()?;
-            Ok(outcome)
-        }
+        Some(Command::Serve(a)) => serve(a, input, out),
+        None => search(&cli.search, input, out, tty, printing),
     }
 }
 
-/// Run `cli` over the process argv and print the result.
+/// `run`'s matches printed as `p` asks: rg's human format, a counts summary,
+/// or under `--json` rg's event stream or the wire report.
+fn render(
+    p: &QueryParams,
+    json: bool,
+    out: &mut dyn Write,
+    run: impl FnOnce(&mut dyn MatchSink) -> Result<OutputReport, String>,
+) -> Result<OutputReport, String> {
+    Ok(match p.mode {
+        Mode::JsonMatches => {
+            let mut sink = JsonSink::new(out, p.json_config());
+            let report = run(&mut sink)?;
+            sink.finish()?;
+            report
+        }
+        _ if json => {
+            let report = run(&mut Discard)?;
+            print::query_report(out, &report)?;
+            report
+        }
+        Mode::Counts => {
+            let report = run(&mut Discard)?;
+            print::counts_summary(out, &report)?;
+            report
+        }
+        _ => {
+            let mut writer = MatchWriter::new(out, p.output_config());
+            let report = run(&mut writer)?;
+            writer.finish()?;
+            report
+        }
+    })
+}
+
+/// Run the process argv and print the result.
 ///
-/// Exit codes: 0 success, 2 bad argv / unreadable input / build refusal, 1 an
-/// IO failure writing output. A closed pipe is not a failure.
-pub fn run(cli: &Cli) {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Exit codes, as rg's: 0 success, 1 a search that matched nothing or an IO
+/// failure writing output, 2 bad argv / unreadable input / build refusal. A
+/// closed pipe is not a failure.
+pub fn run() {
     let tty = std::io::stdout().is_terminal();
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut input = std::io::stdin().lock();
-    let mut result = dispatch_to(cli, &args, &mut input, &mut out, tty).map(|_| ());
+    let args = std::env::args_os().skip(1);
+    let mut result = dispatch_to(args, &mut input, &mut out, tty).map(|o| match o {
+        Outcome::Query(r) => r
+            .queries
+            .iter()
+            .any(|q| q.total_matches > 0 || q.docs_matched > 0),
+        _ => true,
+    });
     // Flush on every path: a failed run must still end on a whole line.
     // A closed pipe left the writer silent; nothing else may be.
     if let Err(e) = out.flush()
@@ -219,8 +194,12 @@ pub fn run(cli: &Cli) {
     {
         result = Err(format!("{WRITE_FAILED} output: {e}"));
     }
-    if let Err(m) = result {
-        eprintln!("{m}");
-        std::process::exit(if m.starts_with(WRITE_FAILED) { 1 } else { 2 });
+    match result {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(m) => {
+            eprintln!("{m}");
+            std::process::exit(if m.starts_with(WRITE_FAILED) { 1 } else { 2 });
+        }
     }
 }

@@ -1,13 +1,13 @@
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::blobs::{create_sink, finish_sink};
 use crate::docs;
-use crate::manifest::{MANIFEST_FORMAT, Manifest, NAME, create_output_dir, write_manifest};
+use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manifest};
 use crate::plan::shard_bytes;
 use crate::sharded::DocfmIndex;
-use crate::source::write_stamps;
+use crate::source::{write_stamps, write_walk};
 use crate::wire::IndexSummary;
 
 /// The default index directory, under the indexed folder.
@@ -25,9 +25,9 @@ pub struct IndexRequest<'a> {
 ///
 /// `build_time_us` is the index wall — the document stream, construction and
 /// the blob flush, all of it, so the number keeps its meaning however many
-/// shards are built at once; only the manifest write it carries is outside
-/// it. Any failure, error or panic, removes the output dir, so a
-/// half-written index is never queryable.
+/// shards are built at once; the manifest write is outside it. Any failure,
+/// error or panic, removes the output dir, so a half-written index is never
+/// queryable.
 pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     std::fs::read_dir(req.folder)
         .map_err(|e| format!("error: cannot list folder {}: {e}", req.folder.display()))?;
@@ -41,31 +41,32 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     create_output_dir(&output)?;
     let persist = |output: &Path| -> Result<Manifest, String> {
         let start = Instant::now();
+        let started = SystemTime::now();
         let mut sink = create_sink(output)?;
         let cap = shard_bytes()?;
-        let (docs, built) = docs::stream_while(req.folder, output, cap, req.store_docs, |cuts| {
-            DocfmIndex::build_into(cuts, cap, None, req.store_docs, &mut sink)
-        })?;
+        let (docs, index_size_bytes) =
+            docs::stream_while(req.folder, output, cap, req.store_docs, |cuts| {
+                DocfmIndex::build_into(cuts, cap, None, req.store_docs, &mut sink)
+            })?;
         let (blobs, blob_lens) = finish_sink(sink)?;
         if !req.store_docs {
-            write_stamps(output, docs::mtimes(&docs))?;
+            write_stamps(output, &docs.mtimes)?;
+            write_walk(output, &docs.walk, started)?;
         }
+        let build_time_us = start.elapsed().as_micros() as u64;
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
-            engine: NAME.to_string(),
             store_docs: req.store_docs,
-            index_name: NAME.to_string(),
             num_docs: docs.num_docs(),
-            num_files_indexed: built.num_files_indexed,
-            num_bytes: docs::total_bytes(&docs),
-            bom_bytes: docs::bom_bytes(&docs),
-            index_size_bytes: built.index_size_bytes,
-            build_time_us: start.elapsed().as_micros() as u64,
-            files: docs::paths(&docs).to_vec(),
+            num_bytes: docs.num_bytes,
+            bom_bytes: docs.bom_bytes,
+            index_size_bytes,
+            build_time_us,
+            files: docs.paths,
             blobs,
-            doc_lens: docs::lens(&docs).to_vec(),
+            doc_lens: docs.lens,
             blob_lens,
-            corpus_root: docs::root(&docs).map(str::to_owned),
+            corpus_root: docs.root,
         };
         write_manifest(output, &manifest)?;
         Ok(manifest)
@@ -82,7 +83,6 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         }
     };
     Ok(IndexSummary {
-        index_name: manifest.index_name,
         store_docs: manifest.store_docs,
         path: output.display().to_string(),
         num_files: manifest.num_docs,

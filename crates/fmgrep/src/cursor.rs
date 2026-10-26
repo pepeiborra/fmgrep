@@ -54,7 +54,7 @@ impl BackwardCursor for ScanCursor<'_> {
         if self.query.is_empty() {
             return self.text.len() as u64 + 1;
         }
-        crate::pattern::count_occurrences(self.text, &self.query)
+        crate::pattern::count_overlapping(self.text, &memchr::memmem::Finder::new(&self.query))
     }
 }
 

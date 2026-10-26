@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::manifest::MANIFEST_FORMAT;
+use crate::manifest::{MANIFEST_FORMAT, shard_offsets};
 
 #[test]
 fn index_of_an_unindexable_folder_errors_and_leaves_no_output() {
@@ -9,7 +9,7 @@ fn index_of_an_unindexable_folder_errors_and_leaves_no_output() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = stage_corpus(tmp.path(), &[]);
     let output = tmp.path().join("idx");
-    let err = match dispatch(&cli_spec(), &index_words(&empty, Some(&output), true)) {
+    let err = match dispatch(index_words(&empty, Some(&output), true)) {
         Err(e) => e,
         Ok(_) => panic!("an unindexable folder must refuse"),
     };
@@ -23,7 +23,7 @@ fn index_of_a_missing_folder_creates_nothing() {
     // be refused before any directory is created.
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("nope");
-    let err = match dispatch(&cli_spec(), &index_words(&missing, None, true)) {
+    let err = match dispatch(index_words(&missing, None, true)) {
         Err(e) => e,
         Ok(_) => panic!("a missing folder must refuse"),
     };
@@ -50,6 +50,15 @@ fn load_index_ignores_stray_root_files() {
     );
 }
 
+fn root_files(dir: &Path) -> Vec<String> {
+    let mut root: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    root.sort();
+    root
+}
+
 #[test]
 fn stored_docs_index_writes_both_shards_and_tables() {
     // Doc lengths and blob lengths round-trip; the docs shard is the staged
@@ -66,8 +75,13 @@ fn stored_docs_index_writes_both_shards_and_tables() {
     );
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
+    assert_eq!(
+        root_files(&output),
+        [BLOBS_SHARD, DOCS_SHARD, "manifest.json"]
+    );
     let (manifest, docs, blobs) = read_back(&output);
     assert_eq!(manifest.format, MANIFEST_FORMAT);
+    assert!(manifest.store_docs && manifest.corpus_root.is_none());
     assert_eq!(manifest.doc_lens, vec![12, 2, 0]);
     assert_eq!(manifest.doc_lens.iter().sum::<u64>(), manifest.num_bytes);
 
@@ -87,19 +101,25 @@ fn stored_docs_index_writes_both_shards_and_tables() {
 }
 
 #[test]
-fn files_index_writes_blobs_stamps_manifest_only() {
+fn files_index_writes_blobs_stamps_walk_and_manifest_only() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(tmp.path(), &[("a.c", b"printk hello"), ("e.c", b"")]);
     let output = tmp.path().join("idx");
     let summary = index_it(&folder, &output, false);
-    let mut root: Vec<String> = std::fs::read_dir(&output)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    root.sort();
     assert_eq!(
-        root,
-        [BLOBS_SHARD, crate::source::DOCS_STAMPS, "manifest.json"]
+        root_files(&output),
+        [
+            BLOBS_SHARD,
+            "dirs.stamps",
+            crate::source::DOCS_STAMPS,
+            "manifest.json"
+        ]
+    );
+    let dirs = std::fs::read(output.join("dirs.stamps")).unwrap();
+    assert_eq!(
+        (&dirs[..8], &dirs[24..28]),
+        (&b"fmdirs\0\x01"[..], &[0u8; 4][..]),
+        "opens with the root"
     );
     let manifest = read_manifest(&output).unwrap();
     assert!(!manifest.store_docs);

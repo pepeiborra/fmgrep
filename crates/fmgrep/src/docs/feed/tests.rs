@@ -60,7 +60,7 @@ fn a_stream_failure_wakes_every_waiter() {
         }
     });
     assert_eq!(cuts.error().as_deref(), Some("error: cannot read a.c"));
-    assert!(cuts.shape().is_none());
+    assert!(cuts.get(0).is_none());
 }
 
 /// The path a panicking stream takes: it never calls `end`, so only the

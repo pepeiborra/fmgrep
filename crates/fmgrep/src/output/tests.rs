@@ -58,7 +58,7 @@ fn render(
                 ignore_case: false,
             },
         );
-        for (doc, (path, raw)) in docs.iter().enumerate() {
+        for (path, raw) in docs {
             // The drive's view of a document: BOM stripped.
             let raw = &strip_bom(raw);
             let outcome = matcher.scan(raw, output);
@@ -66,7 +66,6 @@ fn render(
                 continue;
             }
             w.doc(DocMatches {
-                doc,
                 path,
                 raw,
                 outcome: &outcome,
@@ -394,7 +393,6 @@ fn broken_pipe_is_not_an_error() {
         let outcome = matcher.scan(FIXTURE[0].1, MATCHES);
         w.term_start("alpha")?;
         w.doc(DocMatches {
-            doc: 0,
             path: FIXTURE[0].0,
             raw: FIXTURE[0].1,
             outcome: &outcome,

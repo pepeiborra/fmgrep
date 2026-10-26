@@ -41,8 +41,6 @@ pub struct MatchMode {
 pub enum QueryOutput {
     /// Wire counts only: the harness path.
     Counts,
-    /// Wire `total_matches` only; a literal is counted without a locate.
-    Occurrences,
     /// Matched lines with spans and text, plus `before`/`after` context.
     Matches { before: usize, after: usize },
     /// Matched lines per file (rg `-c`).
@@ -616,7 +614,7 @@ fn with_context(
 /// term that cannot overlap itself has the same overlapping and
 /// non-overlapping occurrence count, so rg's `--count-matches` can be served
 /// from the literal probe with no fetch.
-pub fn self_overlapping(term: &[u8]) -> bool {
+fn self_overlapping(term: &[u8]) -> bool {
     let n = term.len();
     if n < 2 {
         return false;

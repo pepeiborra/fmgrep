@@ -2,9 +2,18 @@
 
 fmgrep is ripgrep over a persistent index. `fmgrep index` builds an
 FM-index of a source tree once; after that a search prints what `rg` would
-print, but typically answers in milliseconds, with tens of MB of memory,
-instead of scanning the whole tree. The index is mapped from disk and used
-in place rather than loaded.
+print, but typically answers in milliseconds, without scanning the whole tree.
+The index is mapped from disk and used in place.
+
+## Status
+
+fmgrep is experimental software:  
+* the index format, the serve protocol and the `--json` output can change in any release.
+* the `.fmgrep` directory holds the indexed text unencrypted: treat it as a copy of the source.  
+* `fmgrep serve` has no authentication and listens on 127.0.0.1 by default ([SECURITY.md](SECURITY.md)). 
+* Linux is the measured platform; macOS works, Windows is unsupported. 
+
+fmgrep is provided as is, under the MIT license, without warranty.
 
 ## Install
 
@@ -22,7 +31,7 @@ Index a tree once, at its root:
 ```console
 $ fmgrep index .
 skipped 70 non-text file(s) (binary or NUL); set FMGREP_VERBOSE=1 or pass --verbose to list them
-indexed 26787 files (88781005 bytes) -> ./.fmgrep (fmgrep) in 1997 ms
+indexed 26787 files (88781005 bytes) -> ./.fmgrep in 1997 ms
 ```
 
 The index lives in `./.fmgrep`; add it to `.gitignore`. Search from
@@ -42,23 +51,24 @@ compiler/GHC/Driver/Main/Hsc.hs
 143:initHscEnv mb_top_dir = do
 ```
 
-The nearest enclosing `.fmgrep` is used, found as git finds `.git`, and
-paths are relative to the indexed root. The common rg flags work (`-i`,
-`-l`, `-c`, `-o`, `-A/-B/-C`, `-U`); `fmgrep --help` lists them.
-Unlike rg, a search with no match exits 0.
+* The nearest enclosing `.fmgrep` index is used.
+* Paths are relative to the indexed root.
+* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`); `fmgrep --help` lists them.
 
 For many searches in a row, keep the index loaded in a server:
 
 ```console
 $ fmgrep serve --listen 127.0.0.1:7777 &
 127.0.0.1:7777
-$ fmgrep --server 127.0.0.1:7777 HscEnv '/Dyn[A-Z]\w+/'
-HscEnv: 605 matches in 85 files
-/Dyn[A-Z]\w+/: 2279 matches in 345 files
+$ fmgrep --server 127.0.0.1:7777 -l initHscEnv
+compiler/GHC.hs
+compiler/GHC/Driver/Main.hs
+compiler/GHC/Driver/Main/Hsc.hs
 $ fmgrep --server 127.0.0.1:7777 --shutdown
 ```
 
-`--server` answers counts only; search locally for lines.
+`--server` takes every search flag but `--index` and prints what the local
+search would; the server answers ([details](docs/protocol.md#--server)).
 
 ## Expressions
 
@@ -74,20 +84,42 @@ fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)'
 `AND` and `OR` are capitals, `AND` binds tighter, and quoting is as in sh.
 They pick files; fmgrep then prints the lines of every TERM in those files.
 
-## Staleness
+## Indexing
 
-An edited file is read in full by every search, so answers stay current;
-after many edits, remove `.fmgrep` and re-index. A deleted file is skipped
-with a warning, new files are invisible until the re-index, and an
-`index --store-docs` index answers as of index time.
+```sh
+fmgrep index .              # index the current folder
+fmgrep index . --store-docs # also keep a copy of every file
+```
+
+A search reads every file it prints, and a regex every candidate. By
+default it opens them in the tree, so answers stay current: edited and new
+files are read in full; after many edits, remove `.fmgrep` and re-index.
+`--store-docs` reads them from the copy instead, for about 1.8 times the
+disk: it never reads the tree and answers as of indexing time. Details:
+[docs/index-format.md](docs/index-format.md#staleness).
+
+| | GHC | linux |
+|---|--:|--:|
+| index size, default / `--store-docs` | 113 / 197 MB | 1.89 / 3.42 GB |
+| files read per literal (mean) | 122 | 798 |
+| literal p50, default / `--store-docs` | 4.7 / 4.3 ms | 10.1 / 7.0 ms |
+| regex p50, default / `--store-docs` | 9.3 / 8.6 ms | 15.4 / 10.0 ms |
+
+Apple M5, median of repeated warm queries (the
+Performance table below is one spawn-to-exit pass). A file costs an
+`open(2)` of about 5.5 µs by default and a `pread` of 1.4-2 µs with
+`--store-docs`, so the gap grows with the files read; it is several times
+larger when the tree is out of the page cache or the filesystem is busy. A
+lower `FMGREP_SAMPLE_RATE` speeds the index probe, not the reads
+([docs/tuning.md](docs/tuning.md)).
 
 ## Performance
 
 Apple M5 (10 cores, 16 GiB), macOS 26.5.1, fmgrep 0.1.0, ripgrep 15.2.0,
-2026-09-24; median of 3 runs of `scripts/bench.sh` (chromium: 1 run, on a
-loaded box). Latency is the per-query median, spawn to exit: one
-`fmgrep --server` process against a running `fmgrep serve`, or one `rg`
-scanning the tree. Footprint is the peak anonymous memory while answering.
+2026-09-24 (chromium: 1 run, loaded box). Latency is the per-query
+median, spawn to exit, of one `fmgrep --server` or `rg` process; footprint
+is the peak anonymous memory while answering. [BENCHMARKS.md](BENCHMARKS.md)
+has the method, every column and the index built with `--store-docs`.
 
 | corpus | files / text | index build / size | fmgrep literal / regex | rg literal / regex | footprint fmgrep / rg |
 |---|--:|--:|--:|--:|--:|
@@ -96,8 +128,7 @@ scanning the tree. Footprint is the peak anonymous memory while answering.
 | chromium | 460957 / 2.8 GB | 72 s / 3.7 GB | 64 ms / 2.6 s | 12.6 / 13.9 s | 63 / 789 MB |
 
 Regexes cost more on chromium because every candidate file is read from
-the tree. [BENCHMARKS.md](BENCHMARKS.md) has the method, every column and
-the index built with `--store-docs`.
+the tree.
 
 ## How it works
 
@@ -111,15 +142,13 @@ each occurrence's file without touching the tree.
 A regex is narrowed by the index first, through the literals every match
 must contain or a walk of its reversed DFA over the index, and the regex
 crate then verifies only the candidate files, read from the tree. Details:
-[docs/index-format.md](docs/index-format.md) and
-[docs/design](docs/design/decisions.md).
+[docs/index-format.md](docs/index-format.md).
 
 ## Environment
 
 | variable | default | effect |
 |---|---|---|
 | `FMGREP_SHARD_BYTES` | `100MB` | text per index shard |
-| `FMGREP_BUILD_THREADS` | machine parallelism, capped by memory | shards built at once |
 | `FMGREP_VERBOSE` | off | as `index -v`: list skipped binary files |
 
 Developer knobs are in [docs/tuning.md](docs/tuning.md).

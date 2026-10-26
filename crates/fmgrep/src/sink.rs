@@ -6,7 +6,6 @@ use crate::wire::QueryReport;
 /// One document's matches, borrowed from the fetch batch and valid only for
 /// the call. `outcome.lines` index `raw`.
 pub struct DocMatches<'a> {
-    pub doc: usize,
     pub path: &'a str,
     pub raw: &'a [u8],
     pub outcome: &'a DocOutcome,
@@ -15,7 +14,7 @@ pub struct DocMatches<'a> {
 /// Consumer of a query's match output.
 ///
 /// `corpus` once, then per term: `term_start`, one `doc` call per matching
-/// document strictly ascending by doc id, then `term_end` with that term's
+/// document strictly ascending by path, then `term_end` with that term's
 /// finished report. Nothing is retained across calls, so a streaming sink
 /// peaks at one fetch batch. Never called in [`crate::matching::QueryOutput::Counts`].
 ///
@@ -42,8 +41,7 @@ pub trait MatchSink {
     }
 }
 
-/// Drops match output: the [`crate::dispatch`] seam, which reports counts
-/// only.
+/// Drops match output: a search that prints its report only.
 pub struct Discard;
 
 impl MatchSink for Discard {

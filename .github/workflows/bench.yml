@@ -25,41 +25,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Install ripgrep
-        run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update -q
-            sudo apt-get install -y -q ripgrep
-          else
-            HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
-          fi
-          rg --version
-      - name: Pinned corpus
-        id: pin
-        run: |
-          commit=$(jq -er .commit crates/bench/queries/ghc.json)
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup
       # Outside target/, which rust-cache prunes.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/bench/ghc
-          key: bench-ghc-${{ runner.os }}-${{ steps.pin.outputs.commit }}
-      - run: cargo build --release --locked -p fmgrep -p bench
+          key: bench-ghc-${{ runner.os }}-${{ hashFiles('crates/bench/queries/ghc.json') }}
       - name: Benchmark
-        run: scripts/bench.sh --skip-build --bench-dir "$RUNNER_TEMP/bench" --results bench-results.md
+        run: scripts/bench.sh --bench-dir "$RUNNER_TEMP/bench"
       - name: Job summary
         if: always()
         run: |
-          if [ -f bench-results.md ]; then
-            cat bench-results.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$RUNNER_TEMP/bench/results-ghc.md" ]; then
+            cat "$RUNNER_TEMP/bench/results-ghc.md" >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: bench-ghc-${{ matrix.os }}
-          path: bench-results.md
+          path: |
+            ${{ runner.temp }}/bench/results-ghc.md
+            ${{ runner.temp }}/bench/trace-ghc.jsonl

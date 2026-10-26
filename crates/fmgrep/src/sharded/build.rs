@@ -1,24 +1,24 @@
-//! Shard construction: up to K shards in flight (`FMGREP_BUILD_THREADS`), each
-//! built by T threads (`FMGREP_BUILD_SHARD_THREADS`). K is a memory budget,
-//! not a core count, since every shard in flight holds its own construction
-//! transient. A gate emits blobs in slot order, so `blobs.shard` depends on
-//! neither K nor T.
+//! Shard construction on one rayon pool: each shard is a task, and docfm
+//! splits its phases into units any idle thread takes. At most a window of
+//! shards is held from claim to emit, each with its construction transient.
+//! A thread waiting inside a shard build never starts another. Blobs are
+//! emitted in slot order, so `blobs.shard` depends on neither the pool nor
+//! the window.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, mpsc};
 
-use crate::bytes::env_bytes;
-use crate::docs::{Cut, Cuts, Shape};
+use crate::docs::{Cut, Cuts};
+use crate::env::physical_memory;
 
-const THREADS_VAR: &str = "FMGREP_BUILD_THREADS";
-const SHARD_THREADS_VAR: &str = "FMGREP_BUILD_SHARD_THREADS";
 const BYTES_VAR: &str = "FMGREP_BUILD_BYTES";
-/// Construction footprint the build may take when `FMGREP_BUILD_BYTES` is
-/// unset. A constant, not a reading of this machine's RAM.
-const DEFAULT_BUILD_BYTES: u64 = 8 << 30;
-/// Peak construction bytes per shard text byte: the shard-concurrency
-/// budget's only per-shard input. Too low overcommits memory, too high
-/// serializes the build.
+/// Build budget when physical memory is unknown.
+const FALLBACK_BUILD_BYTES: u64 = 8 << 30;
+/// Peak construction bytes per shard text byte: the window's only per-shard
+/// input. Too low overcommits memory, too high serializes the build.
 const BUILD_BYTES_PER_TEXT_BYTE: u64 = 8;
 
 /// An unbuildable corpus is a loud panic: there is no fallback.
@@ -26,73 +26,28 @@ pub fn refuse(what: String) -> ! {
     panic!("docfm build: {what}");
 }
 
-/// [`threads_from`] over the environment, one shard's transient at `cap`,
-/// and this machine. `shards` is the shard count or an upper bound on it.
-fn build_threads(shards: usize, cap: u64) -> Result<usize, String> {
-    let machine = machine_threads();
-    let knob = parse_knob(std::env::var(THREADS_VAR).ok().as_deref());
-    let budget = env_bytes(BYTES_VAR, DEFAULT_BUILD_BYTES)?;
-    let transient = BUILD_BYTES_PER_TEXT_BYTE.saturating_mul(cap);
-    Ok(threads_from(shards, machine, knob, budget, transient))
+/// Shards held at once: the budget over one shard's transient, at most the
+/// pool size, at least 1.
+pub fn window_from(pool: usize, budget: u64, transient: u64) -> usize {
+    usize::try_from(budget / transient.max(1))
+        .unwrap_or(usize::MAX)
+        .min(pool)
+        .max(1)
 }
 
-/// Threads this machine can run at once, 1 when the count is unavailable.
-pub fn machine_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
-}
-
-/// Threads inside one shard build, from `FMGREP_BUILD_SHARD_THREADS`.
-pub fn shard_threads(in_flight: usize, machine: usize) -> usize {
-    let knob = parse_knob(std::env::var(SHARD_THREADS_VAR).ok().as_deref());
-    shard_threads_from(in_flight, machine, knob)
-}
-
-/// The knob is obeyed exactly; without one the machine is divided over the
-/// shards in flight, so K x T never oversubscribes it. At least 1.
-pub fn shard_threads_from(in_flight: usize, machine: usize, knob: Option<usize>) -> usize {
-    knob.unwrap_or(machine / in_flight.max(1)).max(1)
-}
-
-/// A knob that is not a positive count is no knob: junk and zero fall back to
-/// the budget rather than to machine parallelism.
-pub fn parse_knob(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-}
-
-/// Shards in flight: the knob exactly, else the budget divided by one
-/// shard's transient, capped by machine parallelism. Clamped to `1..=shards`.
-pub fn threads_from(
-    shards: usize,
-    machine: usize,
-    knob: Option<usize>,
-    budget: u64,
-    transient: u64,
-) -> usize {
-    let threads = match knob {
-        Some(n) => n,
-        None => {
-            let fits = (budget / transient.max(1)).max(1);
-            machine.min(usize::try_from(fits).unwrap_or(usize::MAX))
-        }
-    };
-    threads.clamp(1, shards.max(1))
-}
-
-/// Build every shard the stream cuts, ascending by slot into `emit` and
-/// never concurrently, so the bytes do not depend on `threads` (the shards in
-/// flight; `None` derives it from the environment).
-///
-/// Blocks on the first cut: `Shape::One` must stay at one worker, or a
-/// one-shard corpus would build in a 1-thread rayon pool.
+/// Build every shard the stream cuts into `emit`, ascending, on a pool sized
+/// by rayon's defaults (`RAYON_NUM_THREADS`, else machine parallelism).
+/// `window` is the shards held at once; `None` derives it from the build
+/// budget (`FMGREP_BUILD_BYTES`, else half of physical memory) and one
+/// shard's transient at `cap`.
 pub fn build_shards<T: Send>(
     cuts: &Cuts,
     cap: u64,
-    threads: Option<usize>,
+    window: Option<usize>,
     build: &(dyn Fn(&Cut) -> Result<T, String> + Sync),
-    emit: &(dyn Fn(usize, T) -> Result<(), String> + Sync),
+    emit: &mut dyn FnMut(usize, T) -> Result<(), String>,
 ) -> Result<(), String> {
-    let Some(shape) = cuts.shape() else {
+    if cuts.get(0).is_none() {
         // A stream that died cut nothing: its error is the cause.
         if let Some(e) = cuts.error() {
             return Err(e);
@@ -101,226 +56,176 @@ pub fn build_shards<T: Send>(
             "corpus holds no indexable bytes ({} doc(s), 0 non-empty)",
             cuts.num_docs()
         ));
-    };
-    let threads = match threads {
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .build()
+        .unwrap_or_else(|e| refuse(format!("cannot create a build thread pool: {e}")));
+    let window = match window {
         Some(n) => n,
-        None => build_threads(
-            match shape {
-                Shape::One => 1,
-                // The slot count is still unknown, so this machine is the
-                // ceiling: a knob may not ask for more workers than it.
-                Shape::Many => machine_threads(),
-            },
-            cap,
-        )?,
+        None => window_from(
+            pool.current_num_threads(),
+            crate::env::bytes(
+                BYTES_VAR,
+                physical_memory().map_or(FALLBACK_BUILD_BYTES, |m| m / 2),
+            )?,
+            BUILD_BYTES_PER_TEXT_BYTE.saturating_mul(cap),
+        ),
     };
-    build_plan(cuts, threads, build, emit)
+    build_plan(&pool, cuts, window, build, emit)
 }
 
-/// Build every slot `cuts` closes, with at most `threads` in flight.
-///
-/// The slot count is unknown up front: a worker blocks on the next cut, so
-/// construction overlaps the document stream. `build` runs on every worker,
-/// inside its rayon pool; `emit` sees every slot exactly once, ascending,
-/// never concurrently.
-pub fn build_plan<T: Send>(
-    cuts: &Cuts,
-    threads: usize,
-    build: &(dyn Fn(&Cut) -> Result<T, String> + Sync),
-    emit: &(dyn Fn(usize, T) -> Result<(), String> + Sync),
-) -> Result<(), String> {
-    let threads = threads.max(1);
-    let per_shard = shard_threads(threads, machine_threads());
-    let gate = Gate::new();
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| scope.spawn(|| work(cuts, per_shard, &next, &gate, build, emit)))
-            .collect();
-        // Join eagerly: a worker panic is a build refusal and must reach the
-        // caller as a panic, not as the gate's abort error.
-        for worker in workers {
-            if let Err(payload) = worker.join() {
-                std::panic::resume_unwind(payload);
-            }
+thread_local! {
+    static BUILDING: Cell<bool> = const { Cell::new(false) };
+}
+
+enum Event<T> {
+    Built(usize, std::thread::Result<Result<T, String>>),
+    /// A thread waiting inside one build picked up another: starting it
+    /// there would stall the first build until the second one ends.
+    Busy(usize, Cut),
+    Skipped,
+    /// The claims are over, after this many slots.
+    End(usize),
+}
+
+/// Slots emitted so far, and whether the build stopped.
+struct Emitted {
+    state: Mutex<(usize, bool)>,
+    moved: Condvar,
+}
+
+impl Emitted {
+    fn lock(&self) -> MutexGuard<'_, (usize, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn update(&self, f: impl FnOnce(&mut (usize, bool))) {
+        f(&mut self.lock());
+        self.moved.notify_all();
+    }
+}
+
+/// Stops the claims if `emit` panics, so the scope can end.
+struct StopOnUnwind<'a>(&'a Emitted, &'a Cuts);
+
+impl Drop for StopOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.update(|state| state.1 = true);
+            self.1.abort();
         }
+    }
+}
+
+/// Build every slot `cuts` closes on `pool`, holding at most `window` slots
+/// from claim until emitted. A claiming thread starts each build as the
+/// stream closes its cut; the caller's thread runs `emit` on every slot
+/// exactly once, ascending. The lowest-slot error is returned; a panicking
+/// build panics here.
+pub fn build_plan<T: Send>(
+    pool: &rayon::ThreadPool,
+    cuts: &Cuts,
+    window: usize,
+    build: &(dyn Fn(&Cut) -> Result<T, String> + Sync),
+    emit: &mut dyn FnMut(usize, T) -> Result<(), String>,
+) -> Result<(), String> {
+    let window = window.max(1);
+    let stop = AtomicBool::new(false);
+    let emitted = Emitted {
+        state: Mutex::new((0, false)),
+        moved: Condvar::new(),
+    };
+    let (tx, rx) = mpsc::channel();
+    let mut failure: Option<(usize, String)> = None;
+    let mut panic = None;
+    pool.in_place_scope(|scope| {
+        let start = |slot: usize, cut: Cut| {
+            let (tx, stop) = (tx.clone(), &stop);
+            scope.spawn(move |_| {
+                let event = if stop.load(Ordering::Relaxed) {
+                    Event::Skipped
+                } else if BUILDING.get() {
+                    Event::Busy(slot, cut)
+                } else {
+                    BUILDING.set(true);
+                    let built = catch_unwind(AssertUnwindSafe(|| build(&cut)));
+                    BUILDING.set(false);
+                    Event::Built(slot, built)
+                };
+                let _ = tx.send(event);
+            });
+        };
+        // A plain thread: it waits on the window, so on the pool it could starve the builds.
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                let mut slot = 0;
+                loop {
+                    let mut state = emitted.lock();
+                    while !state.1 && slot - state.0 >= window {
+                        state = emitted.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if state.1 {
+                        break;
+                    }
+                    drop(state);
+                    let Some(cut) = cuts.get(slot) else { break };
+                    start(slot, cut);
+                    slot += 1;
+                }
+                let _ = tx.send(Event::End(slot));
+            });
+            let _unwind = StopOnUnwind(&emitted, cuts);
+            let mut ready = BTreeMap::new();
+            let (mut received, mut next) = (0, 0);
+            let mut claimed = None;
+            while claimed != Some(received) {
+                let stopped = failure.is_some() || panic.is_some();
+                match rx.recv().expect("the caller holds a sender") {
+                    Event::End(n) => claimed = Some(n),
+                    Event::Busy(slot, cut) if !stopped => start(slot, cut),
+                    Event::Busy(..) | Event::Skipped => received += 1,
+                    Event::Built(slot, built) => {
+                        received += 1;
+                        match built {
+                            Ok(Ok(shard)) => {
+                                ready.insert(slot, shard);
+                            }
+                            Ok(Err(e)) => fail(&mut failure, slot, e),
+                            Err(payload) => {
+                                panic.get_or_insert(payload);
+                            }
+                        }
+                    }
+                }
+                while failure.is_none() && panic.is_none() {
+                    let Some(shard) = ready.remove(&next) else {
+                        break;
+                    };
+                    if let Err(e) = emit(next, shard) {
+                        fail(&mut failure, next, e);
+                    }
+                    next += 1;
+                    emitted.update(|state| state.0 = next);
+                }
+                if !stopped && (failure.is_some() || panic.is_some()) {
+                    stop.store(true, Ordering::Relaxed);
+                    emitted.update(|state| state.1 = true);
+                    cuts.abort();
+                }
+            }
+        });
     });
-    match gate.failure() {
-        Some(e) => Err(e),
+    if let Some(payload) = panic {
+        resume_unwind(payload);
+    }
+    match failure {
+        Some((_, e)) => Err(e),
         None => Ok(()),
     }
 }
 
-fn work<T: Send>(
-    cuts: &Cuts,
-    per_shard: usize,
-    next: &AtomicUsize,
-    gate: &Gate,
-    build: &(dyn Fn(&Cut) -> Result<T, String> + Sync),
-    emit: &(dyn Fn(usize, T) -> Result<(), String> + Sync),
-) {
-    let abort = AbortOnDrop(gate, cuts);
-    // Built on the first claim, not up front: a worker spawned against an
-    // unknown shard count may never claim a slot.
-    let mut pool = None;
-    loop {
-        let slot = next.fetch_add(1, Ordering::Relaxed);
-        if gate.aborted() {
-            break;
-        }
-        let Some(cut) = cuts.get(slot) else { break };
-        let pool = pool.get_or_insert_with(|| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(per_shard)
-                .build()
-                .unwrap_or_else(|e| refuse(format!("cannot create a build thread pool: {e}")))
-        });
-        let built = pool.install(|| build(&cut));
-        let done = built.and_then(|shard| gate.emit_in_order(slot, || emit(slot, shard)));
-        match done {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(e) => {
-                gate.fail(slot, e);
-                // Wake the workers blocked on a cut, and stop the stream.
-                cuts.abort();
-                break;
-            }
-        }
-    }
-    abort.disarm();
-}
-
-/// Admits slot `s` to `emit` only once every lower slot has been emitted.
-///
-/// The mutex guards only the turn counter: `emit` runs unlocked, since only
-/// the worker whose slot equals `next` may emit and `next` advances after.
-/// No worker can strand the others: a failure records itself and aborts, and
-/// [`AbortOnDrop`] aborts for a worker that unwinds, so every waiter wakes.
-struct Gate {
-    state: Mutex<GateState>,
-    ready: Condvar,
-    /// Set before the mutex is taken to notify, so a waiter that checks it
-    /// under the mutex cannot miss the wake-up.
-    aborted: AtomicBool,
-}
-
-struct GateState {
-    next: usize,
-    /// Lowest-slot failure, the one reported.
-    failure: Option<(usize, String)>,
-}
-
-impl Gate {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(GateState {
-                next: 0,
-                failure: None,
-            }),
-            ready: Condvar::new(),
-            aborted: AtomicBool::new(false),
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, GateState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn aborted(&self) -> bool {
-        self.aborted.load(Ordering::Acquire)
-    }
-
-    /// `Ok(false)` means another worker aborted and this slot must not be
-    /// emitted.
-    fn emit_in_order(
-        &self,
-        slot: usize,
-        emit: impl FnOnce() -> Result<(), String>,
-    ) -> Result<bool, String> {
-        let mut state = self.lock();
-        while !self.aborted() && state.next != slot {
-            state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-        if self.aborted() {
-            return Ok(false);
-        }
-        drop(state);
-        // An error or unwind leaves `next` at `slot`: nobody else emits.
-        emit()?;
-        self.lock().next += 1;
-        self.ready.notify_all();
-        Ok(true)
-    }
-
-    fn fail(&self, slot: usize, e: String) {
-        let mut state = self.lock();
-        if state.failure.as_ref().is_none_or(|(at, _)| slot < *at) {
-            state.failure = Some((slot, e));
-        }
-        drop(state);
-        self.abort();
-    }
-
-    fn abort(&self) {
-        self.aborted.store(true, Ordering::Release);
-        // Taking the mutex orders the store before any waiter's next check.
-        drop(self.lock());
-        self.ready.notify_all();
-    }
-
-    fn failure(&self) -> Option<String> {
-        self.lock().failure.take().map(|(_, e)| e)
-    }
-}
-
-/// Aborts the gate and the cut feed unless the worker left its loop cleanly:
-/// a waiter blocked on a cut that will never come must wake, and the stream
-/// behind it must stop.
-struct AbortOnDrop<'a>(&'a Gate, &'a Cuts);
-
-impl AbortOnDrop<'_> {
-    fn disarm(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for AbortOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.abort();
-        self.1.abort();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    /// A worker claiming its next slot checks the gate while another worker
-    /// is still emitting: the check must not wait out the emit.
-    #[test]
-    fn a_slow_emit_does_not_block_the_next_claim() {
-        let gate = Gate::new();
-        std::thread::scope(|scope| {
-            let emitted = gate.emit_in_order(0, || {
-                let (tx, rx) = mpsc::channel();
-                let gate = &gate;
-                scope.spawn(move || {
-                    let _ = tx.send(gate.aborted());
-                });
-                match rx.recv_timeout(Duration::from_secs(10)) {
-                    Ok(aborted) => {
-                        assert!(!aborted);
-                        Ok(())
-                    }
-                    Err(_) => Err("the claim waited out the emit".to_string()),
-                }
-            });
-            assert_eq!(emitted, Ok(true));
-            let next = scope.spawn(|| gate.emit_in_order(1, || Ok(())));
-            assert_eq!(next.join().unwrap(), Ok(true));
-        });
+fn fail(failure: &mut Option<(usize, String)>, slot: usize, e: String) {
+    if failure.as_ref().is_none_or(|(at, _)| slot < *at) {
+        *failure = Some((slot, e));
     }
 }

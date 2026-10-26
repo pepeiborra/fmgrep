@@ -36,7 +36,8 @@ pub fn read_cut(shard: &Path, cut: &Cut) -> Result<Vec<Document>, String> {
 /// The documents of `cut` re-read from the files under `root`; a file whose
 /// stamp moved since the walk read it is refused by path.
 pub fn read_files(root: &Path, cut: &Cut) -> Result<Vec<Document>, String> {
-    let read = crate::read_stamped(root, &cut.paths)?;
+    let pool = crate::walk::read_pool()?;
+    let read = crate::walk::read_batch(&pool, root, &cut.paths, &String::as_str)?;
     let mut out = Vec::with_capacity(read.len());
     for (at, (id, (bytes, stamp))) in cut.docs.clone().zip(read).enumerate() {
         let want = Stamp {

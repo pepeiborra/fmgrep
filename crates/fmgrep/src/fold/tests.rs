@@ -93,7 +93,7 @@ fn walk_agrees_with_a_naive_case_insensitive_scan() {
         let plan = plan_of(pattern).expect("plan");
         for text in texts {
             assert_eq!(
-                fold_any_capped(ScanCursor::from(*text), &plan, max_live()),
+                fold_any_capped(ScanCursor::from(*text), &plan, MAX_LIVE),
                 Some(oracle(text, pattern)),
                 "pattern {pattern:?} text {:?}",
                 String::from_utf8_lossy(text),

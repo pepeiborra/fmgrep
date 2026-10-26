@@ -1,4 +1,5 @@
 [workspace]
+default-members = ["crates/fmgrep"]
 members = ["crates/docfm", "crates/fmgrep", "crates/bench"]
 resolver = "3"
 

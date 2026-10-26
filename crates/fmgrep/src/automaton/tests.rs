@@ -4,16 +4,6 @@
 use super::*;
 use crate::cursor::ScanCursor;
 
-/// The default budgets, overridden per test.
-fn test_caps() -> Caps {
-    Caps {
-        live: 256,
-        depth: 64,
-        nodes: 20_000,
-        class_bytes: 64,
-    }
-}
-
 fn ci() -> MatchMode {
     MatchMode {
         ignore_case: true,
@@ -99,24 +89,23 @@ fn plan_refuses_lookaround_and_unsupported_shapes() {
     }
     // An over-large DFA is refused, not built.
     assert!(plan_capped("[a-z]{300}", MatchMode::default(), 1024).is_none());
-    assert!(plan_capped("[a-z]{300}", MatchMode::default(), 8 << 20).is_some());
+    assert!(plan_capped("[a-z]{300}", MatchMode::default(), DFA_BYTES).is_some());
 }
 
 #[test]
 fn walk_agrees_with_the_regex_crate() {
-    let caps = test_caps();
     for pattern in BATTERY {
         let plan = plan_of(pattern, MatchMode::default()).expect("plan");
-        let from_hir = plan_hir(&hir_of(pattern), 8 << 20).expect("plan");
+        let from_hir = plan_hir(&hir_of(pattern), DFA_BYTES).expect("plan");
         let re = oracle(pattern, MatchMode::default());
         for text in TEXTS {
             assert_eq!(
-                any_capped(ScanCursor::from(*text), &from_hir, &caps),
-                any_capped(ScanCursor::from(*text), &plan, &caps),
+                any_capped(ScanCursor::from(*text), &from_hir, &CAPS),
+                any_capped(ScanCursor::from(*text), &plan, &CAPS),
                 "pattern {pattern:?}",
             );
             assert_eq!(
-                any_capped(ScanCursor::from(*text), &plan, &caps),
+                any_capped(ScanCursor::from(*text), &plan, &CAPS),
                 Some(re.is_match(text)),
                 "pattern {pattern:?} text {:?}",
                 String::from_utf8_lossy(text),
@@ -127,7 +116,6 @@ fn walk_agrees_with_the_regex_crate() {
 
 #[test]
 fn accepted_offsets_start_matches_and_meet_every_match() {
-    let caps = test_caps();
     for pattern in BATTERY {
         let plan = plan_of(pattern, MatchMode::default()).expect("plan");
         let re = oracle(pattern, MatchMode::default());
@@ -135,7 +123,7 @@ fn accepted_offsets_start_matches_and_meet_every_match() {
         // offset really begins a whole match.
         let at_offset = oracle(&format!("^(?:{pattern})"), MatchMode::default());
         for text in TEXTS {
-            let mut got = locate_capped(ScanCursor::from(*text), &plan, &caps).expect("no widen");
+            let mut got = locate_capped(ScanCursor::from(*text), &plan, &CAPS).expect("no widen");
             got.sort_unstable();
             got.dedup();
             for &off in &got {
@@ -164,10 +152,7 @@ fn accepted_offsets_start_matches_and_meet_every_match() {
 #[test]
 fn depth_cap_widens_instead_of_answering_no() {
     let plan = plan_of("[A-Z][a-z]+Env", MatchMode::default()).expect("plan");
-    let caps = Caps {
-        depth: 3,
-        ..test_caps()
-    };
+    let caps = Caps { depth: 3, ..CAPS };
     assert_eq!(
         any_capped(ScanCursor::from(b"HscEnv".as_slice()), &plan, &caps),
         None
@@ -183,10 +168,7 @@ fn depth_cap_widens_instead_of_answering_no() {
 #[test]
 fn live_cap_widens() {
     let plan = plan_of("gr[ae]y", MatchMode::default()).expect("plan");
-    let caps = Caps {
-        live: 1,
-        ..test_caps()
-    };
+    let caps = Caps { live: 1, ..CAPS };
     assert_eq!(
         any_capped(ScanCursor::from(b"gray grey".as_slice()), &plan, &caps),
         None
@@ -200,10 +182,7 @@ fn live_cap_widens() {
 #[test]
 fn node_cap_widens() {
     let plan = plan_of("abc", MatchMode::default()).expect("plan");
-    let caps = Caps {
-        nodes: 1,
-        ..test_caps()
-    };
+    let caps = Caps { nodes: 1, ..CAPS };
     assert_eq!(
         any_capped(ScanCursor::from(b"abc".as_slice()), &plan, &caps),
         None
@@ -219,7 +198,7 @@ fn class_width_cap_widens() {
     let plan = plan_of("a[bc]d", MatchMode::default()).expect("plan");
     let caps = Caps {
         class_bytes: 1,
-        ..test_caps()
+        ..CAPS
     };
     assert_eq!(
         any_capped(ScanCursor::from(b"abd".as_slice()), &plan, &caps),
@@ -252,17 +231,16 @@ fn an_over_wide_first_step_never_plans() {
 #[test]
 fn ci_plan_covers_the_unicode_folds() {
     let plan = plan_of("printk", ci()).expect("plan");
-    let caps = test_caps();
     for text in [b"printk".as_slice(), b"PRINTK", b"print\xe2\x84\xaa"] {
         assert_eq!(
-            any_capped(ScanCursor::from(text), &plan, &caps),
+            any_capped(ScanCursor::from(text), &plan, &CAPS),
             Some(true),
             "text {:?}",
             String::from_utf8_lossy(text),
         );
     }
     assert_eq!(
-        any_capped(ScanCursor::from(b"nothing".as_slice()), &plan, &caps),
+        any_capped(ScanCursor::from(b"nothing".as_slice()), &plan, &CAPS),
         Some(false)
     );
 }
@@ -313,15 +291,14 @@ const CORE_TEXTS: &[&[u8]] = &[
 
 #[test]
 fn core_plan_meets_every_match() {
-    let caps = test_caps();
     for pattern in CORE_BATTERY {
         let hir = hir_of(pattern);
         let anchor = required_literal(&hir).expect("anchored");
         let core = core(&hir, &anchor, 64).unwrap_or_else(|| panic!("{pattern:?} has a core"));
-        let plan = plan_hir(&core, 8 << 20).expect("plan");
+        let plan = plan_hir(&core, DFA_BYTES).expect("plan");
         let re = oracle(pattern, MatchMode::default());
         for text in CORE_TEXTS {
-            let got = locate_capped(ScanCursor::from(*text), &plan, &caps).expect("no widen");
+            let got = locate_capped(ScanCursor::from(*text), &plan, &CAPS).expect("no widen");
             for m in re.find_iter(text) {
                 assert!(
                     got.iter().any(|&o| (m.start()..m.end()).contains(&o)),

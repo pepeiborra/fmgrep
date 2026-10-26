@@ -10,25 +10,29 @@ mod read;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::manifest::{DOCS_SHARD, SHARD_WRITE_BUFFER, shard_offsets};
+use crate::manifest::{DOCS_SHARD, SHARD_WRITE_BUFFER};
 use crate::plan::Cutter;
+use crate::walk::WalkNotes;
 
 use feed::CutSource;
-pub use feed::{Cut, Cuts, Shape};
+pub use feed::{Cut, Cuts};
 
 /// One index's per-document manifest tables; `Cuts` holds the documents.
 pub struct Docs {
-    /// Corpus-relative path per doc, kept so a refusal can name the document.
-    paths: Vec<String>,
+    /// Corpus-relative path per doc, the manifest's `files`.
+    pub paths: Vec<String>,
     /// Raw stored byte length per doc, ascending by id.
-    lens: Vec<u64>,
-    /// Prefix sums of `lens`; the last entry is the shard's byte count.
-    offsets: Vec<u64>,
+    pub lens: Vec<u64>,
+    /// The manifest's `num_bytes`.
+    pub num_bytes: u64,
     /// Leading UTF-8 BOM bytes over all docs, the manifest's `bom_bytes`.
-    bom_bytes: u64,
-    mtimes: Vec<i64>,
+    pub bom_bytes: u64,
+    /// The walk's mtime per doc, ascending by id.
+    pub mtimes: Vec<i64>,
     /// Canonical corpus root; files layout only.
-    root: Option<String>,
+    pub root: Option<String>,
+    /// What the walk saw besides documents.
+    pub walk: WalkNotes,
 }
 
 /// Stream every indexable document under `folder` while `build` consumes the
@@ -43,14 +47,13 @@ pub fn stream_while<R>(
     store_docs: bool,
     build: impl FnOnce(&Cuts) -> Result<R, String>,
 ) -> Result<(Docs, R), String> {
-    let (source, root) = if store_docs {
-        (CutSource::Shard(output.join(DOCS_SHARD)), None)
+    let source = if store_docs {
+        CutSource::Shard(output.join(DOCS_SHARD))
     } else {
-        let root = corpus_root(folder)?;
-        let utf8 = root.to_str().map(str::to_owned);
-        (CutSource::Files(root), utf8)
+        CutSource::Files(corpus_root(folder)?)
     };
     let (cuts, writer) = feed::feed(source.clone());
+    // A plain thread: the stream blocks for the whole build and must never run a shard build.
     let (streamed, built) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| stream_into(folder, output, &source, cap, writer));
         let built = {
@@ -76,8 +79,7 @@ pub fn stream_while<R>(
         return Err(e.clone());
     }
     let built = built?;
-    let mut docs = streamed.expect("the stream only aborts once the build has failed");
-    docs.root = root;
+    let docs = streamed.expect("the stream only aborts once the build has failed");
     Ok((docs, built))
 }
 
@@ -136,35 +138,39 @@ fn stream_into(
         |shard: &Path, e: std::io::Error| format!("error: cannot write {}: {e}", shard.display());
     let mut cutter = Cutter::of(cap);
     let mut bom_bytes = 0u64;
-    let walked = crate::for_each_index_doc(folder, Some(output), |doc, stamp| {
+    let walked = crate::for_each_index_doc(folder, Some(output), |path, bytes, stamp| {
         if writer.aborted() {
             return Err(ABORTED.to_string());
         }
-        if matches!(source, CutSource::Files(_)) && doc.bytes.len() as u64 != stamp.len {
-            return Err(read::changed_while_indexing(&folder.join(&doc.path)));
+        if matches!(source, CutSource::Files(_)) && bytes.len() as u64 != stamp.len {
+            return Err(read::changed_while_indexing(&folder.join(path)));
         }
         let stamp = crate::Stamp {
-            len: doc.bytes.len() as u64,
+            len: bytes.len() as u64,
             ..stamp
         };
-        bom_bytes += (doc.bytes.len() - crate::matching::strip_bom(&doc.bytes).len()) as u64;
-        let cut = cutter.push(doc.bytes.len() as u64);
+        bom_bytes += (bytes.len() - crate::matching::strip_bom(&bytes).len()) as u64;
+        let cut = cutter.push(bytes.len() as u64);
         let handed = match out.as_mut() {
             Some((w, shard)) => {
-                w.write_all(&doc.bytes).map_err(|e| failed(shard, e))?;
+                w.write_all(&bytes).map_err(|e| failed(shard, e))?;
                 if cut.is_some() {
                     w.flush().map_err(|e| failed(shard, e))?;
                 }
                 None
             }
-            None => Some(doc.bytes),
+            None => Some(bytes),
         };
-        writer.pushed(doc.path, stamp, handed, cut);
+        writer.pushed(path.to_owned(), stamp, handed, cut);
         Ok(())
     });
     let flushed = match out.as_mut() {
         Some((w, shard)) => w.flush().map_err(|e| failed(shard, e)),
         None => Ok(()),
+    };
+    let (walk, walked) = match walked {
+        Ok(walk) => (walk, Ok(())),
+        Err(e) => (WalkNotes::default(), Err(e)),
     };
     let error = walked.and(flushed).err();
     // A short stream announces no trailing cut: its error is the answer.
@@ -173,48 +179,22 @@ fn stream_into(
     match error {
         Some(e) => Err(e),
         None => Ok(Docs {
-            offsets: shard_offsets(&tables.lens)?,
+            num_bytes: tables.lens.iter().sum(),
             paths: tables.paths,
             lens: tables.lens,
             bom_bytes,
             mtimes: tables.mtimes,
-            root: None,
+            root: match source {
+                CutSource::Files(root) => root.to_str().map(str::to_owned),
+                CutSource::Shard(_) => None,
+            },
+            walk,
         }),
     }
 }
 
 /// Not reported: the build gave up first, so its own error is the answer.
 const ABORTED: &str = "the document stream was aborted by the build";
-
-/// Corpus-relative path per doc, the manifest's `files`.
-pub fn paths(docs: &Docs) -> &[String] {
-    &docs.paths
-}
-
-/// Raw byte length per doc, ascending by id: the shard plan's only input.
-pub fn lens(docs: &Docs) -> &[u64] {
-    &docs.lens
-}
-
-/// Bytes indexed, the manifest's `num_bytes`.
-pub fn total_bytes(docs: &Docs) -> u64 {
-    docs.offsets.last().copied().unwrap_or(0)
-}
-
-/// Stored bytes rg's searcher would skip: the leading BOMs.
-pub fn bom_bytes(docs: &Docs) -> u64 {
-    docs.bom_bytes
-}
-
-/// The walk's mtime per doc, ascending by id.
-pub fn mtimes(docs: &Docs) -> &[i64] {
-    &docs.mtimes
-}
-
-/// The canonical corpus root of a files-layout stream.
-pub fn root(docs: &Docs) -> Option<&str> {
-    docs.root.as_deref()
-}
 
 impl Docs {
     pub fn num_docs(&self) -> usize {
