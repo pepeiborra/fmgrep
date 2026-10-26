@@ -49,14 +49,7 @@ fn longest_common_substring(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// Longest byte string every match of `hir` must contain, or `None` when no
-/// non-empty such string is known.
-///
-/// Soundness rule: the result is contained in every match, so absence proved
-/// by FM backward search means zero matches. Literals propagate;
-/// concatenations take the longest child literal; min > 0 repetitions and
-/// captures propagate their inner literal; alternations take the longest
-/// common substring of the branches' literals; classes, look-around, nullable
-/// repetitions and empty subexpressions contribute nothing.
+/// non-empty such string is known. Sound: FM absence of it proves no match.
 pub fn required_literal(hir: &regex_syntax::hir::Hir) -> Option<Vec<u8>> {
     use regex_syntax::hir::HirKind;
     match hir.kind() {
@@ -97,10 +90,39 @@ pub fn required_literal(hir: &regex_syntax::hir::Hir) -> Option<Vec<u8>> {
     }
 }
 
+/// Literals every match of `hir` must contain: a concat's children's, else
+/// [`required_literal`].
+fn required_literals(hir: &regex_syntax::hir::Hir) -> Vec<Vec<u8>> {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Concat(hirs) => hirs.iter().flat_map(required_literals).collect(),
+        HirKind::Capture(cap) => required_literals(&cap.sub),
+        HirKind::Repetition(rep) if rep.min > 0 => required_literals(&rep.sub),
+        _ => required_literal(hir).into_iter().collect(),
+    }
+}
+
+/// `hir`'s separator-free required literals not contained in `anchor` or in a
+/// longer one kept, longest first.
+fn others_of(hir: &regex_syntax::hir::Hir, anchor: &[u8]) -> Vec<Vec<u8>> {
+    let mut lits = required_literals(hir);
+    lits.retain(|lit| !lit.is_empty() && !lit.contains(&UNIFIED_SEPARATOR));
+    lits.sort_by_key(|lit| std::cmp::Reverse(lit.len()));
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    for lit in lits {
+        let within = |k: &[u8]| memchr::memmem::find(k, &lit).is_some();
+        if !within(anchor) && !kept.iter().any(|k| within(k)) {
+            kept.push(lit);
+        }
+    }
+    kept
+}
+
 /// One regex compiled once, plus the literals the FM-index prunes it with.
 pub struct PreparedPattern {
     re: regex::bytes::Regex,
     anchor: Option<Vec<u8>>,
+    others: Vec<Vec<u8>>,
     literal: Option<Vec<u8>>,
     fold: Option<FoldPlan>,
     automaton: Option<RegexPlan>,
@@ -172,9 +194,15 @@ impl PreparedPattern {
             .zip(anchor.as_deref())
             .filter(|_| fold.is_none() && !short)
             .and_then(|(hir, anchor)| DeferredPlan::new(hir, anchor));
+        let others = hir
+            .as_ref()
+            .zip(anchor.as_deref())
+            .filter(|_| fold.is_none() && automaton.is_none())
+            .map_or_else(Vec::new, |(hir, anchor)| others_of(hir, anchor));
         Ok(Self {
             re,
             anchor,
+            others,
             literal,
             fold,
             automaton,
@@ -215,6 +243,11 @@ pub fn narrows(p: &PreparedPattern) -> bool {
 /// The literal every match of `p` holds, never holding the separator.
 pub fn anchor(p: &PreparedPattern) -> Option<&[u8]> {
     p.anchor.as_deref()
+}
+
+/// Required literals of `p` besides its anchor, for the literal route only.
+pub fn others(p: &PreparedPattern) -> &[Vec<u8>] {
+    &p.others
 }
 
 /// The plan a shard walks where `p`'s longer anchor is common.
@@ -263,6 +296,43 @@ mod tests {
         assert_eq!(anchor_bytes("x?"), None);
         assert_eq!(anchor_bytes("[ab]+"), None);
         assert_eq!(anchor_bytes("a+|b+"), None);
+    }
+
+    #[test]
+    fn other_literals_of_a_concat() {
+        let lits = |p: &str, mode| {
+            let prepared = PreparedPattern::prepare_with(p, mode).unwrap();
+            let others: Vec<String> = others(&prepared)
+                .iter()
+                .map(|o| String::from_utf8_lossy(o).into())
+                .collect();
+            let anchor = anchor(&prepared).map(|a| String::from_utf8_lossy(a).into_owned());
+            (anchor, others)
+        };
+        let plain = MatchMode::default();
+        let want = |a: &str, o: &[&str]| {
+            let o: Vec<String> = o.iter().map(ToString::to_string).collect();
+            (Some(a.to_string()), o)
+        };
+        assert_eq!(lits("stg_\\w+_info", plain), want("_info", &["stg_"]));
+        assert_eq!(lits("(foo){2}.*barbaz", plain), want("barbaz", &["foo"]));
+        // An alternation gives its common substring only.
+        assert_eq!(
+            lits("(printk|printf)\\(.*KERN_", plain),
+            want("KERN_", &["print", "("])
+        );
+        // Nullable parts, separator-holding and anchor-contained literals give none.
+        assert_eq!(lits("(xy)?z*[ab]a\\x00b.*abcd", plain), want("abcd", &[]));
+        assert_eq!(lits("abcd\\w+bc", plain), want("abcd", &[]));
+        assert_eq!(lits("printk", plain), want("printk", &[]));
+        // Under -i only the fold-invariant bytes.
+        assert_eq!(lits("abc_1234\\w+x-y", plain), want("abc_1234", &["x-y"]));
+        assert_eq!(lits("abc_1234\\w+x-y", ci()), want("_1234", &["-"]));
+        // A fold plan or an eager automaton plan gets none.
+        let folded = PreparedPattern::prepare_with("x____y-z", ci()).unwrap();
+        assert!(folded.fold().is_some() && others(&folded).is_empty());
+        let walked = PreparedPattern::prepare("Int(32|64)#").unwrap();
+        assert!(walked.automaton().is_some() && others(&walked).is_empty());
     }
 
     #[test]

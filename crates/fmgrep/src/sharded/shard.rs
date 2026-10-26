@@ -9,7 +9,7 @@ use crate::automaton::{DeferredPlan, MIN_ANCHOR_COUNT, RegexPlan, automaton_loca
 use crate::blobs::Blob;
 use crate::cursor::{BackwardCursor, LocatingCursor};
 use crate::fold::{FoldPlan, fold_locate};
-use crate::pattern::{PreparedPattern, anchor, count_overlapping, deferred};
+use crate::pattern::{PreparedPattern, anchor, count_overlapping, deferred, others};
 use crate::plan::shard_label;
 
 /// One shard's docfm index. Separators are indexed text here, so the
@@ -144,8 +144,8 @@ impl ShardMeta {
     }
 
     /// Ascending global doc ids that may hold a match of `pattern`: a walk
-    /// where one is planned, else the anchor's documents; empty when
-    /// `pattern` does not [`narrows`](crate::pattern::narrows).
+    /// where one is planned, else by its required literals, rarest first;
+    /// empty when `pattern` does not [`narrows`](crate::pattern::narrows).
     pub fn regex_docs(&self, structure: &Structure, pattern: &PreparedPattern) -> Vec<usize> {
         let anchor = anchor(pattern);
         if let Some(plan) = pattern.fold() {
@@ -154,19 +154,31 @@ impl ShardMeta {
         if let Some(plan) = pattern.automaton() {
             return self.automaton_docs(structure, plan, anchor);
         }
-        let Some(term) = anchor else {
+        let Some(term) = anchor.filter(|t| may_contain(structure, t)) else {
             return Vec::new();
         };
-        if !may_contain(structure, term) {
-            return Vec::new();
+        let others = others(pattern);
+        if others.is_empty() && deferred(pattern).is_none() {
+            return self.term_docs(structure, term);
         }
-        let common = || structure.cursor().extend_front(term).count() >= MIN_ANCHOR_COUNT;
+        let count = self.count(structure, term);
         if let Some(plan) = deferred(pattern)
-            .filter(|_| common())
+            .filter(|_| count >= MIN_ANCHOR_COUNT)
             .and_then(DeferredPlan::plan)
         {
             return self.automaton_docs(structure, plan, anchor);
         }
+        let terms: Vec<&[u8]> = std::iter::once(term)
+            .chain(others.iter().map(Vec::as_slice))
+            .collect();
+        let counts: Vec<u64> = std::iter::once(count)
+            .chain(others.iter().map(|t| self.count(structure, t)))
+            .collect();
+        rarest_first(&counts, |i| self.term_docs(structure, terms[i]))
+    }
+
+    /// Ascending global doc ids holding `term`.
+    fn term_docs(&self, structure: &Structure, term: &[u8]) -> Vec<usize> {
         self.counts(structure, term)
             .into_iter()
             .map(|(doc, _)| doc)
@@ -210,11 +222,7 @@ impl ShardMeta {
     ) -> Vec<usize> {
         let Some(hits) = hits else {
             return match anchor {
-                Some(term) => self
-                    .counts(structure, term)
-                    .into_iter()
-                    .map(|(doc, _)| doc)
-                    .collect(),
+                Some(term) => self.term_docs(structure, term),
                 None => self.docs.clone().collect(),
             };
         };
@@ -228,6 +236,47 @@ impl ShardMeta {
         let text = if store_docs { self.text_len as u64 } else { 0 };
         structure.heap_bytes() + text
     }
+}
+
+/// Located occurrences that cost about one candidate document's read.
+const LOCATE_RATIO: u64 = 8;
+
+/// Candidates from required literal `counts` (anchor first, winning ties):
+/// the rarest literal's docs, narrowed by each literal cheap under
+/// [`LOCATE_RATIO`]; empty when any count is 0.
+fn rarest_first(counts: &[u64], mut docs_of: impl FnMut(usize) -> Vec<usize>) -> Vec<usize> {
+    if counts.contains(&0) {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..counts.len()).collect();
+    order.sort_by_key(|&i| counts[i]);
+    let Some((&first, rest)) = order.split_first() else {
+        return Vec::new();
+    };
+    let mut docs = docs_of(first);
+    for &i in rest {
+        if docs.is_empty() || counts[i] > LOCATE_RATIO * docs.len() as u64 {
+            break;
+        }
+        docs = intersect(&docs, &docs_of(i));
+    }
+    docs
+}
+
+/// Elements of both ascending `a` and `b`.
+fn intersect(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                (i, j) = (i + 1, j + 1);
+            }
+        }
+    }
+    out
 }
 
 /// Hits at or above `kept / DENSE_TALLY` tally in a per-doc array.
@@ -344,4 +393,50 @@ pub fn self_check(
         });
         !stray && here == want && total == count
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`rarest_first`] over `sets`, recording which literals it located.
+    fn run(counts: &[u64], sets: &[&[usize]]) -> (Vec<usize>, Vec<usize>) {
+        let mut located = Vec::new();
+        let docs = rarest_first(counts, |i| {
+            located.push(i);
+            sets[i].to_vec()
+        });
+        (docs, located)
+    }
+
+    #[test]
+    fn a_tie_locates_the_anchor() {
+        assert_eq!(run(&[3, 3], &[&[1, 2], &[2, 3]]), (vec![2], vec![0, 1]));
+        assert_eq!(run(&[9], &[&[4]]), (vec![4], vec![0]));
+    }
+
+    #[test]
+    fn a_zero_count_locates_nothing() {
+        assert_eq!(run(&[5, 0], &[&[1], &[]]), (vec![], vec![]));
+    }
+
+    #[test]
+    fn a_literal_locates_up_to_the_ratio() {
+        let two: &[usize] = &[1, 2];
+        let at = LOCATE_RATIO * 2;
+        assert_eq!(run(&[at, 2], &[&[2, 3], two]), (vec![2], vec![1, 0]));
+        assert_eq!(run(&[at + 1, 2], &[&[2, 3], two]), (vec![1, 2], vec![1]));
+        // The cheaper of two others locates first, the dearer never.
+        assert_eq!(
+            run(&[at + 1, 2, 3], &[&[1], two, &[1]]),
+            (vec![1], vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn an_intersection_only_shrinks() {
+        assert_eq!(intersect(&[1, 3, 5, 7], &[0, 3, 4, 7, 9]), vec![3, 7]);
+        assert!(intersect(&[1], &[]).is_empty());
+        assert_eq!(run(&[1, 1, 1], &[&[1], &[2], &[1]]), (vec![], vec![0, 1]));
+    }
 }

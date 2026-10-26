@@ -3,6 +3,7 @@ use super::*;
 mod build;
 mod count;
 mod docfm;
+mod literals;
 mod walk;
 use std::path::Path;
 use std::sync::Mutex;

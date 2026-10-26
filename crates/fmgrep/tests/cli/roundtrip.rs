@@ -205,7 +205,7 @@ fn a_common_anchor_reads_only_matching_docs() {
     // fmgrep's `MIN_ANCHOR_COUNT`: from this many anchors a shard walks.
     const WALKS: usize = 256;
     let stage = |copies: usize| {
-        let common = b"union x\n".repeat(copies);
+        let common = b"union x {\n".repeat(copies);
         let (tmp, docs) =
             stage_files(&[("a.c", &common), ("b.c", b"union {\n"), ("c.c", b"none\n")]);
         let index_dir = do_index(&docs, false);
@@ -221,7 +221,7 @@ fn a_common_anchor_reads_only_matching_docs() {
     let out = run(&["--index", &index, "-c", &regex]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b.c:1\n");
     assert!(!stderr(&out).contains("excluding"));
-    // Control arm: the anchor prune reads `a.c`, which is excluded.
+    // Control arm: the literal prune reads `a.c`, which is excluded.
     let (_tmp, index_dir) = stage(8);
     let out = run(&query_argv(&index_dir, true, &[PATTERN]));
     let stderr = stderr(&out);

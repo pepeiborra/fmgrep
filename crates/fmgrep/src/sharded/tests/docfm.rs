@@ -145,7 +145,15 @@ fn regex_candidates_prune_via_locate() {
     let idx = build(&docs, 1 << 20);
     let nullable = PreparedPattern::prepare("a*").unwrap();
     assert!(idx.regex_candidates(&nullable).is_none());
-    for pattern in ["printk", "aa", "missing", "pr[i1]ntk", "[ap]+"] {
+    for pattern in [
+        "printk",
+        "aa",
+        "missing",
+        "pr[i1]ntk",
+        "[ap]+",
+        "stg_\\w+_info",
+        "printk.*hello",
+    ] {
         let prepared = PreparedPattern::prepare(pattern).unwrap();
         let Some(got) = idx.regex_candidates(&prepared) else {
             panic!("{pattern} narrows");
