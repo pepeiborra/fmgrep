@@ -25,12 +25,6 @@ empty is the default, and any other value that does not parse is an error.
 | `FMGREP_SAMPLE_RATE` | `16`; a count over `0` | A document id is stored every this many text positions, so locating an occurrence takes fewer than this many steps: lower can answer literals and regexes faster, from a larger index (below). A search reads the rate from the index. |
 | `RAYON_NUM_THREADS` | machine parallelism | Threads for the build, and for a search's shard probes and directory walk. |
 
-## Search (developer)
-
-| variable | default | trades |
-|---|---|---|
-| `FMGREP_AND_LOCATE_RATIO` | `8`; `0` turns it off | Under an AND, a literal counted over this many times its rarest sibling is not located but checked in the files its siblings leave. Lower reads more files, higher locates more. |
-
 `FMGREP_SAMPLE_RATE` against blob size and the mean warm served search
 (Apple M5, files layout):
 

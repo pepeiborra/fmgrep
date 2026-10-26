@@ -305,6 +305,8 @@ fn blind_index(tmp: &Path, files: &[(&str, &[u8])]) -> PathBuf {
 
 #[test]
 fn expr_literal_only_fetches_nothing() {
+    // Every AND samples; the unreadable sample locates.
+    crate::tests::BAND.set(Some((0.0, f64::INFINITY)));
     let tmp = tempfile::tempdir().unwrap();
     let index = blind_index(
         tmp.path(),
@@ -339,6 +341,32 @@ fn expr_literal_only_fetches_nothing() {
             .docs_matched,
         1
     );
+    crate::tests::BAND.set(None);
+}
+
+#[test]
+fn expr_and_under_an_or_keeps_the_ratio_test() {
+    // The cost rule would demote printk, and approximate counts would read it.
+    crate::tests::BAND.set(Some((0.0, 0.0)));
+    let tmp = tempfile::tempdir().unwrap();
+    let index = blind_index(
+        tmp.path(),
+        &[
+            ("a.c", b"alpha x printk"),
+            ("b.c", b"alpha"),
+            ("c.c", b"printk"),
+        ],
+    );
+    let both = and(vec![t("alpha"), t("printk")]);
+    let under_or = report(
+        &index,
+        &["--approx-counts"],
+        &or(vec![both.clone(), t("zzz")]),
+    );
+    let at_root = report(&index, &["--approx-counts"], &both);
+    crate::tests::BAND.set(None);
+    assert_eq!(under_or.unwrap().docs_matched, 1);
+    assert!(at_root.unwrap_err().contains("cannot read"));
 }
 
 #[test]

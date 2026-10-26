@@ -22,8 +22,10 @@ use crate::wire::OutputReport;
 use support::*;
 
 thread_local! {
-    /// `FMGREP_AND_LOCATE_RATIO` for searches on this thread, over the env.
-    pub static RATIO: Cell<Option<u64>> = const { Cell::new(None) };
+    /// Searches on this thread count nothing and demote nothing.
+    pub static NO_DEMOTION: Cell<bool> = const { Cell::new(false) };
+    /// The AND cost rule's read band `(min_us, max_us)` on this thread.
+    pub static BAND: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
     /// `FMGREP_SHARD_BYTES` for indexes built on this thread, over the env.
     pub static SHARD_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
 }

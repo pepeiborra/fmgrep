@@ -1,57 +1,82 @@
 //! Which AND siblings are located and which are left to verification, from
-//! count-only probes.
+//! count-only probes and the located rarest sibling's cost.
 
 use std::ops::Range;
 
 use super::{Leaf, Probe, demotable};
 use crate::expr::Expr;
-use crate::probe::Query;
+use crate::probe::{Answer, Query};
 use crate::sharded::DocfmIndex;
 
-const RATIO_VAR: &str = "FMGREP_AND_LOCATE_RATIO";
+/// Locate time grows as occurrences to this power.
+const LOCATE_EXPONENT: f64 = 0.75;
 
-/// K from `FMGREP_AND_LOCATE_RATIO`: unset is 8, 0 never demotes.
-pub fn ratio() -> Result<u64, String> {
+const READ_BAND: ReadBand = ReadBand {
+    min_us: 12.0,
+    max_us: 80.0,
+};
+
+/// Reference documents read to measure the read cost.
+const SAMPLE_DOCS: usize = 16;
+
+/// A regex reference, or an AND under an OR, demotes a sibling counted over
+/// this many times the rarest.
+const FALLBACK_RATIO: u64 = 8;
+
+/// Microseconds per document read: outside the band its edge decides,
+/// inside it the cost is sampled.
+#[derive(Clone, Copy)]
+pub struct ReadBand {
+    pub min_us: f64,
+    pub max_us: f64,
+}
+
+pub fn read_band() -> ReadBand {
     #[cfg(test)]
-    if let Some(k) = crate::tests::RATIO.get() {
-        return Ok(k);
+    if let Some((min_us, max_us)) = crate::tests::BAND.get() {
+        return ReadBand { min_us, max_us };
     }
-    crate::env::count(RATIO_VAR, 8).map_err(|e| format!("error: {e}"))
+    READ_BAND
+}
+
+/// An AND node's direct leaf operands.
+pub struct AndGroup {
+    pub leaves: Vec<usize>,
+    pub under_or: bool,
 }
 
 /// Per AND node, the leaf indices of its direct leaf operands.
-pub fn and_groups(expr: &Expr) -> Vec<Vec<usize>> {
-    fn walk(e: &Expr, next: &mut usize, out: &mut Vec<Vec<usize>>) {
+pub fn and_groups(expr: &Expr) -> Vec<AndGroup> {
+    fn walk(e: &Expr, under_or: bool, next: &mut usize, out: &mut Vec<AndGroup>) {
         let (Expr::And(v) | Expr::Or(v)) = e else {
             *next += 1;
             return;
         };
-        let mut group = Vec::new();
+        let mut leaves = Vec::new();
         for child in v {
             if matches!(child, Expr::Term(_) | Expr::Regex(_)) {
-                group.push(*next);
+                leaves.push(*next);
             }
-            walk(child, next, out);
+            walk(child, under_or || matches!(e, Expr::Or(_)), next, out);
         }
         if matches!(e, Expr::And(_)) {
-            out.push(group);
+            out.push(AndGroup { leaves, under_or });
         }
     }
     let mut out = Vec::new();
-    walk(expr, &mut 0, &mut out);
+    walk(expr, false, &mut 0, &mut out);
     out
 }
 
 /// The leaves to count: those of an AND with two countable and one
-/// demotable direct leaves. None at `k == 0`.
-pub fn to_count(
-    groups: &[Vec<usize>],
-    countable: &[bool],
-    demotable: &[bool],
-    k: u64,
-) -> Vec<bool> {
+/// demotable direct leaves.
+pub fn to_count(groups: &[AndGroup], countable: &[bool], demotable: &[bool]) -> Vec<bool> {
     let mut out = vec![false; countable.len()];
-    for g in groups.iter().filter(|_| k > 0) {
+    #[cfg(test)]
+    if crate::tests::NO_DEMOTION.get() {
+        return out;
+    }
+    for g in groups.iter().map(|g| &g.leaves) {
         if g.iter().filter(|&&i| countable[i]).count() >= 2 && g.iter().any(|&i| demotable[i]) {
             g.iter()
                 .filter(|&&i| countable[i])
@@ -61,39 +86,32 @@ pub fn to_count(
     out
 }
 
-/// Per group, every demotable counted leaf whose total exceeds `k` times the
-/// group's smallest; the first smallest is never demoted.
-pub fn demoted(
-    groups: &[Vec<usize>],
-    totals: &[Option<u64>],
-    demotable: &[bool],
-    k: u64,
-) -> Vec<bool> {
-    let mut out = vec![false; totals.len()];
-    for g in groups.iter().filter(|_| k > 0) {
-        let counted = g.iter().filter_map(|&i| totals[i].map(|t| (i, t)));
-        let Some((min_leaf, min)) = counted.clone().min_by_key(|&(_, t)| t) else {
-            continue;
-        };
-        for (i, t) in counted {
-            out[i] = i != min_leaf && demotable[i] && t > k.saturating_mul(min);
-        }
-    }
-    out
-}
-
 /// Which leaves are located, where, and what their exact counts may miss.
 pub struct Plan {
     pub demoted: Vec<bool>,
+    /// Leaves [`decide`] demotes or leaves to a second probe pass.
+    pub candidate: Vec<bool>,
     /// Per located literal, the ranges it is probed on.
     pub within: Vec<Option<Vec<Range<usize>>>>,
     /// Per leaf, the ranges its exact counts may miss.
     pub unsettled: Vec<Vec<Range<usize>>>,
+    /// Per leaf, its count pass answer.
+    pub counts: Vec<Vec<(Range<usize>, u64)>>,
+    pub groups: Vec<Group>,
     pub probe_us: u64,
 }
 
+/// An AND whose candidates wait on its located reference.
+pub struct Group {
+    /// The first smallest counted leaf.
+    pub reference: usize,
+    pub candidates: Vec<usize>,
+    /// Where every demotable counted leaf of the AND occurs.
+    pub within: Vec<Range<usize>>,
+}
+
 /// The count pass; it probes nothing unless some AND can demote.
-pub fn plan(index: &DocfmIndex, expr: &Expr, leaves: &[Leaf<'_>], ratio: u64) -> Plan {
+pub fn plan(index: &DocfmIndex, expr: &Expr, leaves: &[Leaf<'_>]) -> Plan {
     let n = leaves.len();
     let terms: Vec<Option<&[u8]>> = leaves
         .iter()
@@ -107,54 +125,179 @@ pub fn plan(index: &DocfmIndex, expr: &Expr, leaves: &[Leaf<'_>], ratio: u64) ->
         .iter()
         .map(|l| matches!(&l.probe, Probe::Literal(lit) if demotable(lit)))
         .collect();
+    let literal: Vec<bool> = leaves
+        .iter()
+        .map(|l| matches!(l.probe, Probe::Literal(_)))
+        .collect();
     let groups = and_groups(expr);
     let countable: Vec<bool> = terms.iter().map(Option::is_some).collect();
-    let counted = to_count(&groups, &countable, &demotable, ratio);
+    let counted = to_count(&groups, &countable, &demotable);
     let queries: Vec<Query<'_>> = terms
         .iter()
         .zip(&counted)
         .filter_map(|(t, &c)| t.filter(|_| c).map(Query::Count))
         .collect();
+    let mut counts = vec![Vec::new(); n];
+    let mut probe_us = 0;
+    if !queries.is_empty() {
+        for (i, a) in (0..n)
+            .filter(|&i| counted[i])
+            .zip(index.probe_all(&queries))
+        {
+            probe_us += a.probe_us;
+            counts[i] = a.counts;
+        }
+    }
+    let mut plan = arrange(&groups, counts, &counted, &demotable, &literal);
+    plan.probe_us = probe_us;
+    plan
+}
+
+fn ranges(counts: &[(Range<usize>, u64)]) -> Vec<Range<usize>> {
+    counts.iter().map(|(r, _)| r.clone()).collect()
+}
+
+/// The plan from the `counted` leaves' `counts`. Per AND the first smallest
+/// is located; a regex smallest or an AND under an OR demotes now by
+/// [`FALLBACK_RATIO`], otherwise every other demotable leaf is a candidate.
+pub fn arrange(
+    groups: &[AndGroup],
+    counts: Vec<Vec<(Range<usize>, u64)>>,
+    counted: &[bool],
+    demotable: &[bool],
+    literal: &[bool],
+) -> Plan {
+    let n = counted.len();
     let mut plan = Plan {
         demoted: vec![false; n],
+        candidate: vec![false; n],
         within: vec![None; n],
         unsettled: vec![Vec::new(); n],
+        counts: Vec::new(),
+        groups: Vec::new(),
         probe_us: 0,
     };
-    if queries.is_empty() {
-        return plan;
-    }
-    let mut counts = vec![Vec::new(); n];
-    for (i, a) in (0..n)
-        .filter(|&i| counted[i])
-        .zip(index.probe_all(&queries))
+    for AndGroup {
+        leaves: g,
+        under_or,
+    } in groups
     {
-        plan.probe_us += a.probe_us;
-        counts[i] = a.counts;
-    }
-    let totals: Vec<Option<u64>> = counts
-        .iter()
-        .zip(&counted)
-        .map(|(c, &k)| k.then(|| c.iter().map(|(_, n)| n).sum()))
-        .collect();
-    plan.demoted = demoted(&groups, &totals, &demotable, ratio);
-    let docs =
-        |i: usize| -> Vec<Range<usize>> { counts[i].iter().map(|(r, _)| r.clone()).collect() };
-    for g in &groups {
-        let common = g.iter().filter(|&&i| plan.demoted[i]);
-        let Some(within) = common.map(|&i| docs(i)).reduce(|a, b| intersect(&a, &b)) else {
+        let totals = g
+            .iter()
+            .filter(|&&i| counted[i])
+            .map(|&i| (i, counts[i].iter().map(|(_, c)| c).sum::<u64>()));
+        let Some((m, min)) = totals.clone().min_by_key(|&(_, t)| t) else {
             continue;
         };
-        for &i in g {
+        let ratio = (!literal[m] || *under_or).then_some(FALLBACK_RATIO);
+        let mut candidates = Vec::new();
+        for (i, t) in totals.filter(|&(i, _)| i != m && demotable[i]) {
+            match ratio {
+                Some(k) => plan.demoted[i] = t > k.saturating_mul(min),
+                None => candidates.push(i),
+            }
+        }
+        // Under an OR, located literals are probed only where every demoted
+        // leaf occurs.
+        let spans = |i: usize| counted[i] && demotable[i] && (!under_or || plan.demoted[i]);
+        let Some(within) = g
+            .iter()
+            .filter(|&&i| spans(i))
+            .map(|&i| ranges(&counts[i]))
+            .reduce(|a, b| intersect(&a, &b))
+        else {
+            continue;
+        };
+        for &i in g.iter().filter(|&&i| literal[i]) {
             if plan.demoted[i] {
-                plan.unsettled[i] = docs(i);
-            } else if matches!(leaves[i].probe, Probe::Literal(_)) {
-                plan.unsettled[i] = difference(&docs(i), &within);
+                plan.unsettled[i] = ranges(&counts[i]);
+            } else {
+                plan.unsettled[i] = difference(&ranges(&counts[i]), &within);
                 plan.within[i] = Some(within.clone());
             }
         }
+        candidates.iter().for_each(|&i| plan.candidate[i] = true);
+        if !candidates.is_empty() {
+            plan.groups.push(Group {
+                reference: m,
+                candidates,
+                within,
+            });
+        }
     }
+    plan.counts = counts;
     plan
+}
+
+/// Demote each candidate whose estimated locate outlasts reading its
+/// reference's documents. `read_us` times reads of the given documents, per
+/// document; it runs at most once, only when the band cannot decide, and a
+/// failed read counts as the band's max.
+pub fn decide(
+    plan: &mut Plan,
+    band: ReadBand,
+    stage1: &[Option<&Answer>],
+    read_us: &mut dyn FnMut(&[usize]) -> Result<f64, String>,
+) {
+    let mut sampled = None;
+    for g in std::mem::take(&mut plan.groups) {
+        let a = stage1[g.reference].expect("a reference is probed before its candidates");
+        let docs: Vec<usize> = a
+            .exact
+            .iter()
+            .filter(|&&(d, c)| c > 0 && contains(&g.within, d))
+            .map(|&(d, _)| d)
+            .collect();
+        let occ_m = occurrences(&plan.counts[g.reference], &g.within);
+        for &i in &g.candidates {
+            let occ_i = occurrences(&plan.counts[i], &g.within);
+            let cost = |read| demote_by_cost(a.probe_us, occ_m, docs.len(), occ_i, read);
+            let demote = match (cost(band.min_us), cost(band.max_us)) {
+                (false, _) => false,
+                (true, true) => true,
+                (true, false) => cost(match sampled {
+                    Some(read) => read,
+                    None => {
+                        *sampled.insert(read_us(&spread(&docs, SAMPLE_DOCS)).unwrap_or(band.max_us))
+                    }
+                }),
+            };
+            if demote {
+                plan.demoted[i] = true;
+                plan.within[i] = None;
+                plan.unsettled[i] = ranges(&plan.counts[i]);
+            }
+        }
+    }
+}
+
+/// Whether locating `occ_i` occurrences, scaled from `t_m_us` for `occ_m`,
+/// outlasts reading `docs_m` documents at `read_us` each.
+pub fn demote_by_cost(t_m_us: u64, occ_m: u64, docs_m: usize, occ_i: u64, read_us: f64) -> bool {
+    let locate = t_m_us.max(1) as f64 * (occ_i as f64 / occ_m.max(1) as f64).powf(LOCATE_EXPONENT);
+    docs_m == 0 || locate > docs_m as f64 * read_us
+}
+
+/// The occurrences counted in ranges that meet `within`.
+fn occurrences(counts: &[(Range<usize>, u64)], within: &[Range<usize>]) -> u64 {
+    let meets = |r: &Range<usize>| {
+        within
+            .get(within.partition_point(|w| w.end <= r.start))
+            .is_some_and(|w| w.start < r.end)
+    };
+    counts
+        .iter()
+        .filter(|(r, _)| meets(r))
+        .map(|(_, c)| c)
+        .sum()
+}
+
+/// At most `n` of ascending `docs`, evenly spaced.
+fn spread(docs: &[usize], n: usize) -> Vec<usize> {
+    match docs.len() <= n {
+        true => docs.to_vec(),
+        false => (0..n).map(|k| docs[k * docs.len() / n]).collect(),
+    }
 }
 
 /// `a ∩ b`, both ascending disjoint.

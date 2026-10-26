@@ -1,5 +1,6 @@
-//! Document-level AND / OR: a count pass, one probe pass, a set-algebra
-//! prune, then verification of the undecided documents only.
+//! Document-level AND / OR: a count pass, a probe pass (two when a demotion
+//! waits on a located sibling), a set-algebra prune, then verification of
+//! the undecided documents only.
 
 mod demote;
 
@@ -13,7 +14,7 @@ use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{Paths, fetch_stream_parallel, fetch_threads};
 use crate::matching::{self, DocOutcome, LineMatcher, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
-use crate::probe::{Query, candidate_docs};
+use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
 use crate::sink::{DocMatches, MatchSink};
 use crate::verify::{self, LeafSet};
@@ -230,7 +231,6 @@ pub fn answer_expr(
     sink: &mut dyn MatchSink,
 ) -> Result<OutputReport, String> {
     refuse(req, expr)?;
-    let ratio = demote::ratio()?;
     let leaves = leaves(expr, req)?;
     let emit = req.output != QueryOutput::Counts;
     // Lines print and count by the alternation of every leaf, as rg -e a -e b.
@@ -243,39 +243,74 @@ pub fn answer_expr(
     loaded.docs.begin();
     let docs = &mut loaded.docs;
 
-    let plan = demote::plan(index, expr, &leaves, ratio);
-    let probes: Vec<Query<'_>> = leaves
-        .iter()
-        .zip(&plan.within)
-        .enumerate()
-        .filter_map(|(i, (l, within))| match (&l.probe, &l.prep) {
-            _ if plan.demoted[i] => None,
-            (Probe::Never, _) => None,
-            (Probe::Literal(term), _) => Some(match within {
-                Some(within) => Query::LiteralWithin { term, within },
-                None => Query::Literal(term),
-            }),
-            (Probe::Regex, Some(p)) => Some(Query::Regex(p)),
-            (Probe::Regex, None) => unreachable!("a regex leaf holds its pattern"),
-        })
-        .collect();
-    let answers = index.probe_all(&probes);
-    debug_assert_eq!(answers.len(), probes.len());
-    drop(probes);
-    let start = Instant::now();
-    let mut probe_us = plan.probe_us;
-    let mut answers = answers.into_iter();
-    let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
-    for (i, l) in leaves.iter().enumerate() {
-        if matches!(l.probe, Probe::Never) || plan.demoted[i] {
-            hits.push((Vec::new(), Vec::new()));
-            continue;
+    let mut plan = demote::plan(index, expr, &leaves);
+    let probed = |i: usize, plan: &demote::Plan| {
+        !plan.demoted[i] && !matches!(leaves[i].probe, Probe::Never)
+    };
+    let mut answers: Vec<Option<Answer>> = (0..leaves.len()).map(|_| None).collect();
+    let store = |ids: &[usize], got: Vec<Answer>, answers: &mut [Option<Answer>]| {
+        debug_assert_eq!(got.len(), ids.len());
+        for (&i, a) in ids.iter().zip(got) {
+            in_index(
+                &a.exact,
+                a.candidates.as_deref().unwrap_or_default(),
+                num_docs,
+            )?;
+            answers[i] = Some(a);
         }
-        let a = answers.next().expect("one answer per probe");
-        probe_us += a.probe_us;
-        let (exact, candidates) = (a.exact, candidate_docs(a.candidates, num_docs));
-        in_index(&exact, &candidates, num_docs)?;
-        hits.push((exact, candidates));
+        Ok::<_, String>(())
+    };
+    let first: Vec<usize> = (0..leaves.len())
+        .filter(|&i| probed(i, &plan) && !plan.candidate[i])
+        .collect();
+    let got = index.probe_all(&queries(&leaves, &plan, &first));
+    store(&first, got, &mut answers)?;
+    let mut sample_us = 0u64;
+    if !plan.groups.is_empty() {
+        let finders: Vec<memchr::memmem::Finder<'_>> = leaves
+            .iter()
+            .zip(&plan.candidate)
+            .filter_map(|(l, &c)| match &l.probe {
+                Probe::Literal(lit) if c => Some(memchr::memmem::Finder::new(lit)),
+                _ => None,
+            })
+            .collect();
+        let map = |_: usize, raw: &[u8]| finders.iter().all(|f| f.find(raw).is_some());
+        let mut read_us = |ids: &[usize]| -> Result<f64, String> {
+            let start = Instant::now();
+            fetch_stream_parallel(
+                docs,
+                &manifest.files,
+                ids,
+                fetch_threads(),
+                &map,
+                &mut |_, _, _| Ok(()),
+            )?;
+            let us = start.elapsed().as_micros() as u64;
+            sample_us += us;
+            Ok(us as f64 / ids.len().max(1) as f64)
+        };
+        let stage1: Vec<Option<&Answer>> = answers.iter().map(Option::as_ref).collect();
+        demote::decide(&mut plan, demote::read_band(), &stage1, &mut read_us);
+    }
+    let second: Vec<usize> = (0..leaves.len())
+        .filter(|&i| plan.candidate[i] && probed(i, &plan))
+        .collect();
+    if !second.is_empty() {
+        let got = index.probe_all(&queries(&leaves, &plan, &second));
+        store(&second, got, &mut answers)?;
+    }
+    let start = Instant::now();
+    let mut probe_us = plan.probe_us + sample_us;
+    let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
+    for a in answers {
+        hits.push(match a {
+            Some(a) => {
+                probe_us += a.probe_us;
+                (a.exact, candidate_docs(a.candidates, num_docs))
+            }
+            None => (Vec::new(), Vec::new()),
+        });
     }
     // One snapshot of the changed docs for every leaf.
     loop {
@@ -538,6 +573,21 @@ pub fn answer_expr(
 /// nonzero index count: no separator, no first byte of a BOM.
 fn demotable(lit: &[u8]) -> bool {
     !lit.contains(&UNIFIED_SEPARATOR) && !matches!(lit.first(), None | Some(0xEF | 0xBB | 0xBF))
+}
+
+/// The probes of leaves `ids`, each on its planned ranges.
+fn queries<'a>(leaves: &'a [Leaf<'_>], plan: &'a demote::Plan, ids: &[usize]) -> Vec<Query<'a>> {
+    ids.iter()
+        .map(
+            |&i| match (&leaves[i].probe, &leaves[i].prep, &plan.within[i]) {
+                (Probe::Literal(term), _, Some(within)) => Query::LiteralWithin { term, within },
+                (Probe::Literal(term), _, None) => Query::Literal(term),
+                (Probe::Regex, Some(p), _) => Query::Regex(p),
+                (Probe::Regex, None, _) => unreachable!("a regex leaf holds its pattern"),
+                (Probe::Never, ..) => unreachable!("an empty leaf is not probed"),
+            },
+        )
+        .collect()
 }
 
 /// `(?:p1)|(?:p2)|..` over the leaves that can match; `None` when none can.

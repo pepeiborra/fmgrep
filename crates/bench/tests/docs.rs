@@ -60,7 +60,7 @@ fn tuning_names_every_env_knob_and_no_other() {
         let live = text.split("#[cfg(test)]").next().unwrap_or_default();
         code.extend(knobs(live));
     }
-    assert!(code.len() >= 4, "the scan found too few knobs: {code:?}");
+    assert!(code.len() >= 3, "the scan found too few knobs: {code:?}");
     let doc = knobs(&read(&repo().join("docs/tuning.md")));
     let undocumented: Vec<_> = code.difference(&doc).collect();
     let stale: Vec<_> = doc.difference(&code).collect();

@@ -19,8 +19,7 @@
 #
 # --corpus DIR indexes DIR instead and checks AND / OR pairs of GHC terms:
 # -l, -c and --count-matches against rg over the manifest's files, the
-# served counts, --and / --or, --expr of the served label, and
-# FMGREP_AND_LOCATE_RATIO=0. Needs jq.
+# served counts, --and / --or and --expr of the served label. Needs jq.
 #
 # Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
 # `pass N / fail M` (plus the served count); exits 1 if any case
@@ -41,7 +40,7 @@ INDEX_FLAGS=()
 SERVE=false
 CORPUS_DIR=""
 usage() {
-    sed -n 's/^# \{0,1\}//; 29,30p' "${BASH_SOURCE[0]}" >&2
+    sed -n 's/^# \{0,1\}//; 28,29p' "${BASH_SOURCE[0]}" >&2
     exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -384,10 +383,8 @@ pair() {
         fi
         ours "$WORK/ours$flag" "$flag" --expr-json "$JSON"
         ours "$WORK/flags$flag" "$flag" "${OURS[@]}"
-        FMGREP_AND_LOCATE_RATIO=0 ours "$WORK/k0$flag" "$flag" --expr-json "$JSON"
         cmp -s "$WORK/theirs$flag" "$WORK/ours$flag" || fail+=" $flag"
         cmp -s "$WORK/ours$flag" "$WORK/flags$flag" || fail+=" flags$flag"
-        cmp -s "$WORK/ours$flag" "$WORK/k0$flag" || fail+=" k0$flag"
     done
     docs="$(wc -l < "$WORK/members" | tr -d ' ')"
     sum="$(awk -F: '{ s += $NF } END { print s + 0 }' "$WORK/theirs--count-matches")"
@@ -401,11 +398,9 @@ pair() {
     label="$(jq -r '.queries[0].term' <<< "$served")"
     ours "$WORK/text-l" -l --expr "$label"
     cmp -s "$WORK/ours-l" "$WORK/text-l" || fail+=" text"
-    [[ "$(FMGREP_AND_LOCATE_RATIO=0 "$BIN" --index "$IDX" --json --approx-counts --expr-json "$JSON" 2> /dev/null | jq -c "$untimed")" \
-        == "$("$BIN" --index "$IDX" --json --approx-counts --expr-json "$JSON" 2> /dev/null | jq -c "$untimed")" ]] || fail+=" k0-json"
     OURS=()
     if [[ -z "$fail" ]]; then
-        echo "ok   $name [$label] docs=$docs rg_matches=$sum served_total=$total exact=$exact text=ok k0=ok"
+        echo "ok   $name [$label] docs=$docs rg_matches=$sum served_total=$total exact=$exact text=ok"
         OK=$((OK + 1))
     else
         echo "FAIL $name [$label]:$fail (docs=$docs rg_matches=$sum served=$served)"

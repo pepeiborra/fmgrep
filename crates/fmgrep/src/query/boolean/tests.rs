@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use super::demote::ReadBand;
 use super::*;
 use crate::tests::support::{Rng, re, t};
 
@@ -107,7 +108,7 @@ fn unknown_leaves_prune_as_kleene_unknown_within_their_ranges() {
             .collect();
         // A random subset demoted, one operand of each AND kept a Tri.
         let mut unknown = vec![false; n];
-        for g in demote::and_groups(&expr) {
+        for g in demote::and_groups(&expr).into_iter().map(|g| g.leaves) {
             let cand: Vec<usize> = g
                 .iter()
                 .copied()
@@ -163,63 +164,57 @@ fn unknown_leaves_prune_as_kleene_unknown_within_their_ranges() {
     assert!(seen > 100, "{seen}");
 }
 
-/// `(counted, demoted)` for `expr` whose leaves count `totals`: every leaf
-/// is countable, a term demotable unless [`demotable`] refuses it.
-fn choose(expr: &Expr, totals: &[u64], k: u64) -> (Vec<bool>, Vec<bool>) {
+/// The plan for `expr` whose leaves count `counts`: every leaf is
+/// countable, a term literal and demotable unless [`demotable`] refuses it.
+fn arranged(expr: &Expr, counts: Vec<Vec<(Range<usize>, u64)>>) -> (Vec<bool>, demote::Plan) {
     let leaves = expr.leaves();
     let demotable: Vec<bool> = leaves
         .iter()
         .map(|l| matches!(l, Expr::Term(s) if demotable(s.as_bytes())))
         .collect();
+    let literal: Vec<bool> = leaves.iter().map(|l| matches!(l, Expr::Term(_))).collect();
     let groups = demote::and_groups(expr);
-    let counted = demote::to_count(&groups, &vec![true; leaves.len()], &demotable, k);
-    let totals: Vec<Option<u64>> = totals
+    let counted = demote::to_count(&groups, &vec![true; leaves.len()], &demotable);
+    let plan = demote::arrange(&groups, counts, &counted, &demotable, &literal);
+    (counted, plan)
+}
+
+/// Every leaf's `total` counted on doc 0.
+fn on_doc0(totals: &[u64]) -> Vec<Vec<(Range<usize>, u64)>> {
+    totals
         .iter()
-        .zip(&counted)
-        .map(|(&t, &c)| c.then_some(t))
-        .collect();
-    (counted, demote::demoted(&groups, &totals, &demotable, k))
+        .map(|&t| if t > 0 { vec![(0..1, t)] } else { Vec::new() })
+        .collect()
+}
+
+/// `(counted, demoted)` under the fallback ratio: `expr` sits under an OR.
+fn choose(expr: &Expr, totals: &[u64]) -> (Vec<bool>, Vec<bool>) {
+    let (counted, plan) = arranged(&Expr::Or(vec![expr.clone()]), on_doc0(totals));
+    assert!(plan.groups.is_empty() && !plan.candidate.contains(&true));
+    (counted, plan.demoted)
 }
 
 #[test]
-fn demotion_locates_the_rarest_and_demotes_beyond_k() {
+fn demotion_locates_the_rarest_and_demotes_beyond_the_fallback_ratio() {
     let e = Expr::And(vec![t("a"), t("b"), t("c"), t("d")]);
-    assert_eq!(
-        choose(&e, &[80, 10, 81, 800], 8).1,
-        [false, false, true, true]
-    );
-    assert_eq!(choose(&e, &[80, 10, 81, 800], 100).1, [false; 4]);
+    assert_eq!(choose(&e, &[80, 10, 81, 800]).1, [false, false, true, true]);
 }
 
 #[test]
 fn demotion_ties_locate_the_first_and_demote_neither() {
     let ab = Expr::And(vec![t("a"), t("b")]);
-    assert_eq!(choose(&ab, &[10, 10], 8).1, [false, false]);
+    assert_eq!(choose(&ab, &[10, 10]).1, [false, false]);
     assert_eq!(
-        choose(&Expr::And(vec![t("a"), t("b"), t("c")]), &[10, 10, 500], 8).1,
+        choose(&Expr::And(vec![t("a"), t("b"), t("c")]), &[10, 10, 500]).1,
         [false, false, true]
     );
-    assert_eq!(choose(&ab, &[0, 0], 1).1, [false, false]);
 }
 
 #[test]
-fn demotion_is_off_at_k0() {
-    let e = Expr::And(vec![
-        t("a"),
-        t("b"),
-        Expr::Or(vec![t("c"), Expr::And(vec![t("d"), t("e")])]),
-    ]);
-    assert_eq!(
-        choose(&e, &[1, 1_000_000, 1, 1, 1_000_000], 0),
-        (vec![false; 5], vec![false; 5])
-    );
-}
-
-#[test]
-fn demotion_all_common_within_k_demotes_nothing() {
+fn demotion_all_common_within_the_fallback_ratio_demotes_nothing() {
     let e = Expr::And(vec![t("a"), t("b"), t("c")]);
     assert_eq!(
-        choose(&e, &[900, 1000, 1200], 8),
+        choose(&e, &[900, 1000, 1200]),
         (vec![true; 3], vec![false; 3])
     );
 }
@@ -231,13 +226,13 @@ fn demotion_never_touches_or_members() {
         t("c"),
         Expr::And(vec![t("d"), Expr::Or(vec![t("e"), t("f")])]),
     ]);
-    let (counted, demoted) = choose(&e, &[1, 1000, 1, 1000, 1, 1], 8);
+    let (counted, demoted) = choose(&e, &[1, 1000, 1, 1000, 1, 1]);
     assert_eq!(counted, [true, true, false, false, false, false]);
     assert_eq!(demoted, [false, true, false, false, false, false]);
     // A lone leaf and a one-operand AND count nothing.
-    assert_eq!(choose(&t("a"), &[5], 8), (vec![false], vec![false]));
+    assert_eq!(choose(&t("a"), &[5]), (vec![false], vec![false]));
     assert_eq!(
-        choose(&Expr::And(vec![t("a")]), &[5], 8),
+        choose(&Expr::And(vec![t("a")]), &[5]),
         (vec![false], vec![false])
     );
 }
@@ -245,8 +240,8 @@ fn demotion_never_touches_or_members() {
 #[test]
 fn demotion_min_zero_demotes_every_present_sibling() {
     let e = Expr::And(vec![t("a"), t("b"), t("c")]);
-    assert_eq!(choose(&e, &[3, 0, 1], 8).1, [true, false, true]);
-    assert_eq!(choose(&e, &[0, 0, 1], 8).1, [false, false, true]);
+    assert_eq!(choose(&e, &[3, 0, 1]).1, [true, false, true]);
+    assert_eq!(choose(&e, &[0, 0, 1]).1, [false, false, true]);
 }
 
 #[test]
@@ -254,12 +249,12 @@ fn demotion_skips_bom_and_separator_literals_but_they_may_be_located() {
     for odd in ["\u{feff}x", "\u{f000}", "a\0b"] {
         assert!(!demotable(odd.as_bytes()), "{odd:?}");
         let e = Expr::And(vec![t(odd), t("x")]);
-        assert_eq!(choose(&e, &[1000, 1], 8).1, [false, false], "{odd:?}");
-        assert_eq!(choose(&e, &[1, 1000], 8).1, [false, true], "{odd:?}");
+        assert_eq!(choose(&e, &[1000, 1]).1, [false, false], "{odd:?}");
+        assert_eq!(choose(&e, &[1, 1000]).1, [false, true], "{odd:?}");
     }
     // Nothing demotable, so nothing is counted.
     assert_eq!(
-        choose(&Expr::And(vec![t("\u{feff}"), t("\0")]), &[1, 1000], 8).0,
+        choose(&Expr::And(vec![t("\u{feff}"), t("\0")]), &[1, 1000]).0,
         [false, false]
     );
     assert!(!demotable(b"\xbbx") && !demotable(b"\xbf") && !demotable(b""));
@@ -270,15 +265,15 @@ fn demotion_skips_bom_and_separator_literals_but_they_may_be_located() {
 fn regex_anchor_is_a_reference_and_never_demoted() {
     let e = Expr::And(vec![t("import"), re("zonkTc\\w+")]);
     assert_eq!(
-        choose(&e, &[5000, 3], 8),
+        choose(&e, &[5000, 3]),
         (vec![true, true], vec![true, false])
     );
     assert_eq!(
-        choose(&e, &[3, 5000], 8),
+        choose(&e, &[3, 5000]),
         (vec![true, true], vec![false, false])
     );
     let regexes = Expr::And(vec![re("a+"), re("b+")]);
-    assert_eq!(choose(&regexes, &[1, 9], 8).0, [false, false]);
+    assert_eq!(choose(&regexes, &[1, 9]).0, [false, false]);
 }
 
 #[test]
@@ -300,4 +295,177 @@ fn within_intersects_demoted_ranges_and_unsettled_subtracts_it() {
         let want = a.iter().any(|r| r.contains(&d));
         assert_eq!(demote::contains(&a, d), want, "{d}");
     }
+}
+
+fn answer(exact: Vec<(usize, u64)>, probe_us: u64) -> Answer {
+    Answer {
+        exact,
+        candidates: Some(Vec::new()),
+        probe_us,
+        counts: Vec::new(),
+    }
+}
+
+fn span(r: Range<usize>) -> Vec<Range<usize>> {
+    vec![r]
+}
+
+const fn band(min_us: f64, max_us: f64) -> ReadBand {
+    ReadBand { min_us, max_us }
+}
+
+/// [`demote::decide`] with the reference answered by `exact` in `probe_us`;
+/// every read costs `read`. Returns the demoted leaves and each sample.
+fn decided(
+    plan: &mut demote::Plan,
+    band: ReadBand,
+    exact: Vec<(usize, u64)>,
+    probe_us: u64,
+    read: f64,
+) -> (Vec<bool>, Vec<Vec<usize>>) {
+    let reference = plan.groups[0].reference;
+    let a = answer(exact, probe_us);
+    let stage1: Vec<Option<&Answer>> = (0..plan.demoted.len())
+        .map(|i| (i == reference).then_some(&a))
+        .collect();
+    let mut samples = Vec::new();
+    demote::decide(plan, band, &stage1, &mut |ids| {
+        samples.push(ids.to_vec());
+        Ok(read)
+    });
+    (plan.demoted.clone(), samples)
+}
+
+#[test]
+fn cost_rule_demotes_when_locating_costs_more_than_reading() {
+    // 16x the occurrences locate in 8x the time.
+    assert!(demote::demote_by_cost(1000, 100, 1, 1600, 7999.0));
+    assert!(!demote::demote_by_cost(1000, 100, 1, 1600, 8001.0));
+    assert!(demote::demote_by_cost(1000, 100, 10, 1600, 100.0));
+    assert!(!demote::demote_by_cost(1000, 100, 100, 1600, 100.0));
+    // An untimed locate counts 1 us.
+    assert!(demote::demote_by_cost(0, 1, 1, 1, 0.5) && !demote::demote_by_cost(0, 1, 1, 1, 1.0));
+    assert!(!demote::demote_by_cost(1000, 100, 1, 0, 0.0));
+}
+
+#[test]
+fn cost_rule_samples_once_and_only_inside_the_band() {
+    let e = Expr::And(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+    let totals = [100, 200, 1000, 2000, 100_000];
+    let counts = || totals.iter().map(|&t| vec![(0..40, t)]).collect();
+    let exact: Vec<(usize, u64)> = (0..20).map(|d| (d, 5)).collect();
+    // 20 docs: the band spans 200..2000 us; b, c, d, e estimate 168, 562, 946
+    // and 17783 us.
+    let (_, mut plan) = arranged(&e, counts());
+    assert_eq!(plan.candidate, [false, true, true, true, true]);
+    let (demoted, samples) = decided(&mut plan, band(10.0, 100.0), exact.clone(), 100, 40.0);
+    assert_eq!(demoted, [false, false, false, true, true]);
+    let spread: Vec<usize> = (0..16).map(|k| k * 20 / 16).collect();
+    assert_eq!(samples, [spread]);
+    assert_eq!(plan.within[3], None);
+    assert_eq!(plan.within[2], Some(span(0..40)));
+    // Every estimate outside the band: nothing is read.
+    let (_, mut plan) = arranged(&e, counts());
+    let (demoted, samples) = decided(&mut plan, band(1.0, 5.0), exact, 100, 40.0);
+    assert_eq!(
+        (demoted, samples.len()),
+        (vec![false, true, true, true, true], 0)
+    );
+}
+
+#[test]
+fn cost_rule_zero_rare_docs_demotes_every_candidate() {
+    let e = Expr::And(vec![t("a"), t("b"), t("c")]);
+    let (_, mut plan) = arranged(&e, on_doc0(&[5, 0, 7]));
+    assert_eq!(
+        (plan.groups[0].reference, plan.candidate.clone()),
+        (1, vec![true, false, true])
+    );
+    let (demoted, samples) = decided(&mut plan, band(0.0, f64::INFINITY), Vec::new(), 100, 1.0);
+    assert_eq!((demoted, samples.len()), (vec![true, false, true], 0));
+}
+
+#[test]
+fn cost_rule_regex_reference_falls_back_to_ratio_8() {
+    let e = Expr::And(vec![t("import"), re("zonkTc\\w+"), t("x")]);
+    for (totals, want) in [
+        ([5000, 3, 24], [true, false, false]),
+        ([24, 3, 25], [false, false, true]),
+    ] {
+        let (_, plan) = arranged(&e, on_doc0(&totals));
+        assert!(
+            plan.groups.is_empty() && !plan.candidate.contains(&true),
+            "{totals:?}"
+        );
+        assert_eq!(plan.demoted, want, "{totals:?}");
+    }
+}
+
+#[test]
+fn cost_rule_counts_only_occurrences_inside_w() {
+    let e = Expr::And(vec![t("a"), t("b")]);
+    let counts = || {
+        vec![
+            vec![(0..10, 10), (10..20, 10)],
+            vec![(10..20, 10), (20..30, 1_000_000)],
+        ]
+    };
+    let exact = vec![(3, 4), (12, 5), (15, 5)];
+    // Inside W both count 10: the estimate is the reference's 50 us, under
+    // 2 docs x 30 us.
+    let (_, mut plan) = arranged(&e, counts());
+    assert_eq!(plan.groups[0].within, span(10..20));
+    let (demoted, samples) = decided(&mut plan, band(30.0, 1000.0), exact.clone(), 50, 1.0);
+    assert_eq!((demoted, samples.len()), (vec![false, false], 0));
+    // Only the reference's docs inside W are sampled.
+    let (_, mut plan) = arranged(&e, counts());
+    let (demoted, samples) = decided(&mut plan, band(0.0, f64::INFINITY), exact, 50, 24.0);
+    assert_eq!((demoted, samples), (vec![false, true], vec![vec![12, 15]]));
+}
+
+#[test]
+fn within_spans_every_demotable_counted_leaf_even_when_none_is_demoted() {
+    let e = Expr::And(vec![t("a"), t("b"), t("\u{feff}c"), re("d+"), t("e")]);
+    let counts = vec![
+        vec![(0..10, 1), (10..20, 1), (20..30, 1)],
+        vec![(10..20, 1), (20..30, 1)],
+        vec![(0..10, 1)],
+        vec![(0..10, 1)],
+        vec![(0..10, 1), (20..30, 1)],
+    ];
+    let (counted, plan) = arranged(&e, counts);
+    assert_eq!((counted, plan.demoted), (vec![true; 5], vec![false; 5]));
+    let w = Some(span(20..30));
+    assert_eq!(plan.within, [w.clone(), w.clone(), w.clone(), None, w]);
+    assert_eq!(plan.unsettled[0], [0..10, 10..20]);
+    assert_eq!(plan.unsettled[2], span(0..10));
+    assert!(plan.unsettled[3].is_empty());
+}
+
+#[test]
+fn cost_rule_under_an_or_keeps_the_ratio_test_and_the_demoted_w() {
+    let e = Expr::And(vec![
+        t("x"),
+        t("y"),
+        Expr::Or(vec![t("z"), Expr::And(vec![t("a"), t("b")])]),
+    ]);
+    let x = vec![(0..10, 1)];
+    let y = vec![(0..10, 1), (10..20, 1)];
+    let (_, plan) = arranged(
+        &e,
+        vec![x.clone(), y.clone(), vec![], y.clone(), vec![(10..20, 100)]],
+    );
+    assert_eq!(plan.candidate, [false, true, false, false, false]);
+    assert_eq!(plan.demoted, [false, false, false, false, true]);
+    let w = |r| Some(span(r));
+    assert_eq!(plan.within, [w(0..10), w(0..10), None, w(10..20), None]);
+    assert_eq!(plan.unsettled[3], span(0..10));
+    // Nothing demoted under the OR: no skip, nothing unsettled.
+    let (_, plan) = arranged(&e, vec![x, y.clone(), vec![], y, vec![(10..20, 10)]]);
+    assert_eq!(plan.demoted, [false; 5]);
+    assert_eq!(
+        (plan.within[3].clone(), plan.within[4].clone()),
+        (None, None)
+    );
+    assert!(plan.unsettled[3].is_empty() && plan.unsettled[4].is_empty());
 }

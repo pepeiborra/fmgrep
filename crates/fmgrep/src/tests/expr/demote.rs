@@ -1,15 +1,20 @@
-//! AND demotion never changes output, whatever K.
+//! AND demotion never changes output, against a plan that demotes nothing.
 
 use super::*;
 
-use crate::tests::{RATIO, SHARD_BYTES};
+use crate::tests::{BAND, NO_DEMOTION, SHARD_BYTES};
+
+/// Over 8 times `rare`: an AND of the two demotes `common`, even under an OR.
+const COMMON: &[u8] = b"common common common common common common common common common\n\
+    common common common common common common common common common common\n\
+    common common common common common common common and more common XJ 89#%&@\n";
 
 /// Indexed at 16 shard bytes: one shard per file.
 const SHARDS: [(&str, &[u8]); 5] = [
     ("s1.c", b"rare zz qwvbnmjkl\n"),
     ("s2.c", b"common rare cdfghiptuy\ncommon\n"),
     ("s3.c", b"zz only QWERTY\n"),
-    ("s4.c", b"common and more common XJ 89#%&@\n"),
+    ("s4.c", COMMON),
     ("s5.c", b"\xef\xbb\xbfcommon rare zz 01234567\n"),
 ];
 
@@ -53,16 +58,40 @@ const MODES: [&[&str]; 9] = [
     &["--matches", "--json"],
 ];
 
-fn at<T>(k: u64, f: impl FnOnce() -> T) -> T {
-    RATIO.set(Some(k));
+#[derive(Clone, Copy, Debug)]
+enum Demotion {
+    Off,
+    Cost { min_us: f64, max_us: f64 },
+}
+
+const OFF: Demotion = Demotion::Off;
+
+const fn cost(min_us: f64, max_us: f64) -> Demotion {
+    Demotion::Cost { min_us, max_us }
+}
+
+/// The cost rule demoting every candidate, locating every one, and sampling
+/// once.
+const COSTS: [Demotion; 3] = [
+    cost(0.0, 0.0),
+    cost(f64::INFINITY, f64::INFINITY),
+    cost(0.0, f64::INFINITY),
+];
+
+fn at<T>(rule: Demotion, f: impl FnOnce() -> T) -> T {
+    match rule {
+        Demotion::Off => NO_DEMOTION.set(true),
+        Demotion::Cost { min_us, max_us } => BAND.set(Some((min_us, max_us))),
+    }
     let out = f();
-    RATIO.set(None);
+    NO_DEMOTION.set(false);
+    BAND.set(None);
     out
 }
 
 /// Printed output with wall clocks dropped.
-fn out_at(k: u64, index: &Path, flags: &[&str], expr: &Expr) -> Result<String, String> {
-    at(k, || printed_expr(index, flags, expr)).map(|s| untimed(flags, &s))
+fn out_at(rule: Demotion, index: &Path, flags: &[&str], expr: &Expr) -> Result<String, String> {
+    at(rule, || printed_expr(index, flags, expr)).map(|s| untimed(flags, &s))
 }
 
 fn check(index: &Path, ctx: &str, trees: &[Expr]) {
@@ -70,12 +99,12 @@ fn check(index: &Path, ctx: &str, trees: &[Expr]) {
         for ci in [&[][..], &["-i"]] {
             for mode in MODES {
                 let flags = [ci, mode].concat();
-                let want = out_at(0, index, &flags, expr);
-                for k in [1, 8] {
+                let want = out_at(OFF, index, &flags, expr);
+                for rule in COSTS {
                     assert_eq!(
-                        out_at(k, index, &flags, expr),
+                        out_at(rule, index, &flags, expr),
                         want,
-                        "{ctx} K={k} {expr} {flags:?}"
+                        "{ctx} {rule:?} {expr} {flags:?}"
                     );
                 }
             }
@@ -93,7 +122,7 @@ fn shard_index(tmp: &Path, store_docs: bool) -> PathBuf {
 }
 
 #[test]
-fn and_locate_ratio_never_changes_output() {
+fn and_demotion_never_changes_output() {
     for store_docs in LAYOUTS {
         let ctx = format!("store_docs={store_docs}");
         let tmp = tempfile::tempdir().unwrap();
@@ -109,9 +138,10 @@ fn shard_fixture_cuts_one_shard_per_file() {
     let tmp = tempfile::tempdir().unwrap();
     let index = shard_index(tmp.path(), false);
     assert_eq!(read_manifest(&index).unwrap().blobs.len(), SHARDS.len());
-    // The rare side's per-leaf total includes a member it is not located in.
+    // `rare` is located only where `common` occurs, yet its total includes
+    // s1.c, a member through `zz`.
     let expr = or(vec![and(vec![t("common"), t("rare")]), t("zz")]);
-    let r = at(1, || report(&index, &[], &expr)).unwrap();
+    let r = report(&index, &[], &expr).unwrap();
     let totals: Vec<u64> = r.leaves.iter().map(|l| l.total_matches).collect();
     assert_eq!((r.docs_matched, totals), (4, vec![3, 3, 3]));
 }
@@ -127,15 +157,15 @@ fn demoted_leaf_is_decided_by_reading() {
     let tmp = tempfile::tempdir().unwrap();
     let blind = blind_index(tmp.path(), &files);
     assert_eq!(
-        at(0, || printed_expr(&blind, &["-l"], &expr)).unwrap(),
+        at(OFF, || printed_expr(&blind, &["-l"], &expr)).unwrap(),
         "a.c\n"
     );
     assert_eq!(
-        at(0, || report(&blind, &[], &expr)).unwrap().docs_matched,
+        at(OFF, || report(&blind, &[], &expr)).unwrap().docs_matched,
         1
     );
     for flags in [&["-l"][..], &[]] {
-        let err = at(1, || printed_expr(&blind, flags, &expr)).unwrap_err();
+        let err = at(COSTS[0], || printed_expr(&blind, flags, &expr)).unwrap_err();
         assert!(err.contains("cannot read"), "{flags:?}: {err}");
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -170,15 +200,19 @@ fn demotion_over_stale_docs_equals_a_fresh_index() {
         or(vec![and(vec![t("a"), t("x")]), t("beta")]),
         and(vec![t("a"), re("be+ta")]),
     ] {
-        for flags in [&[][..], &["-i"]] {
+        for (rule, flags) in [COSTS[0], COSTS[2]]
+            .into_iter()
+            .flat_map(|r| [(r, &[][..]), (r, &["-i"])])
+        {
             let (s, f) = (
-                at(1, || report(&stale, flags, &expr)).unwrap(),
-                at(0, || report(&fresh, flags, &expr)).unwrap(),
+                at(rule, || report(&stale, flags, &expr)).unwrap(),
+                at(OFF, || report(&fresh, flags, &expr)).unwrap(),
             );
+            let ctx = format!("{rule:?} {expr} {flags:?}");
             assert_eq!(
                 (s.docs_matched, s.total_matches, &s.leaves),
                 (f.docs_matched, f.total_matches, &f.leaves),
-                "{expr} {flags:?}"
+                "{ctx}"
             );
             for mode in [
                 &["-l"][..],
@@ -188,9 +222,9 @@ fn demotion_over_stale_docs_equals_a_fresh_index() {
             ] {
                 let flags = [flags, mode].concat();
                 assert_eq!(
-                    out_at(1, &stale, &flags, &expr),
-                    out_at(0, &fresh, &flags, &expr),
-                    "{expr} {flags:?}"
+                    out_at(rule, &stale, &flags, &expr),
+                    out_at(OFF, &fresh, &flags, &expr),
+                    "{ctx} {mode:?}"
                 );
             }
         }
