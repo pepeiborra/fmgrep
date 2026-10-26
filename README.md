@@ -1,9 +1,8 @@
 # fmgrep
 
-fmgrep is ripgrep over a persistent index. `fmgrep index` builds an
-FM-index of a source tree once; after that a search prints what `rg` would
-print, but typically answers in milliseconds, without scanning the whole tree.
-The index is mapped from disk and used in place.
+fmgrep is ripgrep over a persistent index with efficient support for AND/OR expressions.
+`fmgrep index` builds an FM-index of a source tree once; after that a search prints what `rg` would
+print, but without scanning the whole tree.  The index is mapped from disk and used in place.
 
 ## Status
 
@@ -91,71 +90,41 @@ They pick files; fmgrep then prints the lines of every TERM in those files.
 
 ```sh
 fmgrep index .              # index the current folder
-fmgrep index . --store-docs # also keep a copy of every file
 ```
 
 A search reads every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
 files are read in full; after many edits, remove `.fmgrep` and re-index.
-`--store-docs` reads them from the copy instead, for about 1.7 times the
-disk: it never reads the tree and answers as of indexing time. Details:
-[docs/index-format.md](docs/index-format.md#staleness).
 
-| | GHC | linux |
+| fmgrep / rg | linux | chromium |
 |---|--:|--:|
-| index size, default / `--store-docs` | 129 / 213 MB | 2.18 / 3.71 GB |
-| files read per literal (mean) | 122 | 798 |
-| literal p50, default / `--store-docs` | 4.2 / 3.8 ms | 9.1 / 5.8 ms |
-| regex p50, default / `--store-docs` | 7.6 / 6.4 ms | 13.9 / 7.1 ms |
+| index size | 2.18 GB / - | 4.26 GB / - |
+| files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 |
+| literal p50 | 7.93 / 149 ms | 52.2 / 638 ms |
+| regex p50 | 12.9 / 150 ms | 153 / 645 ms |
 
-Apple M5, median of repeated warm queries (the
-Performance table below is one spawn-to-exit pass). A file costs an
-`open(2)` of about 5.5 µs by default and a `pread` of 1.4-2 µs with
-`--store-docs`, so the gap grows with the files read; it is several times
-larger when the tree is out of the page cache or the filesystem is busy. A
-lower `FMGREP_SAMPLE_RATE` speeds the index probe, not the reads
-([docs/tuning.md](docs/tuning.md)).
-
-## Performance
-
-Apple M5 (10 cores, 16 GiB), macOS 26.5.1, fmgrep 0.1.0, ripgrep 15.2.0,
-2026-10-08 (chromium: 2026-10-09, 1 run).
-Latency is the per-query median, spawn to exit, of one `fmgrep --server`
-or `rg` process printing the matching lines; footprint is the peak
-| corpus | files / text | index build / size | fmgrep literal / regex / AND | rg literal / regex / AND | footprint fmgrep / rg | RSS fmgrep / rg |
-|---|--:|--:|--:|--:|--:|--:|
-| GHC | 26787 / 85 MB | 2.0 s / 129 MB | 3.8 / 7.5 / 3.0 ms | 434 / 417 / 511 ms | 27 / 45 MB | 138 / 48 MB |
-| linux | 95540 / 1.5 GB | 18 s / 2.2 GB | 13.9 / 19.7 / 15.2 ms | 2.9 / 2.9 / 3.5 s | 62 / 146 MB | 1.4 GB / 148 MB |
-| chromium | 460957 / 2.8 GB | 78 s / 4.3 GB | 177 / 466 / 14.2 ms | 15.2 / 15.4 / 16.3 s | 480 / 690 MB | 3.3 GB / 691 MB |
-anonymous memory while answering. [BENCHMARKS.md](BENCHMARKS.md) has the
-method, every column and the index built with `--store-docs`.
-
-
-Regexes cost more on chromium because every candidate file is read from
-the tree.
+AWS i4i.4xlarge, Linux; method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## How it works
 
-`fmgrep index` concatenates the text files of the tree and builds one
-FM-index per 100 MiB shard with [docfm](crates/docfm), a byte-alphabet
-FM-index stored as a single blob. It keeps each file's size and mtime,
-not its text (`--store-docs` keeps a copy of the text too). A search maps
-the blob and uses it in place: backward search counts a literal and locates
-each occurrence's file without touching the tree.
+The goal of a regexp search engine is to avoid scanning a regexp over all the documents in the source tree, which is infeasible for very large corpuses. To achieve this, most modern regexp search engines build an inverted index of posting lists keyed by n-grams. Instead, fmgrep builds an [FM-index](https://en.wikipedia.org/wiki/FM-index), a kind of compressed suffix array; this idea was originally coined and pursued by Nathan Hawkes (@nhawkes) at Meta. 
 
-A regex is narrowed by the index first, through the literals every match
-must contain or a walk of its reversed DFA over the index, and the regex
-crate then verifies only the candidate files, read from the tree. Details:
-[docs/index-format.md](docs/index-format.md).
+An FM-index provides two main operations: 
 
-## Environment
+* `locate`: returns the posting list of a pattern in `O(ocurrences)` time,
+* `count`: how many times the pattern occurs in the tree in `O(pattern)` time,
 
-| variable | default | effect |
-|---|---|---|
-| `FMGREP_SHARD_BYTES` | `100MB` | text per index shard |
-| `FMGREP_VERBOSE` | off | as `index -v`: list skipped binary files |
+`locate` is faster than scanning when the number of ocurrences is smaller than the number of documents, which we can find out with `count`; if not, we fall back to a regexp scan of all the candidates. `count` is also useful for planning AND and OR queries, e.g. start from the least common side for ANDs.
 
-Developer knobs are in [docs/tuning.md](docs/tuning.md).
+A count-augmented n-gram index provides the same two operations at similar cost, with one crucial difference: patterns need to be broken in n-grams. With an FM index this is not the case for literals and most regular expressions, and therefore a match is never a false positive, which means that:
+ * we end up scanning far fewer documents than the n-gram based approach 
+ * we never need to intersect posting lists (other than for AND queries)
+ * `-l` literal queries do not scan any documents at all
+ * the index is never lowercased to support `-i` queries
+ * in a client/server setup, the server could never scan any documents at all, and instead tell the client what to scan.
+
+ The tradeoff is a larger index (1.5X to 2X) and a higher RSS.
+
 
 ## Links
 

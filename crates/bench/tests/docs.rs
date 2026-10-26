@@ -116,26 +116,6 @@ fn manifest_fields_are_documented() {
     );
 }
 
-/// README's environment table lists exactly the knobs `fmgrep index --help` does.
-#[test]
-fn readme_names_exactly_the_public_knobs() {
-    let src = read(&repo().join("crates/fmgrep/src/cli/args.rs"));
-    let help = src
-        .split("Environment:\n")
-        .nth(1)
-        .and_then(|s| s.split("\";").next())
-        .expect("the index help has an Environment: block");
-    let public = knobs(help);
-    assert!(public.len() >= 2, "too few knobs parsed: {public:?}");
-    let readme = read(&repo().join("README.md"));
-    let table = readme
-        .split("\n## Environment\n")
-        .nth(1)
-        .and_then(|s| s.split("\n## ").next())
-        .expect("README has an Environment section");
-    assert_eq!(knobs(table), public);
-}
-
 /// Every relative `](target)` link in the markdown docs names an existing path.
 #[test]
 fn relative_links_resolve() {

@@ -1,10 +1,44 @@
 # docfm
 
 A stand-alone byte-alphabet FM-index for document search: counts by backward
-search, the document of each occurrence from doc ids sampled per row. Its
-dependencies are `libsais`, for BWT construction with aux rows, and
-`rayon`: libsais runs single-threaded and the other build phases run on the
-caller's rayon pool.
+search, the document of each occurrence from doc ids sampled per row. 
+
+## How it works
+
+An FM-index answers `count` by backward search: one rank query per pattern
+byte, whatever the size of the text. Answering `locate`, which documents
+hold the pattern, is where implementations differ, and docfm is built for
+that question alone: it never needs the position of a match, only its
+document.
+
+* Samples are document ids, not positions. Most FM-indexes sample the suffix
+  array, locate a text position and then look up its document; docfm stores
+  the document id at every sampled row and every document start, so a
+  locate walk ends at a document id and never crosses into another document.
+* Locate walks both ways. The backward search passes through the rows of
+  every tail of the pattern, so a sample a few bytes into the pattern is
+  reached from there and verified by a few LF steps back; the rest walk back
+  to the nearest sample. Fewer than the sample rate steps per occurrence,
+  about half that for patterns of 8 bytes or more.
+* No suffix array is ever built. libsais writes the BWT directly and returns
+  the rows the samples need; peak memory is about five times the text,
+  well under what building and then sampling a suffix array takes.
+* One read per rank. Occurrences are bit-sliced blocks over the byte
+  alphabet rather than a wavelet tree, so a backward-search or LF step reads
+  one block and a small hot table instead of one level per bit of the
+  alphabet.
+* The blob is the index. `FmIndex::view` works over any `AsRef<[u8]>`, a
+  mapped file included, copying nothing: a search touches only the pages its
+  walk needs, and a server that maps the whole blob is ready as soon as the
+  file is open.
+* `Cursor` exposes the backward search one byte at a time, with `count` at
+  every step, so a regex automaton or a case-insensitive search branches
+  over the index natively and drops every branch that counts zero.
+
+The trade-off is size: about 1.5 bytes per byte of text at the default
+sample rate, more at lower rates that make locate faster.
+
+## Layout
 
 The text is documents, each followed by one `DOC_END` (0x00). A row is
 sampled when its text position is a multiple of the sample rate or starts a
@@ -17,7 +51,7 @@ up to the sample rate (at most 64); the other sampled rows are LF walks over
 the finished occurrence blocks. Peak live heap is about five times the text,
 mostly libsais's `i32` temporary array.
 
-The blob (version 6, layout in `src/layout.rs`) is the query structure:
+The blob (`src/layout.rs`) is the query structure:
 `FmIndex::view` works over any `AsRef<[u8]>`, a mapped file slice included,
 copying nothing. BWT occurrences are bit-sliced blocks of 4096 positions
 (`src/occ.rs`): per-block u16 counts at the midpoint, then the code bits of
