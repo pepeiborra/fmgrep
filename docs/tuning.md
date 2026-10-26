@@ -4,7 +4,7 @@ Every `FMGREP_*` environment variable, and rayon's `RAYON_NUM_THREADS`,
 with its default and what it trades.
 
 No variable changes an answer, and only `FMGREP_SHARD_BYTES` and
-`FMGREP_SAMPLE_RATE` change index bytes.
+`FMGREP_SAMPLE_RATE` change the blobs.
 
 Value grammar: a byte size is `<n>`, `<n>KB`, `<n>MB` or `<n>GB` over
 zero, in 1024-based units; a count is an integer of `0` or more. Unset or
@@ -45,3 +45,9 @@ rate recovers about half of the regex gap to an index that stores its
 documents, and none of the per-document `open(2)` cost of reading matches
 from the tree, which on linux (about 800 documents per literal) dwarfs it.
 `--store-docs` is the lever for that half.
+
+## Search (developer)
+
+| variable | default | trades |
+|---|---|---|
+| `FMGREP_JOURNAL` | unset: a running watchman | `off` writes and reads no `docs.journal`, so every load stats every file; `on` asks watchman, as unset does. A watchman that misses its deadline warns on stderr and falls back to the stat pass. |

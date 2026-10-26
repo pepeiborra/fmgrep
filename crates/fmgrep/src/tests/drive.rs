@@ -479,6 +479,49 @@ fn missing_doc_is_excluded_from_every_term() {
     assert_eq!(printed(&output, &["-l"], &["/[a-z]+/"]), "b.c\n");
 }
 
+/// Live journal tests add watches, so they take turns on an explicit
+/// `WATCHMAN_SOCK`, with the journal on.
+fn watchman() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if std::env::var_os("WATCHMAN_SOCK").is_none() {
+        eprintln!("skipped the journal: WATCHMAN_SOCK is unset");
+        return None;
+    }
+    let live = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    JOURNAL.set(Some("on"));
+    Some(live)
+}
+
+/// `stale` answers `terms`, and prints each of `printed_terms`, as `fresh`
+/// does: through its journal, then through the sweep.
+fn answers_like(stale: &Path, fresh: &Path, terms: &[&str], printed_terms: &[&str]) {
+    for knob in [JOURNAL.get(), Some("off")] {
+        JOURNAL.set(knob);
+        assert_eq!(
+            totals(&query_it(stale, false, terms)),
+            totals(&query_it(fresh, false, terms)),
+            "{knob:?}"
+        );
+        for flags in [
+            &["-c"][..],
+            &["--count-matches"],
+            &["-l"],
+            &["--matches"],
+            &["-o", "-C", "1"],
+        ] {
+            for term in printed_terms {
+                assert_eq!(
+                    printed(stale, flags, &[term]),
+                    printed(fresh, flags, &[term]),
+                    "{knob:?} {flags:?} {term}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn stale_tree_answers_like_a_fresh_index() {
     let tmp = tempfile::tempdir().unwrap();
@@ -493,6 +536,7 @@ fn stale_tree_answers_like_a_fresh_index() {
         ],
     );
     let stale = tmp.path().join("idx");
+    let _live = watchman();
     index_it(&folder, &stale, false);
     std::fs::write(folder.join("a.c"), b"printk one\nprintk printk\nprintk\n").unwrap();
     std::fs::write(folder.join("b.c"), b"nothing\nnow printk, aa\n").unwrap();
@@ -501,25 +545,7 @@ fn stale_tree_answers_like_a_fresh_index() {
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
     let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/"];
-    assert_eq!(
-        totals(&query_it(&stale, false, &terms)),
-        totals(&query_it(&fresh, false, &terms))
-    );
-    for flags in [
-        &["-c"][..],
-        &["--count-matches"],
-        &["-l"],
-        &["--matches"],
-        &["-o", "-C", "1"],
-    ] {
-        for term in ["printk", "/pr[i1]ntk/", "aa"] {
-            assert_eq!(
-                printed(&stale, flags, &[term]),
-                printed(&fresh, flags, &[term]),
-                "{flags:?} {term}"
-            );
-        }
-    }
+    answers_like(&stale, &fresh, &terms, &["printk", "/pr[i1]ntk/", "aa"]);
 }
 
 #[test]
@@ -535,6 +561,7 @@ fn added_tree_answers_like_a_fresh_index() {
         ],
     );
     let stale = tmp.path().join("idx");
+    let _live = watchman();
     index_it(&folder, &stale, false);
     std::fs::write(folder.join("b.c"), b"printk added\nprintk printk aa\n").unwrap();
     std::fs::create_dir_all(folder.join("new/deep")).unwrap();
@@ -547,25 +574,7 @@ fn added_tree_answers_like_a_fresh_index() {
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
     let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
-    assert_eq!(
-        totals(&query_it(&stale, false, &terms)),
-        totals(&query_it(&fresh, false, &terms))
-    );
-    for flags in [
-        &["-c"][..],
-        &["--count-matches"],
-        &["-l"],
-        &["--matches"],
-        &["-o", "-C", "1"],
-    ] {
-        for term in ["printk", "/pr[i1]ntk/", "aa"] {
-            assert_eq!(
-                printed(&stale, flags, &[term]),
-                printed(&fresh, flags, &[term]),
-                "{flags:?} {term}"
-            );
-        }
-    }
+    answers_like(&stale, &fresh, &terms, &["printk", "/pr[i1]ntk/", "aa"]);
     assert_eq!(
         printed(&stale, &["-l"], &["printk"]),
         "a.c\nb.c\nc.c\nd.c\ne.c\nnew/deep/n.c\n"
@@ -597,6 +606,7 @@ fn pruned_added_tree_answers_like_a_fresh_index() {
     backdate(&folder);
     backdate(&tree);
     let stale = tmp.path().join("idx");
+    let _live = watchman();
     index_it(&folder, &stale, false);
     let recorded = crate::source::Recorded::open(&stale).unwrap();
     assert!(recorded.is_some_and(|r| r.is_dir("kb")));
@@ -612,34 +622,19 @@ fn pruned_added_tree_answers_like_a_fresh_index() {
     std::fs::remove_file(folder.join("gone.c")).unwrap();
     std::fs::remove_file(folder.join("d.c")).unwrap();
     let want = "a.c\nb.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nsub/c.c\nsub/new.c\nsub/t/deep/x.c\nsub/t/y.c\n";
-    assert_eq!(
-        printed(&stale, &["-l"], &["printk"]),
-        want,
-        "kb/k.dat, turned text, is found"
-    );
+    let journal = JOURNAL.get();
+    for knob in [journal, Some("off")] {
+        JOURNAL.set(knob);
+        let got = printed(&stale, &["-l"], &["printk"]);
+        assert_eq!(got, want, "{knob:?}: kb/k.dat, turned text, is found");
+    }
+    JOURNAL.set(journal);
     std::fs::write(folder.join("kb/k.dat"), b"printk\0binary").unwrap();
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
     let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
-    assert_eq!(
-        totals(&query_it(&stale, false, &terms)),
-        totals(&query_it(&fresh, false, &terms))
-    );
-    for flags in [
-        &["-c"][..],
-        &["--count-matches"],
-        &["-l"],
-        &["--matches"],
-        &["-o", "-C", "1"],
-    ] {
-        for term in ["printk", "/pr[i1]ntk/", "aa", "deep", "now"] {
-            assert_eq!(
-                printed(&stale, flags, &[term]),
-                printed(&fresh, flags, &[term]),
-                "{flags:?} {term}"
-            );
-        }
-    }
+    let printed_terms = ["printk", "/pr[i1]ntk/", "aa", "deep", "now"];
+    answers_like(&stale, &fresh, &terms, &printed_terms);
 }
 
 #[test]
@@ -732,4 +727,188 @@ fn missing_corpus_root_refused() {
         err.contains("cannot read") && err.contains("docs.stamps"),
         "got: {err}"
     );
+}
+
+/// Whether a load of `index` replays its journal.
+#[cfg(unix)]
+fn replays(index: &Path) -> bool {
+    let manifest = read_manifest(index).unwrap();
+    let docs = crate::fetch::DocStore::open(index, &manifest, None).unwrap();
+    docs.replay(&manifest.files)
+}
+
+#[cfg(unix)]
+fn journal_json(index: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(index.join("docs.journal")).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_answers_like_the_sweep() {
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    let outside = tmp.path().join("outside");
+    let put = |rel: &str, bytes: &[u8]| {
+        std::fs::create_dir_all(folder.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(folder.join(rel), bytes).unwrap();
+    };
+    for (rel, bytes) in [
+        ("a.c", &b"printk one\n"[..]),
+        ("d.c", b"printk gone\n"),
+        ("kb/k.dat", b"printk\0binary"),
+        ("mw/m.c", b"printk moved\n"),
+        ("r.c", b"printk renamed\n"),
+        ("tb.c", b"printk text\n"),
+    ] {
+        put(rel, bytes);
+    }
+    std::fs::create_dir_all(outside.join("t/deep")).unwrap();
+    std::fs::write(outside.join("t/deep/x.c"), b"deep printk\n").unwrap();
+    std::fs::write(outside.join("target.c"), b"printk linked\n").unwrap();
+    std::os::unix::fs::symlink(outside.join("target.c"), folder.join("link.c")).unwrap();
+    std::os::unix::fs::symlink(outside.join("later.c"), folder.join("kb/dangling.c")).unwrap();
+    let stale = tmp.path().join("idx");
+    index_it(&folder, &stale, false);
+    assert_eq!(journal_json(&stale)["relist"], serde_json::json!(["kb"]));
+    put("a.c", b"printk one\nprintk printk\n");
+    put("b.c", b"printk added\naa\n");
+    put("new/deep/n.c", b"deep printk\n");
+    std::fs::rename(outside.join("t"), folder.join("t")).unwrap();
+    put("kb/k.dat", b"printk text now\n");
+    put("tb.c", b"printk\0now binary");
+    std::fs::rename(folder.join("mw"), folder.join("mv2")).unwrap();
+    std::fs::rename(folder.join("r.c"), folder.join("r2.c")).unwrap();
+    std::fs::remove_file(folder.join("d.c")).unwrap();
+    std::fs::write(outside.join("target.c"), b"printk linked, edited printk\n").unwrap();
+    std::fs::write(outside.join("later.c"), b"printk resolved\n").unwrap();
+    assert!(replays(&stale));
+    let want =
+        "a.c\nb.c\nkb/dangling.c\nkb/k.dat\nlink.c\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
+    let got = printed(&stale, &["-l"], &["printk"]);
+    assert_eq!(got, want, "kb/k.dat, named, is found");
+    put("kb/k.dat", b"printk\0binary");
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    assert!(replays(&stale));
+    let terms = ["printk", "aa", "deep", "now"];
+    answers_like(
+        &stale,
+        &fresh,
+        &["printk", "/pr[i1]ntk/", "aa", "deep", "now"],
+        &terms,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_replays_edits_made_after_its_mark() {
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &[("a.c", b"printk\n"), ("b.c", b"none\n")]);
+    let early = crate::source::marks(&folder, crate::source::Knob::On);
+    std::fs::write(folder.join("a.c"), b"printk printk during\n").unwrap();
+    let stale = tmp.path().join("idx");
+    index_it(&folder, &stale, false);
+    let mut journal = journal_json(&stale);
+    journal["tokens"] = serde_json::to_value(early).unwrap();
+    std::fs::write(stale.join("docs.journal"), journal.to_string()).unwrap();
+    std::fs::write(folder.join("b.c"), b"printk after\n").unwrap();
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    assert!(replays(&stale));
+    answers_like(&stale, &fresh, &["printk", "during", "after"], &["printk"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_skips_the_stat_pass() {
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[("a.c", b"printk hello printk"), ("b.c", b"nothing here")],
+    );
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, false);
+    let mut stamps = std::fs::read(output.join("docs.stamps")).unwrap();
+    stamps[0] ^= 1;
+    std::fs::write(output.join("docs.stamps"), stamps).unwrap();
+    let manifest = read_manifest(&output).unwrap();
+    let mut docs = crate::fetch::DocStore::open(&output, &manifest, None).unwrap();
+    assert!(docs.replay(&manifest.files));
+    docs.begin();
+    assert_eq!(docs.stale(), [0usize; 0], "journal: no doc is named");
+    docs.stat_all(&manifest.files);
+    docs.begin();
+    assert_eq!(docs.stale(), [0], "sweep: the tampered stamp");
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_advances_the_token_and_keeps_changed_paths() {
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (folder, output) = files_index(tmp.path());
+    let clock = |j: &serde_json::Value| j["tokens"][0]["token"]["clock"].clone();
+    let before = journal_json(&output);
+    std::fs::write(folder.join("a.c"), b"printk edited\n").unwrap();
+    std::fs::write(folder.join("n.c"), b"printk new\n").unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nn.c\n");
+    let after = journal_json(&output);
+    assert_ne!(clock(&after), clock(&before), "{after}");
+    assert_eq!(after["named"], serde_json::json!(["a.c", "n.c"]));
+    let kept =
+        |j: &serde_json::Value| (j["recheck"].clone(), j["relist"].clone(), j["root"].clone());
+    assert_eq!(kept(&after), kept(&before));
+    std::fs::remove_file(folder.join("n.c")).unwrap();
+    assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:1\n");
+    assert_eq!(journal_json(&output)["named"], serde_json::json!(["a.c"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_index_dir_skips_the_checkpoint() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (folder, output) = files_index(tmp.path());
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    let journal = std::fs::read(output.join("docs.journal")).unwrap();
+    let mode = |m: u32| std::fs::set_permissions(&output, std::fs::Permissions::from_mode(m));
+    mode(0o555).unwrap();
+    let answer = printed(&output, &["-c"], &["printk"]);
+    mode(0o755).unwrap();
+    assert_eq!(answer, "a.c:1\nb.c:1\n");
+    let now = std::fs::read(output.join("docs.journal")).unwrap();
+    assert_eq!(now, journal, "no checkpoint");
+}
+
+#[cfg(unix)]
+#[test]
+fn knob_off_reads_no_journal_and_writes_none() {
+    let Some(_live) = watchman() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (folder, output) = files_index(tmp.path());
+    let journal = std::fs::read(output.join("docs.journal")).unwrap();
+    JOURNAL.set(Some("off"));
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let now = std::fs::read(output.join("docs.journal")).unwrap();
+    assert_eq!(now, journal, "no checkpoint");
+    let off = tmp.path().join("off");
+    index_it(&folder, &off, false);
+    assert!(!off.join("docs.journal").exists());
 }

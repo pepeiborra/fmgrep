@@ -15,6 +15,18 @@ pub fn bytes(var: &str, default: u64) -> Result<u64, String> {
     read(var, default, what, parse_bytes)
 }
 
+/// One of `values`.
+pub fn choice<'a>(var: &str, values: &[&'a str]) -> Result<Option<&'a str>, String> {
+    match std::env::var_os(var) {
+        Some(raw) if !raw.is_empty() => raw
+            .to_str()
+            .and_then(|s| values.iter().find(|&&v| v == s.trim()))
+            .map(|&v| Some(v))
+            .ok_or_else(|| format!("{var}={raw:?} is not one of {}", values.join(", "))),
+        _ => Ok(None),
+    }
+}
+
 fn read(
     var: &str,
     default: u64,
@@ -122,6 +134,22 @@ mod tests {
         }
         set("0");
         assert!(bytes(VAR, 7).unwrap_err().contains(VAR));
+    }
+
+    #[test]
+    fn a_choice_is_one_of_its_values() {
+        const VAR: &str = "FMGREP_ENV_CHOICE_TEST_VAR";
+        const VALUES: &[&str] = &["off", "on"];
+        // SAFETY: no other test reads this name.
+        let set = |raw: &str| unsafe { std::env::set_var(VAR, raw) };
+        assert_eq!(choice(VAR, VALUES), Ok(None));
+        set("");
+        assert_eq!(choice(VAR, VALUES), Ok(None));
+        set(" on ");
+        assert_eq!(choice(VAR, VALUES), Ok(Some("on")));
+        set("of");
+        let err = choice(VAR, VALUES).unwrap_err();
+        assert!(err.contains(VAR) && err.contains("off, on"), "{err}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

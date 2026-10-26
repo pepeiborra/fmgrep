@@ -14,9 +14,9 @@
 //! 1. `index` walks the tree, cuts it into shards and builds one docfm blob
 //!    per shard into `.fmgrep/blobs.shard`.
 //! 2. A search maps `blobs.shard` and, unless the index was built with
-//!    `--store-docs`, stats every file against its stamp, and every
-//!    directory the index recorded, listing the changed ones for files added
-//!    since.
+//!    `--store-docs`, asks the change journal what changed, or else stats
+//!    every file against its stamp, and every directory the index recorded,
+//!    listing the changed ones for files added since.
 //! 3. Each term probes every shard: a literal by backward search, `-i` by a
 //!    case-folding walk, a pattern by its required literal or a reversed-DFA
 //!    walk. The result is exact documents or candidates.

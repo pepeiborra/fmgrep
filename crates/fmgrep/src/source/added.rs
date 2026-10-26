@@ -133,6 +133,7 @@ impl Discovery {
             Some(recorded) => known.discover_recorded(recorded, files),
             None => known.discover(&known.root, &known.root, files),
         }
+        known.complete.store(true, Ordering::Release);
         let n = known.added().live().count();
         if n > 0 && crate::verbose::verbose() {
             eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
@@ -259,6 +260,19 @@ impl Known {
             Vec::new()
         };
         self.reconcile(rel, &found);
+    }
+
+    /// Reconcile each file directly in `rel` (a dir) that ascending `files`
+    /// does not list.
+    pub fn relist(&self, rel: &str, files: &[String]) {
+        let root = &self.root;
+        let walked =
+            crate::walk::walk_changed(root, vec![root.join(rel)], self.exclude.as_deref(), &|_| {
+                true
+            });
+        for rel in unlisted(walked, files) {
+            self.reconcile_path(root, &root.join(rel), files);
+        }
     }
 
     pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {

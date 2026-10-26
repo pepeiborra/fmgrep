@@ -88,6 +88,8 @@ pub struct WalkNotes {
     /// Every listed directory, `""` the root, stamped before listing; `None`
     /// when unstattable or holding a symlink to no file.
     pub dirs: Vec<(String, Option<Stamp>)>,
+    /// Kept documents that are symlinks.
+    pub links: Vec<String>,
 }
 
 /// The definition of "indexable": every file under `root`, sorted by relative
@@ -114,6 +116,7 @@ pub fn for_each_index_doc(
     // Length per document, for the batch byte bound alone.
     let mut rels: Vec<(String, u64)> = Vec::new();
     let mut dirs = Vec::new();
+    let mut symlinks = Vec::new();
     while let Some(dir) = stack.pop() {
         let meta = if dir == root {
             std::fs::metadata(&dir)
@@ -127,7 +130,11 @@ pub fn for_each_index_doc(
             let entry =
                 entry.map_err(|e| format!("error: cannot list folder {}: {e}", dir.display()))?;
             match classify(&entry, exclude.as_deref()) {
-                Entry::Link(len) => rels.push((relative_path(root, &entry.path()), len)),
+                Entry::Link(len) => {
+                    let rel = relative_path(root, &entry.path());
+                    symlinks.push(rel.clone());
+                    rels.push((rel, len));
+                }
                 Entry::File => {
                     let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
                     rels.push((relative_path(root, &entry.path()), len));
@@ -141,6 +148,8 @@ pub fn for_each_index_doc(
     }
     rels.sort();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    symlinks.sort();
+    let mut links = Vec::new();
     if rels.is_empty() {
         return Err(format!(
             "error: no indexable files in {} (want regular non-hidden files)",
@@ -173,6 +182,9 @@ pub fn for_each_index_doc(
                 continue;
             }
             f(rel, bytes, stamp)?;
+            if symlinks.binary_search(rel).is_ok() {
+                links.push(rel.clone());
+            }
             kept += 1;
         }
         at = end;
@@ -186,7 +198,7 @@ pub fn for_each_index_doc(
     if skipped > 0 {
         eprintln!("{}", skip_summary(skipped));
     }
-    Ok(WalkNotes { dirs })
+    Ok(WalkNotes { dirs, links })
 }
 
 /// What the walk makes of one directory entry.
@@ -799,6 +811,30 @@ mod tests {
         ];
         assert_eq!(notes.dirs, want.map(|(r, s)| (r.to_string(), s)));
         assert_eq!(kept, ["a.c", "links/l.c", "sub/b.c", "sub/deep/c.c"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_notes_record_links() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch_dir("walk-links");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor/mod")).unwrap();
+        std::fs::write(dir.join("a.c"), b"keep").unwrap();
+        std::fs::write(dir.join("sub/b.c"), b"keep").unwrap();
+        std::fs::write(dir.join("vendor/mod/c.c"), b"keep").unwrap();
+        std::fs::write(dir.join("bin.o"), b"\x00binary").unwrap();
+        symlink(dir.join("a.c"), dir.join("alias.c")).unwrap();
+        symlink(dir.join("bin.o"), dir.join("bin-alias.o")).unwrap();
+        let mut paths = Vec::new();
+        let notes = for_each_index_doc(&dir, None, |path, _, _| {
+            paths.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(notes.links, ["alias.c"]);
+        assert_eq!(paths, ["a.c", "alias.c", "sub/b.c", "vendor/mod/c.c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

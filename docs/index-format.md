@@ -16,6 +16,7 @@ directory.
 | `blobs.shard` | always | one docfm blob per shard, concatenated |
 | `docs.stamps` | default | one mtime per document |
 | `dirs.stamps` | default | every walked directory's `(size, mtime)` |
+| `docs.journal` | default, when a change source marks | change-source tokens, rewritten by each search |
 | `docs.shard` | `--store-docs` | the documents, concatenated |
 
 A search opens the index at `--index PATH` (default: the current
@@ -88,7 +89,8 @@ answer, a load stats every document against its `(size, mtime)` stamp:
   those whose stamp moved, and walks new directories below them in full;
 - a file the walk skipped as non-text is sniffed again whenever its
   directory is listed: one rewritten in place as text is found once its
-  directory's stamp moves, or when `serve`'s watch names it.
+  directory's stamp moves, or when a change source or `serve`'s watch
+  names it.
 
 `serve` watches the tree, following new files and directories; with
 `--no-watch` it misses files added after its first answer. On a filesystem
@@ -97,6 +99,18 @@ The directory check relies on the filesystem updating a directory's mtime
 when an entry is created, removed or renamed, as POSIX requires; on one
 that does not, delete `dirs.stamps` to make every load walk the tree.
 Re-index after many edits.
+
+`index` also asks a running watchman daemon (never started; asked to watch
+the tree) for a token before the walk. The token goes to `docs.journal`
+(JSON), with the symlinked documents and the directories holding a
+dangling symlink. A load asks watchman what changed since its token,
+re-checks only those paths, the symlinked documents and those directories,
+and skips the stat pass and the directory check; a search then rewrites
+the token with what differs now. A watchman that answers too slowly or
+names too many paths, and an index without `docs.journal`, fall back to
+the stat pass. An edit made while a directory above the root is renamed
+away and back, and a hard-linked file edited outside the root, are missed
+by the journal. `FMGREP_JOURNAL` disables it (`docs/tuning.md`).
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;

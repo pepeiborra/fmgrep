@@ -5,7 +5,7 @@ use std::process::{Command, Output};
 
 fn bench(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bench"));
-    cmd.current_dir(cwd).args(args);
+    cmd.current_dir(cwd).args(args).env("FMGREP_JOURNAL", "off");
     for var in [
         "FMGREP_CORPUS_GHC",
         "FMGREP_CORPUS_LINUX",

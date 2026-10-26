@@ -88,10 +88,10 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-/// Load the persisted index and its document source, and check coverage
-/// against the manifest. The files layout stats every doc and discovers the
-/// added files alongside the index load, or defers discovery under `defer`;
-/// under `watch` it watches the root from before both.
+/// Load the persisted index and its documents, and check coverage. Alongside
+/// the index load the files layout replays its journal, else stats every doc
+/// and discovers added files (deferred under `defer`); under `watch` it
+/// watches the root from before both.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
@@ -109,18 +109,25 @@ pub fn load(
         w => w.and_then(Result::ok),
     };
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
-    let mut discovery = docs.discovery();
-    let now = (!defer).then(|| discovery.take()).flatten();
     let running = AtomicBool::new(false);
-    // Plain threads: two fixed blocking passes that overlap the load.
-    let index = std::thread::scope(|scope| {
-        scope.spawn(|| docs.stat_all(&manifest.files));
-        if let Some(d) = now {
-            scope.spawn(|| d.run(&manifest.files, &running));
-        }
-        DocfmIndex::load(&blobs, &manifest.doc_lens)
-    })
-    .map_err(|e| format!("error: {e}"))?;
+    let (files, docs_ref, running_ref) = (&manifest.files, &docs, &running);
+    // Plain threads: fixed blocking passes that overlap the load.
+    let (index, discovery) = std::thread::scope(|scope| {
+        let fresh = scope.spawn(move || {
+            if docs_ref.replay(files) {
+                return None;
+            }
+            let mut discovery = docs_ref.discovery();
+            if let Some(d) = (!defer).then(|| discovery.take()).flatten() {
+                scope.spawn(move || d.run(files, running_ref));
+            }
+            docs_ref.stat_all(files);
+            discovery
+        });
+        let index = DocfmIndex::load(&blobs, &manifest.doc_lens);
+        (index, fresh.join().expect("the stat pass panicked"))
+    });
+    let index = index.map_err(|e| format!("error: {e}"))?;
     let loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
@@ -155,7 +162,8 @@ pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<Out
 }
 
 /// Answer every term, or the expression, from `index` and `loaded`, once
-/// discovery is done: a wait counts in `index_time_us`.
+/// discovery is done (a wait counts in `index_time_us`); then checkpoint the
+/// journal.
 pub fn answer(
     index: &DocfmIndex,
     loaded: &mut Loaded,
@@ -169,6 +177,7 @@ pub fn answer(
     loaded.docs.wait_discovered();
     let waited = wait.elapsed().as_micros() as u64;
     let mut report = answer_discovered(index, loaded, req, sink)?;
+    loaded.docs.checkpoint(req.index_dir, &req.manifest.files);
     report.index_time_us += waited;
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter

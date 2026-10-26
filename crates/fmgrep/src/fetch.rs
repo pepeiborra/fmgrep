@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{DOCS_SHARD, Manifest, shard_offsets};
-use crate::source::{Discovery, Files, Recorded, Stamps, Watch};
+use crate::source::{Discovery, Files, Journal, Knob, Recorded, Stamps, Watch};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -116,8 +116,8 @@ const STALE_CACHE_BYTES: u64 = 64 << 20;
 impl DocStore {
     /// The manifest's layout. Stored docs ignore `corpus_root`; a missing
     /// `docs.shard` surfaces only on the first non-empty fetch. The files
-    /// layout maps `docs.stamps`, reads the walk record, and checks
-    /// `corpus_root` (else the manifest's) is a directory.
+    /// layout maps `docs.stamps`, reads the journal and the walk record, and
+    /// checks `corpus_root` (else the manifest's) is a directory.
     pub fn open(
         index_dir: &Path,
         manifest: &Manifest,
@@ -135,6 +135,9 @@ impl DocStore {
                 files.exclude(index_dir);
                 if let Some(recorded) = Recorded::open(index_dir)? {
                     files.record(recorded);
+                }
+                if let Some(journal) = Journal::open(index_dir, Knob::read()?)? {
+                    files.journal(journal);
                 }
                 Source::Files(files)
             }
@@ -176,6 +179,23 @@ impl DocStore {
     pub fn stat_all(&self, files: &[String]) {
         if let Source::Files(f) = &self.source {
             f.stat_all(files, &self.lens);
+        }
+    }
+
+    /// Replay the journal instead of [`Self::stat_all`] and discovery: false
+    /// when it cannot vouch, or for stored docs.
+    pub fn replay(&self, files: &[String]) -> bool {
+        match &self.source {
+            Source::Files(f) => f.replay(files, &self.lens),
+            Source::Shard { .. } => false,
+        }
+    }
+
+    /// Once the stat pass and discovery, or the replay, are done: advance the
+    /// journal under `index_dir`, once.
+    pub fn checkpoint(&mut self, index_dir: &Path, files: &[String]) {
+        if let Source::Files(f) = &mut self.source {
+            f.checkpoint(index_dir, files);
         }
     }
 

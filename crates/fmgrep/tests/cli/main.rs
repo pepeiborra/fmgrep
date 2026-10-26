@@ -10,7 +10,9 @@ mod roundtrip;
 mod serve;
 
 fn fmgrep() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_fmgrep"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fmgrep"));
+    cmd.env("FMGREP_JOURNAL", "off");
+    cmd
 }
 
 fn run<S: AsRef<OsStr>>(args: &[S]) -> Output {

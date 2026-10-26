@@ -32,6 +32,7 @@ fn walk_record_round_trips_and_racy_or_unstatted_dirs_never_match() {
             ("d".into(), Some(at(3000))),
             ("e".into(), Some(at(20_000))),
         ],
+        ..Default::default()
     };
     write_walk(tmp.path(), &walk, UNIX_EPOCH + Duration::from_secs(10_000)).unwrap();
     let recorded = Recorded::open(tmp.path()).unwrap().expect("written");

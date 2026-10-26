@@ -1,11 +1,12 @@
 //! What the files layout knows of each file since indexing: fresh, stale
 //! (scanned in full), gone (excluded) or added (not in the manifest; scanned
-//! in full).
+//! in full). A change journal, when it vouches, names what to re-check
+//! instead of the stat pass and discovery.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -14,9 +15,11 @@ use crate::Stamp;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 mod added;
+mod journal;
 mod recorded;
 
 pub use added::Discovery;
+pub use journal::{Journal, Knob, marks};
 pub use recorded::{Recorded, write_walk};
 
 /// Per-doc mtimes of a files-layout index, at the index root.
@@ -106,6 +109,8 @@ struct Known {
     /// it.
     discovering: AtomicBool,
     recorded: Option<Recorded>,
+    /// Whether every doc was statted and every added file found.
+    complete: AtomicBool,
 }
 
 impl Known {
@@ -188,6 +193,34 @@ impl Known {
         let ids: Vec<usize> = (0..self.state.len()).collect();
         self.stat_ids(&ids, files, lens);
     }
+
+    /// Take ascending `paths` as all that changed in ascending `files`:
+    /// re-stat the docs at or under each and reconcile each; list each of
+    /// `relist` one level.
+    fn replay(&self, paths: &[String], relist: &[String], files: &[String], lens: &[u64]) {
+        self.discovering.store(true, Ordering::Release);
+        let root = &self.root;
+        let by_path: Vec<usize> = (0..files.len()).collect();
+        let mut ids = Vec::new();
+        if paths
+            .iter()
+            .any(|rel| docs_at(root, &root.join(rel), files, &by_path, &mut ids))
+        {
+            self.stat_all(files, lens);
+            self.discover(root, root, files);
+        } else {
+            ids.sort_unstable();
+            ids.dedup();
+            self.stat_ids(&ids, files, lens);
+            parallel(paths, |rel| {
+                self.reconcile_path(root, &root.join(rel), files)
+            });
+            for dir in relist {
+                self.relist(dir, files);
+            }
+        }
+        self.complete.store(true, Ordering::Release);
+    }
 }
 
 /// `f` of each item, in order; on a pool of [`STAT_THREADS`] above [`PARALLEL_STAT_MIN`] items.
@@ -217,6 +250,9 @@ pub struct Snapshot {
 /// each doc since.
 pub struct Files {
     known: Arc<Known>,
+    journal: Option<Journal>,
+    /// Taken by [`Self::replay`] before asking, for [`Self::checkpoint`].
+    marks: OnceLock<Vec<journal::Token>>,
 }
 
 impl Files {
@@ -240,8 +276,81 @@ impl Files {
                 latch: added::Latch::default(),
                 discovering: AtomicBool::new(false),
                 recorded: None,
+                complete: AtomicBool::new(false),
             }),
+            journal: None,
+            marks: OnceLock::new(),
         })
+    }
+
+    /// Replay `journal` rather than stat every doc, when it vouches.
+    pub fn journal(&mut self, journal: Journal) {
+        self.journal = Some(journal);
+    }
+
+    /// Take what the journal names since its marks instead of
+    /// [`Self::stat_all`] and discovery: false when it cannot vouch.
+    pub fn replay(&self, files: &[String], lens: &[u64]) -> bool {
+        let Some(journal) = &self.journal else {
+            return false;
+        };
+        let Ok(root) = self.known.root.canonicalize() else {
+            return false;
+        };
+        if !files.is_sorted() {
+            return false;
+        }
+        let asked = std::time::Instant::now();
+        let (marks, replay) = journal.ask(&root, files.len());
+        let _ = self.marks.set(marks);
+        let Some(replay) = replay else {
+            if crate::verbose::verbose() {
+                eprintln!("note: no change source vouches; statting every file");
+            }
+            return false;
+        };
+        let applied = std::time::Instant::now();
+        self.known
+            .replay(&replay.paths, &replay.relist, files, lens);
+        if crate::verbose::verbose() {
+            let (n, ask, apply) = (replay.paths.len(), applied - asked, applied.elapsed());
+            let kind = replay.kind;
+            eprintln!(
+                "note: {kind} named {n} path(s) to re-check (ask {ask:.1?}, apply {apply:.1?})"
+            );
+            let n = self.known.added().live().count();
+            if n > 0 {
+                eprintln!(
+                    "note: {n} file(s) added since indexing are scanned in full by every query"
+                );
+            }
+        }
+        true
+    }
+
+    /// Once every doc is known, rewrite the journal under `index_dir` from
+    /// [`Self::replay`]'s marks and what differs now.
+    pub fn checkpoint(&mut self, index_dir: &Path, files: &[String]) {
+        let (Some(journal), Some(marks)) = (self.journal.take(), self.marks.take()) else {
+            return;
+        };
+        if !self.known.complete.load(Ordering::Acquire) {
+            return;
+        }
+        let snap = self.snapshot();
+        let mut named: Vec<String> = snap
+            .stale
+            .iter()
+            .chain(&snap.gone)
+            .map(|&id| files[id].clone())
+            .collect();
+        named.extend(
+            snap.added
+                .iter()
+                .map(|&doc| snap.names[doc - files.len()].clone()),
+        );
+        named.sort_unstable();
+        journal.checkpoint(index_dir, marks, named);
     }
 
     /// Never take `index_dir` for an added file. Before any watch or
@@ -394,7 +503,7 @@ impl Watch {
                     Ok(e) if matches!(e.kind, EventKind::Access(_)) => {}
                     Ok(e) => {
                         for path in e.paths {
-                            all |= self.docs_at(&path, files, &by_path, &mut ids);
+                            all |= docs_at(&self.root, &path, files, &by_path, &mut ids);
                             named.push(path);
                         }
                     }
@@ -418,34 +527,35 @@ impl Watch {
             }
         }
     }
+}
 
-    /// Push the docs at or under `path`; true when `path` holds the root.
-    fn docs_at(
-        &self,
-        path: &Path,
-        files: &[String],
-        by_path: &[usize],
-        ids: &mut Vec<usize>,
-    ) -> bool {
-        if self.root.starts_with(path) {
-            return true;
-        }
-        let Some(rel) = path.strip_prefix(&self.root).ok().and_then(Path::to_str) else {
-            return false;
-        };
-        let at = by_path.partition_point(|&id| files[id].as_str() < rel);
-        if by_path.get(at).is_some_and(|&id| files[id] == rel) {
-            ids.push(by_path[at]);
-        }
-        let dir = format!("{rel}/");
-        let lo = by_path.partition_point(|&id| files[id].as_str() < dir.as_str());
-        ids.extend(
-            by_path[lo..]
-                .iter()
-                .take_while(|&&id| files[id].starts_with(&dir)),
-        );
-        false
+/// Push the docs at or under `path`, via `by_path` (`files` ids by path);
+/// true when `path` holds `root`.
+fn docs_at(
+    root: &Path,
+    path: &Path,
+    files: &[String],
+    by_path: &[usize],
+    ids: &mut Vec<usize>,
+) -> bool {
+    if root.starts_with(path) {
+        return true;
     }
+    let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
+        return false;
+    };
+    let at = by_path.partition_point(|&id| files[id].as_str() < rel);
+    if by_path.get(at).is_some_and(|&id| files[id] == rel) {
+        ids.push(by_path[at]);
+    }
+    let dir = format!("{rel}/");
+    let lo = by_path.partition_point(|&id| files[id].as_str() < dir.as_str());
+    ids.extend(
+        by_path[lo..]
+            .iter()
+            .take_while(|&&id| files[id].starts_with(&dir)),
+    );
+    false
 }
 
 #[cfg(test)]
@@ -607,6 +717,43 @@ mod tests {
         assert!(files.warned(0) && files.warned(2));
     }
 
+    #[test]
+    fn replay_restats_named_docs_and_walks_named_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        std::fs::write(fix.path.join(&fix.files[0]), b"printk changed").unwrap();
+        std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
+        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+        std::fs::create_dir_all(fix.path.join("sub/deep")).unwrap();
+        std::fs::write(fix.path.join("sub/deep/n.c"), b"new").unwrap();
+        std::fs::write(fix.path.join("sub/bin.dat"), b"a\0b").unwrap();
+        std::fs::create_dir(fix.path.join("rl")).unwrap();
+        std::fs::write(fix.path.join("rl/r.c"), b"relisted").unwrap();
+        std::fs::write(fix.path.join("unnamed.c"), b"unseen").unwrap();
+        let files = open_files(&fix);
+        let named = ["d0000.c", "d0002.c", "sub"].map(String::from);
+        files
+            .known
+            .replay(&named, &["rl".into()], &fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [STALE, FRESH, GONE], "only named docs");
+        let snap = files.snapshot();
+        let added: Vec<&str> = snap
+            .added
+            .iter()
+            .map(|&d| snap.names[d - 3].as_str())
+            .collect();
+        assert_eq!(added, ["sub/deep/n.c", "rl/r.c"]);
+        files
+            .known
+            .replay(&[String::new()], &[], &fix.files, &fix.lens);
+        assert_eq!(
+            files.kinds(),
+            [STALE, STALE, GONE],
+            "the root is everything"
+        );
+        assert_eq!(files.snapshot().added.len(), 3);
+    }
+
     /// Wait up to 60 s for `done`: a loaded box can hold events that long.
     pub(super) fn eventually(done: impl Fn() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -665,10 +812,11 @@ mod tests {
             .to_vec();
         let by_path: Vec<usize> = (0..names.len()).collect();
         let mut ids = Vec::new();
-        assert!(!watch.docs_at(&watch.root.join("a/b"), &names, &by_path, &mut ids));
-        assert_eq!(ids, [0, 1, 2]);
-        assert!(watch.docs_at(&watch.root, &names, &by_path, &mut ids));
-        assert!(!watch.docs_at(Path::new("/elsewhere/a/b"), &names, &by_path, &mut ids));
+        let root = &watch.root;
+        let mut at = |path: &Path| docs_at(root, path, &names, &by_path, &mut ids);
+        assert!(!at(&root.join("a/b")));
+        assert!(at(root));
+        assert!(!at(Path::new("/elsewhere/a/b")));
         assert_eq!(ids, [0, 1, 2]);
     }
 }
