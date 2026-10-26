@@ -338,11 +338,11 @@ fn decided(
 
 #[test]
 fn cost_rule_demotes_when_locating_costs_more_than_reading() {
-    // 16x the occurrences locate in 8x the time.
-    assert!(demote::demote_by_cost(1000, 100, 1, 1600, 7999.0));
-    assert!(!demote::demote_by_cost(1000, 100, 1, 1600, 8001.0));
+    // 16x the occurrences locate in 16x the time.
+    assert!(demote::demote_by_cost(1000, 100, 1, 1600, 15999.0));
+    assert!(!demote::demote_by_cost(1000, 100, 1, 1600, 16001.0));
     assert!(demote::demote_by_cost(1000, 100, 10, 1600, 100.0));
-    assert!(!demote::demote_by_cost(1000, 100, 100, 1600, 100.0));
+    assert!(!demote::demote_by_cost(1000, 100, 200, 1600, 100.0));
     // An untimed locate counts 1 us.
     assert!(demote::demote_by_cost(0, 1, 1, 1, 0.5) && !demote::demote_by_cost(0, 1, 1, 1, 1.0));
     assert!(!demote::demote_by_cost(1000, 100, 1, 0, 0.0));
@@ -351,11 +351,11 @@ fn cost_rule_demotes_when_locating_costs_more_than_reading() {
 #[test]
 fn cost_rule_samples_once_and_only_inside_the_band() {
     let e = Expr::And(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
-    let totals = [100, 200, 1000, 2000, 100_000];
+    let totals = [100, 150, 600, 1200, 100_000];
     let counts = || totals.iter().map(|&t| vec![(0..40, t)]).collect();
     let exact: Vec<(usize, u64)> = (0..20).map(|d| (d, 5)).collect();
-    // 20 docs: the band spans 200..2000 us; b, c, d, e estimate 168, 562, 946
-    // and 17783 us.
+    // 20 docs: the band spans 200..2000 us; b is below it, c and d inside
+    // (read 800 us) and e above.
     let (_, mut plan) = arranged(&e, counts());
     assert_eq!(plan.candidate, [false, true, true, true, true]);
     let (demoted, samples) = decided(&mut plan, band(10.0, 100.0), exact.clone(), 100, 40.0);

@@ -8,9 +8,6 @@ use crate::expr::Expr;
 use crate::probe::{Answer, Query};
 use crate::sharded::DocfmIndex;
 
-/// Locate time grows as occurrences to this power.
-const LOCATE_EXPONENT: f64 = 0.75;
-
 const READ_BAND: ReadBand = ReadBand {
     min_us: 12.0,
     max_us: 80.0,
@@ -272,9 +269,10 @@ pub fn decide(
 }
 
 /// Whether locating `occ_i` occurrences, scaled from `t_m_us` for `occ_m`,
-/// outlasts reading `docs_m` documents at `read_us` each.
+/// outlasts reading `docs_m` documents at `read_us` each. Locate time grows
+/// linearly with occurrences.
 pub fn demote_by_cost(t_m_us: u64, occ_m: u64, docs_m: usize, occ_i: u64, read_us: f64) -> bool {
-    let locate = t_m_us.max(1) as f64 * (occ_i as f64 / occ_m.max(1) as f64).powf(LOCATE_EXPONENT);
+    let locate = t_m_us.max(1) as f64 * occ_i as f64 / occ_m.max(1) as f64;
     docs_m == 0 || locate > docs_m as f64 * read_us
 }
 
