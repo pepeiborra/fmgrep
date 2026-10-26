@@ -44,6 +44,7 @@ pub struct Row {
     pub ready: Option<Duration>,
     pub index_peak_rss: Option<u64>,
     pub footprint: Option<u64>,
+    pub query_rss: Option<u64>,
     pub load1: Option<(f64, f64)>,
 }
 

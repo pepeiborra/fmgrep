@@ -97,16 +97,16 @@ fmgrep index . --store-docs # also keep a copy of every file
 A search reads every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
 files are read in full; after many edits, remove `.fmgrep` and re-index.
-`--store-docs` reads them from the copy instead, for about 1.8 times the
+`--store-docs` reads them from the copy instead, for about 1.7 times the
 disk: it never reads the tree and answers as of indexing time. Details:
 [docs/index-format.md](docs/index-format.md#staleness).
 
 | | GHC | linux |
 |---|--:|--:|
-| index size, default / `--store-docs` | 113 / 197 MB | 1.89 / 3.42 GB |
+| index size, default / `--store-docs` | 129 / 213 MB | 2.18 / 3.71 GB |
 | files read per literal (mean) | 122 | 798 |
-| literal p50, default / `--store-docs` | 4.7 / 4.3 ms | 10.1 / 7.0 ms |
-| regex p50, default / `--store-docs` | 9.3 / 8.6 ms | 15.4 / 10.0 ms |
+| literal p50, default / `--store-docs` | 4.2 / 3.8 ms | 9.1 / 5.8 ms |
+| regex p50, default / `--store-docs` | 7.6 / 6.4 ms | 13.9 / 7.1 ms |
 
 Apple M5, median of repeated warm queries (the
 Performance table below is one spawn-to-exit pass). A file costs an
@@ -119,17 +119,17 @@ lower `FMGREP_SAMPLE_RATE` speeds the index probe, not the reads
 ## Performance
 
 Apple M5 (10 cores, 16 GiB), macOS 26.5.1, fmgrep 0.1.0, ripgrep 15.2.0,
-2026-10-05 (chromium: 1 run).
+2026-10-08 (chromium: 2026-10-09, 1 run).
 Latency is the per-query median, spawn to exit, of one `fmgrep --server`
 or `rg` process printing the matching lines; footprint is the peak
+| corpus | files / text | index build / size | fmgrep literal / regex / AND | rg literal / regex / AND | footprint fmgrep / rg | RSS fmgrep / rg |
+|---|--:|--:|--:|--:|--:|--:|
+| GHC | 26787 / 85 MB | 2.0 s / 129 MB | 3.8 / 7.5 / 3.0 ms | 434 / 417 / 511 ms | 27 / 45 MB | 138 / 48 MB |
+| linux | 95540 / 1.5 GB | 18 s / 2.2 GB | 13.9 / 19.7 / 15.2 ms | 2.9 / 2.9 / 3.5 s | 62 / 146 MB | 1.4 GB / 148 MB |
+| chromium | 460957 / 2.8 GB | 78 s / 4.3 GB | 177 / 466 / 14.2 ms | 15.2 / 15.4 / 16.3 s | 480 / 690 MB | 3.3 GB / 691 MB |
 anonymous memory while answering. [BENCHMARKS.md](BENCHMARKS.md) has the
 method, every column and the index built with `--store-docs`.
 
-| corpus | files / text | index build / size | fmgrep literal / regex | rg literal / regex | footprint fmgrep / rg |
-|---|--:|--:|--:|--:|--:|
-| GHC | 26787 / 85 MB | 2.0 s / 113 MB | 4.4 / 10.3 ms | 479 / 476 ms | 26 / 46 MB |
-| linux | 95540 / 1.5 GB | 27 s / 1.9 GB | 16.5 / 22.5 ms | 2.9 / 3.1 s | 67 / 209 MB |
-| chromium | 460957 / 2.8 GB | 72 s / 3.7 GB | 141 / 408 ms | 14.8 / 15.2 s | 481 / 688 MB |
 
 Regexes cost more on chromium because every candidate file is read from
 the tree.

@@ -42,7 +42,8 @@ pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
         if !out.stderr.is_empty() {
             return Err(failure(&what, &out));
         }
-        row.footprint = row.footprint.max(peak);
+        row.footprint = row.footprint.max(peak.map(|p| p.footprint));
+        row.query_rss = row.query_rss.max(peak.map(|p| p.rss));
         let hits = hits(&what, &out)?;
         row.queries.push(Query::new(term, latency, hits));
     }
@@ -185,7 +186,8 @@ pub fn fmgrep(
         return Err(failure("fmgrep --server --shutdown", &out));
     }
     let status = server.0.wait().map_err(|e| e.to_string())?;
-    row.footprint = sampler.stop();
+    let peak = sampler.stop();
+    (row.footprint, row.query_rss) = (peak.map(|p| p.footprint), peak.map(|p| p.rss));
     if status.success() {
         Ok(row)
     } else {
@@ -208,11 +210,11 @@ impl Drop for Guard {
 }
 
 /// Runs `cmd` to exit and times spawn to exit; with a `tick`, also samples
-/// its peak footprint.
+/// its peak memory.
 pub fn timed(
     cmd: &mut Command,
     tick: Option<Duration>,
-) -> Result<(Output, Duration, Option<u64>), String> {
+) -> Result<(Output, Duration, Option<Peak>), String> {
     let start = Instant::now();
     let child = cmd
         .stdin(Stdio::null())
@@ -257,33 +259,46 @@ pub fn load1() -> Option<f64> {
     (n == 3).then(|| (avg[0] * 100.0).round() / 100.0)
 }
 
-/// Samples a process's footprint every `tick` and keeps the peak.
-pub struct Sampler(Arc<AtomicBool>, JoinHandle<Option<u64>>);
+/// Peak anonymous memory and peak resident set, file-backed pages included.
+#[derive(Clone, Copy)]
+pub struct Peak {
+    pub footprint: u64,
+    pub rss: u64,
+}
+
+/// Samples a process's memory every `tick` and keeps each field's peak.
+pub struct Sampler(Arc<AtomicBool>, JoinHandle<Option<Peak>>);
 
 impl Sampler {
     pub fn start(pid: u32, tick: Duration) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (flag, mut peak) = (Arc::clone(&stop), footprint(pid));
+        let (flag, mut peak) = (Arc::clone(&stop), memory(pid));
         let handle = std::thread::spawn(move || {
             loop {
                 std::thread::sleep(tick);
                 if flag.load(Ordering::Relaxed) {
                     return peak;
                 }
-                peak = peak.max(footprint(pid));
+                peak = match (peak, memory(pid)) {
+                    (Some(a), Some(b)) => Some(Peak {
+                        footprint: a.footprint.max(b.footprint),
+                        rss: a.rss.max(b.rss),
+                    }),
+                    (a, b) => a.or(b),
+                };
             }
         });
         Self(stop, handle)
     }
 
-    pub fn stop(self) -> Option<u64> {
+    pub fn stop(self) -> Option<Peak> {
         self.0.store(true, Ordering::Relaxed);
         self.1.join().unwrap_or_default()
     }
 }
 
-/// Anonymous memory: macOS `phys_footprint`, Linux resident minus shared pages.
-fn footprint(pid: u32) -> Option<u64> {
+/// Footprint is macOS `phys_footprint` or Linux resident minus shared pages.
+fn memory(pid: u32) -> Option<Peak> {
     #[cfg(target_os = "macos")]
     {
         let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
@@ -291,14 +306,18 @@ fn footprint(pid: u32) -> Option<u64> {
         let rc =
             unsafe { libc::proc_pid_rusage(pid as libc::c_int, libc::RUSAGE_INFO_V2, info_ptr) };
         if rc == 0 && info.ri_resident_size > 0 {
-            return Some(info.ri_phys_footprint);
+            let (footprint, rss) = (info.ri_phys_footprint, info.ri_resident_size);
+            return Some(Peak { footprint, rss });
         }
     }
     let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
     let mut pages = statm.split_whitespace().skip(1).map(str::parse::<u64>);
     let (resident, shared) = (pages.next()?.ok()?, pages.next()?.ok()?);
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
-    (resident > 0).then(|| resident.saturating_sub(shared) * page)
+    (resident > 0).then(|| Peak {
+        footprint: resident.saturating_sub(shared) * page,
+        rss: resident * page,
+    })
 }
 
 #[cfg(test)]
@@ -337,6 +356,12 @@ mod tests {
         ] {
             assert!(run(0, bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
         }
+    }
+
+    #[test]
+    fn memory_reads_rss_and_footprint_of_a_live_process() {
+        let peak = memory(std::process::id()).unwrap();
+        assert!(peak.rss > 0 && peak.footprint > 0);
     }
 
     #[test]

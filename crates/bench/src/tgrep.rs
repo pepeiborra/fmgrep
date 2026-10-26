@@ -143,7 +143,8 @@ pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
             .push(Query::new(term, latency, hits(&what, &out)?));
     }
     drop(server);
-    row.footprint = sampler.stop();
+    let peak = sampler.stop();
+    (row.footprint, row.query_rss) = (peak.map(|p| p.footprint), peak.map(|p| p.rss));
     Ok(row)
 }
 

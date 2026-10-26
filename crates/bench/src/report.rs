@@ -27,8 +27,8 @@ pub struct Stamps {
 }
 
 const SUMMARY: &str = "\
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
 
 pub fn run(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
@@ -182,6 +182,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         cells.extend([opt(p50(&all), ms), opt(mean(&all), ms)]);
         cells.extend([
             opt(r.footprint, bytes),
+            opt(r.query_rss, bytes),
             opt(r.index_peak_rss, bytes),
             opt(r.load1, |(a, b)| {
                 format!("{a:.2}->{b:.2}{}", if a.max(b) >= 4.0 { "!" } else { "" })
@@ -203,9 +204,9 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
          `rg` over a staged copy of the corpus, or `fmgrep --server` against one \
          `fmgrep serve`{tgrep}. An intersection is an `rg` pipe{tgrep_and}. \
-         Footprint is the peak anonymous memory while querying. load1 is the 1-minute load \
-         average at the row's start and end; `!` marks 4 or more, where timings are likely \
-         inflated.\n\n"
+         Footprint is the peak anonymous memory while querying; RSS also counts \
+         file-backed pages such as the mapped index. load1 is the 1-minute load average \
+         at the row's start and end; `!` marks 4 or more, where timings are likely inflated.\n\n"
     );
     md += &match diffs.len() {
         0 => format!(
@@ -299,6 +300,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
             "ready_us": us(r.ready),
             "index_peak_rss_bytes": r.index_peak_rss,
             "query_peak_footprint_bytes": r.footprint,
+            "query_peak_rss_bytes": r.query_rss,
             "loadavg_start": r.load1.map(|l| l.0),
             "loadavg_end": r.load1.map(|l| l.1),
         }));
@@ -352,7 +354,7 @@ mod tests {
                     .push(Query::new(term, Duration::from_millis(2), hits));
             }
         }
-        rg.footprint = Some(1 << 20);
+        (rg.footprint, rg.query_rss) = (Some(1 << 20), Some(2 << 20));
         (docs.index_time, docs.load1) = (Some(Duration::from_secs(2)), Some((1.0, 4.5)));
         (run, vec![rg, docs])
     }
@@ -396,11 +398,11 @@ mod tests {
             &md,
             &[
                 &format!(
-                    "\n| rg | - | - | - |{} 1.00 MB | - | - |\n",
+                    "\n| rg | - | - | - |{} 1.00 MB | 2.00 MB | - | - |\n",
                     " 2.00 ms |".repeat(8)
                 ),
                 "\n| fmgrep `--store-docs` | 2.00 s | - |",
-                "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | - | - | 1.00->4.50! |\n",
+                "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | - | - | - | 1.00->4.50! |\n",
                 "\n- queries: 3 (1 literal, 1 regex, 1 intersection)\n",
                 "\n- tgrep: not found on PATH\n",
                 "verify: OK, 2 rows agree on 3 queries",
@@ -455,6 +457,10 @@ mod tests {
             ("a", "literal"),
         ] {
             let want = format!(r#""term":"{term}","term_kind":"{kind}""#);
+            assert!(trace.contains(&want), "{want} not in\n{trace}");
+        }
+        for rss in ["2097152", "null"] {
+            let want = format!(r#""query_peak_rss_bytes":{rss}"#);
             assert!(trace.contains(&want), "{want} not in\n{trace}");
         }
     }
