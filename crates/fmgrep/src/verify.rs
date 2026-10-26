@@ -102,7 +102,10 @@ impl<'a> LeafSet<'a> {
 /// `src` rewritten to match a multi-line haystack exactly where it matches
 /// one of its lines, or `None` where only its own scan is exact.
 fn line_pattern(src: &str, matcher: &LineMatcher, mode: MatchMode) -> Option<String> {
-    if !matches!(matcher, LineMatcher::Regex { .. }) {
+    if !matches!(
+        matcher,
+        LineMatcher::Regex { .. } | LineMatcher::LocalRegex(_)
+    ) {
         return None;
     }
     let hir = regex_syntax::ParserBuilder::new()
@@ -116,7 +119,8 @@ fn line_pattern(src: &str, matcher: &LineMatcher, mode: MatchMode) -> Option<Str
 }
 
 /// No `\n` in any class or literal, `\A` / `\z` as line anchors; `None` on
-/// a CRLF anchor.
+/// a CRLF anchor or a Unicode `\B` / half boundary (those decode across the
+/// line start).
 fn line_safe(hir: &Hir) -> Option<Hir> {
     Some(match hir.kind() {
         HirKind::Empty => Hir::empty(),
@@ -134,7 +138,13 @@ fn line_safe(hir: &Hir) -> Option<Hir> {
         }
         HirKind::Look(Look::Start) => Hir::look(Look::StartLF),
         HirKind::Look(Look::End) => Hir::look(Look::EndLF),
-        HirKind::Look(Look::StartCRLF | Look::EndCRLF) => return None,
+        HirKind::Look(
+            Look::StartCRLF
+            | Look::EndCRLF
+            | Look::WordUnicodeNegate
+            | Look::WordStartHalfUnicode
+            | Look::WordEndHalfUnicode,
+        ) => return None,
         HirKind::Look(_) => hir.clone(),
         HirKind::Capture(c) => line_safe(&c.sub)?,
         HirKind::Repetition(r) => Hir::repetition(Repetition {

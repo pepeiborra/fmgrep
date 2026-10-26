@@ -1,9 +1,10 @@
-//! Match extraction with ripgrep's semantics. Each scan runs over one line's
-//! content (terminator excluded, `\r` kept), so no match crosses a terminator,
-//! `^ $ \A \z` anchor at line boundaries and a `\n` inside a class never
-//! matches; under [`MatchMode::multiline`] a term that can match a terminator
-//! scans the whole document instead ([`can_match_newline`]). A zero-width
-//! match at an unterminated EOF matches its line but yields no span.
+//! Match extraction with ripgrep's semantics. Matches are those of a scan
+//! over each line's content (terminator excluded, `\r` kept): none crosses a
+//! terminator, `^ $ \A \z` anchor at line boundaries and a `\n` inside a
+//! class never matches; under [`MatchMode::multiline`] a term that can match
+//! a terminator scans the whole document instead ([`can_match_newline`]). A
+//! zero-width match at an unterminated EOF matches its line but yields no
+//! span.
 
 use memchr::memmem;
 
@@ -190,7 +191,9 @@ impl<'a> LineCursor<'a> {
 
     /// The line holding `pos`; a terminator belongs to the line it ends.
     /// `pos` must not decrease. `no` is 0 unless numbered.
+    /// `pos < raw.len()` unless the last line is unterminated.
     fn at(&mut self, pos: usize) -> Line {
+        debug_assert!(pos < self.raw.len() || self.raw.last().is_some_and(|&b| b != b'\n'));
         let (from, no) = match self.cur {
             Some(l) if pos <= l.end => return l,
             Some(l) => (l.end + 1, l.no),
@@ -248,6 +251,9 @@ pub enum LineMatcher {
         re: regex::bytes::Regex,
         anchor: Option<memmem::Finder<'static>>,
     },
+    /// No anchor past one byte, and no match or look leaves its line: one
+    /// scan of the document.
+    LocalRegex(regex::bytes::Regex),
     /// `-U` over a literal holding a terminator: one scan of the document.
     MultiLiteral(memmem::Finder<'static>),
     /// `-U` over a pattern that can match a terminator. The same required
@@ -292,9 +298,12 @@ impl LineMatcher {
             .case_insensitive(mode.ignore_case)
             .build()
             .map_err(|e| RegexError::new(src, e.to_string()))?;
+        let whole_document = anchor.is_none_or(|a| a.len() < 2) && line_local(&hir);
         let anchor = anchor.map(|a| memmem::Finder::new(a).into_owned());
         Ok(if mode.multiline && can_match_newline(&hir) {
             Self::MultiRegex { re, anchor }
+        } else if whole_document {
+            Self::LocalRegex(re)
         } else {
             Self::Regex { re, anchor }
         })
@@ -310,15 +319,13 @@ impl LineMatcher {
             Self::Literal(finder) => {
                 let len = finder.needle().len();
                 if len > 0 {
-                    let mut cursor = LineCursor::new(raw, output.numbers_lines());
-                    for pos in finder.find_iter(raw) {
-                        let line = cursor.at(pos);
-                        acc.push(line, (pos - line.start) as u32, len as u32);
-                        if acc.done() {
-                            break;
-                        }
-                    }
+                    let hits = finder.find_iter(raw).map(|p| (p, p + len));
+                    scan_hits(raw, output.numbers_lines(), hits, &mut acc);
                 }
+            }
+            Self::LocalRegex(re) => {
+                let hits = re.find_iter(raw).map(|m| (m.start(), m.end()));
+                scan_hits(raw, output.numbers_lines(), hits, &mut acc);
             }
             Self::Regex { re, anchor: None } => {
                 for line in Lines::new(raw) {
@@ -408,6 +415,30 @@ fn scan_document(raw: &[u8], matches: impl Iterator<Item = (usize, usize)>, acc:
     }
 }
 
+/// Ascending in-line matches grouped by line; a match at `raw.len()` is
+/// spanless on an unterminated last line and dropped otherwise.
+fn scan_hits(
+    raw: &[u8],
+    numbered: bool,
+    hits: impl Iterator<Item = (usize, usize)>,
+    acc: &mut Accum,
+) {
+    let mut cursor = LineCursor::new(raw, numbered);
+    for (start, end) in hits {
+        if start == raw.len() {
+            if raw.last().is_some_and(|&b| b != b'\n') {
+                acc.push_spanless(cursor.at(start));
+            }
+            break;
+        }
+        let line = cursor.at(start);
+        acc.push(line, (start - line.start) as u32, (end - start) as u32);
+        if acc.done() {
+            break;
+        }
+    }
+}
+
 fn scan_line(re: &regex::bytes::Regex, raw: &[u8], line: Line, acc: &mut Accum) {
     for m in re.find_iter(&raw[line.start..line.end]) {
         // rg's empty-match rule: a match starting at the document's
@@ -479,6 +510,29 @@ fn can_match_newline(hir: &regex_syntax::hir::Hir) -> bool {
         HirKind::Capture(c) => can_match_newline(&c.sub),
         HirKind::Repetition(r) => can_match_newline(&r.sub),
         HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(can_match_newline),
+    }
+}
+
+/// Whether a whole-document scan finds exactly the line scan's matches: no
+/// `\n` in a literal or class; only `^`, `$` and ASCII word looks.
+fn line_local(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::{HirKind, Look};
+    match hir.kind() {
+        HirKind::Look(look) => matches!(
+            look,
+            Look::StartLF
+                | Look::EndLF
+                | Look::WordAscii
+                | Look::WordAsciiNegate
+                | Look::WordStartAscii
+                | Look::WordEndAscii
+                | Look::WordStartHalfAscii
+                | Look::WordEndHalfAscii
+        ),
+        HirKind::Capture(c) => line_local(&c.sub),
+        HirKind::Repetition(r) => line_local(&r.sub),
+        HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().all(line_local),
+        HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) => !can_match_newline(hir),
     }
 }
 

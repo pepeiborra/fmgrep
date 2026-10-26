@@ -1,6 +1,6 @@
 use super::*;
 
-const DOCS: [&[u8]; 17] = [
+const DOCS: [&[u8]; 18] = [
     b"",
     b"\n",
     b"\n\n",
@@ -18,6 +18,7 @@ const DOCS: [&[u8]; 17] = [
     b"ALPHA\nalpha\n",
     b"end with space \n",
     b"tab\there\n",
+    b"x\n\xa9\r",
 ];
 
 const PATTERNS: [&str; 24] = [
@@ -116,8 +117,9 @@ fn set_membership_equals_line_scan() {
 
 #[test]
 fn crlf_and_multiline_leaves_use_their_own_scan() {
-    let cases: [(&str, MatchMode); 4] = [
+    let cases: [(&str, MatchMode); 5] = [
         (r"(?R)two$", MatchMode::default()),
+        (r"\B\r", MatchMode::default()),
         (
             r"a\nb",
             MatchMode {

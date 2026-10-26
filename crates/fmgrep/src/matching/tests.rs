@@ -376,7 +376,10 @@ fn only_terms_that_can_match_a_terminator_leave_the_line_scan() {
     }
     for src in ["a", "a.b", "\\ba\\b", "[abc]+", "a|bc"] {
         let m = LineMatcher::regex(src, None, MULTI).unwrap();
-        assert!(matches!(m, LineMatcher::Regex { .. }), "src={src:?}");
+        assert!(
+            matches!(m, LineMatcher::Regex { .. } | LineMatcher::LocalRegex(_)),
+            "src={src:?}"
+        );
     }
     // `.` only reaches the terminator under --multiline-dotall.
     let dotall = MatchMode {
@@ -387,9 +390,9 @@ fn only_terms_that_can_match_a_terminator_leave_the_line_scan() {
     let m = LineMatcher::regex("a.b", None, dotall).unwrap();
     assert!(matches!(m, LineMatcher::MultiRegex { .. }));
     assert_eq!(hits(&m, "a\nb\n").len(), 2);
-    // Without -U nothing leaves the line scan.
+    // Without -U nothing takes the multiline scan.
     let m = LineMatcher::regex("^a$", None, MatchMode::default()).unwrap();
-    assert!(matches!(m, LineMatcher::Regex { .. }));
+    assert!(matches!(m, LineMatcher::LocalRegex(_)));
 }
 
 #[test]
@@ -435,9 +438,9 @@ fn ignore_case_composes_with_multiline() {
             (2, "Beta".to_string(), vec![(0, 4)]),
         ]
     );
-    // A folded term that cannot hold a terminator keeps the line scan.
+    // A folded term that cannot hold a terminator keeps line semantics.
     let plain = LineMatcher::regex("alpha", None, CI_MULTI).unwrap();
-    assert!(matches!(plain, LineMatcher::Regex { .. }));
+    assert!(matches!(plain, LineMatcher::LocalRegex(_)));
     // The literal path folds nothing, so `-i` reaches it only as a pattern.
     let ci_lit = LineMatcher::regex("ALPHA\nBETA", None, CI_MULTI).unwrap();
     assert_eq!(count_matches(&ci_lit, "alpha\nbeta\n"), 1);
@@ -535,4 +538,231 @@ fn context_numbers_lines_without_line_numbers() {
         vec![2, 3, 4, 5]
     );
     assert_eq!(got, hits_out(&lit("hit"), doc, out(true)));
+}
+
+#[test]
+fn line_local_terms_scan_the_whole_document() {
+    let local = [
+        "a",
+        "$",
+        "^",
+        "x*$",
+        "^$",
+        r"(?-u:\bword\b)",
+        r"(?-u:\<a)",
+        r"(?-u:\B)",
+        r#"[^"\n]*"#,
+        "a\r",
+        r"[ \t]+",
+        "(?i)k",
+        r"stg_\w+_info",
+    ];
+    for src in local {
+        assert!(matches!(re(src), LineMatcher::LocalRegex(_)), "src={src:?}");
+    }
+    let per_line = [
+        r"\s",
+        "[^a]",
+        "(?s).",
+        r"\W",
+        r"\Aa",
+        r"a\z",
+        "(?-m)^a",
+        "(?R)a$",
+        r"\bword\b",
+        r"\<a",
+        r"\B",
+        r"\b{start-half}",
+        r"\b{end-half}",
+    ];
+    for src in per_line {
+        assert!(matches!(re(src), LineMatcher::Regex { .. }), "src={src:?}");
+    }
+    assert!(LineMatcher::regex(r"a\nb", None, MatchMode::default()).is_err());
+    assert!(matches!(multi(r"a\nb"), LineMatcher::MultiRegex { .. }));
+    let anchored =
+        LineMatcher::regex(r"stg_\w+_info", Some(b"stg_"), MatchMode::default()).unwrap();
+    assert!(matches!(
+        anchored,
+        LineMatcher::Regex {
+            anchor: Some(_),
+            ..
+        }
+    ));
+    let one_byte = LineMatcher::regex("a b", Some(b" "), MatchMode::default()).unwrap();
+    assert!(matches!(one_byte, LineMatcher::LocalRegex(_)));
+}
+
+type Digest = (
+    u64,
+    u64,
+    u64,
+    Vec<(u64, usize, usize, Vec<(u32, u32)>, bool)>,
+);
+
+/// `numbered: false` masks line numbers, which the unanchored line scan fills regardless.
+fn digest(o: DocOutcome, numbered: bool) -> Digest {
+    let no = |l: u64| if numbered { l } else { 0 };
+    let lines = o
+        .lines
+        .into_iter()
+        .map(|l| (no(l.line), l.start, l.end, l.spans, l.matched))
+        .collect();
+    (o.matched_lines, o.matched_spans, o.spanless_lines, lines)
+}
+
+#[test]
+fn whole_document_scan_equals_the_line_scan() {
+    const SYMBOLS: [&[u8]; 6] = [b"a", b"\n", b"\r", b" ", "\u{e9}".as_bytes(), b"\xa9"];
+    let patterns = [
+        "a",
+        "$",
+        "^",
+        "x*$",
+        "^$",
+        "a*",
+        "a|",
+        "a*?",
+        r"(?-u:\ba\b)",
+        r"(?-u:\b)",
+        r"(?-u:\B)",
+        r"(?-u:\<a)",
+        r"(?-u:a\>)",
+        r"(?-u:\b{start})",
+        r"(?-u:\b{end})",
+        r"(?-u:\b{start-half})",
+        r"(?-u:\b{end-half})",
+        r"[^\n]",
+        r"[^\na]+",
+        ".*",
+        "\r$",
+        "a\r",
+        r"[ \t]+",
+        r"\w+",
+        r"\S+",
+        "\u{e9}|(?-u:\\w)",
+    ];
+    let mut docs: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut frontier = docs.clone();
+    for _ in 0..4 {
+        frontier = frontier
+            .iter()
+            .flat_map(|d| SYMBOLS.iter().map(move |s| [d.as_slice(), s].concat()))
+            .collect();
+        docs.extend(frontier.iter().cloned());
+    }
+    let c1 = QueryOutput::Matches {
+        before: 1,
+        after: 1,
+        line_numbers: false,
+    };
+    let outputs = [MATCHES, UNNUMBERED, c1, QueryOutput::FilesWithMatches];
+    let modes = [
+        MatchMode::default(),
+        MatchMode {
+            ignore_case: true,
+            ..MatchMode::default()
+        },
+        MULTI,
+    ];
+    for mode in modes {
+        for src in patterns {
+            let local = LineMatcher::regex(src, None, mode).unwrap();
+            let LineMatcher::LocalRegex(ref re) = local else {
+                assert!(mode.multiline, "src={src:?} {mode:?}");
+                continue;
+            };
+            let per_line = LineMatcher::Regex {
+                re: re.clone(),
+                anchor: None,
+            };
+            for doc in &docs {
+                for out in outputs {
+                    let (a, b) = (local.scan(doc, out), per_line.scan(doc, out));
+                    let counts = |o: &DocOutcome| (o.count_lines(), o.count_matches());
+                    assert_eq!(
+                        counts(&a),
+                        counts(&b),
+                        "src={src:?} {mode:?} {out:?} doc={doc:?}"
+                    );
+                    assert_eq!(
+                        digest(a, out.numbers_lines()),
+                        digest(b, out.numbers_lines()),
+                        "src={src:?} {mode:?} {out:?} doc={doc:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn line_local_zero_width_match_after_the_last_terminator_is_dropped() {
+    let one = |no: u64, text: &str, spans: Vec<(u32, u32)>| (no, text.to_string(), spans);
+    let end_of_line = || -> Vec<(&str, Emitted, (u64, u64), u64)> {
+        vec![
+            ("", vec![], (0, 0), 0),
+            ("\n", vec![one(1, "", vec![(0, 0)])], (1, 1), 1),
+            ("a\n", vec![one(1, "a", vec![(1, 0)])], (1, 1), 1),
+            (
+                "a\n\n",
+                vec![one(1, "a", vec![(1, 0)]), one(2, "", vec![(0, 0)])],
+                (2, 2),
+                2,
+            ),
+            (
+                "a\nb",
+                vec![one(1, "a", vec![(1, 0)]), one(2, "b", vec![])],
+                (2, 1),
+                2,
+            ),
+        ]
+    };
+    let cases = [
+        ("x*$", end_of_line()),
+        ("$", end_of_line()),
+        (
+            "^",
+            vec![
+                ("", vec![], (0, 0), 0),
+                ("\n", vec![one(1, "", vec![(0, 0)])], (1, 1), 1),
+                ("a\n", vec![one(1, "a", vec![(0, 0)])], (1, 1), 1),
+                (
+                    "a\n\n",
+                    vec![one(1, "a", vec![(0, 0)]), one(2, "", vec![(0, 0)])],
+                    (2, 2),
+                    2,
+                ),
+                (
+                    "a\nb",
+                    vec![one(1, "a", vec![(0, 0)]), one(2, "b", vec![(0, 0)])],
+                    (2, 2),
+                    2,
+                ),
+            ],
+        ),
+        (
+            "^$",
+            vec![
+                ("", vec![], (0, 0), 0),
+                ("\n", vec![one(1, "", vec![(0, 0)])], (1, 1), 1),
+                ("a\n", vec![], (0, 0), 0),
+                ("a\n\n", vec![one(2, "", vec![(0, 0)])], (1, 1), 1),
+                ("a\nb", vec![], (0, 0), 0),
+            ],
+        ),
+    ];
+    for (src, rows) in cases {
+        let m = re(src);
+        assert!(matches!(m, LineMatcher::LocalRegex(_)), "src={src:?}");
+        for (raw, want, want_counts, want_matches) in rows {
+            assert_eq!(hits(&m, raw), want, "src={src:?} raw={raw:?}");
+            assert_eq!(counts(&m, raw), want_counts, "src={src:?} raw={raw:?}");
+            assert_eq!(
+                count_matches(&m, raw),
+                want_matches,
+                "src={src:?} raw={raw:?}"
+            );
+        }
+    }
 }
