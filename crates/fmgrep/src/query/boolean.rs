@@ -4,6 +4,8 @@
 
 mod demote;
 
+pub use demote::ReadBand;
+
 use std::borrow::Cow;
 use std::ops::Range;
 use std::time::Instant;
@@ -11,7 +13,8 @@ use std::time::Instant;
 use super::{Loaded, QueryRequest, in_index, line_matcher, path_of, prepare};
 use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
-use crate::fetch::{Paths, fetch_stream_parallel, fetch_threads};
+use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::manifest::Manifest;
 use crate::matching::{self, DocOutcome, LineMatcher, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
@@ -240,6 +243,7 @@ pub fn answer_expr(
     };
     let manifest = req.manifest;
     let num_docs = manifest.files.len();
+    let band = demote::read_band(loaded.band);
     loaded.docs.begin();
     let docs = &mut loaded.docs;
 
@@ -283,21 +287,12 @@ pub fn answer_expr(
             .collect();
         let map = |_: usize, raw: &[u8]| finders.iter().all(|f| f.find(raw).is_some());
         let mut read_us = |ids: &[usize]| -> Result<f64, String> {
-            let start = Instant::now();
-            fetch_stream_parallel(
-                docs,
-                &manifest.files,
-                ids,
-                fetch_threads(),
-                &map,
-                &mut |_, _, _| Ok(()),
-            )?;
-            let us = start.elapsed().as_micros() as u64;
+            let us = read_wall_us(docs, &manifest.files, ids, &map)?;
             sample_us += us;
             Ok(us as f64 / ids.len().max(1) as f64)
         };
         let stage1: Vec<Option<&Answer>> = answers.iter().map(Option::as_ref).collect();
-        demote::decide(&mut plan, demote::read_band(), &stage1, &mut read_us);
+        demote::decide(&mut plan, band, &stage1, &mut read_us);
     }
     let second: Vec<usize> = (0..leaves.len())
         .filter(|&i| plan.candidate[i] && probed(i, &plan))
@@ -576,6 +571,50 @@ pub fn answer_expr(
         num_files_indexed: manifest.num_docs,
         queries: vec![report],
     })
+}
+
+/// Wall of reading `ids` as one batch, us.
+fn read_wall_us(
+    docs: &mut DocStore,
+    files: &[String],
+    ids: &[usize],
+    map: &(dyn Fn(usize, &[u8]) -> bool + Sync),
+) -> Result<u64, String> {
+    let start = Instant::now();
+    fetch_stream_parallel(
+        docs,
+        files,
+        ids,
+        fetch_threads(),
+        map,
+        &mut |_, _, _| Ok(()),
+    )?;
+    Ok(start.elapsed().as_micros() as u64)
+}
+
+/// The band around the least of 3 warm per-document reads of spread fresh
+/// non-empty documents; the default when none exists or a read fails.
+pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
+    docs.begin();
+    let fresh: Vec<usize> = (0..manifest.files.len())
+        .filter(|&d| manifest.doc_lens[d] > 0 && docs.changed().binary_search(&d).is_err())
+        .collect();
+    let ids = demote::spread(&fresh, demote::SAMPLE_DOCS);
+    if ids.is_empty() {
+        return ReadBand::DEFAULT;
+    }
+    let map = |_: usize, raw: &[u8]| memchr::memchr(0, raw).is_none();
+    let mut warm = u64::MAX;
+    for pass in 0..4 {
+        docs.begin();
+        let Ok(us) = read_wall_us(docs, &manifest.files, &ids, &map) else {
+            return ReadBand::DEFAULT;
+        };
+        if pass > 0 {
+            warm = warm.min(us);
+        }
+    }
+    ReadBand::around(warm as f64 / ids.len() as f64)
 }
 
 /// A literal whose containment in the BOM-stripped text is exactly a

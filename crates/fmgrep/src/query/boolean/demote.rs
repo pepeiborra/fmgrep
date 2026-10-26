@@ -8,13 +8,8 @@ use crate::expr::Expr;
 use crate::probe::{Answer, Query};
 use crate::sharded::DocfmIndex;
 
-const READ_BAND: ReadBand = ReadBand {
-    min_us: 12.0,
-    max_us: 80.0,
-};
-
 /// Reference documents read to measure the read cost.
-const SAMPLE_DOCS: usize = 16;
+pub const SAMPLE_DOCS: usize = 16;
 
 /// A regex reference, or an AND under an OR, demotes a sibling counted over
 /// this many times the rarest.
@@ -22,18 +17,34 @@ const FALLBACK_RATIO: u64 = 8;
 
 /// Microseconds per document read: outside the band its edge decides,
 /// inside it the cost is sampled.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReadBand {
     pub min_us: f64,
     pub max_us: f64,
 }
 
-pub fn read_band() -> ReadBand {
+impl ReadBand {
+    pub const DEFAULT: ReadBand = ReadBand {
+        min_us: 12.0,
+        max_us: 80.0,
+    };
+
+    /// [`Self::DEFAULT`]'s shape from a warm read clamped to 2..200 us.
+    pub fn around(warm_us: f64) -> ReadBand {
+        let min_us = warm_us.clamp(2.0, 200.0);
+        ReadBand {
+            min_us,
+            max_us: min_us * Self::DEFAULT.max_us / Self::DEFAULT.min_us,
+        }
+    }
+}
+
+pub fn read_band(band: ReadBand) -> ReadBand {
     #[cfg(test)]
     if let Some((min_us, max_us)) = crate::tests::BAND.get() {
         return ReadBand { min_us, max_us };
     }
-    READ_BAND
+    band
 }
 
 /// An AND node's direct leaf operands.
@@ -291,7 +302,7 @@ fn occurrences(counts: &[(Range<usize>, u64)], within: &[Range<usize>]) -> u64 {
 }
 
 /// At most `n` of ascending `docs`, evenly spaced.
-fn spread(docs: &[usize], n: usize) -> Vec<usize> {
+pub fn spread(docs: &[usize], n: usize) -> Vec<usize> {
     match docs.len() <= n {
         true => docs.to_vec(),
         false => (0..n).map(|k| docs[k * docs.len() / n]).collect(),

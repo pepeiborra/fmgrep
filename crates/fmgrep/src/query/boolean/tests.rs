@@ -469,3 +469,94 @@ fn cost_rule_under_an_or_keeps_the_ratio_test_and_the_demoted_w() {
     );
     assert!(plan.unsettled[3].is_empty() && plan.unsettled[4].is_empty());
 }
+
+#[test]
+fn a_measured_band_keeps_the_default_shape_within_2_to_200_us() {
+    assert_eq!(ReadBand::around(12.0), ReadBand::DEFAULT);
+    let band = ReadBand {
+        min_us: 30.0,
+        max_us: 200.0,
+    };
+    assert_eq!(ReadBand::around(30.0), band);
+    assert_eq!(ReadBand::around(0.0).min_us, 2.0);
+    assert_eq!(ReadBand::around(1e9).min_us, 200.0);
+    for w in [0.0, 7.5, 12.0, 30.0, 1e9] {
+        let b = ReadBand::around(w);
+        assert!((b.max_us / b.min_us - 80.0 / 12.0).abs() < 1e-12, "{w}");
+    }
+}
+
+/// The band measured over `index`, once its answers to `expr` are checked
+/// against the default band's.
+fn measured_band(index: &std::path::Path, expr: &Expr) -> ReadBand {
+    let manifest = crate::manifest::read_manifest(index).unwrap();
+    let answers = |measure: bool| {
+        let (fm, mut loaded) = super::super::load(index, &manifest, None, false, false).unwrap();
+        if measure {
+            loaded.measure_band(&manifest);
+        }
+        let outs = [
+            QueryOutput::Counts,
+            QueryOutput::FilesWithMatches,
+            QueryOutput::CountLines,
+        ]
+        .map(|output| {
+            let req = QueryRequest {
+                expr: Some(expr),
+                ..crate::tests::support::request(index, &manifest, &[], output)
+            };
+            answer_expr(&fm, &mut loaded, &req, expr, &mut crate::sink::Discard)
+                .map(crate::tests::support::timeless)
+        });
+        (loaded.band, outs)
+    };
+    let (band, got) = answers(true);
+    let (default, want) = answers(false);
+    assert_eq!(default, ReadBand::DEFAULT);
+    assert_eq!(got, want);
+    band
+}
+
+#[test]
+fn serve_measures_the_band_through_the_store() {
+    use crate::tests::support::{LAYOUTS, index_it, stage_corpus};
+    let files: [(&str, &[u8]); 4] = [
+        ("a.c", b"alpha one printk\n"),
+        ("b.c", b"printk printk printk alpha\n"),
+        ("c.c", b"one\n"),
+        ("d.c", b""),
+    ];
+    let expr = Expr::And(vec![t("one"), t("printk"), t("alpha")]);
+    let indexed = |tmp: &std::path::Path, files: &[(&str, &[u8])], store_docs| {
+        let index = tmp.join("idx");
+        index_it(&stage_corpus(tmp, files), &index, store_docs);
+        index
+    };
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let band = measured_band(&indexed(tmp.path(), &files, store_docs), &expr);
+        assert!((2.0..=200.0).contains(&band.min_us), "{band:?}");
+        assert_eq!(band, ReadBand::around(band.min_us));
+    }
+    // Only stale or empty files: nothing fresh to read.
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = indexed(
+        tmp.path(),
+        &[("a.c", b"one printk alpha\n"), ("d.c", b"")],
+        false,
+    );
+    std::fs::write(
+        tmp.path().join("corpus/a.c"),
+        b"one printk alpha, changed\n",
+    )
+    .unwrap();
+    assert_eq!(measured_band(&stale, &expr), ReadBand::DEFAULT);
+    let tmp = tempfile::tempdir().unwrap();
+    let blind = indexed(tmp.path(), &files, true);
+    std::fs::rename(
+        blind.join(crate::manifest::DOCS_SHARD),
+        blind.join("hidden"),
+    )
+    .unwrap();
+    assert_eq!(measured_band(&blind, &expr), ReadBand::DEFAULT);
+}

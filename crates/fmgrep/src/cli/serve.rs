@@ -332,7 +332,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     let root = docs_root(req)?;
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("error: cannot resolve {}: {e}", root.display()))?;
-    let (index, docs) = load(
+    let (index, mut docs) = load(
         req.index_dir,
         req.manifest,
         req.corpus_root,
@@ -342,6 +342,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }
+    docs.measure_band(req.manifest);
     Ok(Served {
         index,
         docs,

@@ -46,9 +46,15 @@ pub struct Loaded {
     pub load_wall: Duration,
     watch: Option<Watch>,
     discovery: Option<Discovery>,
+    band: boolean::ReadBand,
 }
 
 impl Loaded {
+    /// Plan ANDs from this machine's warm read cost, measured now.
+    pub fn measure_band(&mut self, manifest: &Manifest) {
+        self.band = boolean::warm_band(&mut self.docs, manifest);
+    }
+
     /// The watch [`load`] started, if asked to.
     pub fn take_watch(&mut self) -> Option<Watch> {
         self.watch.take()
@@ -119,6 +125,7 @@ pub fn load(
         load_wall: load_start.elapsed(),
         watch,
         discovery,
+        band: boolean::ReadBand::DEFAULT,
     };
     let loaded = finish(loaded, manifest);
     covers(index.num_files_indexed(), manifest)?;
