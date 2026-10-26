@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 mod build;
+mod forward;
 mod layout;
 mod marks;
 mod occ;
@@ -130,6 +131,9 @@ impl<D: AsRef<[u8]>> FmIndex<D> {
             lo: 0,
             hi: self.header.n + 1,
             root: true,
+            tails: [(0, 0); RING],
+            front: [0; RING],
+            len: 0,
         }
     }
 
@@ -215,6 +219,8 @@ impl View<'_> {
     /// Visit the doc id of each row of `rows`, all non-empty suffixes, with
     /// up to [`LANES`] walks interleaved. Each walk stays inside its
     /// document: its start is sampled.
+    // Out of line: inlined into the forward pass it runs slower.
+    #[inline(never)]
     fn docs(&self, mut rows: impl Iterator<Item = usize>, visit: &mut dyn FnMut(usize)) {
         let marks = self.header.marks(self.bytes);
         let rate = self.header.sample_rate as usize;
@@ -258,6 +264,12 @@ impl View<'_> {
 /// Locate walks in flight: independent LF chains overlap their cache misses.
 const LANES: usize = 16;
 
+/// Ancestor slots a cursor keeps: every forward depth.
+const RING: usize = forward::MAX_DEPTH + 1;
+
+// Rows fit the ring's u32 slots.
+const _: () = assert!(MAX_TEXT_BYTES < u32::MAX as u64);
+
 /// A half-open row interval: the suffixes prefixed by the query so far.
 #[derive(Clone, Copy)]
 pub struct Cursor<'a> {
@@ -265,6 +277,13 @@ pub struct Cursor<'a> {
     lo: usize,
     hi: usize,
     root: bool,
+    /// Slot `(len - i) % RING`: the rows of `path[i..]`, `path` the bytes
+    /// prepended since the root or [`Cursor::rows`].
+    tails: [(u32, u32); RING],
+    /// Slot `(len - 1 - j) % RING`: `path[j]`.
+    front: [u8; RING],
+    /// Bytes prepended since the root or [`Cursor::rows`].
+    len: u32,
 }
 
 impl Cursor<'_> {
@@ -276,6 +295,10 @@ impl Cursor<'_> {
                 break;
             }
             next.root = false;
+            let slot = next.len as usize % RING;
+            next.tails[slot] = (next.lo as u32, next.hi as u32);
+            next.front[slot] = byte;
+            next.len = next.len.wrapping_add(1);
             let Some(code) = self.view.header.code_of[usize::from(byte)] else {
                 next.hi = next.lo;
                 break;
@@ -287,11 +310,13 @@ impl Cursor<'_> {
     }
 
     /// Its rows `within`, clamped to its count; the root stays the root.
+    /// Drops the ancestors: its locate walks every row back.
     pub fn rows(&self, within: std::ops::Range<u64>) -> Self {
         let at = |row: u64| self.lo + row.min(self.count()) as usize;
         Self {
             lo: at(within.start),
             hi: at(within.end).max(at(within.start)),
+            len: 0,
             ..*self
         }
     }
@@ -302,11 +327,9 @@ impl Cursor<'_> {
     }
 
     /// Visit the doc id of every occurrence, in no fixed order; the root
-    /// visits nothing.
+    /// visits nothing. Occurrences resolve from samples a few bytes into the
+    /// query first; the rest walk back.
     pub fn locate(&self, visit: &mut dyn FnMut(usize)) {
-        if self.root {
-            return;
-        }
-        self.view.docs(self.lo..self.hi, visit);
+        self.locate_at(self.forward_depth(), visit);
     }
 }

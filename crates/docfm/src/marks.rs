@@ -54,6 +54,36 @@ impl<'a> Marks<'a> {
             lo + k,
         )
     }
+
+    /// `(row, marks before it)` of each marked row in `lo..hi`, ascending;
+    /// both clamp to `rows`.
+    pub fn range(&self, lo: usize, hi: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
+        let marks = *self;
+        let hi = hi.min(self.rows);
+        let mut bucket = lo.min(self.rows) / BUCKET;
+        let mut rank = self.get_rank(lo).1;
+        let at = 4 * dir_len(self.rows);
+        std::iter::from_fn(move || {
+            if rank >= marks.count {
+                return None;
+            }
+            while bucket + 2 < dir_len(marks.rows) && marks.dir(bucket + 1) <= rank {
+                bucket += 1;
+            }
+            let offset = u16::from_le_bytes(
+                *marks.bytes[at + 2 * rank..]
+                    .first_chunk()
+                    .expect("in the offsets"),
+            );
+            let row = bucket * BUCKET + usize::from(offset);
+            if row >= hi {
+                rank = marks.count;
+                return None;
+            }
+            rank += 1;
+            Some((row, rank - 1))
+        })
+    }
 }
 
 /// Fills `out` with the rows set in `bits` (bits from `rows` on ignored);

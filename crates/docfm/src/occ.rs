@@ -42,16 +42,28 @@ impl<'a> Occ<'a> {
     /// The code at `i < n` and its occurrences in `0..i`, from one block.
     #[inline]
     pub fn access_rank(&self, i: usize) -> (u8, usize) {
-        let h = self.header;
-        let i = i.min(h.n);
+        let i = i.min(self.header.n);
         let block = self.block(i);
+        let code = self.code_in(block, i);
+        (code as u8, self.rank_in(block, code, i))
+    }
+
+    /// The code at `i < n`, from one 64-position group.
+    #[inline]
+    pub fn access(&self, i: usize) -> u8 {
+        let i = i.min(self.header.n);
+        self.code_in(self.block(i), i) as u8
+    }
+
+    #[inline]
+    fn code_in(&self, block: &[u8], i: usize) -> usize {
+        let h = self.header;
         let off = i % BLOCK;
         let group = h.counts_bytes + off / 64 * h.bits * 8;
-        let code = (0..h.bits).fold(0usize, |code, j| {
+        (0..h.bits).fold(0usize, |code, j| {
             let word = u64::from_le_bytes(*block[group + j * 8..].first_chunk().expect("in block"));
             code | ((word >> (off % 64)) as usize & 1) << j
-        });
-        (code as u8, self.rank_in(block, code, i))
+        })
     }
 
     #[inline]

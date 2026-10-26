@@ -686,7 +686,7 @@ fn interleaved_locate_equals_rowwise() {
                 let mut rowwise: Vec<usize> =
                     (cursor.lo..cursor.hi).map(|r| cursor.view.doc(r)).collect();
                 let mut got = Vec::new();
-                cursor.locate(&mut |d| got.push(d));
+                cursor.view.docs(cursor.lo..cursor.hi, &mut |d| got.push(d));
                 rowwise.sort_unstable();
                 got.sort_unstable();
                 assert_eq!(got, rowwise, "rate {rate} pattern {pattern:?}");
@@ -739,3 +739,6 @@ fn rows_locates_a_slice_of_the_rows() {
     index.cursor().rows(0..5).locate(&mut |_| visited += 1);
     assert_eq!(visited, 0, "the root visits nothing");
 }
+
+#[path = "forward_tests.rs"]
+mod forward_tests;

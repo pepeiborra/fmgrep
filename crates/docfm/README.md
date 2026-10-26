@@ -42,8 +42,10 @@ sample rate, more at lower rates that make locate faster.
 
 The text is documents, each followed by one `DOC_END` (0x00). A row is
 sampled when its text position is a multiple of the sample rate or starts a
-document, and stores that document's id; `locate` walks LF to the nearest
-sample, fewer than rate steps, and never crosses into another document.
+document, and stores that document's id. `locate` first resolves
+occurrences from samples a few bytes into the pattern, then walks LF from the
+rest to the nearest sample, fewer than rate steps; neither crosses into
+another document.
 
 Construction builds no suffix array: libsais writes the BWT over the text
 and returns the row of every `r`-th position, `r` the largest power of two
