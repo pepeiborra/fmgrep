@@ -2,7 +2,7 @@
 
 use std::io::BufRead;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, ColorChoice, Parser, Subcommand};
@@ -13,7 +13,8 @@ use crate::regex_pattern;
 
 const SEARCH_NOTE: &str = "\
 A search reads the .fmgrep of the nearest enclosing directory. Put -- first
-to search for a TERM named index or serve.";
+to search for a TERM named index or serve. Trailing TERMs naming files or
+directories are PATHs, as in rg; with --expr every argument is one.";
 
 const ENV: &str = "\
 Environment:
@@ -126,12 +127,27 @@ pub struct Search {
     #[arg(
         long,
         value_name = "EXPR",
-        conflicts_with_all = ["terms", "regex", "and", "or", "expr_json"]
+        conflicts_with_all = ["regex", "and", "or", "expr_json"]
     )]
     pub expr: Option<String>,
     /// Use the index at or above PATH
     #[arg(long, value_name = "PATH", conflicts_with = "server")]
     pub index: Option<PathBuf>,
+
+    /// Include or exclude (!GLOB) paths; the last match wins
+    #[arg(
+        short = 'g',
+        long = "glob",
+        value_name = "GLOB",
+        help_heading = "Filter"
+    )]
+    pub glob: Vec<String>,
+    /// As -g, ignoring case
+    #[arg(long, value_name = "GLOB", help_heading = "Filter")]
+    pub iglob: Vec<String>,
+    /// Make every -g ignore case
+    #[arg(long, help_heading = "Filter")]
+    pub glob_case_insensitive: bool,
 
     /// Search through a running fmgrep serve
     #[arg(
@@ -225,7 +241,7 @@ pub struct Search {
     #[arg(
         long,
         value_name = "JSON",
-        conflicts_with_all = ["terms", "regex", "and", "or"],
+        conflicts_with_all = ["regex", "and", "or"],
         help_heading = "Protocol (unstable)"
     )]
     pub expr_json: Option<String>,
@@ -250,16 +266,22 @@ impl Search {
             _ if self.matches || (printing && !self.json) => Mode::Lines,
             _ => Mode::Counts,
         };
+        let (terms, paths) = self.split()?;
         let mut p = QueryParams {
-            terms: self.terms.clone(),
+            terms,
             expr: self.expr(input)?,
             regex: self.regex,
             ignore_case: self.ignore_case,
             multiline: self.multiline,
             dotall: self.multiline_dotall,
             mode,
+            globs: self.glob.clone(),
+            iglobs: self.iglob.clone(),
+            glob_case_insensitive: self.glob_case_insensitive,
+            paths,
             ..QueryParams::default()
         };
+        p.filter()?;
         if self.and || self.or {
             let op = if self.and { "--and" } else { "--or" };
             if p.terms.len() < 2 {
@@ -291,6 +313,23 @@ impl Search {
             };
         }
         Ok(p)
+    }
+
+    /// The positionals as TERMs and PATHs: under an expression all are
+    /// PATHs, else the trailing ones after the first that name files or
+    /// directories and are not spelled /REGEX/.
+    fn split(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        if self.expr.is_some() || self.expr_json.is_some() {
+            if let Some(t) = self.terms.iter().find(|t| !Path::new(t).exists()) {
+                return Err(format!("error: {t}: No such file or directory"));
+            }
+            return Ok((Vec::new(), self.terms.clone()));
+        }
+        let n = (self.terms.iter().skip(1).rev())
+            .take_while(|t| regex_pattern(t).is_none() && Path::new(t).exists())
+            .count();
+        let (terms, paths) = self.terms.split_at(self.terms.len() - n);
+        Ok((terms.to_vec(), paths.to_vec()))
     }
 
     fn expr(&self, input: &mut dyn BufRead) -> Result<Option<Expr>, String> {

@@ -2,6 +2,7 @@
 
 mod drive;
 mod expr;
+pub(crate) mod filter;
 mod index;
 mod json;
 mod matches;

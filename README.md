@@ -53,7 +53,7 @@ compiler/GHC/Driver/Main/Hsc.hs
 
 * The nearest enclosing `.fmgrep` index is used.
 * Paths are relative to the indexed root.
-* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`); `fmgrep --help` lists them.
+* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, PATH arguments); `fmgrep --help` lists them.
 
 For many searches in a row, keep the index loaded in a server:
 

@@ -30,8 +30,9 @@ fmgrep --server 127.0.0.1:7777 --shutdown
 
 - A TERM is a **literal**, not a regex: `fmgrep 'a.b'` finds the three
   bytes `a.b`. Write `/a.b/` or pass `--regex` for a pattern.
-- Every search covers the **whole indexed tree**, and paths are relative to
-  the directory holding `.fmgrep`, not the cwd.
+- Printed paths and `-g` globs are relative to the directory holding
+  `.fmgrep`, not the cwd; a PATH argument is resolved from the cwd, as in
+  rg: `fmgrep -g '*.hs' HscEnv compiler` searches `compiler/**/*.hs`.
 - Exit status is rg's: 0 on a match, 1 on no match, 2 on an error.
 - `--json` alone prints a counts report. `--json --matches` gives rg's JSON
   event stream.

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::events::JsonConfig;
 use crate::expr::Expr;
+use crate::filter::PathFilter;
 use crate::manifest::Manifest;
 use crate::matching::{MatchMode, QueryOutput};
 use crate::output::{Format, OutputConfig};
@@ -39,6 +40,17 @@ pub struct QueryParams {
     pub heading: bool,
     #[serde(default, skip_serializing_if = "Color::is_never")]
     pub color: Color,
+    /// `-g`, in argv order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub globs: Vec<String>,
+    /// `--iglob`, after `globs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iglobs: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub glob_case_insensitive: bool,
+    /// Files or directories relative to the indexed root, `""` the root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -93,6 +105,10 @@ fn is_true(v: &bool) -> bool {
     *v
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 impl Default for QueryParams {
     fn default() -> Self {
         Self {
@@ -107,6 +123,10 @@ impl Default for QueryParams {
             line_numbers: true,
             heading: true,
             color: Color::Never,
+            globs: Vec::new(),
+            iglobs: Vec::new(),
+            glob_case_insensitive: false,
+            paths: Vec::new(),
         }
     }
 }
@@ -117,8 +137,8 @@ impl QueryParams {
         index_dir: &'a Path,
         manifest: &'a Manifest,
         corpus_root: Option<&'a Path>,
-    ) -> QueryRequest<'a> {
-        QueryRequest {
+    ) -> Result<QueryRequest<'a>, String> {
+        Ok(QueryRequest {
             index_dir,
             manifest,
             corpus_root,
@@ -131,7 +151,17 @@ impl QueryParams {
             terms: &self.terms,
             expr: self.expr.as_ref(),
             output: self.output(),
-        }
+            filter: self.filter()?,
+        })
+    }
+
+    pub fn filter(&self) -> Result<Option<PathFilter>, String> {
+        PathFilter::new(
+            &self.globs,
+            &self.iglobs,
+            self.glob_case_insensitive,
+            &self.paths,
+        )
     }
 
     fn output(&self) -> QueryOutput {

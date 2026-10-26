@@ -323,3 +323,50 @@ fn the_sample_rate_changes_the_blobs_not_the_answers() {
         assert_ne!(cells[0].1.0, cells[4].1.0, "{store_docs}");
     }
 }
+
+#[test]
+fn paths_resolve_from_the_cwd() {
+    let (tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/c.c"), "printk c\n").unwrap();
+    std::fs::write(docs.join("sub/d.h"), "printk d\n").unwrap();
+    assert!(run_in(&docs, &["index"]).status.success());
+    let sub = docs.join("sub");
+    let lists = |args: &[&str]| {
+        let out = run_in(&sub, &[&["-l"][..], args].concat());
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    assert_eq!(
+        lists(&["printk", "."]),
+        (Some(0), "sub/c.c\nsub/d.h\n".into())
+    );
+    assert_eq!(
+        lists(&["printk", "../a.c", "."]),
+        (Some(0), "a.c\nsub/c.c\nsub/d.h\n".into())
+    );
+    assert_eq!(
+        lists(&["-g", "*.c", "printk"]),
+        (Some(0), "a.c\nsub/c.c\n".into())
+    );
+    assert_eq!(
+        lists(&["-g", "*.c", "printk", ".."]),
+        (Some(0), "a.c\nsub/c.c\n".into())
+    );
+    let out = run_in(&sub, &["-g", "*.zz", "printk"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).starts_with("error: no files were searched"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run_in(&sub, &["--expr", "printk", tmp.path().to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("is outside the indexed tree"),
+        "{}",
+        stderr(&out)
+    );
+}

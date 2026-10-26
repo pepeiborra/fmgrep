@@ -45,6 +45,7 @@ mod env;
 mod events;
 mod expr;
 mod fetch;
+mod filter;
 mod fold;
 mod index;
 mod manifest;

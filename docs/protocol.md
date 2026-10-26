@@ -51,6 +51,10 @@ response line each.
 | `line_numbers` | bool | true | false: `-N` |
 | `heading` | bool | true | false: `--no-heading` |
 | `color` | string | `never` | `always`: `--color always` |
+| `globs` | [string] | [] | `-g`, in order; `!` excludes |
+| `iglobs` | [string] | [] | `--iglob`, after `globs` |
+| `glob_case_insensitive` | bool | false | `--glob-case-insensitive` |
+| `paths` | [string] | [] | PATH arguments, relative to the indexed root; `""` is the root |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -182,8 +186,8 @@ deliberate:
 3. `binary_offset` is always null, because binary files are skipped at
    index time.
 4. `searches` and `bytes_searched` cover the whole index, which is what rg
-   over the indexed file list reports. Leading UTF-8 BOMs are excluded, as
-   rg's searcher strips them.
+   over the indexed file list reports, whatever `-g` or PATH. Leading UTF-8
+   BOMs are excluded, as rg's searcher strips them.
 5. `path` is always `{"text": ...}`, because manifest paths are UTF-8.
 6. `-c`, `--count-matches` and `-l` with `--json` print the report; rg
    ignores `--json` there and prints plain counts.

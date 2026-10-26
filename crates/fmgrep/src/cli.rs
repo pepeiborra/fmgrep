@@ -11,14 +11,14 @@ mod print;
 mod serve;
 
 use crate::events::JsonSink;
-use crate::index::{IndexRequest, run_index};
+use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
 use args::{Cli, Command, Search, ServeArgs};
-use locate::locate;
+use locate::{Located, locate};
 use params::{Mode, QueryParams};
 use serve::{ServeRequest, run_client, run_serve};
 
@@ -32,9 +32,10 @@ pub enum Outcome {
 }
 
 fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<Outcome, String> {
-    let (index_dir, manifest, root) = open_index(a.path.as_deref())?;
+    let (found, manifest) = open_index(a.path.as_deref())?;
+    let root = found.root.filter(|_| !manifest.store_docs);
     let req = ServeRequest {
-        index_dir: &index_dir,
+        index_dir: &found.index_dir,
         manifest: &manifest,
         corpus_root: root.as_deref(),
         listen: (!a.stdio).then_some(a.listen),
@@ -44,10 +45,9 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
     Ok(Outcome::Done)
 }
 
-/// The index found from `start` (else the cwd), its manifest, and the
-/// corpus root overriding the manifest's: a files-source dotdir reads the
-/// tree it sits in.
-fn open_index(start: Option<&Path>) -> Result<(PathBuf, Manifest, Option<PathBuf>), String> {
+/// The index found from `start` (else the cwd) and its manifest. A
+/// files-source dotdir reads the tree it sits in, not the manifest's.
+fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
     let found = locate(start.unwrap_or(Path::new(".")))?;
     if !found.index_dir.join(BLOBS_SHARD).is_file() {
         return Err(format!(
@@ -56,8 +56,51 @@ fn open_index(start: Option<&Path>) -> Result<(PathBuf, Manifest, Option<PathBuf
         ));
     }
     let manifest = read_manifest(&found.index_dir)?;
-    let root = found.root.filter(|_| !manifest.store_docs);
-    Ok((found.index_dir, manifest, root))
+    Ok((found, manifest))
+}
+
+/// `typed`, resolved from the cwd, relative to the indexed `tree`.
+fn rebase(typed: &[String], tree: Option<&Path>) -> Result<Vec<String>, String> {
+    if typed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolve = |p: &Path| {
+        std::fs::canonicalize(p).map_err(|e| format!("error: cannot resolve {}: {e}", p.display()))
+    };
+    let tree = tree.ok_or("error: a PATH needs the indexed tree; this index records none")?;
+    let root = resolve(tree)?;
+    typed
+        .iter()
+        .map(|t| {
+            let path = Path::new(t);
+            // A symlink names its own path, not its target's.
+            let abs = match (path.parent(), path.file_name()) {
+                (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => resolve(dir)?.join(name),
+                (_, Some(name)) => resolve(Path::new("."))?.join(name),
+                _ => resolve(path)?,
+            };
+            let outside = || {
+                format!(
+                    "error: {t} is outside the indexed tree at {}",
+                    root.display()
+                )
+            };
+            let rel = abs.strip_prefix(&root).map_err(|_| outside())?;
+            let parts: Option<Vec<&str>> =
+                rel.components().map(|c| c.as_os_str().to_str()).collect();
+            parts
+                .map(|p| p.join("/"))
+                .ok_or_else(|| format!("error: {t} is not UTF-8"))
+        })
+        .collect()
+}
+
+/// The tree a manifest's paths are relative to.
+fn tree_of(found: &Located, manifest: &Manifest) -> Option<PathBuf> {
+    found
+        .root
+        .clone()
+        .or_else(|| manifest.corpus_root.as_ref().map(PathBuf::from))
 }
 
 fn search(
@@ -72,13 +115,39 @@ fn search(
     {
         return serve::manage(addr, s.shutdown, out);
     }
-    let p = s.params(input, printing, tty)?;
+    let mut p = s.params(input, printing, tty)?;
     if let Some(addr) = &s.server {
-        return run_client(addr, &p, s.json, out);
+        return client(addr, p, s.json, out);
     }
-    let (index_dir, manifest, root) = open_index(s.index.as_deref())?;
-    let req = p.request(&index_dir, &manifest, root.as_deref());
+    let (found, manifest) = open_index(s.index.as_deref())?;
+    p.paths = rebase(&p.paths, tree_of(&found, &manifest).as_deref())?;
+    let root = found.root.filter(|_| !manifest.store_docs);
+    let req = p.request(&found.index_dir, &manifest, root.as_deref())?;
     render(&p, s.json, out, |sink| run_query(&req, sink)).map(Outcome::Query)
+}
+
+/// `--server`: one `query`; PATHs resolve against the served tree.
+fn client(
+    addr: &str,
+    mut p: QueryParams,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<Outcome, String> {
+    let typed = std::mem::take(&mut p.paths);
+    if !typed.is_empty() {
+        let status = serve::status(addr)?;
+        let root = Path::new(&status.root);
+        p.paths = rebase(&typed, served_tree(root, status.store_docs))?;
+    }
+    run_client(addr, &p, json, out)
+}
+
+/// The tree a server's PATHs are relative to.
+fn served_tree(root: &Path, store_docs: bool) -> Option<&Path> {
+    match store_docs {
+        true => root.parent().filter(|_| root.ends_with(INDEX_DIR)),
+        false => Some(root),
+    }
 }
 
 /// Parse and run `args` (argv without the binary name), writing output to

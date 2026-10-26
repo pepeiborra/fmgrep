@@ -270,6 +270,12 @@ impl DocStore {
         candidates.retain(|&id| keep(id));
     }
 
+    /// Whether indexed doc `id` was gone as of the last [`Self::begin`] or
+    /// [`Self::screen`].
+    pub fn is_gone(&self, id: usize) -> bool {
+        self.changed.binary_search(&id).is_ok() && !self.is_stale(id)
+    }
+
     fn is_stale(&self, id: usize) -> bool {
         self.stale.binary_search(&id).is_ok()
     }

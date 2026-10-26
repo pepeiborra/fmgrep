@@ -364,3 +364,76 @@ fn help_and_version_print_to_stdout() {
         );
     }
 }
+
+// Tests run in the crate directory, which holds `src` and `Cargo.toml`.
+
+#[test]
+fn glob_flags_reach_the_params() {
+    let p = params(&[
+        "-g", "*.rs", "--iglob", "*.MD", "-g", "!src/**", "--glob=b", "x",
+    ]);
+    assert_eq!(p.globs, ["*.rs", "!src/**", "b"]);
+    assert_eq!(p.iglobs, ["*.MD"]);
+    assert!(!p.glob_case_insensitive);
+    assert!(params(&["--glob-case-insensitive", "x"]).glob_case_insensitive);
+    assert_eq!(
+        err(&["-g", "[", "x"]),
+        "error: invalid glob '[': unclosed character class; missing ']'"
+    );
+}
+
+#[test]
+fn trailing_existing_paths_are_paths() {
+    let p = params(&["a", "b", "src", "Cargo.toml"]);
+    assert_eq!(
+        (p.terms, p.paths),
+        (
+            vec!["a".into(), "b".into()],
+            vec!["src".into(), "Cargo.toml".into()]
+        )
+    );
+    let p = params(&["a", "src", "b"]);
+    assert_eq!((p.terms.len(), p.paths.len()), (3, 0));
+    assert!(!params(&["a", "src"]).output_config().banner);
+}
+
+#[test]
+fn the_first_positional_is_always_a_term() {
+    let p = params(&["src", "Cargo.toml"]);
+    assert_eq!(
+        (p.terms, p.paths),
+        (vec!["src".into()], vec!["Cargo.toml".into()])
+    );
+    let p = params(&["a", "/src/"]);
+    assert_eq!((p.terms.len(), p.paths.len()), (2, 0));
+}
+
+#[test]
+fn under_expr_every_positional_is_a_path() {
+    let p = params(&["--expr", AND_TEXT, "src", "Cargo.toml"]);
+    assert_eq!(
+        (p.terms.len(), p.paths),
+        (0, vec!["src".into(), "Cargo.toml".into()])
+    );
+    let p = params(&["--expr-json", AND_JSON, "--", "src"]);
+    assert_eq!(p.paths, ["src"]);
+    assert_eq!(
+        err(&["--expr", AND_TEXT, "src", "x"]),
+        "error: x: No such file or directory"
+    );
+}
+
+#[test]
+fn and_or_count_terms_without_their_paths() {
+    assert_eq!(
+        params(&["--and", "a", "/b+/", "src"]),
+        QueryParams {
+            paths: vec!["src".into()],
+            ..params(&["--expr-json", AND_JSON, "src"])
+        }
+    );
+    assert_eq!(
+        err(&["--or", "a", "src"]),
+        "error: --or needs at least two terms"
+    );
+}

@@ -8,6 +8,7 @@ use crate::regex_pattern;
 use crate::blobs::BlobSlots;
 use crate::expr::Expr;
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::filter::PathFilter;
 use crate::manifest::Manifest;
 use crate::matching::{self, DocOutcome, LineMatcher, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
@@ -33,6 +34,8 @@ pub struct QueryRequest<'a> {
     pub expr: Option<&'a Expr>,
     /// What each term must produce.
     pub output: QueryOutput,
+    /// The files searched, of those indexed or added.
+    pub filter: Option<PathFilter>,
 }
 
 mod boolean;
@@ -159,6 +162,15 @@ pub fn answer(
     let waited = wait.elapsed().as_micros() as u64;
     let mut report = answer_discovered(index, loaded, req, sink)?;
     report.index_time_us += waited;
+    let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
+    if let Some(f) = &req.filter
+        && !report.queries.iter().any(matched)
+        && f.excludes_all(&loaded.docs.paths(&req.manifest.files), |id| {
+            loaded.docs.is_gone(id)
+        })
+    {
+        return Err("error: no files were searched: the globs exclude every file".to_owned());
+    }
     Ok(report)
 }
 
@@ -301,12 +313,18 @@ fn answer_terms(
         // Counts mode counts a fetched document with the pattern: a literal
         // never has candidates.
         debug_assert!(emit || pattern.is_some() || candidates.is_empty());
+        let paths = docs.paths(&manifest.files);
+        let mut stale = docs.stale().to_vec();
+        if let Some(f) = &req.filter {
+            f.retain(&paths, &mut exact, |e| e.0);
+            f.retain(&paths, &mut candidates, |&id| id);
+            f.retain(&paths, &mut stale, |&id| id);
+        }
         let mut scan = scan_ids(req.output, literal, &candidates, &exact);
-        if !docs.stale().is_empty() {
-            scan.extend_from_slice(docs.stale());
+        if !stale.is_empty() {
+            scan.extend_from_slice(&stale);
             scan.sort_unstable();
         }
-        let paths = docs.paths(&manifest.files);
         paths.sort(&mut scan);
         let mut counts = if emit {
             TermCounts::from_matching(req.output)

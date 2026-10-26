@@ -248,14 +248,20 @@ pub fn answer_expr(
         !plan.demoted[i] && !matches!(leaves[i].probe, Probe::Never)
     };
     let mut answers: Vec<Option<Answer>> = (0..leaves.len()).map(|_| None).collect();
+    let indexed = docs.paths(&manifest.files);
     let store = |ids: &[usize], got: Vec<Answer>, answers: &mut [Option<Answer>]| {
         debug_assert_eq!(got.len(), ids.len());
-        for (&i, a) in ids.iter().zip(got) {
+        for (&i, mut a) in ids.iter().zip(got) {
             in_index(
                 &a.exact,
                 a.candidates.as_deref().unwrap_or_default(),
                 num_docs,
             )?;
+            if let Some(f) = &req.filter {
+                let candidates = a.candidates.get_or_insert_with(|| (0..num_docs).collect());
+                f.retain(&indexed, candidates, |&id| id);
+                f.retain(&indexed, &mut a.exact, |e| e.0);
+            }
             answers[i] = Some(a);
         }
         Ok::<_, String>(())
@@ -322,8 +328,11 @@ pub fn answer_expr(
             break;
         }
     }
-    let stale = docs.stale().to_vec();
     let paths = docs.paths(&manifest.files);
+    let mut stale = docs.stale().to_vec();
+    if let Some(f) = &req.filter {
+        f.retain(&paths, &mut stale, |&id| id);
+    }
     let mut tris = Vec::with_capacity(leaves.len());
     for (l, (exact, candidates)) in leaves.iter().zip(&hits) {
         tris.push(match l.probe {

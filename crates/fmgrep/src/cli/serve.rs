@@ -70,13 +70,13 @@ enum Answer {
 /// `status` result.
 #[derive(Serialize, Deserialize)]
 pub struct ServeStatus {
-    store_docs: bool,
+    pub store_docs: bool,
     files: usize,
     num_bytes: u64,
     index_size_bytes: u64,
     load_us: u64,
     /// The documents' directory: the tree, or the index directory holding `docs.shard`.
-    root: String,
+    pub root: String,
 }
 
 /// What `serve` serves.
@@ -100,7 +100,12 @@ struct Served<'m> {
 
 impl Served<'_> {
     fn query(&mut self, p: &QueryParams) -> Result<Answer, RpcError> {
-        let req = p.request(self.index_dir, self.manifest, None);
+        let req = p
+            .request(self.index_dir, self.manifest, None)
+            .map_err(|message| RpcError {
+                code: QUERY_FAILED,
+                message,
+            })?;
         let (index, loaded) = (&self.index, &mut self.docs);
         let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
         let answered = match p.mode {

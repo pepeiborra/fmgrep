@@ -121,6 +121,7 @@ pub(crate) fn request<'a>(
         terms,
         expr: None,
         output,
+        filter: None,
     }
 }
 

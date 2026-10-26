@@ -666,4 +666,69 @@ fn server_expr_json_round_trip() {
     server.join().unwrap().unwrap();
 }
 
+#[test]
+fn served_searches_honour_the_filter() {
+    use crate::tests::filter::{FILES, dotted_tree};
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = dotted_tree(tmp.path(), "all", &FILES, store_docs);
+        let (addr, server) = spawn_server(&tree.join(INDEX_DIR), &[]);
+        let sub = tree.join("sub").display().to_string();
+        let b = tree.join("b.h").display().to_string();
+        for (flags, terms) in [
+            (&["-g", "*.c", "-l"][..], &["printk"][..]),
+            (&["--iglob", "*.H", "-n"], &["printk"]),
+            (
+                &["-g", "!sub", "--json", "--approx-counts"],
+                &["printk", "/al[a-z]ha/"],
+            ),
+            (&["-c"], &["printk", &sub]),
+            (&["-g", "!*.h", "-l"], &["printk", &b, &sub]),
+            (&["-g", "!z.c", "-l", "--expr", "printk AND alpha"], &[]),
+        ] {
+            let ctx = format!("store_docs={store_docs} {flags:?} {terms:?}");
+            let (_, served) = client(
+                &addr,
+                &words(&[], flags, terms)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(
+                untimed(flags, &served),
+                untimed(flags, &printed(&tree, flags, terms)),
+                "{ctx}"
+            );
+        }
+        let err = client(&addr, &["-g", "*.zz", "--", "printk"])
+            .err()
+            .unwrap();
+        assert_eq!(
+            err,
+            "error: server: no files were searched: the globs exclude every file"
+        );
+        client(&addr, &["--shutdown"]).unwrap();
+        server.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn a_path_needs_the_served_tree() {
+    use crate::tests::filter::{FILES, dotted_tree};
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = dotted_tree(tmp.path(), "all", &FILES, false);
+    let index = tmp.path().join("docs");
+    index_it(&tree, &index, true);
+    let (addr, server) = spawn_server(&index, &[]);
+    let sub = tree.join("sub").display().to_string();
+    let err = client(&addr, &["--", "printk", &sub]).err().unwrap();
+    assert_eq!(
+        err,
+        "error: a PATH needs the indexed tree; this index records none"
+    );
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
 mod text;

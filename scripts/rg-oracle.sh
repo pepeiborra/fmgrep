@@ -19,7 +19,9 @@
 #
 # --corpus DIR indexes DIR instead and checks AND / OR pairs of GHC terms:
 # -l, -c and --count-matches against rg over the manifest's files, the
-# served counts, --and / --or and --expr of the served label. Needs jq.
+# served counts, --and / --or and --expr of the served label; then -g sets:
+# our -l of every line, local and served, against rg's walk with the same
+# globs over the manifest's files. Needs jq.
 #
 # Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
 # `pass N / fail M` (plus the served count); exits 1 if any case
@@ -29,6 +31,8 @@
 #        scripts/rg-oracle.sh --corpus DIR [--store-docs]
 
 set -euo pipefail
+# Flags hold globs, word-split unquoted.
+set -f
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -87,8 +91,14 @@ spawn_serve() {
     [[ -n "${!4}" ]] || { echo "$2 did not become ready"; cat "$WORK/serve.err"; exit 2; }
 }
 
-RG_COMMON=(--no-ignore --no-require-git -a --sort path -g '!k.dat')
+RG_COMMON=(--no-ignore --no-require-git -a --sort path)
+# --iglob: rg adds them after every -g, so a case's own globs cannot undo them.
+RG_SKIP=(--iglob '!k.dat')
 TERM=alpha
+# A case's PATHs: ours from sub/, rg's from the root; WANT overrides WARNINGS.
+PATHS=""
+RG_PATHS=.
+WANT=""
 FAIL=0
 PASS=""
 WARNINGS=0
@@ -97,14 +107,14 @@ FAILED=0
 SERVED=0
 RC=0
 
-# The case just run, again through the `--serve` server: no stderr, and the
-# local search's exit status, RC.
+# The case just run, again through the `--serve` server: no stderr unless the
+# local search refused, and its exit status, RC.
 served() {
     [[ -n "$ADDR" ]] || return 0
     local name="$1" rc=0
     shift
     ( cd "$CORPUS/sub" && "$BIN" --server "$ADDR" "$@" ) > "$WORK/srv" 2> "$WORK/srv.err" || rc=$?
-    if [[ "$rc" != "$RC" || -s "$WORK/srv.err" ]]; then
+    if [[ "$rc" != "$RC" || ("$RC" != 2 && -s "$WORK/srv.err") ]]; then
         echo "FAIL srv $PASS$name  (exit $rc, want exit $RC and no stderr)"
         cat "$WORK/srv.err"
         FAIL=1
@@ -125,11 +135,11 @@ check() {
     local name="$1" mine="$2" theirs="$3" term="${4:-$TERM}" rgrc
     RC=0
     # shellcheck disable=SC2086
-    ( cd "$HERE" && "$BIN" $mine -- "$term" ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+    ( cd "$HERE" && "$BIN" $mine -- "$term" $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
     set +e
     # rg echoes the directory it was given; our paths are corpus-relative.
     # shellcheck disable=SC2086
-    ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs -- "$term" . ) | sed 's|\./||g' > "$WORK/theirs"
+    ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $RG_PATHS < /dev/null ) | sed 's|\./||g' > "$WORK/theirs"
     rgrc="${PIPESTATUS[0]}"
     set -e
     if [[ "$RC" != "$rgrc" ]]; then
@@ -137,8 +147,8 @@ check() {
         cat "$WORK/err"
         FAIL=1
         FAILED=$((FAILED + 1))
-    elif [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
-        echo "FAIL $PASS$name  (want $WARNINGS warning line(s))"
+    elif [[ "$(grep -c '^warning:' "$WORK/err")" != "${WANT:-$WARNINGS}" ]]; then
+        echo "FAIL $PASS$name  (want ${WANT:-$WARNINGS} warning line(s))"
         cat "$WORK/err"
         FAIL=1
         FAILED=$((FAILED + 1))
@@ -146,13 +156,27 @@ check() {
         echo "ok   $PASS$name"
         OK=$((OK + 1))
     else
-        echo "FAIL $PASS$name  (ours: $mine | rg: $theirs)"
+        echo "FAIL $PASS$name  (ours: $mine $PATHS | rg: $theirs $RG_PATHS)"
         cat "$WORK/diff"
         FAIL=1
         FAILED=$((FAILED + 1))
     fi
     # shellcheck disable=SC2086
-    served "$name" $mine -- "$term"
+    served "$name" $mine -- "$term" $PATHS
+}
+
+# A filter case in lines and -l: name, our flags, rg's flags, our PATHs, rg's
+# PATHs (default ., none when empty), and `tb` when it searches tb.txt, whose
+# read warns in the stale pass.
+filtered() {
+    PATHS="${4:-}"
+    RG_PATHS="${5-.}"
+    [[ "${6:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    check "$1 [lines]" "$2" "--heading -n $3"
+    check "$1 [-l]" "$2 -l" "-l $3"
+    PATHS=""
+    RG_PATHS=.
+    WANT=""
 }
 
 # Expressions (--expr-json, then the same tree as --expr text). Tokens:
@@ -226,7 +250,7 @@ node() {
         else
             set +e
             # shellcheck disable=SC2086
-            ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $MFLAGS -l -e "$pat" . ) | sed 's|^\./||' | LC_ALL=C sort > "$out"
+            ( cd "$CORPUS" && rg "${RG_COMMON[@]}" "${RG_SKIP[@]}" $MFLAGS -l -e "$pat" . ) | sed 's|^\./||' | LC_ALL=C sort > "$out"
             set -e
         fi
         ;;
@@ -261,7 +285,7 @@ check_expr() {
         while IFS= read -r w; do files+=("$w"); done < "$WORK/members"
         set +e
         # shellcheck disable=SC2086
-        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" -H $theirs "${RGE[@]}" -- "${files[@]}" ) > "$WORK/theirs"
+        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" "${RG_SKIP[@]}" -H $theirs "${RGE[@]}" -- "${files[@]}" ) > "$WORK/theirs"
         rgrc=$?
         set -e
     fi
@@ -410,6 +434,33 @@ pair() {
     fi
 }
 
+# One --corpus glob set: -g per argument, after GLOB_FLAGS.
+globbed() {
+    local g args=() rc=0 src=0 rgrc=0 fail=""
+    for g in "$@"; do args+=(-g "$g"); done
+    args=(${GLOB_FLAGS[@]+"${GLOB_FLAGS[@]}"} ${args[@]+"${args[@]}"})
+    "$BIN" --index "$IDX" -l "${args[@]}" --regex '^' > "$WORK/raw" 2> /dev/null || rc=$?
+    LC_ALL=C sort "$WORK/raw" > "$WORK/ours-g"
+    "$BIN" --server "$ADDR" -l "${args[@]}" --regex '^' > "$WORK/raw" 2> /dev/null || src=$?
+    LC_ALL=C sort "$WORK/raw" > "$WORK/srv-g"
+    # No PATH: rg exits 2 only then when the globs exclude every file.
+    ( cd "$CORPUS" && rg --no-ignore --no-require-git -a -l "${args[@]}" '^' < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
+    sed 's|^\./||' "$WORK/raw" | LC_ALL=C sort | LC_ALL=C comm -12 - "$WORK/files" > "$WORK/rg-g"
+    [[ "$rc" == "$rgrc" ]] || fail+=" exit=$rc/$rgrc"
+    [[ "$src" == "$rc" ]] || fail+=" served-exit=$src"
+    cmp -s "$WORK/ours-g" "$WORK/rg-g" || fail+=" files"
+    cmp -s "$WORK/ours-g" "$WORK/srv-g" || fail+=" served"
+    if [[ -z "$fail" ]]; then
+        echo "ok   glob [${args[*]}] files=$(wc -l < "$WORK/ours-g" | tr -d ' ') exit=$rc"
+        OK=$((OK + 1))
+    else
+        echo "FAIL glob [${args[*]}]:$fail"
+        diff "$WORK/rg-g" "$WORK/ours-g" | head -5 || true
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+}
+
 if [[ -n "$CORPUS_DIR" ]]; then
     IDX="$WORK/index"
     "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} --output "$IDX" "$CORPUS" >&2
@@ -446,6 +497,37 @@ if [[ -n "$CORPUS_DIR" ]]; then
     pair and t:import 'r:zonkTc\w+'
     pair and t:where t:simplifyTop
     pair and t:module t:tcLookupGlobal
+
+    LC_ALL=C sort <(tr '\0' '\n' < "$WORK/all0") > "$WORK/files"
+    GLOB_FLAGS=()
+    globbed '*.hs'
+    globbed '!*.hs'
+    globbed 'compiler/**'
+    globbed '!testsuite/**'
+    globbed '/compiler/GHC/*.hs'
+    globbed '**/GHC/Core/*.hs'
+    globbed '*.{c,h}'
+    globbed '[A-Z]*.hs'
+    globbed 'rts/'
+    globbed '!testsuite/'
+    globbed '*.hs' '!*Test*'
+    globbed '!*' '*.hs'
+    globbed '!**/tests/**'
+    globbed 'docs/**/*.rst'
+    globbed '*.cabal'
+    globbed '!*.hs' '!*.c'
+    globbed 'Makefile'
+    globbed '/README*'
+    globbed 'compiler/GHC/Tc/**' '!**/Solver/**'
+    globbed '**/Utils/*'
+    globbed '#comment' '*.y'
+    globbed '*.[ch]'
+    globbed 'libraries/base/**' '!libraries/base/src/GHC/**'
+    globbed '!/compiler'
+    GLOB_FLAGS=(--glob-case-insensitive)
+    globbed '*.HS'
+    GLOB_FLAGS=(--iglob '*.HS')
+    globbed '!*Test*'
 
     echo "pass $OK / fail $FAILED"
     exit "$FAIL"
@@ -626,6 +708,23 @@ flag_cases "--regex --and 'alpha \w+' beta" "--regex" and 'r:alpha \w+' r:beta
 check_flags "flags-ci-lines [--and ALPHA one]"          "-i"    "--heading -n -i" and t:ALPHA t:one
 check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"           and t:ALPHA t:one
 check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "-U"    "--heading -n -U" or 'r:alpha one\nbeta' t:zz
+
+# -g, --iglob and PATHs; globs are relative to the root, PATHs to sub/.
+filtered "glob-txt      " "-g *.txt"                  "-g *.txt"                  "" . tb
+filtered "glob-not-sub  " "-g !sub"                   "-g !sub"                   "" . tb
+filtered "glob-sub-tree " "-g sub/**"                 "-g sub/**"
+filtered "glob-anchored " "-g /*.txt"                 "-g /*.txt"                 "" . tb
+filtered "glob-last-wins" "-g !*.txt -g a.txt"        "-g !*.txt -g a.txt"
+filtered "glob-none     " "-g a.txt -g !*.txt"        "-g a.txt -g !*.txt"        "" ""
+filtered "iglob         " "--iglob H.TXT"             "--iglob H.TXT"
+filtered "glob-ci       " "--glob-case-insensitive -g SUB/**" "--glob-case-insensitive -g SUB/**"
+filtered "iglob-last    " "--iglob *.TXT -g !*.txt"   "--iglob *.TXT -g !*.txt"   "" . tb
+filtered "glob-dir-only " "-g !mw/"                   "-g !mw/"                   "" . tb
+filtered "path-dot      " ""                          ""                          "."                 sub
+filtered "path-files    " ""                          ""                          "../a.txt ../h.txt" "a.txt h.txt"
+filtered "path-up       " ""                          ""                          ".."                .   tb
+filtered "path-glob-dir " "-g !sub"                   "-g !sub"                   "."                 sub
+filtered "path-file-glob" "-g !*.txt"                 "-g !*.txt"                 "../a.txt ../b.txt" "a.txt b.txt"
 }
 
 # Under --serve, wait until the server's watch agrees with a local search.
@@ -663,7 +762,7 @@ if [[ "$STORE_DOCS" == false ]]; then
     printf 'alpha now text\n' > "$CORPUS/kb/k.tmp" && mv -f "$CORPUS/kb/k.tmp" "$CORPUS/kb/k.dat"
     printf 'alpha\0now binary\n' > "$CORPUS/tb.txt"
     mv "$CORPUS/mw" "$CORPUS/mv2"
-    RG_COMMON=(--no-ignore --no-require-git -a --sort path -g '!bin.dat' -g '!tb.txt')
+    RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
     await_watch
     rm -f "$CORPUS/gone.txt"
     await_watch
