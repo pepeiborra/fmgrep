@@ -36,6 +36,11 @@
     "/\\{-# INLINE \\w+ #-\\}/",
     "/import GHC\\.(Core|Stg|Cmm)\\.[\\w.]+/",
     "/foreign import ccall (unsafe|safe)/",
-    "/stg_\\w+_info/"
+    "/stg_\\w+_info/",
+    "import AND zonkTcType",
+    "the AND tcLookupGlobal",
+    "module AND tcLookupGlobal",
+    "/-- \\|/ AND simplifyTop",
+    "zonkTcType AND tcLookupGlobal"
   ]
 }

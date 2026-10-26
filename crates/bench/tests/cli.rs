@@ -10,9 +10,14 @@ fn bench(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
         "FMGREP_CORPUS_GHC",
         "FMGREP_CORPUS_LINUX",
         "FMGREP_CORPUS_CHROMIUM",
+        "FMGREP_BENCH_TGREP_BIN",
     ] {
         cmd.env_remove(var);
     }
+    // Without tgrep, so no machine-dependent tgrep note reaches stderr.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::split_paths(&path).filter(|d| !d.join("tgrep").exists());
+    cmd.env("PATH", std::env::join_paths(path).unwrap());
     for (var, val) in env {
         cmd.env(var, val);
     }
@@ -95,7 +100,7 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         format!("{n} rows agree")
     };
     assert!(
-        md.contains(&format!("verify: OK, {agree} on 35 queries")),
+        md.contains(&format!("verify: OK, {agree} on 40 queries")),
         "{md}"
     );
     let trace = std::fs::read_to_string(dir.path().join("t.jsonl")).unwrap();
@@ -103,12 +108,27 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), n * 36, "{trace}");
+    assert_eq!(lines.len(), n * 41, "{trace}");
     assert!(lines.iter().all(|v| v["fixture"] == true), "{trace}");
     for v in lines
         .iter()
         .filter(|v| v["type"] == "query" && !v["term"].as_str().unwrap().starts_with('/'))
     {
-        assert!(v["total_matches"].as_u64() > Some(0), "{v}");
+        let (lines, files) = (v["lines"].as_u64(), v["files"].as_u64());
+        assert!(lines >= files && files > Some(0), "{v}");
     }
+    let queries = lines.iter().filter(|v| v["type"] == "query");
+    let mut kinds = std::collections::BTreeMap::new();
+    for v in queries {
+        let (term, kind) = (v["term"].as_str().unwrap(), v["term_kind"].as_str());
+        let regex = term.starts_with('/') && !term.contains(" AND ");
+        assert_eq!(kind == Some("regex"), regex, "{v}");
+        *kinds.entry(kind.unwrap()).or_insert(0) += 1;
+    }
+    let per_kind = [
+        ("intersection", 5 * n),
+        ("literal", 30 * n),
+        ("regex", 5 * n),
+    ];
+    assert_eq!(kinds, per_kind.into(), "{trace}");
 }

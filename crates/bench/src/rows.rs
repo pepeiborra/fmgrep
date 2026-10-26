@@ -1,5 +1,7 @@
-//! The rg and fmgrep rows, and the process measurements every row shares.
+//! The rg and fmgrep rows, and the output parsing and process measurements
+//! every row shares.
 
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -11,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fmgrep::regex_pattern;
 
-use crate::{Query, Row};
+use crate::{Query, Row, leaves};
 
 pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
     let mut walk = Command::new("rg");
@@ -23,46 +25,98 @@ pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
     }
     let mut row = Row::new("rg", n);
     for term in terms {
-        let (mode, pattern) = match regex_pattern(term) {
-            Some(p) => ("--null-data", p),
-            None => ("-F", term.as_str()),
+        let mut cmd = match &leaves(term)[..] {
+            [_] => {
+                let (pattern, fixed) =
+                    regex_pattern(term).map_or((term.as_str(), Some("-F")), |p| (p, None));
+                let mut cmd = Command::new("rg");
+                cmd.args(LINES).arg("--with-filename").args(WALK);
+                cmd.args(fixed).args(["-e", pattern, "--"]).arg(staged);
+                cmd
+            }
+            all => rg_and(staged, all),
         };
-        let mut cmd = Command::new("rg");
-        cmd.args([
-            "--count-matches",
-            "--with-filename",
-            "--no-heading",
-            "-a",
-            mode,
-        ]);
-        cmd.args(["--no-ignore", "--no-require-git", "-e", pattern, "--"]);
-        let (out, latency, peak) = timed(cmd.arg(staged), Some(Duration::from_millis(1)))?;
-        row.footprint = row.footprint.max(peak);
-        if !matches!(out.status.code(), Some(0 | 1)) {
-            return Err(failure(&format!("rg {term:?}"), &out));
+        let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
+        let what = format!("rg {term:?}");
+        // xargs hides rg's exit status.
+        if !out.stderr.is_empty() {
+            return Err(failure(&what, &out));
         }
-        row.queries
-            .push(Query::new(term, latency, count_rows(&out.stdout)?));
+        row.footprint = row.footprint.max(peak);
+        let hits = hits(&what, &out)?;
+        row.queries.push(Query::new(term, latency, hits));
     }
     Ok(row)
 }
 
-/// Sums `path:N` lines, ended by `\n` or NUL, into (matches, files).
-pub fn count_rows(stdout: &[u8]) -> Result<(u64, usize), String> {
-    let (mut matches, mut files) = (0, 0);
-    for line in stdout.split(|&b| b == b'\n' || b == 0) {
-        if line.is_empty() {
-            continue;
-        }
-        let line = String::from_utf8_lossy(line);
-        let n = line
-            .rsplit_once(':')
-            .and_then(|(_, n)| n.parse::<u64>().ok());
-        let n = n.ok_or_else(|| format!("not a path:count line: {line:?}"))?;
-        matches += n;
-        files += usize::from(n > 0);
+const WALK: [&str; 3] = ["-a", "--no-ignore", "--no-require-git"];
+
+/// Lists the files holding every leaf, one rg per leaf, then prints their
+/// lines matching any leaf.
+fn rg_and(staged: &Path, leaves: &[&str]) -> Command {
+    let walk = WALK.join(" ");
+    let list = |k: usize, leaf: &str| {
+        let fixed = regex_pattern(leaf).map_or(" -F", |_| "");
+        format!("rg {walk} --files-with-matches --null{fixed} -e \"${{{k}}}\" --")
+    };
+    let n = leaves.len();
+    let mut script = format!("{} \"${{{}}}\"", list(1, leaves[0]), n + 1);
+    for (k, leaf) in leaves.iter().enumerate().skip(1) {
+        script += &format!(" | xargs -0 -r {}", list(k + 1, leaf));
     }
-    Ok((matches, files))
+    let any: String = (1..=n).map(|k| format!(" -e \"${{{k}}}\"")).collect();
+    let lines = LINES.join(" ");
+    script += &format!(" | xargs -0 -r rg {lines} --with-filename {walk}{any} --");
+    let mut cmd = Command::new("sh");
+    let patterns = leaves.iter().map(|l| regex_pattern(l).unwrap_or(l));
+    cmd.args(["-c", &script, "sh"]).args(patterns).arg(staged);
+    cmd
+}
+
+/// Printed by every row: `path:N:text`, one line per matching line.
+pub const LINES: [&str; 4] = ["-n", "--no-heading", "--color", "never"];
+
+pub struct Hits {
+    pub lines: u64,
+    pub files: usize,
+    /// Of the sorted `(file id, line number)` set.
+    pub digest: u64,
+}
+
+/// Reads `path:N:text` lines of staged `{id:08}.c` files, in any order and
+/// under any path prefix, from a run that exited 0 or 1.
+pub fn hits(what: &str, out: &Output) -> Result<Hits, String> {
+    if !matches!(out.status.code(), Some(0 | 1)) {
+        return Err(failure(what, out));
+    }
+    let lines = out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty());
+    let bad = |l: &[u8]| format!("{what}: not path:N:text: {:?}", String::from_utf8_lossy(l));
+    let set: Result<Vec<_>, _> = lines
+        .map(|l| staged_line(l).ok_or_else(|| bad(l)))
+        .collect();
+    let mut set = set?;
+    set.sort_unstable();
+    Ok(Hits {
+        lines: set.len() as u64,
+        files: set.chunk_by(|a, b| a.0 == b.0).count(),
+        digest: BuildHasherDefault::<DefaultHasher>::default().hash_one(&set),
+    })
+}
+
+/// The id and line number at the first `:` that ends a staged name and
+/// starts `N:`.
+fn staged_line(line: &[u8]) -> Option<(u32, u32)> {
+    let number = |s: &[u8]| match s.iter().all(u8::is_ascii_digit) {
+        true => std::str::from_utf8(s).ok()?.parse().ok(),
+        false => None,
+    };
+    (0..line.len()).filter(|&i| line[i] == b':').find_map(|i| {
+        let name = line[..i].rsplit(|&b| b == b'/').next()?;
+        let id = name.strip_suffix(b".c").filter(|id| id.len() == 8)?;
+        let rest = &line[i + 1..];
+        let n = rest.iter().position(|&b| b == b':')?;
+        Some((number(id)?, number(&rest[..n])?))
+    })
 }
 
 pub fn fmgrep(
@@ -82,7 +136,8 @@ pub fn fmgrep(
     if !status.success() {
         return Err(format!("fmgrep index: {status}"));
     }
-    let summary = json(&stdout)?;
+    let summary: serde_json::Value =
+        serde_json::from_slice(&stdout).map_err(|e| format!("fmgrep index --json: {e}"))?;
     let field = |k: &str| summary[k].as_u64().ok_or(format!("no {k} in {summary}"));
     let name = if store_docs {
         "fmgrep-store-docs"
@@ -116,22 +171,13 @@ pub fn fmgrep(
 
     for term in terms {
         let mut cmd = Command::new(bin);
-        cmd.args(["--server", &addr, "--json", "--approx-counts", "--", term]);
+        let leaves = leaves(term);
+        cmd.args(["--server", &addr]).args(LINES);
+        cmd.args((leaves.len() > 1).then_some("--and"));
+        cmd.arg("--").args(leaves);
         let (out, latency, _) = timed(&mut cmd, None)?;
-        // Exit 1 is a term with no match.
-        if !matches!(out.status.code(), Some(0 | 1)) {
-            return Err(failure(&format!("fmgrep --server {term:?}"), &out));
-        }
-        let report = json(&out.stdout)?;
-        let [q] = report["queries"].as_array().map_or(&[][..], Vec::as_slice) else {
-            return Err(format!("fmgrep --server {term:?} answered {report}"));
-        };
-        let counts = (q["total_matches"].as_u64(), q["docs_matched"].as_u64());
-        let (Some(matches), Some(files), true) = (counts.0, counts.1, q["term"] == **term) else {
-            return Err(format!("fmgrep --server {term:?} answered {report}"));
-        };
-        row.queries
-            .push(Query::new(term, latency, (matches, files as usize)));
+        let hits = hits(&format!("fmgrep --server {term:?}"), &out)?;
+        row.queries.push(Query::new(term, latency, hits));
     }
     let mut shutdown = Command::new(bin);
     let (out, _, _) = timed(shutdown.args(["--server", &addr, "--shutdown"]), None)?;
@@ -150,11 +196,6 @@ pub fn fmgrep(
 pub fn failure(what: &str, out: &Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr);
     format!("{what}: {}: {}", out.status, stderr.trim())
-}
-
-fn json(bytes: &[u8]) -> Result<serde_json::Value, String> {
-    let text = String::from_utf8_lossy(bytes);
-    serde_json::from_str(&text).map_err(|e| format!("{e}: {text:?}"))
 }
 
 pub struct Guard(pub Child);
@@ -264,11 +305,59 @@ fn footprint(pid: u32) -> Option<u64> {
 mod tests {
     use super::*;
 
+    fn run(code: i32, stdout: &[u8]) -> Result<Hits, String> {
+        let (status, stdout) = (ExitStatus::from_raw(code << 8), stdout.to_vec());
+        let stderr = Vec::new();
+        let out = Output {
+            status,
+            stdout,
+            stderr,
+        };
+        hits("t", &out)
+    }
+
     #[test]
-    fn count_rows_sums_path_count_lines() {
-        assert_eq!(count_rows(b""), Ok((0, 0)));
-        assert_eq!(count_rows(b"/s/1.c:3\n/s/a:b/2.c:4\n"), Ok((7, 2)));
-        assert_eq!(count_rows(b"/s/1.c:3\0/s/2.c:1\0"), Ok((4, 2)));
-        assert!(count_rows(b"/s/1.c\n").is_err());
+    fn hits_reads_matched_lines_of_staged_files() {
+        let out = b"/s:x/00000002.c:7:a: b\n00000000.c:1:foo\n\n/s/00000002.c:9:\xff 00000001.c:3:";
+        let h = run(0, out).unwrap();
+        assert_eq!((h.lines, h.files), (3, 2));
+        let reordered = run(0, b"/t/00000002.c:9:x\n00000002.c:7:\n/u/00000000.c:1:y\n").unwrap();
+        assert_eq!(reordered.digest, h.digest);
+        let other = run(0, b"00000002.c:8:\n00000002.c:9:\n00000000.c:1:\n").unwrap();
+        assert_ne!(other.digest, h.digest);
+        let none = run(1, b"").unwrap();
+        assert_eq!((none.lines, none.files), (0, 0));
+        assert!(run(2, b"").is_err());
+        for bad in [
+            &b"/s/00000000.c:3\n"[..],
+            b"/s/00000000.c\n1:foo\n",
+            b"/s/evil.c:1:foo\n",
+            b"/s/0000000.c:1:foo\n",
+            b"/s/00000000.c::foo\n",
+        ] {
+            assert!(run(0, bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn rg_answers_an_intersection_with_a_pipe() {
+        if Command::new("rg").arg("--version").output().is_err() {
+            eprintln!("skipped: rg is not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let docs = ["alpha\n", "beta\n", "alpha\nx\nbeta\n", "alpha beta\n"];
+        for (id, text) in docs.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("{id:08}.c")), text).unwrap();
+        }
+        let terms = ["alpha AND beta", "/al+pha/ AND beta", "alpha AND zzz"];
+        let row = rg(dir.path(), docs.len(), &terms.map(String::from)).unwrap();
+        let got: Vec<_> = row
+            .queries
+            .iter()
+            .map(|q| (q.hits.lines, q.hits.files))
+            .collect();
+        assert_eq!(got, [(3, 2), (3, 2), (0, 0)]);
+        assert!(rg(dir.path(), docs.len(), &["/(/ AND beta".to_string()]).is_err());
     }
 }

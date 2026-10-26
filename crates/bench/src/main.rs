@@ -14,7 +14,7 @@ const USAGE: &str = "\
 usage: bench [--corpus ghc|linux|chromium] [--rows ROWS] [--fixture] [--trace FILE]
 
 Stages the corpus, runs every row over its queries, checks that every row
-agrees with the first on every count, and prints the results as markdown.
+prints the same lines as the first, and prints the results as markdown.
 
   --corpus ID    ghc (default), linux or chromium; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
@@ -31,8 +31,7 @@ const ROWS: [&str; 4] = ["rg", "fmgrep", "fmgrep-store-docs", "tgrep"];
 pub struct Query {
     pub term: String,
     pub latency: Duration,
-    pub matches: u64,
-    pub files: usize,
+    pub hits: rows::Hits,
 }
 
 #[derive(Default)]
@@ -49,12 +48,11 @@ pub struct Row {
 }
 
 impl Query {
-    fn new(term: &str, latency: Duration, (matches, files): (u64, usize)) -> Self {
+    fn new(term: &str, latency: Duration, hits: rows::Hits) -> Self {
         Query {
             term: term.to_string(),
             latency,
-            matches,
-            files,
+            hits,
         }
     }
 }
@@ -67,6 +65,38 @@ impl Row {
             ..Row::default()
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Literal,
+    Regex,
+    Intersection,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 3] = [Kind::Literal, Kind::Regex, Kind::Intersection];
+
+    pub fn of(query: &str) -> Kind {
+        match (leaves(query).len(), regex_pattern(query)) {
+            (2.., _) => Kind::Intersection,
+            (_, Some(_)) => Kind::Regex,
+            _ => Kind::Literal,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Literal => "literal",
+            Kind::Regex => "regex",
+            Kind::Intersection => "intersection",
+        }
+    }
+}
+
+/// The sides of `A AND B [AND ..]`; the query itself otherwise.
+pub fn leaves(query: &str) -> Vec<&str> {
+    query.split(" AND ").collect()
 }
 
 pub struct QuerySet {
@@ -149,24 +179,31 @@ fn corpus_root(id: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-/// Every row's counts must equal the first row's.
+/// Every row must answer the first row's queries with the same lines.
 fn verify(rows: &[Row]) -> Vec<String> {
     let Some((base, others)) = rows.split_first() else {
         return Vec::new();
     };
+    let terms = |r: &Row| r.queries.iter().map(|q| q.term.clone()).collect::<Vec<_>>();
     let mut diffs = Vec::new();
     for row in others {
         if row.files != base.files {
             let (bn, bf, rn, rf) = (base.name, base.files, row.name, row.files);
             diffs.push(format!("files: {bn} {bf}, {rn} {rf}"));
         }
+        if terms(row) != terms(base) {
+            diffs.push(format!("queries: {} and {} differ", base.name, row.name));
+            continue;
+        }
         for (b, q) in base.queries.iter().zip(&row.queries) {
-            if (b.matches, b.files) != (q.matches, q.files) {
-                let (bn, qn) = (base.name, row.name);
+            let (bn, qn, bh, qh) = (base.name, row.name, &b.hits, &q.hits);
+            if (bh.lines, bh.files) != (qh.lines, qh.files) {
                 diffs.push(format!(
-                    "{:?}: {bn} {} matches in {} files, {qn} {} in {}",
-                    b.term, b.matches, b.files, q.matches, q.files
+                    "{:?}: {bn} {} lines in {} files, {qn} {} in {}",
+                    b.term, bh.lines, bh.files, qh.lines, qh.files
                 ));
+            } else if bh.digest != qh.digest {
+                diffs.push(format!("{:?}: {bn} and {qn} print different lines", b.term));
             }
         }
     }
@@ -215,7 +252,8 @@ fn run() -> Result<(), Fail> {
     let fixture_dir = fixture_dir.map_err(failed)?;
     let root = match &fixture_dir {
         Some(dir) => {
-            let literals = set.queries.iter().filter(|q| regex_pattern(q).is_none());
+            let leaves = set.queries.iter().flat_map(|q| leaves(q));
+            let literals = leaves.filter(|l| regex_pattern(l).is_none());
             let text: String = literals.map(|q| format!("{q}\n")).collect();
             std::fs::write(dir.path().join(format!("{corpus}.txt")), text).map_err(failed)?;
             dir.path().to_path_buf()
@@ -285,12 +323,20 @@ mod tests {
     use super::*;
 
     fn regexes(set: &QuerySet) -> impl Iterator<Item = &str> {
-        set.queries.iter().filter_map(|q| regex_pattern(q))
+        set.queries
+            .iter()
+            .flat_map(|q| leaves(q))
+            .filter_map(regex_pattern)
     }
 
     #[test]
     fn query_files_pin_a_commit_and_list_literals_first() {
-        for (id, literals, regexes) in [("ghc", 30, 5), ("linux", 92, 10), ("chromium", 30, 5)] {
+        let counts = [
+            ("ghc", 30, 5, 5),
+            ("linux", 92, 10, 5),
+            ("chromium", 30, 5, 5),
+        ];
+        for (id, literals, regexes, intersections) in counts {
             let QuerySet {
                 repo_url,
                 commit,
@@ -298,12 +344,13 @@ mod tests {
             } = query_set(id);
             assert!(repo_url.starts_with("https://") && repo_url.ends_with(".git"));
             assert!(commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()));
-            let kinds: Vec<bool> = queries.iter().map(|q| regex_pattern(q).is_some()).collect();
-            assert_eq!(
-                kinds,
-                [vec![false; literals], vec![true; regexes]].concat(),
-                "{id}"
-            );
+            let kinds: Vec<Kind> = queries.iter().map(|q| Kind::of(q)).collect();
+            let want = [
+                vec![Kind::Literal; literals],
+                vec![Kind::Regex; regexes],
+                vec![Kind::Intersection; intersections],
+            ];
+            assert_eq!(kinds, want.concat(), "{id}");
             let mut sorted = queries.clone();
             sorted.sort();
             sorted.dedup();
@@ -314,41 +361,37 @@ mod tests {
         assert_eq!(ghc, "4cf7628aa66f56000c29aef93924b6b8515db8f7");
     }
 
-    fn can_match_newline(hir: &regex_syntax::hir::Hir) -> bool {
-        use regex_syntax::hir::{Class, HirKind};
-        match hir.kind() {
-            HirKind::Empty | HirKind::Look(_) => false,
-            HirKind::Literal(lit) => lit.0.contains(&b'\n'),
-            HirKind::Class(Class::Unicode(c)) => c
-                .ranges()
-                .iter()
-                .any(|r| r.start() <= '\n' && '\n' <= r.end()),
-            HirKind::Class(Class::Bytes(c)) => c
-                .ranges()
-                .iter()
-                .any(|r| r.start() <= b'\n' && b'\n' <= r.end()),
-            HirKind::Capture(c) => can_match_newline(&c.sub),
-            HirKind::Repetition(r) => can_match_newline(&r.sub),
-            HirKind::Concat(v) | HirKind::Alternation(v) => v.iter().any(can_match_newline),
+    #[test]
+    fn kind_and_leaves_follow_the_spelling() {
+        assert_eq!((Kind::of("a"), leaves("a")), (Kind::Literal, vec!["a"]));
+        assert_eq!((Kind::of("/a/"), leaves("/a/")), (Kind::Regex, vec!["/a/"]));
+        for (q, want) in [
+            ("a AND b", &["a", "b"][..]),
+            ("/-- \\|/ AND x", &["/-- \\|/", "x"]),
+            ("a AND b AND c", &["a", "b", "c"]),
+        ] {
+            assert_eq!((Kind::of(q), &leaves(q)[..]), (Kind::Intersection, want));
         }
+        let names = Kind::ALL.map(Kind::name);
+        assert_eq!(names, ["literal", "regex", "intersection"]);
     }
 
-    /// Rows search whole documents, so a pattern spanning `\n` would count
-    /// differently from a line-oriented rg.
+    /// The rg and tgrep rows' last stage reads literal leaves as regexes.
     #[test]
-    fn no_query_can_match_across_a_newline() {
-        let parse = |p: &str| regex_syntax::parse(p).unwrap();
-        assert!(can_match_newline(&parse(r"a\s+b")) && can_match_newline(&parse(r"a[^;]*b")));
-        assert!(!can_match_newline(&parse(r"a[^;\n]*b")) && !can_match_newline(&parse(r"^a.b$")));
+    fn intersection_literals_need_no_escaping() {
         for id in CORPORA {
             let set = query_set(id);
-            for p in regexes(&set) {
-                assert!(
-                    !can_match_newline(&parse(p)),
-                    "{id}: {p:?} can match a newline"
-                );
+            let ands = set
+                .queries
+                .iter()
+                .filter(|q| Kind::of(q) == Kind::Intersection);
+            for q in ands {
+                assert_eq!(leaves(q).len(), 2, "{id} {q:?}");
+                for l in leaves(q).into_iter().filter(|l| regex_pattern(l).is_none()) {
+                    let plain = !l.contains(char::is_whitespace) && regex::escape(l) == l;
+                    assert!(plain, "{id} {q:?}");
+                }
             }
-            assert!(set.queries.iter().all(|q| !q.contains('\n')), "{id}");
         }
     }
 
@@ -370,25 +413,29 @@ mod tests {
 
     #[test]
     fn verify_names_the_term_and_row_of_a_mismatch() {
-        let row = |name, files, counts: &[(u64, usize)]| {
+        let row = |name, files, hits: &[(u64, usize, u64)]| {
             let mut row = Row::new(name, files);
-            for (i, &c) in counts.iter().enumerate() {
+            for (i, &(lines, files, digest)) in hits.iter().enumerate() {
+                let hits = rows::Hits {
+                    lines,
+                    files,
+                    digest,
+                };
                 row.queries
-                    .push(Query::new(&format!("t{i}"), Duration::ZERO, c));
+                    .push(Query::new(&format!("t{i}"), Duration::ZERO, hits));
             }
             row
         };
-        let (rg, same) = (
-            row("rg", 5, &[(3, 2), (0, 0)]),
-            row("fmgrep", 5, &[(3, 2), (0, 0)]),
-        );
-        assert!(verify(&[rg, same]).is_empty());
-        let (rg, other) = (
-            row("rg", 5, &[(3, 2), (0, 0)]),
-            row("fmgrep", 4, &[(3, 2), (1, 1)]),
-        );
-        let diffs = verify(&[rg, other]);
-        let term = "\"t1\": rg 0 matches in 0 files, fmgrep 1 in 1";
-        assert_eq!(diffs, ["files: rg 5, fmgrep 4", term]);
+        let rg = || row("rg", 5, &[(3, 2, 7), (0, 0, 0), (2, 1, 8)]);
+        assert!(verify(&[rg(), rg()]).is_empty());
+        let mut partial = rg();
+        partial.name = "tgrep";
+        partial.queries.remove(1);
+        assert_eq!(verify(&[rg(), partial]), ["queries: rg and tgrep differ"]);
+        let other = row("fmgrep", 4, &[(3, 2, 7), (1, 1, 1), (2, 1, 9)]);
+        let diffs = verify(&[rg(), other]);
+        let t1 = "\"t1\": rg 0 lines in 0 files, fmgrep 1 in 1";
+        let t2 = "\"t2\": rg and fmgrep print different lines";
+        assert_eq!(diffs, ["files: rg 5, fmgrep 4", t1, t2]);
     }
 }

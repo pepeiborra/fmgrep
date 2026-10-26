@@ -4,10 +4,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use fmgrep::regex_pattern;
 use serde_json::json;
 
-use crate::{QuerySet, Row};
+use crate::{Kind, QuerySet, Row};
 
 pub struct Run {
     pub corpus: &'static str,
@@ -28,8 +27,8 @@ pub struct Stamps {
 }
 
 const SUMMARY: &str = "\
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
 
 pub fn run(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
@@ -145,12 +144,10 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         None => format!("unknown (not a git checkout; pinned {url} @ {pin})"),
     };
     let n = run.set.queries.len();
-    let regexes = run
-        .set
-        .queries
-        .iter()
-        .filter(|q| regex_pattern(q).is_some());
-    let regexes = regexes.count();
+    let counts = Kind::ALL.map(|k| {
+        let count = run.set.queries.iter().filter(|q| Kind::of(q) == k).count();
+        format!("{count} {}", k.name())
+    });
     let stamps = &run.stamps;
     let note = stamps
         .tgrep_note
@@ -158,51 +155,57 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         .map_or(String::new(), |n| format!("- {n}\n"));
     let mut md = format!(
         "## fmgrep benchmark: {}{}\n\n- corpus: {} files, {}\n- revision: {revision}\n\
-         - queries: {n} ({} literal, {regexes} regex)\n- machine: {}\n- versions: {}\n{note}\
+         - queries: {n} ({})\n- machine: {}\n- versions: {}\n{note}\
          - date: {}\n\n{SUMMARY}\n",
         run.corpus,
         if run.fixture { " (FIXTURE)" } else { "" },
         run.files,
         bytes(run.bytes),
-        n - regexes,
+        counts.join(", "),
         stamps.machine,
         stamps.versions,
         stamps.date,
     );
     for r in rows {
-        let kind = |regex: bool| -> Vec<Duration> {
-            let queries = r.queries.iter();
-            let of_kind = queries.filter(|q| regex_pattern(&q.term).is_some() == regex);
-            of_kind.map(|q| q.latency).collect()
-        };
-        let (literal, regex) = (kind(false), kind(true));
-        let cells = [
+        let mut cells = vec![
             label(r.name).to_string(),
             opt(r.index_time, ms),
             opt(r.index_bytes, bytes),
             opt(r.ready, ms),
-            opt(p50(&literal), ms),
-            opt(mean(&literal), ms),
-            opt(p50(&regex), ms),
-            opt(mean(&regex), ms),
+        ];
+        for kind in Kind::ALL {
+            let of_kind = r.queries.iter().filter(|q| Kind::of(&q.term) == kind);
+            let latencies: Vec<Duration> = of_kind.map(|q| q.latency).collect();
+            cells.extend([opt(p50(&latencies), ms), opt(mean(&latencies), ms)]);
+        }
+        let all: Vec<Duration> = r.queries.iter().map(|q| q.latency).collect();
+        cells.extend([opt(p50(&all), ms), opt(mean(&all), ms)]);
+        cells.extend([
             opt(r.footprint, bytes),
             opt(r.index_peak_rss, bytes),
             opt(r.load1, |(a, b)| {
                 format!("{a:.2}->{b:.2}{}", if a.max(b) >= 4.0 { "!" } else { "" })
             }),
-        ];
+        ]);
         md += &format!("| {} |\n", cells.join(" | "));
     }
     let tgrep = if rows.iter().any(|r| r.name == "tgrep") {
-        ", or one `tgrep` client against one `tgrep serve`"
+        ", or a `tgrep` client against one `tgrep serve`"
     } else {
         ""
     };
+    let tgrep_and = if tgrep.is_empty() {
+        ""
+    } else {
+        ", or several `tgrep` clients"
+    };
     md += &format!(
-        "\nLatency is per query, spawn to exit: one `rg` process over a staged copy of the corpus, \
-         or one `fmgrep --server` process against one `fmgrep serve`{tgrep}. Footprint is the peak \
-         anonymous memory while querying. load1 is the 1-minute load average at the row's start \
-         and end; `!` marks 4 or more, where timings are likely inflated.\n\n"
+        "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
+         `rg` over a staged copy of the corpus, or `fmgrep --server` against one \
+         `fmgrep serve`{tgrep}. An intersection is an `rg` pipe{tgrep_and}. \
+         Footprint is the peak anonymous memory while querying. load1 is the 1-minute load \
+         average at the row's start and end; `!` marks 4 or more, where timings are likely \
+         inflated.\n\n"
     );
     md += &match diffs.len() {
         0 => format!(
@@ -221,36 +224,49 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     let Some((base, others)) = rows.split_first() else {
         return md;
     };
-    let mut header = vec!["query".to_string(), "matches".into(), "files".into()];
+    let mut header = vec!["query".to_string(), "lines".into(), "files".into()];
     header.extend(rows.iter().map(|r| label(r.name).to_string()));
     header.extend(others.iter().map(|r| match others.len() {
         1 => "speedup".to_string(),
         _ => format!("speedup {}", label(r.name)),
     }));
     let align = "|--:".repeat(header.len() - 1);
-    md += &format!(
-        "\n<details><summary>Per query</summary>\n\n| {} |\n|---{align}|\n",
-        header.join(" | ")
-    );
-    for (i, q) in base.queries.iter().enumerate() {
-        let ticks = if q.term.contains('`') { "``" } else { "`" };
-        let term = format!("{ticks}{}{ticks}", q.term.replace('|', "\\|"));
-        let mut cells = vec![term, q.matches.to_string(), q.files.to_string()];
-        let latency = |r: &Row| r.queries.get(i).map(|q| q.latency);
-        cells.extend(rows.iter().map(|r| opt(latency(r), ms)));
-        cells.extend(others.iter().map(|r| {
-            opt(latency(r).filter(|d| !d.is_zero()), |d| {
-                let x = q.latency.as_secs_f64() / d.as_secs_f64();
-                if x >= 10.0 {
-                    format!("{x:.0}x")
-                } else {
-                    format!("{x:.1}x")
-                }
-            })
-        }));
-        md += &format!("| {} |\n", cells.join(" | "));
+    for kind in Kind::ALL {
+        let queries: Vec<_> = base
+            .queries
+            .iter()
+            .filter(|q| Kind::of(&q.term) == kind)
+            .collect();
+        if queries.is_empty() {
+            continue;
+        }
+        md += &format!(
+            "\n<details><summary>{} queries ({})</summary>\n\n| {} |\n|---{align}|\n",
+            kind.name(),
+            queries.len(),
+            header.join(" | ")
+        );
+        for q in queries {
+            let ticks = if q.term.contains('`') { "``" } else { "`" };
+            let term = format!("{ticks}{}{ticks}", q.term.replace('|', "\\|"));
+            let mut cells = vec![term, q.hits.lines.to_string(), q.hits.files.to_string()];
+            let latency = |r: &Row| Some(r.queries.iter().find(|o| o.term == q.term)?.latency);
+            cells.extend(rows.iter().map(|r| opt(latency(r), ms)));
+            cells.extend(others.iter().map(|r| {
+                opt(latency(r).filter(|d| !d.is_zero()), |d| {
+                    let x = q.latency.as_secs_f64() / d.as_secs_f64();
+                    if x >= 10.0 {
+                        format!("{x:.0}x")
+                    } else {
+                        format!("{x:.1}x")
+                    }
+                })
+            }));
+            md += &format!("| {} |\n", cells.join(" | "));
+        }
+        md += "\n</details>\n";
     }
-    md + "\n</details>\n"
+    md
 }
 
 pub fn trace(run: &Run, rows: &[Row]) -> String {
@@ -265,9 +281,10 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
                 "corpus_revision": run.revision,
                 "fixture": run.fixture,
                 "term": q.term,
+                "term_kind": Kind::of(&q.term).name(),
                 "latency_us": q.latency.as_micros() as u64,
-                "total_matches": q.matches,
-                "docs_matched": q.files,
+                "lines": q.hits.lines,
+                "files": q.hits.files,
             }));
         }
         lines.push(json!({
@@ -296,7 +313,9 @@ mod tests {
 
     const PIN: &str = "4cf7628aa66f56000c29aef93924b6b8515db8f7";
 
-    fn markdown_of(fixture: bool, revision: &str, diffs: &[String]) -> String {
+    const TERMS: [&str; 3] = ["a", "/b/", "a AND b"];
+
+    fn run_of(fixture: bool, revision: &str) -> (Run, Vec<Row>) {
         let note = Some("tgrep: not found on PATH".to_string());
         let (machine, versions, date) = ("m".into(), "v".into(), "d".into());
         let stamps = Stamps {
@@ -305,7 +324,8 @@ mod tests {
             tgrep_note: note,
             date,
         };
-        let (set, revision) = (crate::query_set("ghc"), Some(revision.to_string()));
+        let (mut set, revision) = (crate::query_set("ghc"), Some(revision.to_string()));
+        set.queries = TERMS.map(String::from).to_vec();
         let run = Run {
             corpus: "ghc",
             fixture,
@@ -316,15 +336,30 @@ mod tests {
             stamps,
         };
         let (mut rg, mut docs) = (Row::new("rg", 1), Row::new("fmgrep-store-docs", 1));
-        for term in ["a", "/b/"] {
-            rg.queries
-                .push(Query::new(term, Duration::from_millis(2), (1, 1)));
-            docs.queries
-                .push(Query::new(term, Duration::from_millis(2), (1, 1)));
+        for term in TERMS {
+            let rows = if term.contains(" AND ") {
+                vec![&mut rg]
+            } else {
+                vec![&mut rg, &mut docs]
+            };
+            for row in rows {
+                let hits = crate::rows::Hits {
+                    lines: 1,
+                    files: 1,
+                    digest: 0,
+                };
+                row.queries
+                    .push(Query::new(term, Duration::from_millis(2), hits));
+            }
         }
         rg.footprint = Some(1 << 20);
         (docs.index_time, docs.load1) = (Some(Duration::from_secs(2)), Some((1.0, 4.5)));
-        markdown(&run, &[rg, docs], diffs)
+        (run, vec![rg, docs])
+    }
+
+    fn markdown_of(fixture: bool, revision: &str, diffs: &[String]) -> String {
+        let (run, rows) = run_of(fixture, revision);
+        markdown(&run, &rows, diffs)
     }
 
     fn assert_has(md: &str, wants: &[&str]) {
@@ -342,17 +377,33 @@ mod tests {
     }
 
     #[test]
-    fn summary_table_has_the_benchmarks_md_columns() {
-        assert!(include_str!("../../../BENCHMARKS.md").contains(SUMMARY));
+    fn benchmarks_md_has_the_summary_columns_and_row_commands() {
+        let doc = include_str!("../../../BENCHMARKS.md");
+        assert!(doc.contains(SUMMARY));
+        let lines = crate::rows::LINES[..2].join(" ");
+        for row in ["rg", "fmgrep --server ADDR", "tgrep"] {
+            let command = format!("`{row} {lines}");
+            assert!(doc.contains(&command), "{command} not in BENCHMARKS.md");
+        }
+        let pipe = format!("xargs -0 -r rg {lines}");
+        assert!(doc.contains(&pipe), "{pipe} not in BENCHMARKS.md");
+        assert!(
+            doc.contains("-t and`"),
+            "tgrep's intersection not in BENCHMARKS.md"
+        );
         let md = markdown_of(false, PIN, &[]);
         assert_has(
             &md,
             &[
-                "\n| rg | - | - | - | 2.00 ms | 2.00 ms | 2.00 ms | 2.00 ms | 1.00 MB | - | - |\n",
+                &format!(
+                    "\n| rg | - | - | - |{} 1.00 MB | - | - |\n",
+                    " 2.00 ms |".repeat(8)
+                ),
                 "\n| fmgrep `--store-docs` | 2.00 s | - |",
-                "| 1.00->4.50! |\n",
+                "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | - | - | 1.00->4.50! |\n",
+                "\n- queries: 3 (1 literal, 1 regex, 1 intersection)\n",
                 "\n- tgrep: not found on PATH\n",
-                "verify: OK, 2 rows agree on 35 queries",
+                "verify: OK, 2 rows agree on 3 queries",
             ],
         );
     }
@@ -372,5 +423,39 @@ mod tests {
                 "verify: FAILED, 1 difference(s)",
             ],
         );
+    }
+
+    #[test]
+    fn per_query_tables_follow_the_kinds() {
+        let md = markdown_of(false, PIN, &[]);
+        let at = |want: &str| {
+            md.find(want)
+                .unwrap_or_else(|| panic!("{want:?} not in\n{md}"))
+        };
+        let blocks = ["literal", "regex", "intersection"].map(|k| {
+            at(&format!(
+                "\n<details><summary>{k} queries (1)</summary>\n\n|"
+            ))
+        });
+        assert!(blocks.is_sorted(), "{md}");
+        assert_eq!(md.matches("<details>").count(), 3, "{md}");
+        assert_eq!(md.matches("\n\n</details>\n").count(), 3, "{md}");
+        let and = at("\n| `a AND b` | 1 | 1 | 2.00 ms | - | - |\n");
+        assert!(and > blocks[2], "{md}");
+
+        let (run, rows) = run_of(false, PIN);
+        let md = markdown(&run, &rows[1..], &[]);
+        assert_has(&md, &["regex queries (1)"]);
+        assert!(!md.contains("intersection queries"), "{md}");
+
+        let trace = trace(&run, &rows);
+        for (term, kind) in [
+            ("a AND b", "intersection"),
+            ("/b/", "regex"),
+            ("a", "literal"),
+        ] {
+            let want = format!(r#""term":"{term}","term_kind":"{kind}""#);
+            assert!(trace.contains(&want), "{want} not in\n{trace}");
+        }
     }
 }

@@ -1,32 +1,58 @@
 //! The optional tgrep row: `tgrep index`, one `tgrep serve --no-watch`, then
-//! one `tgrep --count-matches` client per query.
+//! one `tgrep -n` client per query; an intersection is one `tgrep -l` per side
+//! and one more over the files they share.
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use fmgrep::regex_pattern;
 use serde_json::Value;
 
-use crate::rows::{Guard, Sampler, count_rows, failure, run_measured, timed};
-use crate::{Query, Row};
+use crate::rows::{Guard, LINES, Sampler, failure, hits, run_measured, timed};
+use crate::{Query, Row, leaves};
 
 pub struct Tgrep {
     pub bin: PathBuf,
     pub version: String,
 }
 
-/// The first executable `tgrep` on `PATH` whose `--version` and `serve --help`
-/// succeed; `Err` is the note saying why there is no tgrep row.
+const WRONG_TOOL: &str = "is not the indexed-search tgrep (the crates.io tgrep crate is a different tool); see BENCHMARKS.md for how to build it";
+
+/// `FMGREP_BENCH_TGREP_BIN`, else the first executable `tgrep` on `PATH`, if
+/// it is Microsoft tgrep; `Err` is the note saying why there is no tgrep row,
+/// also printed to stderr when a binary was found but rejected.
 pub fn detect() -> Result<Tgrep, String> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut found = std::env::split_paths(&path).map(|d| d.join("tgrep"));
+    let found = std::env::var_os("FMGREP_BENCH_TGREP_BIN").map(PathBuf::from);
+    let found = found
+        .map(|b| (format!("FMGREP_BENCH_TGREP_BIN={}", b.display()), b))
+        .or_else(|| {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            on_path(&path).map(|b| ("tgrep on PATH".to_string(), b))
+        });
+    let (what, bin) = found.ok_or("tgrep: not found on PATH")?;
+    let tgrep = check(bin, &what);
+    if let Err(note) = &tgrep {
+        eprintln!("{note}");
+    }
+    tgrep
+}
+
+fn on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
     let executable = |m: std::fs::Metadata| m.is_file() && m.permissions().mode() & 0o111 != 0;
-    let bin = found.find(|p| p.metadata().is_ok_and(executable));
-    let bin = bin.ok_or("tgrep: not found on PATH")?;
+    std::env::split_paths(path)
+        .map(|d| d.join("tgrep"))
+        .find(|p| p.metadata().is_ok_and(executable))
+}
+
+/// `bin` as the tgrep row's binary if its CLI has the `index` / `serve` /
+/// `--index-path` surface the row drives.
+fn check(bin: PathBuf, what: &str) -> Result<Tgrep, String> {
     let probe = |args: &[&str]| {
         let out = Command::new(&bin).args(args).stdin(Stdio::null()).output();
         match out {
@@ -42,15 +68,19 @@ pub fn detect() -> Result<Tgrep, String> {
             Err(e) => Err(format!("{}: {e}", bin.display())),
         }
     };
-    let version = probe(&["--version"]).and_then(|v| probe(&["serve", "--help"]).map(|_| v));
-    let version = version.map_err(|e| format!("tgrep: does not work ({e})"))?;
-    let version = version
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    Ok(Tgrep { bin, version })
+    let broken = |e| format!("tgrep: does not work ({e})");
+    let version = probe(&["--version"]).map_err(broken)?;
+    // The crates.io tgrep exits 0 on these too, printing its own usage.
+    let index = probe(&["index", "--help"]).unwrap_or_default();
+    let serve = probe(&["serve", "--help"]).unwrap_or_default();
+    if !index.contains("--index-path") || !serve.contains("--no-watch") {
+        return Err(format!("{what} {WRONG_TOOL}"));
+    }
+    let version = version.lines().next().unwrap_or_default().trim();
+    Ok(Tgrep {
+        bin,
+        version: version.to_string(),
+    })
 }
 
 pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
@@ -98,29 +128,84 @@ pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
     row.ready = Some(start.elapsed());
 
     for term in terms {
-        let (pattern, fixed) = match regex_pattern(term) {
-            Some(p) => (p, None),
-            None => (term.as_str(), Some("-F")),
+        let what = format!("tgrep {term:?}");
+        let start = Instant::now();
+        let out = match &leaves(term)[..] {
+            [leaf] => {
+                let (fixed, e) = pattern(leaf);
+                let args: Vec<&str> = LINES.into_iter().chain(fixed).chain([&*e]).collect();
+                search(&mut tgrep(&args), &what)?
+            }
+            all => and(&tgrep, all, &what)?,
         };
-        let e = format!("-e={pattern}");
-        let args: Vec<&str> = ["--count-matches"]
-            .into_iter()
-            .chain(fixed)
-            .chain([&*e])
-            .collect();
-        let (out, latency, _) = timed(&mut tgrep(&args), None)?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let fallback = ["scanning every file", "falling back to local index"];
-        if fallback.iter().any(|m| stderr.contains(m)) || !matches!(out.status.code(), Some(0 | 1))
-        {
-            return Err(failure(&format!("tgrep {term:?}"), &out));
-        }
+        let latency = start.elapsed();
         row.queries
-            .push(Query::new(term, latency, count_rows(&out.stdout)?));
+            .push(Query::new(term, latency, hits(&what, &out)?));
     }
     drop(server);
     row.footprint = sampler.stop();
     Ok(row)
+}
+
+/// `-F` unless `leaf` is a regex, and its `-e`.
+fn pattern(leaf: &str) -> (Option<&'static str>, String) {
+    match regex_pattern(leaf) {
+        Some(p) => (None, format!("-e={p}")),
+        None => (Some("-F"), format!("-e={leaf}")),
+    }
+}
+
+/// Runs one tgrep search to exit; `Err` when it left the server.
+fn search(cmd: &mut Command, what: &str) -> Result<Output, String> {
+    let (out, _, _) = timed(cmd, None)?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let fallback = ["scanning every file", "falling back to local index"];
+    if fallback.iter().any(|m| stderr.contains(m)) {
+        return Err(failure(what, &out));
+    }
+    Ok(out)
+}
+
+/// One `tgrep -l` per leaf, then the lines matching any leaf in the files every
+/// leaf listed, restricted by `--type-add`/`-t` (`-g` and paths bypass the index).
+fn and(tgrep: &impl Fn(&[&str]) -> Command, leaves: &[&str], what: &str) -> Result<Output, String> {
+    let mut shared: Option<BTreeSet<String>> = None;
+    for leaf in leaves {
+        let (fixed, e) = pattern(leaf);
+        let args: Vec<&str> = ["-l"].into_iter().chain(fixed).chain([&*e]).collect();
+        let out = search(&mut tgrep(&args), what)?;
+        if !matches!(out.status.code(), Some(0 | 1)) {
+            return Err(failure(what, &out));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let names = stdout.lines().filter_map(|l| l.rsplit('/').next());
+        let mut names: BTreeSet<String> =
+            names.filter(|n| !n.is_empty()).map(String::from).collect();
+        if let Some(shared) = &shared {
+            names.retain(|n| shared.contains(n));
+        }
+        if names.is_empty() {
+            let status = ExitStatus::from_raw(1 << 8);
+            let (stdout, stderr) = (Vec::new(), Vec::new());
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        shared = Some(names);
+    }
+    let any = leaves
+        .iter()
+        .map(|l| format!("-e={}", regex_pattern(l).unwrap_or(l)));
+    let files = shared
+        .into_iter()
+        .flatten()
+        .map(|n| format!("--type-add=and:{n}"));
+    let args: Vec<String> = any.chain(files).collect();
+    let args = args.iter().map(String::as_str).chain(["-t", "and"]);
+    let args: Vec<&str> = LINES.into_iter().chain(args).collect();
+    search(&mut tgrep(&args), what)
 }
 
 fn dir_size(dir: &Path) -> u64 {
@@ -185,6 +270,70 @@ fn status_ready(s: &Value, n: usize) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `tgrep` script in a fresh directory, printing `help` for any `--help`.
+    fn fake(help: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tgrep");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in --version) echo 'tgrep 9.9';; *--help) printf '%s\\n' '{help}';; esac\n"
+        );
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn check_rejects_a_tgrep_without_the_index_surface() {
+        let dir = fake("USAGE: tgrep [FLAGS] [OPTIONS] <regexp> [--] [paths]");
+        let bin = on_path(dir.path().as_os_str()).unwrap();
+        let note = check(bin, "tgrep on PATH").err().unwrap();
+        assert_eq!(note, format!("tgrep on PATH {WRONG_TOOL}"));
+    }
+
+    #[test]
+    fn check_accepts_a_tgrep_with_the_index_surface() {
+        let dir = fake("--index-path <INDEX_PATH> --no-watch");
+        let bin = on_path(dir.path().as_os_str()).unwrap();
+        let tgrep = check(bin.clone(), "tgrep on PATH").unwrap();
+        assert_eq!((tgrep.bin, tgrep.version.as_str()), (bin, "tgrep 9.9"));
+    }
+
+    #[test]
+    fn row_answers_intersections_as_rg_does() {
+        let Ok(tgrep) = detect() else {
+            eprintln!("skipped: no tgrep");
+            return;
+        };
+        if Command::new("rg").arg("--version").output().is_err() {
+            eprintln!("skipped: rg is not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let docs = ["alpha\n", "beta\n", "alpha\nx\nbeta\n", "alpha beta\n"];
+        for (id, text) in docs.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("{id:08}.c")), text).unwrap();
+        }
+        let terms = [
+            "alpha AND beta",
+            "/al+pha/ AND beta",
+            "alpha AND zzz",
+            "zzz AND alpha",
+            "beta",
+        ]
+        .map(String::from);
+        let row = row(&tgrep.bin, dir.path(), docs.len(), &terms).unwrap();
+        let rg = crate::rows::rg(dir.path(), docs.len(), &terms).unwrap();
+        let got: Vec<_> = row
+            .queries
+            .iter()
+            .map(|q| (q.hits.lines, q.hits.files))
+            .collect();
+        assert_eq!(got, [(3, 2), (3, 2), (0, 0), (0, 0), (3, 3)]);
+        for (t, r) in row.queries.iter().zip(&rg.queries) {
+            assert_eq!(t.hits.digest, r.hits.digest, "{}", t.term);
+        }
+    }
 
     #[test]
     fn status_ready_requires_reconcile_done() {

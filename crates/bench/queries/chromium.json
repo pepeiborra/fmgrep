@@ -36,6 +36,11 @@
     "/std::unique_ptr<\\w+>/",
     "/#include \"base/\\w+\\.h\"/",
     "/DCHECK_(EQ|NE|LT|GT)\\([^;\\n]*\\)/",
-    "/RenderFrameHostImpl::\\w+\\(/"
+    "/RenderFrameHostImpl::\\w+\\(/",
+    "std::unique_ptr AND blink::LocalFrame",
+    "DCHECK AND net::URLRequest",
+    "std::vector AND net::URLRequest",
+    "TODO AND blink::LocalFrame",
+    "blink::LocalFrame AND content::RenderFrameHost"
   ]
 }

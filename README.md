@@ -116,16 +116,17 @@ lower `FMGREP_SAMPLE_RATE` speeds the index probe, not the reads
 ## Performance
 
 Apple M5 (10 cores, 16 GiB), macOS 26.5.1, fmgrep 0.1.0, ripgrep 15.2.0,
-2026-09-24 (chromium: 1 run, loaded box). Latency is the per-query
-median, spawn to exit, of one `fmgrep --server` or `rg` process; footprint
-is the peak anonymous memory while answering. [BENCHMARKS.md](BENCHMARKS.md)
-has the method, every column and the index built with `--store-docs`.
+2026-10-05 (chromium: 1 run).
+Latency is the per-query median, spawn to exit, of one `fmgrep --server`
+or `rg` process printing the matching lines; footprint is the peak
+anonymous memory while answering. [BENCHMARKS.md](BENCHMARKS.md) has the
+method, every column and the index built with `--store-docs`.
 
 | corpus | files / text | index build / size | fmgrep literal / regex | rg literal / regex | footprint fmgrep / rg |
 |---|--:|--:|--:|--:|--:|
-| GHC | 26787 / 85 MB | 1.7 s / 113 MB | 2.8 / 9.4 ms | 448 / 447 ms | 13 / 78 MB |
-| linux | 95540 / 1.5 GB | 13 s / 1.9 GB | 4.5 / 5.1 ms | 2.0 / 2.3 s | 22 / 446 MB |
-| chromium | 460957 / 2.8 GB | 72 s / 3.7 GB | 64 ms / 2.6 s | 12.6 / 13.9 s | 63 / 789 MB |
+| GHC | 26787 / 85 MB | 2.0 s / 113 MB | 4.4 / 10.3 ms | 479 / 476 ms | 26 / 46 MB |
+| linux | 95540 / 1.5 GB | 27 s / 1.9 GB | 16.5 / 22.5 ms | 2.9 / 3.1 s | 67 / 209 MB |
+| chromium | 460957 / 2.8 GB | 72 s / 3.7 GB | 141 / 408 ms | 14.8 / 15.2 s | 481 / 688 MB |
 
 Regexes cost more on chromium because every candidate file is read from
 the tree.

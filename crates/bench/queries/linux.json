@@ -103,6 +103,11 @@
     "/DECLARE_WAIT_QUEUE_HEAD\\(/",
     "/subsys_initcall\\(/",
     "/WARN_ONCE\\(/",
-    "/EXPORT_SYMBOL_GPL\\(devm_\\w+\\)/"
+    "/EXPORT_SYMBOL_GPL\\(devm_\\w+\\)/",
+    "static AND devm_platform_ioremap_resource",
+    "return AND kvzalloc",
+    "include AND alloc_pages_node",
+    "int AND kmem_cache_create",
+    "kvzalloc AND kmem_cache_create"
   ]
 }

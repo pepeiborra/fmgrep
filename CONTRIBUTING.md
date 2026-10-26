@@ -21,7 +21,9 @@ The Benchmark workflow runs GHC against ripgrep on every pull request and
 posts the table as the job summary. Shared runners are noisy, so it gates
 nothing. A pull request that claims a speedup includes a `scripts/bench.sh`
 table from a quiet machine, before and after; see
-[docs/benchmark.md](docs/benchmark.md).
+[docs/benchmark.md](docs/benchmark.md). For the optional tgrep row, build
+Microsoft's tgrep from https://github.com/microsoft/tgrep; `cargo install
+tgrep` installs an unrelated crate, which the harness skips.
 
 ## License
 

@@ -6,97 +6,118 @@ fmgrep against ripgrep on three pinned source trees, on one machine.
 
 Every run is `scripts/bench.sh` ([docs/benchmark.md](docs/benchmark.md)).
 Every row searches the same staged copy of the corpus, one query at a time,
-and a run fails unless all rows agree on every query's match and file
-counts.
+and prints each matching line as `path:line:text`; a run fails unless all
+rows print the same lines, by file and line number, for every query they
+answer. A query `A AND B` is an intersection: the lines matching `A` or `B`
+in the files that hold both.
 
-- **rg**: one `rg --count-matches` process per query.
+- **rg**: one `rg -n --no-heading` process per query; an intersection is
+  one pipe, `rg -l --null A | xargs -0 -r rg -l --null B |
+  xargs -0 -r rg -n --no-heading -e A -e B`.
 - **fmgrep**: an index (`index build`, `index size`), one `fmgrep serve`
-  (`ready`), then one `fmgrep --server` process per query.
+  (`ready`), then one `fmgrep --server ADDR -n --no-heading` process per
+  query (`--and A B` for an intersection).
 - **tgrep**, when installed: `tgrep index`, one `tgrep serve --no-watch`,
-  then one `tgrep --count-matches` client per query.
+  then one `tgrep -n --no-heading` client per query; an intersection is one
+  `tgrep -l` per side, then `tgrep -n --no-heading -e A -e B --type-add
+  and:FILE ... -t and` over the files on every list (`-g` and path arguments
+  would bypass the index). This is Microsoft's tgrep, built
+  from [github.com/microsoft/tgrep](https://github.com/microsoft/tgrep)
+  (`cargo install --locked --git https://github.com/microsoft/tgrep
+  tgrep-cli`); the crates.io crate named `tgrep` is an unrelated tool, so do
+  not `cargo install tgrep`. See [docs/benchmark.md](docs/benchmark.md#tgrep-optional).
 
-Latency is spawn to exit, process start-up included. `p50` is the lower
-median over the literal or the regex queries, beside their mean. `query
-footprint` is the peak anonymous memory of the process answering (the
-server, or each rg); `index peak RSS` is the index build's peak resident
-memory. `load1` is the 1-minute load average at the row's start and end
-(the harness marks 4 or more with `!`). Each cell is the median of 3 runs
-(chromium: 1 run). MB and GB are 2^20 and 2^30 bytes.
+Latency is spawn to exit, process start-up and printing included. `p50` is
+the lower median over the literal, the regex or the intersection queries,
+beside their mean; `all` is over every query. `query footprint` is the
+peak anonymous memory of the process answering (the server, or each rg);
+`index peak RSS` is the index build's peak resident memory. `load1` is the
+1-minute load average at the row's start and end (the harness marks 4 or
+more with `!`). Each cell is the median of 3 runs (chromium: 1 run). MB
+and GB are 2^20 and 2^30 bytes.
 
-Each run started with load1 below 3 and no other build or benchmark
+Each run was started at load1 below 3 with no other build or benchmark
 running, except where noted; rg keeps every core busy, so the rows after it
-start at a load1 of 4 to 12. The linux checkout sits on a case-insensitive
+start at a load1 of 4 to 18. The linux checkout sits on a case-insensitive
 file system, where 13 files of the pinned tree collide; every row sees the
 same 95540 files.
 
 Machine: Apple M5, 10 cores (4P + 6E), 16 GiB, macOS 26.5.1. fmgrep 0.1.0
-(release build), ripgrep 15.2.0. Measured 2026-09-24 (UTC).
+(release build), ripgrep 15.2.0. Measured 2026-10-05, UTC.
 
 ## GHC
 
-26787 files, 84.67 MB, at ghc `4cf7628`; 35 queries (30 literal, 5 regex).
+26787 files, 84.67 MB, at ghc `4cf7628`; 40 queries (30 literal, 5 regex,
+5 intersection).
 
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 448 ms | 449 ms | 447 ms | 448 ms | 77.55 MB | - | 1.85->4.15, 2.84->4.80, 3.08->5.86 |
-| fmgrep | 1.71 s | 112.66 MB | 21.7 ms | 2.76 ms | 2.94 ms | 9.43 ms | 8.65 ms | 12.63 MB | 713.14 MB | 4.15->4.15, 4.80->4.65, 5.86->5.63 |
-| fmgrep `--store-docs` | 2.17 s | 197.35 MB | 4.03 ms | 2.77 ms | 2.96 ms | 7.24 ms | 6.90 ms | 12.80 MB | 720.00 MB | 4.15->4.15, 4.65->4.65, 5.63->5.63 |
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| rg | - | - | - | 479 ms | 516 ms | 476 ms | 521 ms | 507 ms | 499 ms | 479 ms | 514 ms | 45.58 MB | - | 3.08->6.54, 2.99->4.64, 2.62->5.50 |
+| fmgrep | 1.98 s | 112.66 MB | 26.8 ms | 4.37 ms | 5.35 ms | 10.3 ms | 9.79 ms | 3.03 ms | 3.29 ms | 4.37 ms | 5.65 ms | 26.06 MB | 686.09 MB | 6.54->7.38, 4.64->4.64, 5.50->5.50 |
+| fmgrep `--store-docs` | 2.16 s | 197.35 MB | 6.38 ms | 3.74 ms | 3.89 ms | 7.67 ms | 6.90 ms | 3.26 ms | 3.33 ms | 3.78 ms | 4.20 ms | 29.06 MB | 700.23 MB | 7.38->7.67, 4.64->4.75, 5.50->5.14 |
 
-The slowest fmgrep queries, about 11 ms, are the regexes whose candidate
-files must all be read and verified: `/\{-# INLINE \w+ #-\}/` (3102
-matches in 426 files) and `/stg_\w+_info/` (1084 matches in 87 files).
+Printing a line reads its file from the tree, so the slowest fmgrep
+queries are those that touch the most files, such as
+`/\{-# INLINE \w+ #-\}/` (3102 lines in 426 files, 14.8 ms). With
+`--store-docs` no query takes more than 9.2 ms. An intersection costs rg a pass over the whole tree for its
+first side, then one over the files left per further side.
 
 ## linux
 
-95540 files, 1.53 GB, at linux `5878583`; 102 queries (92 literal, 10
-regex). Runs 2 and 3 started after a 30-minute wait with another checkout's
-idle `cargo test` (0% CPU) still present, at load1 1.7 and 1.3.
+95540 files, 1.53 GB, at linux `5878583`; 107 queries (92 literal, 10
+regex, 5 intersection). Runs 1, 3 and 4; run 2 is left out because builds
+in other checkouts started during it and took load1 to 40.
 
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 1.96 s | 2.06 s | 2.29 s | 2.28 s | 445.84 MB | - | 3.15->6.90, 2.07->11.76, 1.45->5.84 |
-| fmgrep | 12.94 s | 1.89 GB | 69.4 ms | 4.50 ms | 13.4 ms | 5.09 ms | 21.1 ms | 21.94 MB | 5.23 GB | 6.90->7.83, 11.76->11.76, 5.84->7.68 |
-| fmgrep `--store-docs` | 12.91 s | 3.42 GB | 19.5 ms | 4.72 ms | 12.9 ms | 13.7 ms | 16.5 ms | 22.70 MB | 5.14 GB | 7.83->7.96, 11.76->10.63, 7.68->8.39 |
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| rg | - | - | - | 2.85 s | 2.80 s | 3.13 s | 3.13 s | 4.08 s | 4.04 s | 3.01 s | 2.89 s | 208.89 MB | - | 3.88->13.19, 2.90->6.51, 6.15->10.70 |
+| fmgrep | 26.93 s | 1.89 GB | 107 ms | 16.5 ms | 28.8 ms | 22.5 ms | 35.4 ms | 17.9 ms | 19.4 ms | 17.2 ms | 29.0 ms | 67.30 MB | 4.84 GB | 13.19->17.35, 6.51->7.95, 10.70->15.19 |
+| fmgrep `--store-docs` | 25.05 s | 3.42 GB | 21.8 ms | 7.78 ms | 17.2 ms | 8.90 ms | 12.4 ms | 12.9 ms | 12.4 ms | 8.17 ms | 16.5 ms | 64.44 MB | 4.33 GB | 17.35->17.35, 7.95->11.42, 15.19->14.58 |
 
-Run 2 ran at load1 near 12, and its rg row is 40% slower than the other two.
+The first queries meet a cold page cache: `netdev_err`, the first, took
+164 ms (3710 lines in 519 files), and `atomic_set`, the third, 223 ms
+(3946 lines in 1499 files). An intersection costs rg three passes, the
+first over the whole tree.
 
 ## chromium
 
-460957 files, 2.84 GB, at chromium `e2c5a77`; 35 queries (30 literal, 5
-regex). One run, rows rg and fmgrep only. It started after a 30-minute wait
-with the same idle process present, at load1 1.35, and the fmgrep row ended
-at load1 14.9, so treat its timings as indicative.
+460957 files, 2.84 GB, at chromium `e2c5a77`; 40 queries (30 literal, 5
+regex, 5 intersection). One run, started at load1 2.50.
 
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 12.62 s | 13.87 s | 13.87 s | 13.87 s | 789.49 MB | - | 3.03->6.64 |
-| fmgrep | 71.65 s | 3.73 GB | 2.24 s | 64.3 ms | 315 ms | 2.63 s | 3.62 s | 62.50 MB | 5.97 GB | 6.64->14.92 |
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| rg | - | - | - | 14.78 s | 14.56 s | 15.18 s | 15.27 s | 17.08 s | 17.03 s | 14.91 s | 14.96 s | 688.31 MB | - | 3.45->5.92 |
+| fmgrep | 71.83 s | 3.73 GB | 2.81 s | 141 ms | 408 ms | 408 ms | 709 ms | 7.59 ms | 8.97 ms | 92.6 ms | 396 ms | 480.50 MB | 4.53 GB | 5.92->6.41 |
+| fmgrep `--store-docs` | 72.65 s | 6.57 GB | 40.0 ms | 40.3 ms | 147 ms | 101 ms | 110 ms | 7.70 ms | 7.50 ms | 34.1 ms | 125 ms | 481.58 MB | 3.75 GB | 6.41->7.53 |
 
 Here the files read from the tree dominate. `ready` is the stat of every
-file before the first answer. The first query, `base::BindOnce` (55196
-matches in 14079 files), took 3.47 s against a cold cache. The regexes
-verify every candidate file: `/#include "base/\w+\.h"/` reads 46770 of
-them and took 8.82 s, against rg's 13.85 s. `index --store-docs` avoids
-these reads for about 2.84 GB more index (not measured here).
+file before the first answer. The first query, `base::BindOnce` (55162
+lines in 14079 files), took 1.32 s against a cold cache. The regexes
+verify every candidate file: `/#include "base/\w+\.h"/` (78449 lines in
+46770 files) took 1.90 s, against rg's 15.54 s; with `--store-docs`,
+225 ms. An intersection touches few files, so it costs fmgrep under 13 ms
+and rg over 16 s.
 
 ## tgrep
 
 [tgrep](https://github.com/microsoft/tgrep), a trigram-index grep, is an
 optional row ([Method](#method); install:
 [docs/benchmark.md](docs/benchmark.md)). Same machine, tgrep 1.0.8 (commit
-`b1d0fc2`), measured 2026-09-25 (UTC) on a shared box, so treat the timings
-as indicative. The fmgrep rows are from the same runs.
+`b1d0fc2`). The fmgrep rows are from the same runs.
 
-GHC, median of 3 runs:
+GHC, three runs on 2026-10-05 (UTC):
 
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fmgrep | 2.02 s | 112.66 MB | 36.1 ms | 2.87 ms | 3.11 ms | 13.3 ms | 11.9 ms | 13.05 MB | 710.98 MB | 6.72->6.72, 6.92->6.77, 6.36->6.33 |
-| tgrep | 1.34 s | 87.62 MB | 159 ms | 5.53 ms | 6.57 ms | 12.3 ms | 20.1 ms | 109.44 MB | 126.38 MB | 6.72->6.72, 6.77->6.77, 6.33->6.33 |
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fmgrep | 2.18 s | 112.66 MB | 26.1 ms | 5.62 ms | 6.78 ms | 12.3 ms | 11.9 ms | 3.77 ms | 4.17 ms | 5.49 ms | 6.97 ms | 29.08 MB | 695.92 MB | 3.21->3.28, 3.18->3.33, 2.77->3.03 |
+| tgrep | 1.37 s | 87.61 MB | 172 ms | 7.94 ms | 8.39 ms | 13.4 ms | 22.7 ms | 134 ms | 97.5 ms | 8.85 ms | 21.2 ms | 138.02 MB | 128.80 MB | 3.28->3.28, 3.33->3.33, 3.03->3.03 |
 
-linux, single run:
+An intersection with a common side, such as `import AND zonkTcType`
+(161 ms), costs tgrep a `-l` over every file holding that side.
 
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | query footprint | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| fmgrep | 15.84 s | 1.89 GB | 70.4 ms | 4.49 ms | 12.1 ms | 5.17 ms | 22.2 ms | 21.38 MB | 5.32 GB | 6.50->7.69 |
-| tgrep | 12.10 s | 1.02 GB | 537 ms | 17.3 ms | 24.3 ms | 26.0 ms | 32.9 ms | 1.25 GB | 266.48 MB | 7.69->6.87 |
+linux, the runs above:
+
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fmgrep | 26.93 s | 1.89 GB | 107 ms | 16.5 ms | 28.8 ms | 22.5 ms | 35.4 ms | 17.9 ms | 19.4 ms | 17.2 ms | 29.0 ms | 67.30 MB | 4.84 GB | 13.19->17.35, 6.51->7.95, 10.70->15.19 |
+| tgrep | 15.44 s | 1.02 GB | 756 ms | 29.1 ms | 46.9 ms | 35.0 ms | 74.0 ms | - | - | - | - | 1.25 GB | 273.59 MB | 17.35->14.15, 11.42->10.37, 14.58->11.81 |
