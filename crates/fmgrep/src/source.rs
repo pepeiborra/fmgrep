@@ -120,7 +120,7 @@ impl Known {
 
     fn set(&self, id: usize, kind: u8) {
         let old = self.state[id]
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
                 Some(s & WARNED | kind)
             })
             .expect("the update always applies");
