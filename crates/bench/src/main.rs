@@ -348,8 +348,8 @@ mod tests {
     fn query_files_pin_a_commit_and_list_literals_first() {
         let counts = [
             ("ghc", 30, 5, 5),
-            ("linux", 92, 10, 5),
-            ("chromium", 30, 5, 5),
+            ("linux", 92, 13, 8),
+            ("chromium", 30, 8, 8),
         ];
         for (id, literals, regexes, intersections) in counts {
             let QuerySet {

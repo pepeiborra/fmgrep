@@ -104,10 +104,16 @@
     "/subsys_initcall\\(/",
     "/WARN_ONCE\\(/",
     "/EXPORT_SYMBOL_GPL\\(devm_\\w+\\)/",
+    "/BIF_CFG_DEV0_EPF\\d_VF\\d{3,}/",
+    "/0x[0-9A-F]{8}ULL/",
+    "/reg\\w+_BASE_IDX.*__SHIFT/",
     "static AND devm_platform_ioremap_resource",
     "return AND kvzalloc",
     "include AND alloc_pages_node",
     "int AND kmem_cache_create",
-    "kvzalloc AND kmem_cache_create"
+    "kvzalloc AND kmem_cache_create",
+    "DWC_E12MP_PHY_X4_NS_X4_ AND BIFPLR",
+    "regBIF_CFG_DEV0_EPF AND PERFCOUNTER",
+    "MARGINING AND PERFCOUNTER"
   ]
 }

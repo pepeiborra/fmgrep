@@ -37,10 +37,16 @@
     "/#include \"base/\\w+\\.h\"/",
     "/DCHECK_(EQ|NE|LT|GT)\\([^;\\n]*\\)/",
     "/RenderFrameHostImpl::\\w+\\(/",
+    "/include_subdomains\\d+/",
+    "/0x[0-9A-F]{8}L/",
+    "/Win32_Foundation.*unchecked/",
     "std::unique_ptr AND blink::LocalFrame",
     "DCHECK AND net::URLRequest",
     "std::vector AND net::URLRequest",
     "TODO AND blink::LocalFrame",
-    "blink::LocalFrame AND content::RenderFrameHost"
+    "blink::LocalFrame AND content::RenderFrameHost",
+    "Win32_Foundation AND from_bytes_unchecked",
+    "CurrencyDisplayname AND from_bytes_unchecked",
+    "CurrencyExtendedData AND UnitsDisplayNames"
   ]
 }
