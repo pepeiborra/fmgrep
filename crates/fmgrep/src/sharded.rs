@@ -98,7 +98,7 @@ fn build_one(cut: &Cut, docs: Cow<'_, [Document]>, rate: u32) -> Shard {
 }
 
 /// µs per occurrence locating `rows` rows of `shard`'s commonest byte, in
-/// chunks spread through one third of its rows; fastest of the 3 thirds.
+/// chunks spread through its rows; fastest of 3 passes over the same rows.
 fn sample_locate(shard: &Structure, rows: u64) -> Option<f64> {
     let root = shard.cursor();
     let byte = (1..=u8::MAX).max_by_key(|&b| root.extend_front(&[b]).count())?;
@@ -107,16 +107,15 @@ fn sample_locate(shard: &Structure, rows: u64) -> Option<f64> {
         return None;
     }
     let chunks = rows.div_ceil(SAMPLE_CHUNK);
-    let third = cursor.count() / 3;
-    let stride = third / chunks;
+    let stride = cursor.count() / chunks;
     let len = SAMPLE_CHUNK.min(stride);
     let mut docs = Vec::with_capacity(rows as usize);
     let mut fastest = f64::INFINITY;
-    for pass in 0..3 {
+    for _ in 0..3 {
         docs.clear();
         let start = Instant::now();
         for chunk in 0..chunks {
-            let at = pass * third + chunk * stride;
+            let at = chunk * stride;
             cursor.rows(at..at + len).locate(&mut |d| docs.push(d));
         }
         fastest = fastest.min(start.elapsed().as_secs_f64());
