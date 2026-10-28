@@ -93,7 +93,7 @@ answer, a load stats every document against its `(size, mtime)` stamp:
   names it.
 
 `serve` watches the tree, following new files and directories; with
-`--no-watch` it misses files added after its first answer. On a filesystem
+`--no-watch` it misses files added after it is ready. On a filesystem
 with 1-second mtimes, a same-size edit within that second goes unnoticed.
 The directory check relies on the filesystem updating a directory's mtime
 when an entry is created, removed or renamed, as POSIX requires; on one

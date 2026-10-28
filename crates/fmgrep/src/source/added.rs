@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, MutexGuard, PoisonError};
 
-use super::{Known, Recorded, WATCH_TICK, parallel};
+use super::{Known, Recorded, parallel};
 use crate::binary::sniff_binary;
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
@@ -68,67 +68,11 @@ impl Added {
     }
 }
 
-/// Closed while a [`Discovery`] exists; open when none was made.
-#[derive(Default)]
-pub struct Latch {
-    closed: AtomicBool,
-    lock: Mutex<()>,
-    open: Condvar,
-}
-
-impl Latch {
-    fn release(&self) {
-        let _held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.closed.store(false, Ordering::Release);
-        self.open.notify_all();
-    }
-
-    /// Block until open, or until `stop`: whether it opened.
-    pub fn wait(&self, stop: Option<&AtomicBool>) -> bool {
-        if !self.closed.load(Ordering::Acquire) {
-            return true;
-        }
-        let mut held = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        while self.closed.load(Ordering::Acquire) {
-            if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
-                return false;
-            }
-            held = self
-                .open
-                .wait_timeout(held, WATCH_TICK)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
-        }
-        true
-    }
-}
-
-/// One walk of the root for added files; waiters are released when it is
-/// dropped, run or not.
-pub struct Discovery {
-    known: Arc<Known>,
-}
-
 impl super::Files {
-    /// The walk for added files; [`Self::wait_discovered`] blocks until it
-    /// is dropped.
-    pub fn discovery(&self) -> Discovery {
-        self.known.latch.closed.store(true, Ordering::Release);
-        Discovery {
-            known: Arc::clone(&self.known),
-        }
-    }
-}
-
-impl Discovery {
     /// Register every text file under the root that ascending `files` does
     /// not list; with a record, only changed and new directories are listed.
-    pub fn run(self, files: &[String], stop: &AtomicBool) {
+    pub fn discover(&self, files: &[String]) {
         let known = &*self.known;
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        known.discovering.store(true, Ordering::Release);
         match &known.recorded {
             Some(recorded) => known.discover_recorded(recorded, files),
             None => known.discover(&known.root, &known.root, files),
@@ -138,12 +82,6 @@ impl Discovery {
         if n > 0 && crate::verbose::verbose() {
             eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
         }
-    }
-}
-
-impl Drop for Discovery {
-    fn drop(&mut self) {
-        self.known.latch.release();
     }
 }
 
@@ -234,9 +172,6 @@ impl Known {
     /// Reconcile what is at `path` now: a text file not in ascending `files`
     /// is added, a directory is walked, anything else is dropped.
     pub fn reconcile_path(&self, root: &Path, path: &Path, files: &[String]) {
-        if !self.discovering.load(Ordering::Acquire) {
-            return;
-        }
         let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
         };

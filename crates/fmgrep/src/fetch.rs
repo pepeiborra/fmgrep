@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{DOCS_SHARD, Manifest, shard_offsets};
-use crate::source::{Discovery, Files, Journal, Knob, Recorded, Stamps, Watch};
+use crate::source::{Files, Journal, Knob, Recorded, Stamps, Watch};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -207,17 +207,11 @@ impl DocStore {
         }
     }
 
-    /// The walk for added files; `None` for a shard source.
-    pub fn discovery(&self) -> Option<Discovery> {
-        match &self.source {
-            Source::Shard { .. } => None,
-            Source::Files(f) => Some(f.discovery()),
-        }
-    }
-
-    pub fn wait_discovered(&self) {
+    /// Register the text files under the root that ascending `files` does
+    /// not list; nothing for stored docs.
+    pub fn discover(&self, files: &[String]) {
         if let Source::Files(f) = &self.source {
-            f.wait_discovered();
+            f.discover(files);
         }
     }
 

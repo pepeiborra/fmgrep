@@ -332,13 +332,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     let root = docs_root(req)?;
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("error: cannot resolve {}: {e}", root.display()))?;
-    let (index, mut docs) = load(
-        req.index_dir,
-        req.manifest,
-        req.corpus_root,
-        req.watch,
-        true,
-    )?;
+    let (index, mut docs) = load(req.index_dir, req.manifest, req.corpus_root, req.watch)?;
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }
@@ -353,8 +347,8 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     })
 }
 
-/// Load once, then serve. Over TCP the bound address is printed on `out` as
-/// the readiness line.
+/// Load and check the tree once, then serve; over TCP the bound address
+/// printed on `out` is the readiness line.
 pub fn run_serve(
     req: &ServeRequest<'_>,
     input: &mut dyn BufRead,
@@ -375,16 +369,13 @@ pub fn run_serve(
             Some(listener)
         }
     };
-    let (watch, discovery) = (session.docs.take_watch(), session.docs.take_discovery());
+    let watch = session.docs.take_watch();
     let stop = AtomicBool::new(false);
     // Plain threads: they live as long as the session.
     std::thread::scope(|scope| {
         let (stop, files, lens) = (&stop, &req.manifest.files, &req.manifest.doc_lens);
         if let Some(watch) = watch {
             scope.spawn(move || watch.run(files, lens, stop));
-        }
-        if let Some(discovery) = discovery {
-            scope.spawn(move || discovery.run(files, stop));
         }
         let served = match listener {
             None => serve_lines(&mut session, input, out).map(|_| ()),

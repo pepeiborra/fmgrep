@@ -247,8 +247,7 @@ mod tests {
         };
         let measured = |index: &std::path::Path| {
             let manifest = crate::manifest::read_manifest(index).unwrap();
-            let (fm, mut loaded) =
-                super::super::load(index, &manifest, None, false, false).unwrap();
+            let (fm, mut loaded) = super::super::load(index, &manifest, None, false).unwrap();
             assert_eq!(loaded.locate_us, locate_us(16, None));
             loaded.measure_locate(&fm);
             (fm, loaded.locate_us)
@@ -278,7 +277,7 @@ mod tests {
         let index = indexed(tmp.path(), &TWO_FILES);
         crate::tests::SAMPLE_RATE.set(None);
         let manifest = crate::manifest::read_manifest(&index).unwrap();
-        let (_, loaded) = super::super::load(&index, &manifest, None, false, false).unwrap();
+        let (_, loaded) = super::super::load(&index, &manifest, None, false).unwrap();
         assert!((loaded.locate_us - 3.52).abs() < 1e-9);
     }
 }

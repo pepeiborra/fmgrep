@@ -18,7 +18,6 @@ mod added;
 mod journal;
 mod recorded;
 
-pub use added::Discovery;
 pub use journal::{Journal, Knob, marks};
 pub use recorded::{Recorded, write_walk};
 
@@ -104,10 +103,6 @@ struct Known {
     /// The index dir, canonical: never an added file.
     exclude: Option<PathBuf>,
     added: Mutex<added::Added>,
-    latch: added::Latch,
-    /// Whether discovery has started; added files are reconciled only after
-    /// it.
-    discovering: AtomicBool,
     recorded: Option<Recorded>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
@@ -198,7 +193,6 @@ impl Known {
     /// re-stat the docs at or under each and reconcile each; list each of
     /// `relist` one level.
     fn replay(&self, paths: &[String], relist: &[String], files: &[String], lens: &[u64]) {
-        self.discovering.store(true, Ordering::Release);
         let root = &self.root;
         let by_path: Vec<usize> = (0..files.len()).collect();
         let mut ids = Vec::new();
@@ -273,8 +267,6 @@ impl Files {
                 epoch: AtomicUsize::new(0),
                 exclude: None,
                 added: Mutex::default(),
-                latch: added::Latch::default(),
-                discovering: AtomicBool::new(false),
                 recorded: None,
                 complete: AtomicBool::new(false),
             }),
@@ -365,10 +357,6 @@ impl Files {
     pub fn record(&mut self, recorded: Recorded) {
         let known = Arc::get_mut(&mut self.known).expect("record precedes sharing");
         known.recorded = Some(recorded);
-    }
-
-    pub fn wait_discovered(&self) {
-        self.known.latch.wait(None);
     }
 
     /// Stat every doc; each newly gone one warns, in doc order.
@@ -479,12 +467,9 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Once discovery is done, re-stat and re-check for added files what each
-    /// burst names, until `stop`; an error, overflow or root event redoes all.
+    /// Re-stat and re-check for added files what each burst names, until
+    /// `stop`; an error, overflow or root event redoes all.
     pub fn run(self, files: &[String], lens: &[u64], stop: &AtomicBool) {
-        if !self.known.latch.wait(Some(stop)) {
-            return;
-        }
         let mut by_path: Vec<usize> = (0..files.len()).collect();
         by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
         while !stop.load(Ordering::Relaxed) {
@@ -512,9 +497,7 @@ impl Watch {
             }
             if all {
                 self.known.stat_all(files, lens);
-                if self.known.discovering.load(Ordering::Acquire) {
-                    self.known.discover(&self.root, &self.root, files);
-                }
+                self.known.discover(&self.root, &self.root, files);
             } else {
                 ids.sort_unstable();
                 ids.dedup();

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::regex_pattern;
@@ -15,7 +14,7 @@ use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
 use crate::sink::{DocMatches, MatchSink};
-use crate::source::{Discovery, Watch};
+use crate::source::Watch;
 use crate::wire::{OutputReport, QueryReport};
 
 /// What a search answers. The manifest is read once by the dispatcher and
@@ -46,7 +45,6 @@ pub struct Loaded {
     docs: DocStore,
     pub load_wall: Duration,
     watch: Option<Watch>,
-    discovery: Option<Discovery>,
     band: boolean::ReadBand,
     locate_us: f64,
 }
@@ -77,11 +75,6 @@ impl Loaded {
         self.watch.take()
     }
 
-    /// The discovery [`load`] deferred; [`answer`] waits for it.
-    pub fn take_discovery(&mut self) -> Option<Discovery> {
-        self.discovery.take()
-    }
-
     /// Indexed files missing at load.
     pub fn gone(&self) -> usize {
         self.docs.gone()
@@ -106,14 +99,13 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout replays its journal, else stats every doc
-/// and discovers added files (deferred under `defer`); under `watch` it
-/// watches the root from before both.
+/// and discovers added files; under `watch` it watches the root from before
+/// both.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
     corpus_root: Option<&Path>,
     watch: bool,
-    defer: bool,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
     let docs = DocStore::open(index_dir, manifest, corpus_root)?;
@@ -125,30 +117,25 @@ pub fn load(
         w => w.and_then(Result::ok),
     };
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
-    let running = AtomicBool::new(false);
-    let (files, docs_ref, running_ref) = (&manifest.files, &docs, &running);
+    let (files, docs_ref) = (&manifest.files, &docs);
     // Plain threads: fixed blocking passes that overlap the load.
-    let (index, discovery) = std::thread::scope(|scope| {
+    let index = std::thread::scope(|scope| {
         let fresh = scope.spawn(move || {
             if docs_ref.replay(files) {
-                return None;
+                return;
             }
-            let mut discovery = docs_ref.discovery();
-            if let Some(d) = (!defer).then(|| discovery.take()).flatten() {
-                scope.spawn(move || d.run(files, running_ref));
-            }
+            scope.spawn(move || docs_ref.discover(files));
             docs_ref.stat_all(files);
-            discovery
         });
         let index = DocfmIndex::load(&blobs, &manifest.doc_lens);
-        (index, fresh.join().expect("the stat pass panicked"))
+        fresh.join().expect("the stat pass panicked");
+        index
     });
     let index = index.map_err(|e| format!("error: {e}"))?;
     let loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
         watch,
-        discovery,
         band: boolean::ReadBand::DEFAULT,
         locate_us: read::locate_us(index.sample_rate(), None),
     };
@@ -174,28 +161,34 @@ fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
 
 /// [`load`] then [`answer`].
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
-    let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, false, false)?;
+    let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, false)?;
     answer(&index, &mut loaded, req, sink)
 }
 
-/// Answer every term, or the expression, from `index` and `loaded`, once
-/// discovery is done (a wait counts in `index_time_us`); then checkpoint the
-/// journal.
+/// Answer every term, or the expression, from `index` and `loaded`; then
+/// checkpoint the journal.
 pub fn answer(
     index: &DocfmIndex,
     loaded: &mut Loaded,
     req: &QueryRequest<'_>,
     sink: &mut dyn MatchSink,
 ) -> Result<OutputReport, String> {
-    let wait = Instant::now();
-    if let Some(d) = loaded.discovery.take() {
-        d.run(&req.manifest.files, &AtomicBool::new(false));
-    }
-    loaded.docs.wait_discovered();
-    let waited = wait.elapsed().as_micros() as u64;
-    let mut report = answer_discovered(index, loaded, req, sink)?;
+    let report = match req.expr {
+        Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink)?,
+        None => {
+            let terms: Vec<Term<'_>> = req
+                .terms
+                .iter()
+                .map(|t| Term {
+                    name: Cow::Borrowed(t),
+                    literal: t.as_bytes(),
+                    pattern: spelled(t, req.regex, req.mode.ignore_case),
+                })
+                .collect();
+            answer_terms(index, loaded, req, &terms, sink)?
+        }
+    };
     loaded.docs.checkpoint(req.index_dir, &req.manifest.files);
-    report.index_time_us += waited;
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter
         && !report.queries.iter().any(matched)
@@ -210,27 +203,6 @@ pub fn answer(
         return Err(format!("error: no files were searched: {why}"));
     }
     Ok(report)
-}
-
-fn answer_discovered(
-    index: &DocfmIndex,
-    loaded: &mut Loaded,
-    req: &QueryRequest<'_>,
-    sink: &mut dyn MatchSink,
-) -> Result<OutputReport, String> {
-    if let Some(expr) = req.expr {
-        return boolean::answer_expr(index, loaded, req, expr, sink);
-    }
-    let terms: Vec<Term<'_>> = req
-        .terms
-        .iter()
-        .map(|t| Term {
-            name: Cow::Borrowed(t),
-            literal: t.as_bytes(),
-            pattern: spelled(t, req.regex, req.mode.ignore_case),
-        })
-        .collect();
-    answer_terms(index, loaded, req, &terms, sink)
 }
 
 /// One per-term query: the name it reports under, its literal bytes, and

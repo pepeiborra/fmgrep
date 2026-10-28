@@ -47,7 +47,7 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     }
     let mut files = open_files(&fix);
     files.exclude(&root.join("idx"));
-    files.discovery().run(&fix.files, &AtomicBool::new(false));
+    files.discover(&fix.files);
     let want: &[&str] = if cfg!(unix) {
         &["alias.c", "b.c", "new/deep/n.c"]
     } else {
@@ -72,12 +72,11 @@ fn watch_registers_created_renamed_and_new_dir_files() {
     let root = fix.path.clone();
     let files = open_files(&fix);
     let watch = files.watch().unwrap();
-    let discovery = files.discovery();
+    files.discover(&fix.files);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
         let _stop = StopOnDrop(&stop);
-        discovery.run(&fix.files, &stop);
         // FSEvents can miss changes made just after the watch starts.
         let created = || {
             write(&root, "x.c", b"printk");
@@ -103,12 +102,11 @@ fn watch_drops_a_deleted_added_file_and_readds_it_when_recreated() {
     write(&root, "x.c", b"printk");
     let files = open_files(&fix);
     let watch = files.watch().unwrap();
-    let discovery = files.discovery();
+    files.discover(&fix.files);
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
         let _stop = StopOnDrop(&stop);
-        discovery.run(&fix.files, &stop);
         assert_eq!(files.snapshot().added, [1]);
         let deleted = || {
             let _ = std::fs::remove_file(root.join("x.c"));
@@ -125,43 +123,13 @@ fn watch_drops_a_deleted_added_file_and_readds_it_when_recreated() {
 }
 
 #[test]
-fn watch_waits_for_discovery_before_applying_events() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fix = stage_files(tmp.path(), &[b"printk"]);
-    let files = open_files(&fix);
-    let watch = files.watch().unwrap();
-    let discovery = files.discovery();
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-        let _stop = StopOnDrop(&stop);
-        write(&fix.path, "x.c", b"printk");
-        std::fs::write(fix.path.join(&fix.files[0]), b"changed").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            files.snapshot().stale.is_empty(),
-            "no event is applied before discovery"
-        );
-        // Unrun, it only releases; a rewrite covers events FSEvents dropped.
-        files.known.discovering.store(true, Ordering::Release);
-        drop(discovery);
-        let seen = || {
-            write(&fix.path, "x.c", b"printk");
-            std::fs::write(fix.path.join(&fix.files[0]), b"changed").unwrap();
-            live(&files) == ["x.c"] && files.snapshot().stale == [0]
-        };
-        assert!(eventually(seen), "{:?}", files.snapshot());
-    });
-}
-
-#[test]
 fn read_of_an_added_file_turned_binary_drops_it_silently() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk"]);
     write(&fix.path, "x.c", b"printk");
     write(&fix.path, "y.c", b"printk");
     let files = open_files(&fix);
-    files.discovery().run(&fix.files, &AtomicBool::new(false));
+    files.discover(&fix.files);
     assert_eq!(files.snapshot().added, [1, 2]);
     let epoch = files.epoch();
     std::fs::write(fix.path.join("x.c"), b"printk\0").unwrap();
@@ -203,7 +171,7 @@ fn discovered(fix: &Fix, manifest: &[String], walk_all: bool) -> Files {
         let index = fix.path.parent().unwrap();
         files.record(super::super::Recorded::open(index).unwrap().unwrap());
     }
-    files.discovery().run(manifest, &AtomicBool::new(false));
+    files.discover(manifest);
     files
 }
 

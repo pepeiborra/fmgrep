@@ -15,15 +15,14 @@ then answers newline-delimited JSON-RPC 2.0: one request per line, one
 response line each.
 
 - `--listen ADDR` (default `127.0.0.1:0`): TCP. The bound address is the
-  only line on stdout, printed once the index is loaded, so it doubles as
-  the readiness signal. Connections are served one at a time, each until
-  EOF, until a `shutdown`.
+  only line on stdout, printed once the index is loaded and the tree
+  checked, so it doubles as the readiness signal. Connections are served
+  one at a time, each until EOF, until a `shutdown`.
 - `--stdio`: requests on stdin, responses on stdout, ending at EOF.
 - A load that fails (no index, an old format, a damaged index) exits 2
   before the readiness line, with the message a search would print.
 - `serve` watches the tree for changed and added files unless `--no-watch`
-  is given ([Staleness](index-format.md#staleness)). Its first answer waits
-  for the walk that finds files added before it started.
+  is given ([Staleness](index-format.md#staleness)).
 - `serve` needs its documents: `docs.shard`, or the tree with
   `docs.stamps` and at most half the indexed files. Otherwise it exits 2
   before the readiness line.

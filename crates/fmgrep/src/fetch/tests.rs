@@ -714,10 +714,7 @@ fn discovered(fix: &Fix, added: &[(&str, &[u8])]) -> DocStore {
     }
     let mut store = reader(fix);
     store.stat_all(&fix.files);
-    store
-        .discovery()
-        .unwrap()
-        .run(&fix.files, &std::sync::atomic::AtomicBool::new(false));
+    store.discover(&fix.files);
     store.begin();
     store
 }

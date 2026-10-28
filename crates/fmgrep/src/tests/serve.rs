@@ -513,7 +513,6 @@ fn serve_no_watch_finds_only_files_added_before_load() {
     let corpus = tmp.path().join("corpus");
     std::fs::write(corpus.join("ab.c"), b"printk before\n").unwrap();
     let (addr, server) = spawn_server(&index, &["--no-watch"]);
-    // The first answer waits for discovery.
     assert_eq!(served_totals(&addr, &["printk"]), [5]);
     std::fs::write(corpus.join("c.c"), b"printk after\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));

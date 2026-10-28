@@ -135,6 +135,46 @@ fn serve_watch_handles_delete_then_recreate() {
     assert!(stderr.contains("a.bin"), "{stderr}");
 }
 
+#[test]
+fn serve_is_ready_only_once_added_files_are_found() {
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    std::fs::write(docs.join("d.bin"), b"printk added\n").unwrap();
+    for flags in [&[][..], &["--no-watch"]] {
+        // One file for both streams keeps their writes in order.
+        let log = tmp.path().join("serve.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let mut server = Server(
+            fmgrep()
+                .args([&["serve", &index][..], flags].concat())
+                .env("FMGREP_VERBOSE", "1")
+                .stdout(out)
+                .stderr(err)
+                .spawn()
+                .expect("spawn serve"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (text, addr) = loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            let mut lines = text.split_inclusive('\n');
+            let addr = lines.find(|l| l.starts_with("127.0.0.1:") && l.ends_with('\n'));
+            if let Some(addr) = addr.map(|a| a.trim_end().to_owned()) {
+                break (text, addr);
+            }
+            assert!(Instant::now() < deadline, "no readiness line: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let note = text.find("1 file(s) added since indexing");
+        assert!(
+            note.is_some_and(|n| n < text.find(&addr).unwrap()),
+            "{flags:?}: {text}"
+        );
+        assert_eq!(served_printk(&addr), 4, "{flags:?}");
+        shutdown(&mut server, &addr);
+    }
+}
+
 /// `--server` reads no local index: the `--no-watch` server's answer, which
 /// misses a file added after its first search, from anywhere.
 #[test]
