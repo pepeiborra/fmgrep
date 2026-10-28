@@ -3,6 +3,7 @@
 //! the undecided documents only.
 
 mod demote;
+mod explain;
 
 pub use demote::{ReadBand, read_band};
 
@@ -304,8 +305,13 @@ pub fn answer_expr(
     }
     let start = Instant::now();
     let mut probe_us = plan.probe_us + sample_us;
+    let verbose = crate::verbose::plans();
+    let mut leaf_us = Vec::new();
     let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
     for a in answers {
+        if verbose {
+            leaf_us.push(a.as_ref().map(|a| a.probe_us));
+        }
         hits.push(match a {
             Some(a) => {
                 probe_us += a.probe_us;
@@ -399,7 +405,7 @@ pub fn answer_expr(
     }
     let mut docs_matched = 0usize;
     let mut leaf_totals = vec![0u64; leaves.len()];
-    match (req.output, alternation.as_ref()) {
+    let fetch = match (req.output, alternation.as_ref()) {
         (QueryOutput::Counts, _) => {
             // Members a regex or unsettled leaf still has to count are
             // fetched too.
@@ -417,7 +423,30 @@ pub fn answer_expr(
                         || plan.unsettled.iter().any(|u| demote::contains(u, d))
                 })
                 .collect();
-            let fetch = union(&root.maybe, &unsure);
+            union(&root.maybe, &unsure)
+        }
+        (QueryOutput::FilesWithMatches, _) => root.maybe.clone(),
+        (_, None) => Vec::new(),
+        (_, Some(_)) => union(&root.yes, &root.maybe),
+    };
+    if verbose {
+        eprint!(
+            "{}",
+            explain::Explain {
+                expr,
+                leaves: &leaves,
+                plan: &plan,
+                leaf_us: &leaf_us,
+                hits: &hits,
+                root: &root,
+                stale: stale.len(),
+                output: req.output,
+                reads: fetch.len(),
+            }
+        );
+    }
+    match (req.output, alternation.as_ref()) {
+        (QueryOutput::Counts, _) => {
             let mut order = fetch.clone();
             paths.sort(&mut order);
             let map =
@@ -471,7 +500,7 @@ pub fn answer_expr(
                 Ok(())
             };
             let mut members = 0usize;
-            let mut maybe = root.maybe.clone();
+            let mut maybe = fetch;
             paths.sort(&mut maybe);
             fetch_stream_parallel(
                 docs,
@@ -497,7 +526,7 @@ pub fn answer_expr(
                 req.output,
                 QueryOutput::CountLines | QueryOutput::CountMatches
             );
-            let mut fetch = union(&root.yes, &root.maybe);
+            let mut fetch = fetch;
             paths.sort(&mut fetch);
             let output = req.output;
             let map = |doc: usize, raw: &[u8]| {

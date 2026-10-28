@@ -1,18 +1,48 @@
-//! The one verbosity switch: per-file walk detail is off unless asked for.
+//! The one verbosity switch: level 1 prints per-file walk detail and serve's
+//! measured costs, level 2 also every query's plan.
 
+use std::fmt;
 use std::sync::OnceLock;
 
-static VERBOSE: OnceLock<bool> = OnceLock::new();
+static LEVEL: OnceLock<u64> = OnceLock::new();
 
-/// Apply `--verbose` or a positive `FMGREP_VERBOSE`; the first call fixes the
-/// answer.
+/// Apply `--verbose` (level 1) or `FMGREP_VERBOSE`'s count; the first call
+/// fixes the level.
 pub fn set_verbose(flag: bool) -> Result<(), String> {
-    let on = crate::env::count("FMGREP_VERBOSE", 0)? > 0 || flag;
-    let _ = VERBOSE.set(on);
+    let level = crate::env::count("FMGREP_VERBOSE", 0)?.max(u64::from(flag));
+    let _ = LEVEL.set(level);
     Ok(())
 }
 
-/// Whether per-file detail is printed.
+fn level() -> u64 {
+    LEVEL.get().copied().unwrap_or(0)
+}
+
+/// Whether per-file detail and serve's measured costs are printed.
 pub fn verbose() -> bool {
-    VERBOSE.get().copied().unwrap_or(false)
+    level() >= 1
+}
+
+/// Whether each query's plan is printed.
+pub fn plans() -> bool {
+    level() >= 2
+}
+
+/// Microseconds, shown in µs, ms or s.
+pub struct Us(pub f64);
+
+impl fmt::Display for Us {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            us if us < 10.0 && us.fract() != 0.0 => write!(f, "{us:.2} µs"),
+            us if us < 1e3 => write!(f, "{us:.0} µs"),
+            us if us < 1e6 => write!(f, "{:.1} ms", us / 1e3),
+            us => write!(f, "{:.2} s", us / 1e6),
+        }
+    }
+}
+
+/// `"s"` unless `n` is 1.
+pub fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }

@@ -465,3 +465,57 @@ fn paths_print_and_glob_as_rg_from_a_subdirectory() {
         ok(&format!("{abs}/c.c\n"))
     );
 }
+
+/// `FMGREP_VERBOSE=2` prints the plan on stderr and changes nothing on stdout.
+#[test]
+fn verbose_prints_the_plan_on_stderr_and_leaves_stdout_alone() {
+    let common = "common ".repeat(20) + "zonkA\n";
+    let (_tmp, docs) = stage_files(&[
+        ("a.c", common.as_bytes()),
+        ("b.c", b"common\n"),
+        ("c.c", b"zonkB\n"),
+    ]);
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/d.c"), "common\n").unwrap();
+    assert!(run_in(&docs, &["index"]).status.success());
+    let search = |dir: &Path, args: &[&str], verbose: bool| {
+        let mut cmd = fmgrep();
+        cmd.current_dir(dir).args(args).env_remove("FMGREP_VERBOSE");
+        if verbose {
+            cmd.env("FMGREP_VERBOSE", "2");
+        }
+        let out = cmd.output().expect("spawn fmgrep");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr(&out),
+        )
+    };
+    let expr = ["-l", "--expr", r"common AND /zonk\w+/"];
+    for (dir, args, stdout, said) in [
+        (
+            docs.clone(),
+            &expr[..],
+            "a.c\n",
+            &[
+                "plan: common AND /zonk\\w+/\nleaf 0 common ",
+                "demoted by the 8x fallback ratio: 22 > 8 x 2 of leaf 1 (a regex reference)",
+                "\nroot: yes 0, maybe 2 (stale 0); -l reads 2\n",
+            ][..],
+        ),
+        (
+            docs.join("sub"),
+            &["-l", "common"],
+            "d.c\n",
+            &["plan:\nterm 0 common  read 1 file (7 bytes) instead of locating"],
+        ),
+    ] {
+        let plain = search(&dir, args, false);
+        assert_eq!(plain, (stdout.to_owned(), String::new()), "{args:?}");
+        let (out, err) = search(&dir, args, true);
+        assert_eq!(out, stdout, "{args:?}");
+        for s in said {
+            assert!(err.contains(s), "{args:?}: {err}");
+        }
+    }
+}

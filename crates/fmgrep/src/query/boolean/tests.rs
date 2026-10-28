@@ -471,6 +471,157 @@ fn cost_rule_under_an_or_keeps_the_ratio_test_and_the_demoted_w() {
 }
 
 #[test]
+fn arrange_records_the_reference_and_the_ratio() {
+    use demote::Why;
+    let e = Expr::And(vec![t("import"), re("zonkTc\\w+"), t("x")]);
+    let (counted, plan) = arranged(&e, on_doc0(&[5000, 3, 24]));
+    assert_eq!(plan.counted, counted);
+    let ratio = |total| Why::Ratio {
+        reference: 1,
+        total,
+        min: 3,
+    };
+    assert_eq!(plan.why, [ratio(5000), Why::Reference, ratio(24)]);
+    let (_, plan) = arranged(&Expr::And(vec![t("a"), t("b")]), on_doc0(&[5, 1]));
+    assert_eq!(plan.why, [Why::Located, Why::Reference]);
+}
+
+#[test]
+fn decide_records_the_edge_or_sample_that_decided() {
+    use demote::{Read, Why};
+    let e = Expr::And(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+    let totals = [100, 150, 600, 1200, 100_000];
+    let counts = || totals.iter().map(|&t| vec![(0..40, t)]).collect();
+    let exact: Vec<(usize, u64)> = (0..20).map(|d| (d, 5)).collect();
+    let cost = |locate_us, read_us, read| Why::Cost {
+        reference: 0,
+        locate_us,
+        docs: 20,
+        read_us,
+        read,
+    };
+    let (_, mut plan) = arranged(&e, counts());
+    decided(&mut plan, band(10.0, 100.0), exact.clone(), 100, 40.0);
+    assert_eq!(
+        plan.why,
+        [
+            Why::Reference,
+            cost(150.0, 10.0, Read::Floor),
+            cost(600.0, 40.0, Read::Sampled(16)),
+            cost(1200.0, 40.0, Read::Sampled(16)),
+            cost(100_000.0, 100.0, Read::Ceiling),
+        ]
+    );
+    let (_, mut plan) = arranged(&e, counts());
+    let a = answer(exact, 100);
+    let stage1: Vec<Option<&Answer>> = (0..5).map(|i| (i == 0).then_some(&a)).collect();
+    demote::decide(&mut plan, band(10.0, 100.0), &stage1, &mut |_| {
+        Err("gone".into())
+    });
+    assert_eq!(plan.why[2], cost(600.0, 100.0, Read::Failed));
+    assert_eq!(plan.demoted, [false, false, false, false, true]);
+}
+
+#[test]
+fn the_plan_states_each_decision_and_its_numbers() {
+    use demote::{Read, Why};
+    use explain::{Reason, Runs};
+    let said = |why, demoted, counted, regex_reference| {
+        Reason {
+            why,
+            demoted,
+            counted,
+            regex_reference,
+        }
+        .to_string()
+    };
+    let ratio = Why::Ratio {
+        reference: 1,
+        total: 27166,
+        min: 2004,
+    };
+    let cost = |docs, read| Why::Cost {
+        reference: 1,
+        locate_us: 82_000.0,
+        docs,
+        read_us: 9.8,
+        read,
+    };
+    for (why, demoted, counted, regex, want) in [
+        (Why::Located, false, false, false, "located"),
+        (Why::Located, false, true, false, "located: not demotable"),
+        (
+            Why::Reference,
+            false,
+            true,
+            false,
+            "reference: rarest counted leaf of its AND",
+        ),
+        (
+            ratio,
+            true,
+            true,
+            true,
+            "demoted by the 8x fallback ratio: 27166 > 8 x 2004 of leaf 1 (a regex reference)",
+        ),
+        (
+            ratio,
+            false,
+            true,
+            false,
+            "located: 27166 <= 8 x 2004 of leaf 1, within the 8x fallback ratio (an AND under an OR)",
+        ),
+        (
+            cost(85, Read::Ceiling),
+            true,
+            true,
+            false,
+            "demoted: locate est 82.0 ms > read 85 docs of leaf 1 x 9.80 µs = 833 µs at the band ceiling",
+        ),
+        (
+            cost(10_000, Read::Floor),
+            false,
+            true,
+            false,
+            "located: locate est 82.0 ms <= read 10000 docs of leaf 1 x 9.80 µs = 98.0 ms at the band floor",
+        ),
+        (
+            cost(1, Read::Sampled(1)),
+            true,
+            true,
+            false,
+            "demoted: locate est 82.0 ms > read 1 doc of leaf 1 x 9.80 µs = 9.80 µs, the read cost sampled over 1 doc",
+        ),
+        (
+            cost(85, Read::Failed),
+            true,
+            true,
+            false,
+            "demoted: locate est 82.0 ms > read 85 docs of leaf 1 x 9.80 µs = 833 µs at the band ceiling, the read sample failed",
+        ),
+        (
+            cost(0, Read::Ceiling),
+            true,
+            true,
+            false,
+            "demoted: leaf 1 has no document to read",
+        ),
+    ] {
+        assert_eq!(said(why, demoted, counted, regex), want);
+    }
+    let runs = |r: &[Range<usize>]| Runs(r.iter().cloned()).to_string();
+    assert_eq!(runs(&[]), "[]");
+    assert_eq!(runs(&[0..10, 10..12, 20..30]), "[0..12) [20..30)");
+    let many: Vec<Range<usize>> = (0..7).map(|k| 2 * k..2 * k + 1).collect();
+    assert_eq!(runs(&many), "[0..1) [2..3) [4..5) [6..7) +3 more");
+    let us = |x| crate::verbose::Us(x).to_string();
+    assert_eq!(
+        [us(1.76), us(8.0), us(989.4), us(6800.0), us(2.5e6)],
+        ["1.76 µs", "8 µs", "989 µs", "6.8 ms", "2.50 s"]
+    );
+}
+
+#[test]
 fn a_measured_band_keeps_the_default_shape_within_2_to_200_us() {
     assert_eq!(ReadBand::around(12.0), ReadBand::DEFAULT);
     let band = ReadBand {

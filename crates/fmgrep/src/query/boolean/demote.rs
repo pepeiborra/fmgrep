@@ -13,7 +13,7 @@ pub const SAMPLE_DOCS: usize = 16;
 
 /// A regex reference, or an AND under an OR, demotes a sibling counted over
 /// this many times the rarest.
-const FALLBACK_RATIO: u64 = 8;
+pub const FALLBACK_RATIO: u64 = 8;
 
 /// Microseconds per document read: outside the band its edge decides,
 /// inside it the cost is sampled.
@@ -94,6 +94,39 @@ pub fn to_count(groups: &[AndGroup], countable: &[bool], demotable: &[bool]) -> 
     out
 }
 
+/// What placed a leaf; the verbose plan prints it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Why {
+    Located,
+    /// Its AND's first smallest counted leaf.
+    Reference,
+    /// Judged by [`FALLBACK_RATIO`]: `total` against the reference's `min`.
+    Ratio {
+        reference: usize,
+        total: u64,
+        min: u64,
+    },
+    /// Judged by [`decide`]: locating against reading `docs` at `read_us`.
+    Cost {
+        reference: usize,
+        locate_us: f64,
+        docs: usize,
+        read_us: f64,
+        read: Read,
+    },
+}
+
+/// Where [`decide`]'s read cost came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Read {
+    Floor,
+    Ceiling,
+    /// Sampled over this many documents.
+    Sampled(usize),
+    /// The sample failed; the ceiling stood in.
+    Failed,
+}
+
 /// Which leaves are located, where, and what their exact counts may miss.
 pub struct Plan {
     pub demoted: Vec<bool>,
@@ -107,6 +140,8 @@ pub struct Plan {
     pub counts: Vec<Vec<(Range<usize>, u64)>>,
     pub groups: Vec<Group>,
     pub probe_us: u64,
+    pub counted: Vec<bool>,
+    pub why: Vec<Why>,
 }
 
 /// An AND whose candidates wait on its located reference.
@@ -189,6 +224,8 @@ pub fn arrange(
         counts: Vec::new(),
         groups: Vec::new(),
         probe_us: 0,
+        counted: counted.to_vec(),
+        why: vec![Why::Located; n],
     };
     for AndGroup {
         leaves: g,
@@ -203,10 +240,18 @@ pub fn arrange(
             continue;
         };
         let ratio = (!literal[m] || *under_or).then_some(FALLBACK_RATIO);
+        plan.why[m] = Why::Reference;
         let mut candidates = Vec::new();
         for (i, t) in totals.filter(|&(i, _)| i != m && demotable[i]) {
             match ratio {
-                Some(k) => plan.demoted[i] = t > k.saturating_mul(min),
+                Some(k) => {
+                    plan.demoted[i] = t > k.saturating_mul(min);
+                    plan.why[i] = Why::Ratio {
+                        reference: m,
+                        total: t,
+                        min,
+                    };
+                }
                 None => candidates.push(i),
             }
         }
@@ -242,10 +287,11 @@ pub fn arrange(
     plan
 }
 
-/// Demote each candidate whose estimated locate outlasts reading its
-/// reference's documents. `read_us` times reads of the given documents, per
-/// document; it runs at most once, only when the band cannot decide, and a
-/// failed read counts as the band's max.
+/// Demote a candidate when its locate estimate exceeds reading the
+/// reference's documents in [`Group::within`]: the band floor keeps it, the
+/// ceiling demotes it, in between one read sample of [`SAMPLE_DOCS`] decides
+/// (a failed one counts as the ceiling). `read_us` times reads of the given
+/// documents, per document.
 pub fn decide(
     plan: &mut Plan,
     band: ReadBand,
@@ -265,15 +311,26 @@ pub fn decide(
         for &i in &g.candidates {
             let occ_i = occurrences(&plan.counts[i], &g.within);
             let cost = |read| demote_by_cost(a.probe_us, occ_m, docs.len(), occ_i, read);
-            let demote = match (cost(band.min_us), cost(band.max_us)) {
-                (false, _) => false,
-                (true, true) => true,
-                (true, false) => cost(match sampled {
-                    Some(read) => read,
-                    None => {
-                        *sampled.insert(read_us(&spread(&docs, SAMPLE_DOCS)).unwrap_or(band.max_us))
-                    }
-                }),
+            let (demote, us, read) = match (cost(band.min_us), cost(band.max_us)) {
+                (false, _) => (false, band.min_us, Read::Floor),
+                (true, true) => (true, band.max_us, Read::Ceiling),
+                (true, false) => {
+                    let (us, read) = *sampled.get_or_insert_with(|| {
+                        let ids = spread(&docs, SAMPLE_DOCS);
+                        match read_us(&ids) {
+                            Ok(us) => (us, Read::Sampled(ids.len())),
+                            Err(_) => (band.max_us, Read::Failed),
+                        }
+                    });
+                    (cost(us), us, read)
+                }
+            };
+            plan.why[i] = Why::Cost {
+                reference: g.reference,
+                locate_us: locate_est_us(a.probe_us, occ_m, occ_i),
+                docs: docs.len(),
+                read_us: us,
+                read,
             };
             if demote {
                 plan.demoted[i] = true;
@@ -284,12 +341,15 @@ pub fn decide(
     }
 }
 
-/// Whether locating `occ_i` occurrences, scaled from `t_m_us` for `occ_m`,
-/// outlasts reading `docs_m` documents at `read_us` each. Locate time grows
-/// linearly with occurrences.
+/// Demote when locating costs more than reading `docs_m` documents at
+/// `read_us` each, or there is none to read.
 pub fn demote_by_cost(t_m_us: u64, occ_m: u64, docs_m: usize, occ_i: u64, read_us: f64) -> bool {
-    let locate = t_m_us.max(1) as f64 * occ_i as f64 / occ_m.max(1) as f64;
-    docs_m == 0 || locate > docs_m as f64 * read_us
+    docs_m == 0 || locate_est_us(t_m_us, occ_m, occ_i) > docs_m as f64 * read_us
+}
+
+/// Locating `occ_i` occurrences costs `t_m_us` per `occ_m`, linearly.
+pub fn locate_est_us(t_m_us: u64, occ_m: u64, occ_i: u64) -> f64 {
+    t_m_us.max(1) as f64 * occ_i as f64 / occ_m.max(1) as f64
 }
 
 /// The occurrences counted in ranges that meet `within`.

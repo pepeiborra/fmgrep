@@ -1,10 +1,12 @@
 //! A filtered literal answered by reading the files the filter keeps
 //! instead of locating its occurrences.
 
+use std::fmt::Write;
 use std::ops::{Range, RangeInclusive};
 
 use crate::probe::{Answer, Query};
 use crate::sharded::DocfmIndex;
+use crate::verbose::{Us, plans, plural};
 
 /// Unmeasured µs per occurrence per sample-rate step: a warm locate on an
 /// AWS Xeon core, 1.76 µs at rate 16.
@@ -84,8 +86,21 @@ pub fn read_instead(
         ids.push(id);
         bytes += doc_lens[id];
         if !reads(bound, ids.len(), bytes, costs) {
+            if plans() {
+                let (read, locate) = estimates(bound, ids.len(), bytes, costs);
+                eprintln!(
+                    "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}",
+                    ids.len(),
+                    plural(ids.len()),
+                    Us(read),
+                    Us(locate)
+                );
+            }
             return none();
         }
+    }
+    if plans() {
+        eprint!("{}", note(literals, &spreads, ids.len(), bytes, costs));
     }
     let mut counted = counted.into_iter().zip(spreads);
     literals
@@ -106,13 +121,59 @@ pub fn read_instead(
 /// Whether reading `files` of `bytes` costs less than locating `spread` plus,
 /// when fetched, reading the files an even spread hits.
 fn reads(spread: Spread, files: usize, bytes: u64, costs: Costs) -> bool {
+    let (read, locate) = estimates(spread, files, bytes, costs);
+    locate > read
+}
+
+/// [`reads`]' two costs, µs: reading, then locating.
+fn estimates(spread: Spread, files: usize, bytes: u64, costs: Costs) -> (f64, f64) {
     let read = files as f64 * costs.file_us + bytes as f64 * BYTE_NS / 1000.0;
     let mut locate = spread.busiest as f64 * costs.locate_us;
     if spread.fetched && files > 0 {
         let hits = spread.per_byte * bytes as f64;
         locate += read * -(-hits / files as f64).exp_m1();
     }
-    locate > read
+    (read, locate)
+}
+
+/// The verbose plan: per literal, both costs and which one won.
+fn note(
+    literals: &[Option<&[u8]>],
+    spreads: &[Spread],
+    files: usize,
+    bytes: u64,
+    costs: Costs,
+) -> String {
+    let terms: Vec<(usize, String)> = (literals.iter().enumerate())
+        .filter_map(|(k, l)| l.map(|l| (k, String::from_utf8_lossy(l).into_owned())))
+        .collect();
+    let width = terms.iter().map(|t| t.1.chars().count()).max().unwrap_or(0);
+    let mut out = String::from("plan:\n");
+    for ((k, term), &spread) in terms.iter().zip(spreads) {
+        let (read, locate) = estimates(spread, files, bytes, costs);
+        let s = plural(files);
+        let base = spread.busiest as f64 * costs.locate_us;
+        let mut how = format!("busiest shard {} x {}", spread.busiest, Us(costs.locate_us));
+        if locate > base {
+            let _ = write!(how, " + fetch {}", Us(locate - base));
+        }
+        let _ = match locate > read {
+            true => writeln!(
+                out,
+                "term {k} {term:<width$}  read {files} file{s} ({bytes} bytes) instead of locating: read est {} < locate est {} ({how})",
+                Us(read),
+                Us(locate)
+            ),
+            false => writeln!(
+                out,
+                "term {k} {term:<width$}  located: locate est {} ({how}) <= read est {} ({files} file{s} x {} + {bytes} bytes)",
+                Us(locate),
+                Us(read),
+                Us(costs.file_us)
+            ),
+        };
+    }
+    out
 }
 
 #[cfg(test)]
