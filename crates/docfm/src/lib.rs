@@ -49,6 +49,27 @@ pub struct FmIndex<D> {
     header: Header,
 }
 
+/// Counters of one locate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocateStats {
+    /// Occurrences visited.
+    pub occurrences: u64,
+    /// Occurrences resolved from a tail's sample.
+    pub forward: u64,
+    /// LF steps walked back to a sample, over all occurrences.
+    pub walk_steps: u64,
+    /// Longest walk.
+    pub max_walk: u32,
+    /// Tail marks the forward pass probed.
+    pub probes: u64,
+    /// Occurrences read from their own mark.
+    pub zero_step: u64,
+    /// Nanoseconds before the walk.
+    pub forward_ns: u64,
+    /// Nanoseconds in the walk.
+    pub walk_ns: u64,
+}
+
 /// Why a build, a write or a view failed.
 #[derive(Debug)]
 pub enum Error {
@@ -208,13 +229,19 @@ impl View<'_> {
     }
 
     /// Visit the doc id of each row of `rows`, all non-empty suffixes, with
-    /// up to [`LANES`] walks interleaved. Each walk stays inside its
-    /// document: its start is sampled.
+    /// up to [`LANES`] walks interleaved; under `STATS` returns the LF steps
+    /// and the longest walk. Each walk stays inside its document: its start
+    /// is sampled.
     // Out of line: inlined into the forward pass it runs slower.
     #[inline(never)]
-    fn docs(&self, mut rows: impl Iterator<Item = usize>, visit: &mut dyn FnMut(usize)) {
+    fn docs<const STATS: bool>(
+        &self,
+        mut rows: impl Iterator<Item = usize>,
+        visit: &mut dyn FnMut(usize),
+    ) -> (u64, usize) {
         let marks = self.header.marks(self.bytes);
         let bound = self.header.walk_bound();
+        let (mut total, mut longest) = (0u64, 0usize);
         // (row, LF steps taken)
         let mut lanes = [(0usize, 0usize); LANES];
         let mut live = 0;
@@ -236,6 +263,10 @@ impl View<'_> {
                     i += 1;
                     continue;
                 }
+                if STATS {
+                    total += steps as u64;
+                    longest = longest.max(steps);
+                }
                 visit(self.sampled(rank));
                 match rows.next() {
                     Some(next) => {
@@ -249,6 +280,7 @@ impl View<'_> {
                 }
             }
         }
+        (total, longest)
     }
 }
 
@@ -321,6 +353,12 @@ impl Cursor<'_> {
     /// visits nothing. Occurrences resolve from samples at or a few bytes
     /// into the query first; the rest walk back.
     pub fn locate(&self, visit: &mut dyn FnMut(usize)) {
-        self.locate_at(self.forward_depth(), visit);
+        self.locate_from::<false>(self.forward_depth(), visit, None);
+    }
+
+    /// [`Cursor::locate`], counted and timed.
+    pub fn locate_stats(&self, visit: &mut dyn FnMut(usize)) -> LocateStats {
+        let start = std::time::Instant::now();
+        self.locate_from::<true>(self.forward_depth(), visit, Some(start))
     }
 }

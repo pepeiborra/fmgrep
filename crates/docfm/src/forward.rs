@@ -1,8 +1,10 @@
 //! Forward locate: rows with their own mark first, then an occurrence at `p`
 //! from a mark at `p + i` in a probed tail `path[i..]`, `i` LF steps back.
 
+use std::time::Instant;
+
 use crate::build::word_start;
-use crate::{Cursor, DOC_END, RING, View};
+use crate::{Cursor, DOC_END, LocateStats, RING, View};
 
 /// A tail is used while it holds at most `RATIO * count / d` marks, `d` the
 /// text bytes per mark: fewer than `RATIO / 2` candidates per occurrence over
@@ -53,12 +55,25 @@ impl Cursor<'_> {
             .unwrap_or(0)
     }
 
+    /// [`Cursor::locate_from`] counted, untimed.
+    #[cfg(test)]
+    pub(super) fn locate_at(&self, depth: usize, visit: &mut dyn FnMut(usize)) -> LocateStats {
+        self.locate_from::<true>(depth, visit, None)
+    }
+
     /// Visits the doc of every occurrence: from the rows' own marks, then
     /// from tails `1..=depth` (clamped to the cap), then by walking back.
-    pub(super) fn locate_at(&self, depth: usize, visit: &mut dyn FnMut(usize)) {
+    /// Counted under `STATS`, timed from `start` if given.
+    pub(super) fn locate_from<const STATS: bool>(
+        &self,
+        depth: usize,
+        visit: &mut dyn FnMut(usize),
+        start: Option<Instant>,
+    ) -> LocateStats {
         let (lo, hi, view) = (self.lo, self.hi, self.view);
+        let mut stats = LocateStats::default();
         if self.root || lo == hi {
-            return;
+            return stats;
         }
         let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
         let mut own = 0;
@@ -67,16 +82,36 @@ impl Cursor<'_> {
             visit(view.sampled(rank));
             own += 1;
         }
-        if own == hi - lo {
-            return;
+        let tails = own < hi - lo
+            && self.resolve_into::<STATS>(depth, &mut resolved, &mut stats.probes, visit);
+        let walk_start = if STATS {
+            start.map(|_| Instant::now())
+        } else {
+            None
+        };
+        let (steps, longest) = if own == hi - lo {
+            (0, 0)
+        } else if !tails && own == 0 {
+            view.docs::<STATS>(lo..hi, visit)
+        } else {
+            view.docs::<STATS>(
+                (lo..hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
+                visit,
+            )
+        };
+        if STATS {
+            let ones: u64 = resolved.iter().map(|w| u64::from(w.count_ones())).sum();
+            stats.occurrences = self.count();
+            stats.zero_step = own as u64;
+            stats.forward = ones - own as u64;
+            stats.walk_steps = steps;
+            stats.max_walk = longest as u32;
+            if let (Some(start), Some(walk_start)) = (start, walk_start) {
+                stats.forward_ns = (walk_start - start).as_nanos() as u64;
+                stats.walk_ns = walk_start.elapsed().as_nanos() as u64;
+            }
         }
-        if !self.resolve_into(depth, &mut resolved, visit) && own == 0 {
-            return view.docs(lo..hi, visit);
-        }
-        view.docs(
-            (lo..hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
-            visit,
-        );
+        stats
     }
 
     /// Visits the doc of each occurrence a probed tail `1..=depth` (clamped
@@ -85,16 +120,17 @@ impl Cursor<'_> {
     #[cfg(test)]
     pub(super) fn resolve(&self, depth: usize, visit: &mut dyn FnMut(usize)) -> Option<Vec<u64>> {
         let mut resolved = vec![0u64; (self.hi - self.lo).div_ceil(64)];
-        self.resolve_into(depth, &mut resolved, visit)
+        self.resolve_into::<false>(depth, &mut resolved, &mut 0, visit)
             .then_some(resolved)
     }
 
-    /// [`Cursor::resolve`] into `resolved`, skipping rows set there; false
-    /// at depth 0.
-    fn resolve_into(
+    /// [`Cursor::resolve`] into `resolved`, skipping rows set there and,
+    /// under `STATS`, adding the marks probed to `probes`; false at depth 0.
+    fn resolve_into<const STATS: bool>(
         &self,
         depth: usize,
         resolved: &mut [u64],
+        probes: &mut u64,
         visit: &mut dyn FnMut(usize),
     ) -> bool {
         let (lo, hi, view) = (self.lo, self.hi, self.view);
@@ -108,6 +144,9 @@ impl Cursor<'_> {
         for i in (1..=depth).filter(|&i| self.probed(i)) {
             let (from, to) = self.tail(i);
             for (row, rank) in marks.range(from, to) {
+                if STATS {
+                    *probes += 1;
+                }
                 let Some(at) = view.back(row, &codes[..i]) else {
                     continue;
                 };

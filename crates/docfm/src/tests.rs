@@ -767,7 +767,9 @@ fn interleaved_locate_equals_rowwise() {
                 let mut rowwise: Vec<usize> =
                     (cursor.lo..cursor.hi).map(|r| cursor.view.doc(r)).collect();
                 let mut got = Vec::new();
-                cursor.view.docs(cursor.lo..cursor.hi, &mut |d| got.push(d));
+                cursor
+                    .view
+                    .docs::<false>(cursor.lo..cursor.hi, &mut |d| got.push(d));
                 rowwise.sort_unstable();
                 got.sort_unstable();
                 assert_eq!(got, rowwise, "{sampling:?} pattern {pattern:?}");
@@ -957,12 +959,103 @@ fn own_marks_resolve_first() {
         for pattern in patterns(&text) {
             let cursor = index.cursor().extend_front(&pattern);
             let mut docs = Vec::new();
-            cursor.locate(&mut |d| docs.push(d));
+            let stats = cursor.locate_stats(&mut |d| docs.push(d));
             docs.sort_unstable();
             assert_eq!(docs, naive_docs(&text, &pattern), "{pattern:?}");
             assert_eq!(cursor.forward_depth(), 0, "{pattern:?}");
+            let n = docs.len() as u64;
+            assert_eq!(
+                (
+                    stats.zero_step,
+                    stats.forward,
+                    stats.probes,
+                    stats.walk_steps
+                ),
+                (n, 0, 0, 0),
+                "{pattern:?}"
+            );
         }
     }
+}
+
+#[test]
+fn locate_stats_count_the_walks() {
+    let mut forward = 0;
+    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
+        for sampling in samplings() {
+            let walks = naive_walks(&text, sampling);
+            let index = build_with(text.clone(), sampling).unwrap();
+            for pattern in patterns(&text) {
+                let at = naive_positions(&text, &pattern);
+                let cursor = index.cursor().extend_front(&pattern);
+                let want = LocateStats {
+                    occurrences: at.len() as u64,
+                    walk_steps: at.iter().map(|&p| walks[p] as u64).sum(),
+                    max_walk: at.iter().map(|&p| walks[p] as u32).max().unwrap_or(0),
+                    zero_step: at.iter().filter(|&&p| walks[p] == 0).count() as u64,
+                    ..LocateStats::default()
+                };
+                assert_eq!(
+                    cursor.locate_at(0, &mut |_| ()),
+                    want,
+                    "{sampling:?} {pattern:?}"
+                );
+                let gated = cursor.locate_stats(&mut |_| ());
+                let mut rows = at.clone();
+                rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
+                let resolved = match at.len() {
+                    0 => 0,
+                    _ => cursor
+                        .resolve(cursor.forward_depth(), &mut |_| ())
+                        .map_or(0, |bits| {
+                            (0..at.len())
+                                .filter(|&k| bits[k / 64] >> (k % 64) & 1 == 1)
+                                .filter(|&k| walks[rows[k]] != 0)
+                                .count()
+                        }),
+                };
+                assert_eq!(
+                    (gated.occurrences, gated.forward, gated.zero_step),
+                    (want.occurrences, resolved as u64, want.zero_step),
+                    "{sampling:?} {pattern:?}"
+                );
+                assert!(gated.walk_steps <= want.walk_steps && gated.max_walk <= want.max_walk);
+                forward += gated.forward;
+            }
+        }
+    }
+    assert!(forward > 0);
+}
+
+#[test]
+fn locate_stats_count_the_probes() {
+    let mut probes = 0;
+    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
+        for sampling in samplings() {
+            let marked = naive_marked(&text, sampling);
+            let index = build_with(text.clone(), sampling).unwrap();
+            for pattern in patterns(&text).into_iter().chain([b"\treturn".to_vec()]) {
+                let at = naive_positions(&text, &pattern);
+                let cursor = index.cursor().extend_front(&pattern);
+                let depth = cursor.forward_depth();
+                let marks_of = |p: &[u8]| {
+                    naive_positions(&text, p)
+                        .into_iter()
+                        .filter(|&q| marked[q])
+                        .count() as u64
+                };
+                let unresolved = at.iter().any(|&p| !marked[p]);
+                let want: u64 = (1..=depth)
+                    .filter(|&i| unresolved && naive_probed(&pattern, i))
+                    .map(|i| marks_of(&pattern[i..]))
+                    .sum();
+                let got = cursor.locate_stats(&mut |_| ()).probes;
+                assert_eq!(got, want, "{sampling:?} {pattern:?}");
+                probes += got;
+            }
+        }
+    }
+    assert!(probes > 0);
 }
 
 #[path = "forward_tests.rs"]
