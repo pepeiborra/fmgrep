@@ -70,15 +70,15 @@ fn forward_depths_equal_naive() {
                 (p, docs)
             })
             .collect();
-        for rate in [1, 3, 4, 16, 32] {
-            let index = Built::build(text.clone(), rate).unwrap();
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
             for (pattern, docs) in &want {
                 let cursor = index.cursor().extend_front(pattern);
                 for depth in depths(&text) {
                     let (got, _) = at_depth(&cursor, depth);
-                    assert_eq!(&got, docs, "rate {rate} depth {depth} pattern {pattern:?}");
+                    assert_eq!(&got, docs, "{sampling:?} depth {depth} pattern {pattern:?}");
                 }
-                assert_eq!(&located(&index, pattern), docs, "rate {rate} {pattern:?}");
+                assert_eq!(&located(&index, pattern), docs, "{sampling:?} {pattern:?}");
             }
         }
     }
@@ -94,7 +94,7 @@ fn forward_walk_stops_at_the_text_start() {
             .chain([DOC_END])
             .collect();
         for rate in [1, 2, 3, 4] {
-            let index = Built::build(text.clone(), rate).unwrap();
+            let index = build_with(text.clone(), gaps(rate, rate, rate)).unwrap();
             for k in 1..text.len() - 1 {
                 for x in *b"ab" {
                     let pattern = [&[x], &text[..k]].concat();
@@ -110,24 +110,26 @@ fn forward_walk_stops_at_the_text_start() {
     }
 }
 
-/// The gate's depth from the text alone: a tail's marks are its
-/// occurrences at a rate multiple or a document start.
-fn naive_depth(text: &[u8], pattern: &[u8], rate: usize) -> usize {
+/// The gate's depth from the text alone: probed tails' marks, its
+/// occurrences at a `marked` position, against the unmarked occurrences.
+fn naive_depth(text: &[u8], pattern: &[u8], gaps: Gaps, marked: &[bool]) -> usize {
     let known = pattern.len().min(RING);
     let cap = (0..known)
         .find(|&j| pattern[j] == DOC_END)
         .unwrap_or(pattern.len().saturating_sub(1));
-    let limit = cap
-        .min((rate / 2).saturating_sub(1))
-        .min(forward::MAX_DEPTH);
-    let count = naive_positions(text, pattern).len();
+    let (num, den) = (text.len(), marked.iter().filter(|&&m| m).count());
+    let depth = (gaps.max as usize / 2).saturating_sub(1);
+    let limit = cap.min(depth).min(forward::MAX_DEPTH);
+    let at = naive_positions(text, pattern);
+    let count = at.iter().filter(|&&p| !marked[p]).count();
     (1..=limit)
+        .filter(|&i| count > 0 && naive_probed(pattern, i))
         .take_while(|&i| {
             let marks = naive_positions(text, &pattern[i..])
                 .into_iter()
-                .filter(|&p| p % rate == 0 || text[p - 1] == DOC_END)
+                .filter(|&p| marked[p])
                 .count();
-            marks * rate <= 32 * count
+            marks * num <= 32 * count * den
         })
         .last()
         .unwrap_or(0)
@@ -138,31 +140,34 @@ fn mark_gate_matches_naive() {
     let mut rng = Rng(59);
     for text in texts() {
         let patterns = forward_patterns(&text, &mut rng);
-        for rate in [1, 3, 4, 16, 32] {
-            let index = Built::build(text.clone(), rate).unwrap();
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
+            let marked = naive_marked(&text, sampling);
             for pattern in patterns.iter().filter(|p| count(&index, p) > 0) {
                 assert_eq!(
                     index.cursor().extend_front(pattern).forward_depth(),
-                    naive_depth(&text, pattern, rate as usize),
-                    "rate {rate} {pattern:?}"
+                    naive_depth(&text, pattern, sampling, &marked),
+                    "{sampling:?} {pattern:?}"
                 );
             }
         }
     }
     let depth = |text: &[u8], pattern: &[u8], rate| {
-        let index = Built::build(text.to_vec(), rate).unwrap();
+        let index = build_with(text.to_vec(), gaps(rate, rate, rate)).unwrap();
         index.cursor().extend_front(pattern).forward_depth()
     };
-    let text = [b"xabcd\0".repeat(4), b"bcd\0".repeat(4)].concat();
-    assert_eq!(depth(&text, b"cd\0xab", 32), 2, "capped at the separator");
-    assert_eq!(depth(&text, b"\0xab", 32), 0);
+    let text = [b"x a b c d\0".repeat(4), b" b c d\0".repeat(4)].concat();
+    assert_eq!(depth(&text, b"c d\0x a", 32), 2, "capped at the separator");
+    assert_eq!(depth(&text, b"\0x a", 32), 0);
     assert_eq!(depth(&text, b"d", 32), 0, "one byte has no tail");
-    assert_eq!(depth(&text, b"abcd", 1), 0, "rate 1 has no depth");
-    assert_eq!(depth(&text, b"abcd", 4), 1, "rate / 2 - 1");
+    assert_eq!(depth(&text, b" b c d", 1), 0, "gap 1 has no depth");
+    assert_eq!(depth(&text, b" b c d", 4), 1, "max / 2 - 1");
+    assert_eq!(depth(&text, b" b c d", 32), 5);
     // Every tiny "b" doc start is a mark: marks fail the gate where the
     // width passes.
-    assert_eq!(depth(b"ab\0b\0", b"ab", 32), 1);
-    assert_eq!(depth(b"ab\0b\0b\0", b"ab", 32), 0);
+    let long = [b" x b".as_slice(), &[b'y'; 200], b"\0"].concat();
+    assert_eq!(depth(&[&long[..], b"b\0"].concat(), b"x b", 32), 2);
+    assert_eq!(depth(&[&long[..], b"b\0b\0"].concat(), b"x b", 32), 0);
 }
 
 /// Some occurrences resolve forward, none twice.
@@ -171,12 +176,12 @@ fn forward_resolves_occurrences() {
     let mut rng = Rng(29);
     let (mut deepest, mut gate) = (0, 0);
     for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-        for rate in [3, 16] {
-            let index = Built::build(text.clone(), rate).unwrap();
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
             for pattern in forward_patterns(&text, &mut rng) {
                 let cursor = index.cursor().extend_front(&pattern);
                 let (docs, forward) = at_depth(&cursor, forward::MAX_DEPTH);
-                assert!(forward <= docs.len(), "rate {rate} {pattern:?}");
+                assert!(forward <= docs.len(), "{sampling:?} {pattern:?}");
                 deepest += forward;
                 gate += at_depth(&cursor, cursor.forward_depth()).1;
             }
@@ -242,7 +247,7 @@ fn occ_access_matches_access_rank() {
             for b in 0..sigma {
                 alphabet[b / 64] |= 1 << (b % 64);
             }
-            let h = layout::Header::new(n, 0, 16, alphabet, [0; 257], 0, 0);
+            let h = layout::Header::new(n, 0, Gaps::WORDS, alphabet, [0; 257], 0, 0);
             let mut blob = vec![0u8; h.blob_len];
             occ::write_occ(&codes, &h, &mut blob);
             let bwt = occ::Occ::new(&blob, &h);
@@ -294,8 +299,8 @@ fn cursor_chains_equal_naive() {
     let mut rng = Rng(43);
     for text in texts() {
         let patterns = chain_patterns(&text, &mut rng);
-        for rate in [1, 3, 4, 16, 32] {
-            let index = Built::build(text.clone(), rate).unwrap();
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
             for pattern in &patterns {
                 let docs = naive_docs(&text, pattern);
                 for cursor in [
@@ -304,9 +309,9 @@ fn cursor_chains_equal_naive() {
                 ] {
                     for depth in depths(&text) {
                         let (got, _) = at_depth(&cursor, depth);
-                        assert_eq!(got, docs, "rate {rate} depth {depth} pattern {pattern:?}");
+                        assert_eq!(got, docs, "{sampling:?} depth {depth} pattern {pattern:?}");
                     }
-                    assert_eq!(gated(&cursor), docs, "rate {rate} {pattern:?}");
+                    assert_eq!(gated(&cursor), docs, "{sampling:?} {pattern:?}");
                 }
             }
         }
@@ -318,8 +323,8 @@ fn cursor_chunking_does_not_change_locates() {
     let mut rng = Rng(47);
     for text in texts().into_iter().filter(|t| t.len() < 10_000) {
         let patterns = chain_patterns(&text, &mut rng);
-        for rate in [3, 16] {
-            let index = Built::build(text.clone(), rate).unwrap();
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
             for pattern in &patterns {
                 let whole = index.cursor().extend_front(pattern);
                 for cursor in [
@@ -331,7 +336,7 @@ fn cursor_chunking_does_not_change_locates() {
                         assert_eq!(
                             at_depth(&cursor, depth),
                             at_depth(&whole, depth),
-                            "rate {rate} depth {depth} {pattern:?}"
+                            "{sampling:?} depth {depth} {pattern:?}"
                         );
                     }
                 }
@@ -344,8 +349,12 @@ fn cursor_chunking_does_not_change_locates() {
 fn rows_drops_the_ancestors() {
     let mut rng = Rng(53);
     let mut rebuilt = 0;
-    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-        let index = Built::build(text.clone(), 4).unwrap();
+    for (text, sampling) in texts()
+        .into_iter()
+        .filter(|t| t.len() < 10_000)
+        .flat_map(|t| samplings().into_iter().map(move |s| (t.clone(), s)))
+    {
+        let index = build_with(text.clone(), sampling).unwrap();
         for pattern in forward_patterns(&text, &mut rng) {
             let cursor = chained(&index, &pattern, None);
             for within in [0..1, 1..3, 2..u64::MAX] {

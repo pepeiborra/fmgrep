@@ -8,19 +8,18 @@ use crate::probe::{Answer, Query};
 use crate::sharded::DocfmIndex;
 use crate::verbose::{Us, plans, plural};
 
-/// Unmeasured µs per occurrence per sample-rate step: a warm locate on an
-/// AWS Xeon core, 1.76 µs at rate 16.
-const STEP_US: f64 = 1.76 / 16.0;
+/// Unmeasured µs per located occurrence.
+const LOCATE_US: f64 = 0.7;
 /// Bounds on a measured locate cost.
 const LOCATE_RANGE: RangeInclusive<f64> = 0.02..=20.0;
 /// Nanoseconds per byte read.
 const BYTE_NS: f64 = 0.15;
 
-/// µs per occurrence a shard locates: `measured` clamped, else `rate` steps.
-pub fn locate_us(rate: u32, measured: Option<f64>) -> f64 {
+/// µs per occurrence a shard locates: `measured` clamped, else the default.
+pub fn locate_us(measured: Option<f64>) -> f64 {
     match measured {
         Some(us) if us.is_finite() => us.clamp(*LOCATE_RANGE.start(), *LOCATE_RANGE.end()),
-        _ => f64::from(rate) * STEP_US,
+        _ => LOCATE_US,
     }
 }
 
@@ -225,16 +224,13 @@ mod tests {
     }
 
     #[test]
-    fn the_locate_cost_is_measured_clamped_else_rate_scaled() {
-        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        assert!(near(locate_us(16, None), 1.76));
-        assert!(near(locate_us(32, None), 3.52));
-        assert!(near(locate_us(4, None), 0.44));
-        assert_eq!(locate_us(16, Some(0.3)), 0.3);
-        assert_eq!(locate_us(16, Some(0.0)), 0.02);
-        assert_eq!(locate_us(16, Some(1e9)), 20.0);
-        assert!(near(locate_us(16, Some(f64::NAN)), 1.76));
-        assert!(near(locate_us(16, Some(f64::INFINITY)), 1.76));
+    fn the_locate_cost_is_measured_clamped_else_the_default() {
+        assert_eq!(locate_us(None), 0.7);
+        assert_eq!(locate_us(Some(0.3)), 0.3);
+        assert_eq!(locate_us(Some(0.0)), 0.02);
+        assert_eq!(locate_us(Some(1e9)), 20.0);
+        assert_eq!(locate_us(Some(f64::NAN)), 0.7);
+        assert_eq!(locate_us(Some(f64::INFINITY)), 0.7);
     }
 
     #[test]
@@ -248,12 +244,12 @@ mod tests {
         let measured = |index: &std::path::Path| {
             let manifest = crate::manifest::read_manifest(index).unwrap();
             let (fm, mut loaded) = super::super::load(index, &manifest, None, false).unwrap();
-            assert_eq!(loaded.locate_us, locate_us(16, None));
+            assert_eq!(loaded.locate_us, locate_us(None));
             loaded.measure_locate(&fm);
             (fm, loaded.locate_us)
         };
         let tmp = tempfile::tempdir().unwrap();
-        let wide = "e".repeat(2000) + "\n";
+        let wide = "E".repeat(2000) + "\n";
         let files: Vec<(String, &[u8])> = (0..3)
             .map(|i| (format!("{i}.c"), wide.as_bytes()))
             .collect();
@@ -263,21 +259,13 @@ mod tests {
         crate::tests::SHARD_BYTES.set(None);
         let (fm, us) = measured(&index);
         let shards = crate::manifest::read_manifest(&index).unwrap().blobs.len();
-        assert_eq!((fm.sample_rate(), shards), (16, 3));
+        assert_eq!(shards, 3);
         assert!(fm.locate_us().is_some());
         assert!(us.is_finite() && LOCATE_RANGE.contains(&us), "{us}");
 
         let tmp = tempfile::tempdir().unwrap();
         let index = indexed(tmp.path(), &TWO_FILES);
         let (fm, us) = measured(&index);
-        assert_eq!((fm.locate_us(), us), (None, locate_us(16, None)));
-
-        let tmp = tempfile::tempdir().unwrap();
-        crate::tests::SAMPLE_RATE.set(Some(32));
-        let index = indexed(tmp.path(), &TWO_FILES);
-        crate::tests::SAMPLE_RATE.set(None);
-        let manifest = crate::manifest::read_manifest(&index).unwrap();
-        let (_, loaded) = super::super::load(&index, &manifest, None, false).unwrap();
-        assert!((loaded.locate_us - 3.52).abs() < 1e-9);
+        assert_eq!((fm.locate_us(), us), (None, locate_us(None)));
     }
 }

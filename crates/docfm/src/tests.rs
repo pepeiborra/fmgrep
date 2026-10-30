@@ -27,6 +27,10 @@ fn naive_docs(text: &[u8], pattern: &[u8]) -> Vec<usize> {
 
 type Built = FmIndex<Vec<u8>>;
 
+fn build_with(text: Vec<u8>, gaps: Gaps) -> Result<Built, Error> {
+    FmIndex::view(build::build(text, gaps)?)
+}
+
 /// `f` inside a rayon pool of `threads` threads.
 fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
     rayon::ThreadPoolBuilder::new()
@@ -100,6 +104,84 @@ fn terminated(mut text: Vec<u8>) -> Vec<u8> {
     text
 }
 
+/// About 8 KB of code-like documents: identifiers in every case, `_` runs,
+/// indentation, blank and CRLF lines, whitespace runs over 64 bytes.
+fn code_text() -> Vec<u8> {
+    let wide = [b"#define FOO_BAR".as_slice(), &[b' '; 72], b"0x1\n"].concat();
+    let tabs = [b"\t".repeat(70), b"}\n".to_vec()].concat();
+    let lines: Vec<Vec<u8>> = [
+        b"static int kmem_cache_create(struct kmem_cache *cachep, size_t size)\n".as_slice(),
+        b"{\n",
+        b"\tif (unlikely(!cachep)) {\n",
+        b"\t\treturn -ENOMEM;\n",
+        b"    HTMLDocumentParser::parseURLRequest(fooBarBaz, kMaxSize_2);\n",
+        b"#define BIF_CFG_DEV0_EPF0_VF12_MASK  0x0000FFFFL\n",
+        b"\n",
+        b"x = __builtin_expect(a__b___c, 0); // TODO: fixMe\r\n",
+        b"  \t  \r\n",
+        b"\treturn x_y + 12ab_CD;\n",
+        &wide,
+        &tabs,
+    ]
+    .map(<[u8]>::to_vec)
+    .to_vec();
+    let mut rng = Rng(61);
+    let mut text = Vec::new();
+    while text.len() < 8000 {
+        if rng.below(30) == 0 {
+            text.push(DOC_END);
+        }
+        text.extend_from_slice(&lines[rng.below(lines.len() as u64) as usize]);
+    }
+    terminated(text)
+}
+
+fn gaps(min: u32, max: u32, ws: u32) -> Gaps {
+    Gaps { min, max, ws }
+}
+
+/// The build's gaps, then tight and per-document-rate ones.
+fn samplings() -> Vec<Gaps> {
+    let texts = [(8, 16, 64), (12, 16, 64), (1, 2, 4), (3, 5, 9)];
+    let rates = [1, 3, 4, 32].map(|r| (r, r, r));
+    texts
+        .into_iter()
+        .chain(rates)
+        .map(|(min, max, ws)| gaps(min, max, ws))
+        .collect()
+}
+
+/// Whether each text position is sampled, by definition.
+fn naive_marked(text: &[u8], gaps: Gaps) -> Vec<bool> {
+    let doc_start = |p: usize| p == 0 || text[p - 1] == DOC_END;
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut marked = vec![false; text.len()];
+    let mut last = 0;
+    for p in 0..text.len() {
+        let (b, prev) = (text[p], p.checked_sub(1).map_or(0, |q| text[q]));
+        let mut q = p;
+        while !doc_start(q) && matches!(text[q - 1], b' ' | b'\t' | b'\r') {
+            q -= 1;
+        }
+        let line_first = !b.is_ascii_whitespace() && (doc_start(q) || text[q - 1] == b'\n');
+        let start = (word(b) && !word(prev))
+            || (prev == b'_' && word(b) && b != b'_')
+            || (prev.is_ascii_lowercase() && b.is_ascii_uppercase())
+            || line_first;
+        let force = if b.is_ascii_whitespace() {
+            gaps.ws
+        } else {
+            gaps.max
+        };
+        let gap = (p - last) as u32;
+        if doc_start(p) || gap >= force || (start && gap >= gaps.min) {
+            marked[p] = true;
+            last = p;
+        }
+    }
+    marked
+}
+
 fn texts() -> Vec<Vec<u8>> {
     let mut texts = joined_texts();
     texts.push(b"mississippi\0".to_vec());
@@ -108,6 +190,7 @@ fn texts() -> Vec<Vec<u8>> {
     texts.push(terminated(vec![b'x'; 70_000]));
     texts.push(terminated(all_bytes()));
     texts.push(tiny_docs());
+    texts.push(code_text());
     texts
 }
 
@@ -133,7 +216,7 @@ fn patterns(text: &[u8]) -> Vec<Vec<u8>> {
 fn counts_match_naive() {
     for threads in [1, 3] {
         for text in texts() {
-            let index = in_pool(threads, || Built::build(text.clone(), 16)).unwrap();
+            let index = in_pool(threads, || Built::build(text.clone())).unwrap();
             assert_eq!(count(&index, b""), text.len() as u64 + 1);
             for pattern in patterns(&text) {
                 let want = naive_positions(&text, &pattern).len() as u64;
@@ -157,14 +240,14 @@ fn locate_visits_each_occurrence_doc() {
             .map(|p| (p.clone(), naive_docs(&text, &p)))
             .collect();
         for threads in [1, 3] {
-            for rate in [1, 3, 4, 12, 32, 64] {
-                let index = in_pool(threads, || Built::build(text.clone(), rate)).unwrap();
+            for sampling in samplings() {
+                let index = in_pool(threads, || build_with(text.clone(), sampling)).unwrap();
                 assert_eq!(index.num_docs(), docs);
                 for (pattern, docs) in &want {
                     assert_eq!(
                         &located(&index, pattern),
                         docs,
-                        "threads {threads} rate {rate} pattern {pattern:?}"
+                        "threads {threads} {sampling:?} pattern {pattern:?}"
                     );
                 }
             }
@@ -193,11 +276,17 @@ fn large_text() -> Vec<u8> {
 #[test]
 fn threads_do_not_change_the_blob() {
     for text in texts().into_iter().chain([large_text()]) {
-        let build = || Built::build(text.clone(), 32).unwrap().into_bytes();
-        let outside = build();
-        for threads in [1, 3, 8] {
-            let inside = in_pool(threads, build);
-            assert!(inside == outside, "threads {threads} len {}", text.len());
+        for sampling in [Gaps::WORDS, gaps(1, 2, 4)] {
+            let build = || build_with(text.clone(), sampling).unwrap().into_bytes();
+            let outside = build();
+            for threads in [1, 3, 8] {
+                let inside = in_pool(threads, build);
+                assert!(
+                    inside == outside,
+                    "threads {threads} {sampling:?} len {}",
+                    text.len()
+                );
+            }
         }
     }
 }
@@ -205,9 +294,10 @@ fn threads_do_not_change_the_blob() {
 /// Marks and samples by definition, from a naive suffix sort.
 #[test]
 fn samples_match_suffix_order() {
-    for rate in [1, 3, 4, 32, 64, 128] {
+    for sampling in samplings() {
         for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-            let index = Built::build(text.clone(), rate).unwrap();
+            let index = build_with(text.clone(), sampling).unwrap();
+            let marked = naive_marked(&text, sampling);
             let mut rows: Vec<usize> = (0..=text.len()).collect();
             rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
             let doc_of: Vec<usize> = text
@@ -220,10 +310,7 @@ fn samples_match_suffix_order() {
                 .collect();
             let want: Vec<Option<usize>> = rows
                 .iter()
-                .map(|&p| {
-                    (p < text.len() && (p % rate as usize == 0 || text[p - 1] == DOC_END))
-                        .then(|| doc_of[p])
-                })
+                .map(|&p| (p < text.len() && marked[p]).then(|| doc_of[p]))
                 .collect();
             let view = index.cursor().view;
             let marks = index.header.marks(view.bytes);
@@ -233,7 +320,7 @@ fn samples_match_suffix_order() {
                     marked.then(|| view.sampled(rank))
                 })
                 .collect();
-            assert_eq!(got, want, "rate {rate} len {}", text.len());
+            assert_eq!(got, want, "{sampling:?} len {}", text.len());
         }
     }
 }
@@ -245,7 +332,7 @@ fn one_byte_docs_build() {
     let text: Vec<u8> = (0..40_000)
         .flat_map(|_| [b'a' + rng.below(3) as u8, DOC_END])
         .collect();
-    let index = Built::build(text.clone(), 32).unwrap();
+    let index = Built::build(text.clone()).unwrap();
     for pattern in [b"a".as_slice(), b"b\0c", b"\0a\0", b"c\0c\0c"] {
         assert_eq!(
             located(&index, pattern),
@@ -253,22 +340,20 @@ fn one_byte_docs_build() {
             "pattern {pattern:?}"
         );
     }
-    let again = in_pool(4, || Built::build(text, 32)).unwrap();
+    let again = in_pool(4, || Built::build(text)).unwrap();
     assert!(again.into_bytes() == index.into_bytes());
 }
 
 #[test]
-fn samples_are_rate_multiples_and_doc_starts() {
-    for rate in [1, 4, 32, 64] {
-        for text in texts() {
-            let index = Built::build(text.clone(), rate).unwrap();
-            let want = (0..text.len())
-                .filter(|&p| p % rate as usize == 0 || text[p - 1] == DOC_END)
-                .count();
+fn sample_count_matches_the_rule() {
+    for sampling in samplings() {
+        for text in texts().into_iter().chain([large_text()]) {
+            let index = build_with(text.clone(), sampling).unwrap();
+            let want = naive_marked(&text, sampling).iter().filter(|&&m| m).count();
             assert_eq!(
                 index.header.num_samples,
                 want,
-                "rate {rate} len {}",
+                "{sampling:?} len {}",
                 text.len()
             );
         }
@@ -278,7 +363,7 @@ fn samples_are_rate_multiples_and_doc_starts() {
 #[test]
 fn bwt_matches_naive_rotation_sort() {
     for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-        let index = Built::build(text.clone(), 4).unwrap();
+        let index = Built::build(text.clone()).unwrap();
         let mut rows: Vec<usize> = (0..=text.len()).collect();
         rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
         let want: Vec<Option<u8>> = rows
@@ -304,7 +389,7 @@ fn bwt_matches_naive_rotation_sort() {
 
 #[test]
 fn cursor_composes() {
-    let index = Built::build(b"abracadabra\0".to_vec(), 4).unwrap();
+    let index = Built::build(b"abracadabra\0".to_vec()).unwrap();
     let root = index.cursor();
     assert_eq!(root.count(), 13);
     let mut visited = 0;
@@ -325,7 +410,7 @@ fn cursor_composes() {
 
 #[test]
 fn out_of_alphabet_is_dead() {
-    let index = Built::build(b"abc\0".to_vec(), 2).unwrap();
+    let index = Built::build(b"abc\0".to_vec()).unwrap();
     assert!(!index.contains_symbol(b'z'));
     let dead = index.cursor().extend_front(b"z");
     assert_eq!(dead.count(), 0);
@@ -337,7 +422,7 @@ fn out_of_alphabet_is_dead() {
 
 #[test]
 fn empty_text_builds_and_matches_nothing() {
-    let index = Built::build(Vec::new(), 16).unwrap();
+    let index = Built::build(Vec::new()).unwrap();
     assert_eq!(count(&index, b""), 1);
     assert_eq!(count(&index, b"a"), 0);
     assert!(located(&index, b"a").is_empty());
@@ -354,7 +439,7 @@ fn encode<D: AsRef<[u8]>>(index: &FmIndex<D>) -> Vec<u8> {
 #[test]
 fn view_of_encoded_bytes_matches_built() {
     for text in texts() {
-        let index = Built::build(text.clone(), 8).unwrap();
+        let index = Built::build(text.clone()).unwrap();
         let blob = encode(&index);
         let mut shifted = vec![0u8; blob.len() + 1];
         shifted[1..].copy_from_slice(&blob);
@@ -374,7 +459,7 @@ fn view_of_encoded_bytes_matches_built() {
 
 #[test]
 fn foreign_or_truncated_blob_is_refused() {
-    let index = Built::build(b"printk hello printk\0".to_vec(), 4).unwrap();
+    let index = Built::build(b"printk hello printk\0".to_vec()).unwrap();
     let blob = encode(&index);
     let refuse = |bytes: &[u8], want: &str| {
         let Err(err) = FmIndex::view(bytes) else {
@@ -408,7 +493,7 @@ fn foreign_or_truncated_blob_is_refused() {
     refuse(&[blob.as_slice(), &[0]].concat(), "trailing");
     refuse(&patched(8, &u64::MAX.to_le_bytes()), "over the bound");
     refuse(&patched(16, &99u64.to_le_bytes()), "sentinel row");
-    refuse(&patched(24, &0u32.to_le_bytes()), "sample rate 0");
+    refuse(&patched(24, &0u32.to_le_bytes()), "v7 sampling");
     refuse(&patched(28, &(h.sigma as u32 + 1).to_le_bytes()), "sigma");
     // One more alphabet symbol than the header's sigma.
     let mut extra = blob.clone();
@@ -488,7 +573,7 @@ fn foreign_or_truncated_blob_is_refused() {
 fn heap_bytes_is_the_blob_plus_header() {
     let mut rng = Rng(11);
     let text: Vec<u8> = (0..200_000).map(|_| b'a' + rng.below(26) as u8).collect();
-    let index = Built::build(terminated(text), 16).unwrap();
+    let index = Built::build(terminated(text)).unwrap();
     let blob = encode(&index).len();
     assert_eq!(
         index.heap_bytes(),
@@ -499,7 +584,7 @@ fn heap_bytes_is_the_blob_plus_header() {
 #[test]
 fn blob_is_page_aligned() {
     for text in texts() {
-        let index = Built::build(text, 16).unwrap();
+        let index = Built::build(text).unwrap();
         let h = &index.header;
         assert_eq!(
             (h.blocks_at % layout::PAGE, h.blob_len % layout::PAGE),
@@ -524,7 +609,7 @@ fn rank_overhead_is_bounded() {
     let text: Vec<u8> = (0..100_000).map(|_| rng.below(256) as u8).collect();
     let text = terminated(text);
     let n = text.len() as f64;
-    let index = Built::build(text, 16).unwrap();
+    let index = Built::build(text).unwrap();
     let h = &index.header;
     let raw = (h.bits as f64 * n + 16.0 * h.sigma as f64 * n / occ::BLOCK as f64) / 8.0;
     let supers = 4.0 * h.sigma as f64 * (n / occ::SUPER as f64 + 1.0);
@@ -568,7 +653,7 @@ fn occ_rank_matches_naive_across_block_boundaries() {
             for b in 0..sigma {
                 alphabet[b / 64] |= 1 << (b % 64);
             }
-            let h = layout::Header::new(n, 0, 16, alphabet, [0; 257], 0, 0);
+            let h = layout::Header::new(n, 0, Gaps::WORDS, alphabet, [0; 257], 0, 0);
             let mut blob = vec![0u8; h.blob_len];
             in_pool(1, || occ::write_occ(&codes, &h, &mut blob));
             let mut threaded = vec![0u8; h.blob_len];
@@ -662,15 +747,11 @@ fn text_too_long_is_refused() {
     let err = build::check_len(i32::MAX as usize + 1).unwrap_err();
     assert!(matches!(err, Error::TextTooLong(_)), "{err}");
     assert!(matches!(
-        Built::build(b"a\0".to_vec(), 0),
-        Err(Error::ZeroSampleRate)
-    ));
-    assert!(matches!(
-        Built::build(b"a".to_vec(), 4),
+        Built::build(b"a".to_vec()),
         Err(Error::Unterminated)
     ));
     assert!(matches!(
-        Built::build(b"a\0b".to_vec(), 4),
+        Built::build(b"a\0b".to_vec()),
         Err(Error::Unterminated)
     ));
 }
@@ -678,9 +759,9 @@ fn text_too_long_is_refused() {
 /// Intervals below and above the lane count, tiny docs, and a long run.
 #[test]
 fn interleaved_locate_equals_rowwise() {
-    for rate in [1, 3, 4, 32] {
+    for sampling in samplings() {
         for text in texts() {
-            let index = Built::build(text.clone(), rate).unwrap();
+            let index = build_with(text.clone(), sampling).unwrap();
             for pattern in patterns(&text) {
                 let cursor = index.cursor().extend_front(&pattern);
                 let mut rowwise: Vec<usize> =
@@ -689,25 +770,16 @@ fn interleaved_locate_equals_rowwise() {
                 cursor.view.docs(cursor.lo..cursor.hi, &mut |d| got.push(d));
                 rowwise.sort_unstable();
                 got.sort_unstable();
-                assert_eq!(got, rowwise, "rate {rate} pattern {pattern:?}");
+                assert_eq!(got, rowwise, "{sampling:?} pattern {pattern:?}");
             }
         }
     }
 }
 
 #[test]
-fn a_view_reports_its_sample_rate() {
-    for rate in [1, 3, 16, 32] {
-        let index = Built::build(b"abracadabra\0".to_vec(), rate).unwrap();
-        assert_eq!(index.sample_rate(), rate);
-        assert_eq!(FmIndex::view(encode(&index)).unwrap().sample_rate(), rate);
-    }
-}
-
-#[test]
 fn rows_locates_a_slice_of_the_rows() {
     for text in texts() {
-        let index = Built::build(text.clone(), 4).unwrap();
+        let index = Built::build(text.clone()).unwrap();
         for pattern in patterns(&text) {
             let cursor = index.cursor().extend_front(&pattern);
             for within in [
@@ -735,9 +807,162 @@ fn rows_locates_a_slice_of_the_rows() {
         }
     }
     let mut visited = 0;
-    let index = Built::build(b"abracadabra\0".to_vec(), 4).unwrap();
+    let index = Built::build(b"abracadabra\0".to_vec()).unwrap();
     index.cursor().rows(0..5).locate(&mut |_| visited += 1);
     assert_eq!(visited, 0, "the root visits nothing");
+}
+
+fn doc_of(text: &[u8]) -> Vec<usize> {
+    text.iter()
+        .scan(0, |docs, &b| {
+            let here = *docs;
+            *docs += usize::from(b == DOC_END);
+            Some(here)
+        })
+        .collect()
+}
+
+/// LF steps from each text position back to its sample.
+fn naive_walks(text: &[u8], gaps: Gaps) -> Vec<usize> {
+    let mut last = 0;
+    naive_marked(text, gaps)
+        .iter()
+        .enumerate()
+        .map(|(p, &marked)| {
+            if marked {
+                last = p;
+            }
+            p - last
+        })
+        .collect()
+}
+
+#[test]
+fn text_walks_stay_within_bound() {
+    for text in [code_text(), terminated(all_bytes()), tiny_docs()] {
+        let mut rows: Vec<usize> = (0..=text.len()).collect();
+        rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
+        let docs = doc_of(&text);
+        for sampling in samplings() {
+            for (p, walk) in naive_walks(&text, sampling).into_iter().enumerate() {
+                let bound = if text[p].is_ascii_whitespace() {
+                    sampling.ws
+                } else {
+                    sampling.max
+                };
+                assert!(walk < bound as usize, "{sampling:?} at {p}: {walk}");
+            }
+            let index = build_with(text.clone(), sampling).unwrap();
+            let view = index.cursor().view;
+            for (row, &p) in rows.iter().enumerate().skip(1) {
+                assert_eq!(view.doc(row), docs[p], "{sampling:?} row {row}");
+            }
+        }
+    }
+}
+
+fn refuse(bytes: &[u8], want: &str) {
+    let Err(err) = FmIndex::view(bytes) else {
+        panic!("must refuse ({want})");
+    };
+    let err = err.to_string();
+    assert!(
+        err.contains("corrupt docfm blob") && err.contains(want),
+        "{want}: {err}"
+    );
+}
+
+fn patched(blob: &[u8], at: usize, bytes: &[u8]) -> Vec<u8> {
+    let mut b = blob.to_vec();
+    b[at..at + bytes.len()].copy_from_slice(bytes);
+    b
+}
+
+#[test]
+fn text_blob_header_is_checked() {
+    let blob = encode(&Built::build(b"printk hello printk\0".to_vec()).unwrap());
+    assert!(FmIndex::view(blob.as_slice()).is_ok());
+    let u32s = |v: u32| v.to_le_bytes();
+    for (at, value) in [
+        (68, 2),
+        (72, 0),
+        (72, 17),
+        (80, 15),
+        (84, 62),
+        (88, 1),
+        (92, 1),
+        (24, 8),
+    ] {
+        refuse(&patched(&blob, at, &u32s(value)), "v7 sampling");
+    }
+    refuse(&patched(&blob, 6, &[6]), "magic/version");
+}
+
+#[test]
+fn blobs_are_v7_with_their_gaps() {
+    for sampling in samplings() {
+        let blob = encode(&build_with(code_text(), sampling).unwrap());
+        assert_eq!(&blob[..8], b"DOCFM\0\x07\0", "{sampling:?}");
+        let Gaps { min, max, ws } = sampling;
+        let got: Vec<u32> = blob[68..96]
+            .chunks(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, [1, min, max, ws, ws - 1, 0, 0], "{sampling:?}");
+        assert_eq!(blob[24..28], max.to_le_bytes(), "{sampling:?}");
+    }
+}
+
+/// Whether a forward locate probes the tail `pattern[i..]`: if `pattern[i]`
+/// may be sampled as a word, subword or line start.
+fn naive_probed(pattern: &[u8], i: usize) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (prev, b) = (pattern[i - 1], pattern[i]);
+    (word(b) && !word(prev))
+        || (prev == b'_' && word(b) && b != b'_')
+        || (prev.is_ascii_lowercase() && b.is_ascii_uppercase())
+        || (matches!(prev, b' ' | b'\t' | b'\r' | b'\n') && !b.is_ascii_whitespace())
+}
+
+#[test]
+fn text_forward_probes_start_tails() {
+    let text = code_text();
+    let index = Built::build(text.clone()).unwrap();
+    for (pattern, starts) in [
+        (b"return".as_slice(), [].as_slice()),
+        (b"int", &[]),
+        (b"\treturn", &[1]),
+        (b"_MASK", &[1]),
+        (b"fooBarBaz", &[3, 6]),
+        (b"x = __b", &[2, 4, 6]),
+    ] {
+        let cursor = index.cursor().extend_front(pattern);
+        let probed: Vec<usize> = (1..pattern.len()).filter(|&i| cursor.probed(i)).collect();
+        assert_eq!(probed, starts, "{pattern:?}");
+        assert!(cursor.count() > 0, "{pattern:?}");
+        assert_eq!(
+            located(&index, pattern),
+            naive_docs(&text, pattern),
+            "{pattern:?}"
+        );
+    }
+}
+
+/// With every position sampled, a locate reads every occurrence's own
+/// mark and probes nothing.
+#[test]
+fn own_marks_resolve_first() {
+    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
+        let index = build_with(text.clone(), gaps(1, 1, 1)).unwrap();
+        for pattern in patterns(&text) {
+            let cursor = index.cursor().extend_front(&pattern);
+            let mut docs = Vec::new();
+            cursor.locate(&mut |d| docs.push(d));
+            docs.sort_unstable();
+            assert_eq!(docs, naive_docs(&text, &pattern), "{pattern:?}");
+            assert_eq!(cursor.forward_depth(), 0, "{pattern:?}");
+        }
+    }
 }
 
 #[path = "forward_tests.rs"]

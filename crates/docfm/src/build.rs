@@ -1,12 +1,12 @@
 use libsais::BwtConstruction;
 use libsais::bwt::AuxIndicesSamplingRate;
 
-use crate::layout::{HEADER_BYTES, Header};
+use crate::layout::{Gaps, HEADER_BYTES, Header};
 use crate::occ::{SUPER, write_occ};
 use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks};
 
-/// Bounds the LF steps from an aux row to a sampled position.
-const MAX_AUX_RATE: usize = 64;
+/// Text positions per aux row: a sample costs fewer LF steps to place.
+const AUX_RATE: usize = 4;
 
 /// `f` of every item, one job per item on the current rayon pool; a lone
 /// item runs inline. `f` runs no parallel work, so no thread ever waits
@@ -34,13 +34,10 @@ pub fn check_len(len: usize) -> Result<(), Error> {
 
 /// The blob of `text`: libsais runs on one thread, the other phases in
 /// `SUPER`-byte units on the current rayon pool. Peak live heap: the text
-/// (replaced by the BWT), libsais's `i32` temporary array and the aux rows.
-/// Each document start costs fewer than the aux rate in LF steps.
-pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
+/// (replaced by the BWT), libsais's `i32` temporary array, the aux rows and
+/// the sampled positions. `gaps` passes [`Gaps::check`].
+pub fn build(mut text: Vec<u8>, gaps: Gaps) -> Result<Vec<u8>, Error> {
     check_len(text.len())?;
-    if sample_rate == 0 {
-        return Err(Error::ZeroSampleRate);
-    }
     if text.last().is_some_and(|&b| b != DOC_END) {
         return Err(Error::Unterminated);
     }
@@ -68,31 +65,26 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
         }
     }
     c[sigma] = row as u32;
+    let positions = text_samples(&text, &starts, gaps);
     // Order-preserving, so the suffix order is the original text's.
     each(text.chunks_mut(SUPER), |chunk| {
         for b in chunk {
             *b = code_of[usize::from(*b)];
         }
     });
-    let rate = sample_rate as usize;
-    let r = 1 << (rate.min(MAX_AUX_RATE).ilog2().max(1));
-    // aux[k] is the row of text position k * r; aux[0] is the sentinel row.
+    // aux[k] is the row of text position k * AUX_RATE; aux[0] is the sentinel row.
     let aux = if n == 0 {
         Vec::new()
     } else {
-        bwt_in_place(&mut text, r)?
+        bwt_in_place(&mut text, AUX_RATE)?
     };
     let sentinel_row = aux.first().map_or(0, |&row| row as usize);
 
-    let off_rate_starts = starts
-        .iter()
-        .filter(|&&s| !(s as usize).is_multiple_of(rate))
-        .count();
-    let num_samples = n.div_ceil(rate) + off_rate_starts;
+    let num_samples = positions.len();
     let header = Header::new(
         n,
         sentinel_row,
-        sample_rate,
+        gaps,
         alphabet,
         c,
         starts.len(),
@@ -108,8 +100,8 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
     };
     // Walks from the aux row at or after `p`, or from row 0 (position `n`).
     let row_of = |p: usize| {
-        let q = p.next_multiple_of(r);
-        let mut row = aux.get(q / r).map_or(0, |&row| row as usize);
+        let q = p.next_multiple_of(AUX_RATE);
+        let mut row = aux.get(q / AUX_RATE).map_or(0, |&row| row as usize);
         for _ in p..q.min(n) {
             row = view.lf(row);
         }
@@ -119,22 +111,15 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
     let sampled = |i: usize| {
         let span = i * SUPER..(i * SUPER + SUPER).min(n);
         let first = starts.partition_point(|&s| s as usize <= span.start) - 1;
-        let mut found = Vec::with_capacity(span.len() / rate + 1);
-        for (doc, &s) in starts.iter().enumerate().skip(first) {
-            let s = s as usize;
-            if s >= span.end {
-                break;
+        let from = positions.partition_point(|&p| (p as usize) < span.start);
+        let to = positions.partition_point(|&p| (p as usize) < span.end);
+        let mut doc = first;
+        let mut found = Vec::with_capacity(to - from);
+        for &p in &positions[from..to] {
+            while starts.get(doc + 1).is_some_and(|&s| s <= p) {
+                doc += 1;
             }
-            let end = starts.get(doc + 1).map_or(n, |&e| e as usize).min(span.end);
-            let lo = s.max(span.start);
-            if lo == s && !s.is_multiple_of(rate) {
-                found.push(row_of(s) << 32 | doc as u64);
-            }
-            found.extend(
-                (lo.next_multiple_of(rate)..end)
-                    .step_by(rate)
-                    .map(|p| row_of(p) << 32 | doc as u64),
-            );
+            found.push(row_of(p as usize) << 32 | doc as u64);
         }
         found
     };
@@ -142,6 +127,7 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
     each(units.iter_mut().enumerate(), |(i, unit)| *unit = sampled(i));
     let mut found = units.concat();
     drop(aux);
+    drop(positions);
     found.sort_unstable();
     debug_assert_eq!(found.len(), num_samples);
 
@@ -162,6 +148,65 @@ pub fn build(mut text: Vec<u8>, sample_rate: u32) -> Result<Vec<u8>, Error> {
     }
     header.write(&mut out[..HEADER_BYTES]);
     Ok(out)
+}
+
+/// The sorted sampled positions of `text`, documents grouped per `SUPER` bytes.
+fn text_samples(text: &[u8], starts: &[u32], gaps: Gaps) -> Vec<u32> {
+    let mut groups = Vec::new();
+    let mut from = 0;
+    for (k, &s) in starts.iter().enumerate().skip(1) {
+        if s as usize - starts[from] as usize >= SUPER {
+            groups.push(from..k);
+            from = k;
+        }
+    }
+    if !starts.is_empty() {
+        groups.push(from..starts.len());
+    }
+    let mut out = vec![Vec::new(); groups.len()];
+    each(out.iter_mut().zip(groups), |(found, docs)| {
+        let end = starts.get(docs.end).map_or(text.len(), |&e| e as usize);
+        let lo = starts[docs.start] as usize;
+        found.reserve((end - lo) / (gaps.min as usize).max(4));
+        for doc in docs {
+            let s = starts[doc] as usize;
+            let e = starts.get(doc + 1).map_or(text.len(), |&e| e as usize);
+            doc_samples(&text[s..e], s as u32, gaps, found);
+        }
+    });
+    out.concat()
+}
+
+/// Whether `b` after `prev` starts a word or subword: after a non-word
+/// byte or `_`, or lower to upper.
+pub fn word_start(prev: u8, b: u8) -> bool {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    (word(b) && (!word(prev) || prev == b'_' && b != b'_'))
+        || (prev.is_ascii_lowercase() && b.is_ascii_uppercase())
+}
+
+/// Greedy over one document: its start; a word, subword or line start `min`
+/// past the previous sample; any byte `max` past it, `ws` on whitespace.
+fn doc_samples(doc: &[u8], at: u32, gaps: Gaps, found: &mut Vec<u32>) {
+    let [min, max, ws] = [gaps.min, gaps.max, gaps.ws].map(|g| g as usize);
+    found.push(at);
+    let (mut last, mut prev) = (0, doc[0]);
+    // Only blanks or '\r' since the line's start.
+    let mut line_start = matches!(prev, b' ' | b'\t' | b'\r' | b'\n');
+    for (p, &b) in doc.iter().enumerate().skip(1) {
+        let start = word_start(prev, b) || (line_start && !b.is_ascii_whitespace());
+        let force = if b.is_ascii_whitespace() { ws } else { max };
+        if p - last >= force || (start && p - last >= min) {
+            found.push(at + p as u32);
+            last = p;
+        }
+        line_start = match b {
+            b'\n' => true,
+            b' ' | b'\t' | b'\r' => line_start,
+            _ => false,
+        };
+        prev = b;
+    }
 }
 
 /// Replaces the non-empty `text` by its sentinel-free BWT; returns the rows

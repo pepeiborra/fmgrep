@@ -6,7 +6,7 @@ mod build;
 mod shard;
 
 use std::borrow::Cow;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -21,12 +21,8 @@ use crate::probe::{Answer, Query};
 use crate::sharded::build::{build_shards, refuse};
 use crate::sharded::shard::{Shard, ShardMeta, Structure, encode_shard, sample_probes, self_check};
 
-const DOC_SAMPLE_RATE: u32 = 16;
-const SAMPLE_RATE_VAR: &str = "FMGREP_SAMPLE_RATE";
-/// LF steps per sampled pass, about: rows times the rate.
-const SAMPLE_STEPS: u64 = 4096;
 /// Rows a locate sample takes per shard.
-const SAMPLE_ROWS: RangeInclusive<u64> = 256..=4096;
+const SAMPLE_ROWS: u64 = 256;
 /// Contiguous rows per sampled chunk: a few batches of docfm's lanes.
 const SAMPLE_CHUNK: u64 = 64;
 
@@ -36,19 +32,6 @@ const _: () = assert!(docfm::DOC_END == UNIFIED_SEPARATOR);
 /// `term`, unless it is empty or holds the separator: it then matches nothing.
 fn literal_term(term: &[u8]) -> Option<&[u8]> {
     (!term.is_empty() && !term.contains(&UNIFIED_SEPARATOR)).then_some(term)
-}
-
-/// docfm's sample rate for a build, from `FMGREP_SAMPLE_RATE`.
-fn sample_rate() -> Result<u32, String> {
-    #[cfg(test)]
-    if let Some(rate) = crate::tests::SAMPLE_RATE.get() {
-        return Ok(rate);
-    }
-    let rate = crate::env::count(SAMPLE_RATE_VAR, DOC_SAMPLE_RATE.into())?;
-    u32::try_from(rate)
-        .ok()
-        .filter(|&r| r > 0)
-        .ok_or_else(|| format!("{SAMPLE_RATE_VAR}={rate} is not a positive 32-bit integer"))
 }
 
 /// `Err` for a shard over docfm's text limit, before any of its bytes are
@@ -67,7 +50,7 @@ fn over_limit(cut: &Cut, max: u64) -> Result<(), String> {
 
 /// One shard: its documents, its text, its structure, its self-check. The
 /// documents are dropped before construction.
-fn build_one(cut: &Cut, docs: Cow<'_, [Document]>, rate: u32) -> Shard {
+fn build_one(cut: &Cut, docs: Cow<'_, [Document]>) -> Shard {
     // A separator byte in a document would make hits unattributable and
     // poison its whole shard.
     if let Some(d) = docs.iter().find(|d| d.bytes.contains(&UNIFIED_SEPARATOR)) {
@@ -85,7 +68,7 @@ fn build_one(cut: &Cut, docs: Cow<'_, [Document]>, rate: u32) -> Shard {
     drop(kept);
     drop(docs);
     // `text` moves into the structure: no shard text stays live.
-    let built = docfm::FmIndex::build(text, rate).unwrap_or_else(|e| refuse(e.to_string()));
+    let built = docfm::FmIndex::build(text).unwrap_or_else(|e| refuse(e.to_string()));
     let structure = docfm::FmIndex::view(Blob::Owned(built.into_bytes()))
         .unwrap_or_else(|e| refuse(e.to_string()));
     let structure = meta.admit(structure).unwrap_or_else(|e| refuse(e));
@@ -97,11 +80,12 @@ fn build_one(cut: &Cut, docs: Cow<'_, [Document]>, rate: u32) -> Shard {
     Shard { structure, meta }
 }
 
-/// µs per occurrence locating `rows` rows of `shard`'s commonest byte, in
+/// µs per occurrence locating `rows` rows of `shard`'s commonest capital, in
 /// chunks spread through its rows; fastest of 3 passes over the same rows.
+/// Capitals mostly start words, as the literals a search locates do.
 fn sample_locate(shard: &Structure, rows: u64) -> Option<f64> {
     let root = shard.cursor();
-    let byte = (1..=u8::MAX).max_by_key(|&b| root.extend_front(&[b]).count())?;
+    let byte = (b'A'..=b'Z').max_by_key(|&b| root.extend_front(&[b]).count())?;
     let cursor = root.extend_front(&[byte]);
     if cursor.count() < rows {
         return None;
@@ -131,14 +115,13 @@ type SlotDocs<'d> = Result<Cow<'d, [Document]>, String>;
 fn build_each<'d>(
     cuts: &Cuts,
     cap: u64,
-    rate: u32,
     window: Option<usize>,
     read: &(dyn Fn(&Cut) -> SlotDocs<'d> + Sync),
     emit: &mut dyn FnMut(usize, Shard) -> Result<(), String>,
 ) -> Result<(), String> {
     let build = |cut: &Cut| {
         over_limit(cut, docfm::MAX_TEXT_BYTES)?;
-        Ok(build_one(cut, read(cut)?, rate))
+        Ok(build_one(cut, read(cut)?))
     };
     build_shards(cuts, cap, window, &build, emit)
 }
@@ -152,8 +135,7 @@ pub struct DocfmIndex {
 }
 
 impl DocfmIndex {
-    /// Persist each shard, built at the `FMGREP_SAMPLE_RATE` sample rate, and
-    /// drop it: the documents, texts and FM-indexes of the shards in flight,
+    /// Persist each shard and drop it: the documents, texts and FM-indexes of the shards in flight,
     /// never the corpus. `window` is the shards in flight; `None` derives it
     /// from the build budget. Returns the index size in bytes.
     pub fn build_into(
@@ -163,12 +145,10 @@ impl DocfmIndex {
         store_docs: bool,
         sink: &mut BlobSink,
     ) -> Result<u64, String> {
-        let rate = sample_rate()?;
         let mut index_size_bytes = 0u64;
         build_each(
             cuts,
             cap,
-            rate,
             window,
             &|cut| cuts.read(cut).map(Cow::Owned),
             &mut |_slot, shard| {
@@ -208,23 +188,14 @@ impl DocfmIndex {
         self.total_docs
     }
 
-    /// Its shards' sample rate; the build default without shards.
-    pub fn sample_rate(&self) -> u32 {
-        self.shards
-            .first()
-            .map_or(DOC_SAMPLE_RATE, |s| s.sample_rate())
-    }
-
     /// Warm µs per located occurrence, sampled; None when no shard is wide enough.
     pub fn locate_us(&self) -> Option<f64> {
         let last = self.shards.len().checked_sub(1)?;
         let mut picks = vec![0, last / 2, last];
         picks.dedup();
-        let rows = (SAMPLE_STEPS / u64::from(self.sample_rate()))
-            .clamp(*SAMPLE_ROWS.start(), *SAMPLE_ROWS.end());
         let mut us: Vec<f64> = picks
             .par_iter()
-            .filter_map(|&i| sample_locate(&self.shards[i], rows))
+            .filter_map(|&i| sample_locate(&self.shards[i], SAMPLE_ROWS))
             .collect();
         us.sort_by(f64::total_cmp);
         us.get(us.len() / 2).copied()
@@ -337,7 +308,6 @@ impl DocfmIndex {
         build_each(
             &cuts,
             cap,
-            DOC_SAMPLE_RATE,
             None,
             &|cut| Ok(Cow::Borrowed(&docs[cut.docs.clone()])),
             &mut |_slot, shard| {

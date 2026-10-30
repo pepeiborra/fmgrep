@@ -29,8 +29,6 @@ thread_local! {
     pub static BAND: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
     /// `FMGREP_SHARD_BYTES` for indexes built on this thread, over the env.
     pub static SHARD_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
-    /// `FMGREP_SAMPLE_RATE` for indexes built on this thread, over the env.
-    pub static SAMPLE_RATE: Cell<Option<u32>> = const { Cell::new(None) };
     /// `FMGREP_JOURNAL` for indexes and loads on this thread, over the env.
     pub static JOURNAL: Cell<Option<&'static str>> = const { Cell::new(Some("off")) };
 }

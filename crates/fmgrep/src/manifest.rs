@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
-pub const MANIFEST_FORMAT: u32 = 2;
+pub const MANIFEST_FORMAT: u32 = 3;
 
 pub const MANIFEST_JSON: &str = "manifest.json";
 
@@ -327,7 +327,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
             at += pos + key.len();
         }
-        assert!(json.starts_with("{\"format\":2,"), "{json}");
+        assert!(json.starts_with("{\"format\":3,"), "{json}");
         for gone in ["engine", "index_name", "num_files_indexed"] {
             assert!(!json.contains(&format!("\"{gone}\"")), "{gone}: {json}");
         }
@@ -349,7 +349,7 @@ mod tests {
         // Every other layout fails at the explicit format check — never a
         // missing-field error, never a silent rebuild.
         let tmp = tempfile::tempdir().unwrap();
-        for format in [1u32, 3, 12] {
+        for format in [1u32, 2, 12] {
             let dir = tmp.path().join(format!("idx{format}"));
             stage(&dir, &[b"hello"], &[b"blob"]);
             retag(&dir, "format", serde_json::json!(format));

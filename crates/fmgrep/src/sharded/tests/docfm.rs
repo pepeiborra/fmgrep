@@ -210,7 +210,7 @@ fn size_is_the_structure_alone() {
         .filter(|d| !d.bytes.is_empty())
         .flat_map(|d| d.bytes.iter().copied().chain([crate::UNIFIED_SEPARATOR]))
         .collect();
-    let structure = ::docfm::FmIndex::build(text, DOC_SAMPLE_RATE).unwrap();
+    let structure = ::docfm::FmIndex::build(text).unwrap();
     assert_eq!(idx.index_size_bytes(), structure.heap_bytes());
 }
 

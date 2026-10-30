@@ -59,7 +59,7 @@ impl Loaded {
     /// verbose, note both costs.
     pub fn measure_locate(&mut self, index: &DocfmIndex) {
         let start = Instant::now();
-        self.locate_us = read::locate_us(index.sample_rate(), index.locate_us());
+        self.locate_us = read::locate_us(index.locate_us());
         if crate::verbose::verbose() {
             eprintln!(
                 "note: a read costs {:.1} µs per file, a locate {:.3} µs per occurrence (sampled in {} µs)",
@@ -137,7 +137,7 @@ pub fn load(
         load_wall: load_start.elapsed(),
         watch,
         band: boolean::ReadBand::DEFAULT,
-        locate_us: read::locate_us(index.sample_rate(), None),
+        locate_us: read::locate_us(None),
     };
     let loaded = finish(loaded, manifest);
     covers(index.num_files_indexed(), manifest)?;

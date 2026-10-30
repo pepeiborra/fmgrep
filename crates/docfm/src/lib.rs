@@ -7,7 +7,7 @@
 //! sentinel ending the text below every byte; row 0 is the empty suffix.
 //!
 //! ```
-//! let index = docfm::FmIndex::build(b"hello world\0say hello\0".to_vec(), 32)?;
+//! let index = docfm::FmIndex::build(b"hello world\0say hello\0".to_vec())?;
 //! assert_eq!(index.cursor().extend_front(b"hello").count(), 2);
 //!
 //! let mut docs = Vec::new();
@@ -33,7 +33,7 @@ mod occ;
 #[cfg(test)]
 mod tests;
 
-use crate::layout::Header;
+use crate::layout::{Gaps, Header};
 use crate::occ::Occ;
 
 /// Longest text [`FmIndex::build`] accepts: libsais's `i32` temporary array
@@ -54,8 +54,6 @@ pub struct FmIndex<D> {
 pub enum Error {
     /// The text, of this many bytes, is over [`MAX_TEXT_BYTES`].
     TextTooLong(usize),
-    /// A sample rate of 0.
-    ZeroSampleRate,
     /// The text does not end in [`DOC_END`].
     Unterminated,
     /// libsais refused the text.
@@ -75,7 +73,6 @@ impl std::fmt::Display for Error {
                     "text of {n} bytes exceeds the {MAX_TEXT_BYTES}-byte docfm bound"
                 )
             }
-            Self::ZeroSampleRate => write!(f, "docfm sample rate must be at least 1"),
             Self::Unterminated => write!(f, "docfm text must end in DOC_END (0x00)"),
             Self::Construction(e) => write!(f, "docfm construction failed: {e}"),
             Self::Io(e) => write!(f, "docfm blob I/O failed: {e}"),
@@ -88,12 +85,11 @@ impl std::error::Error for Error {}
 
 impl FmIndex<Vec<u8>> {
     /// `text` is documents, each followed by one [`DOC_END`]. Samples the doc
-    /// id of every row whose text position is a multiple of `sample_rate` or
-    /// starts a document, so a locate walks fewer than `sample_rate` LF steps
-    /// per occurrence. Runs on the current rayon pool; the blob does not
+    /// id at document, word, subword and line starts, so a locate walks at
+    /// most 63 LF steps. Runs on the current rayon pool; the blob does not
     /// depend on it.
-    pub fn build(text: Vec<u8>, sample_rate: u32) -> Result<Self, Error> {
-        Self::view(build::build(text, sample_rate)?)
+    pub fn build(text: Vec<u8>) -> Result<Self, Error> {
+        Self::view(build::build(text, Gaps::WORDS)?)
     }
 
     /// The blob, for storing and a later [`FmIndex::view`].
@@ -140,11 +136,6 @@ impl<D: AsRef<[u8]>> FmIndex<D> {
     /// Documents in the text: its [`DOC_END`] count.
     pub fn num_docs(&self) -> usize {
         self.header.num_docs
-    }
-
-    /// The sample rate it was built at.
-    pub fn sample_rate(&self) -> u32 {
-        self.header.sample_rate
     }
 
     /// Visit the doc id of every occurrence of `pattern`.
@@ -200,8 +191,8 @@ impl View<'_> {
             }
             steps += 1;
             assert!(
-                steps < self.header.sample_rate as usize,
-                "corrupt docfm index: no sample within the rate"
+                steps <= self.header.walk_bound(),
+                "corrupt docfm index: no sample within the walk bound"
             );
             row = self.lf(row);
         }
@@ -223,7 +214,7 @@ impl View<'_> {
     #[inline(never)]
     fn docs(&self, mut rows: impl Iterator<Item = usize>, visit: &mut dyn FnMut(usize)) {
         let marks = self.header.marks(self.bytes);
-        let rate = self.header.sample_rate as usize;
+        let bound = self.header.walk_bound();
         // (row, LF steps taken)
         let mut lanes = [(0usize, 0usize); LANES];
         let mut live = 0;
@@ -238,8 +229,8 @@ impl View<'_> {
                 let (marked, rank) = marks.get_rank(row);
                 if !marked {
                     assert!(
-                        steps + 1 < rate,
-                        "corrupt docfm index: no sample within the rate"
+                        steps < bound,
+                        "corrupt docfm index: no sample within the walk bound"
                     );
                     lanes[i] = (self.lf(row), steps + 1);
                     i += 1;
@@ -327,8 +318,8 @@ impl Cursor<'_> {
     }
 
     /// Visit the doc id of every occurrence, in no fixed order; the root
-    /// visits nothing. Occurrences resolve from samples a few bytes into the
-    /// query first; the rest walk back.
+    /// visits nothing. Occurrences resolve from samples at or a few bytes
+    /// into the query first; the rest walk back.
     pub fn locate(&self, visit: &mut dyn FnMut(usize)) {
         self.locate_at(self.forward_depth(), visit);
     }

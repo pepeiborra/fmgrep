@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 2): what each
+The on-disk layout `fmgrep index` writes (manifest format 3): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -32,7 +32,7 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `2` |
+| `format` | u32 | `3` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | usize | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
@@ -50,7 +50,7 @@ tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 2, naming the remedy: re-run `fmgrep index`. Old
+- a `format` other than 3, naming the remedy: re-run `fmgrep index`. Old
   indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
@@ -137,20 +137,21 @@ Each blob's length is a multiple of 16 KiB, so every blob, and every
 occurrence block inside one, starts page-aligned. The file is mapped at
 load and used in place, never decoded.
 
-Blob version 6, little-endian. The code-side contract is the table in
+Blob version 7, little-endian. The code-side contract is the table in
 `crates/docfm/src/layout.rs`, with `occ.rs` and `marks.rs` beside it.
 
 | section | holds |
 |---|---|
-| header, 2176 bytes | magic `DOCFM\0\x06\0`; text bytes `n`; sentinel row; sample rate (default 16); alphabet bitmap and size; `c` (first row per byte code); `num_docs`, `num_samples` |
+| header, 2176 bytes | magic `DOCFM\0\x07\0`; text bytes `n`; sentinel row; sampling gaps `min` 8, `max` 16, `ws` 64 and walk bound 63; alphabet bitmap and size; `c` (first row per byte code); `num_docs`, `num_samples` |
 | supers | per 65536 BWT positions: u32 counts per code, padded to 64 bytes |
 | occurrence blocks | from the next 16 KiB boundary; per 4096 positions: u16 counts at the block midpoint, then the code bits of each 64 positions as bit planes |
 | marks | a u32 count per 4096 rows, then a u16 in-bucket offset per sampled row |
 | samples | u32 document id per sampled row, in row order |
 
-A row is sampled iff its text position is a multiple of the sample rate or
-starts a document. A locate walks LF to the nearest sampled row, in fewer
-steps than the sample rate, without leaving its document. The load checks
+A row is sampled iff its text position starts a document, or starts a
+word, subword or line at least 8 bytes past the previous sample, or is 16
+bytes past it (64 on whitespace). A locate walks LF to the nearest sampled
+row, in at most 63 steps, without leaving its document. The load checks
 the header, each code's total against the last block, the marks total and
 the sentinel row's sample. A blob that passes these checks but is corrupt
 elsewhere can miscount or panic, but never reads out of bounds.

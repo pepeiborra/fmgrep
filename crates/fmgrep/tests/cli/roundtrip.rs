@@ -262,9 +262,6 @@ fn failed_build_removes_the_output() {
     let index_dir = tmp.path().join("idx");
     for (var, raw) in [
         ("FMGREP_SHARD_BYTES", "nope"),
-        ("FMGREP_SAMPLE_RATE", "nope"),
-        ("FMGREP_SAMPLE_RATE", "0"),
-        ("FMGREP_SAMPLE_RATE", "4294967296"),
         ("FMGREP_JOURNAL", "nope"),
         ("FMGREP_JOURNAL", "!off"),
     ] {
@@ -279,58 +276,6 @@ fn failed_build_removes_the_output() {
             assert!(stderr(&out).contains("off, on"), "{}", stderr(&out));
         }
         assert!(!index_dir.exists(), "a failed index must persist nothing");
-    }
-}
-
-/// The sample rate trades blob bytes for locate steps: nothing else on disk,
-/// and no answer, moves with it.
-#[test]
-fn the_sample_rate_changes_the_blobs_not_the_answers() {
-    for store_docs in [false, true] {
-        let (tmp, docs) = stage();
-        let mut cells = Vec::new();
-        for rate in ["", "16", "1", "5", "32"] {
-            let index_dir = tmp.path().join(format!("idx-{rate}"));
-            let out = fmgrep()
-                .args(index_argv(&docs, &index_dir, store_docs, &[]))
-                .env("FMGREP_SAMPLE_RATE", rate)
-                .output()
-                .expect("spawn");
-            assert!(out.status.success(), "index: {}", stderr(&out));
-            let mut manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(index_dir.join("manifest.json")).unwrap())
-                    .unwrap();
-            let blobs = std::fs::read(index_dir.join("blobs.shard")).unwrap();
-            let blob_lens = manifest["blob_lens"].take();
-            manifest["index_size_bytes"].take();
-            manifest["build_time_us"].take();
-            let mut files: Vec<_> = std::fs::read_dir(&index_dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| !p.ends_with("manifest.json") && !p.ends_with("blobs.shard"))
-                .map(|p| (p.file_name().unwrap().to_owned(), std::fs::read(p).unwrap()))
-                .collect();
-            files.sort();
-            let index = index_dir.display().to_string();
-            let answers: Vec<_> = [
-                &["printk", "aaaa", "missing"][..],
-                &["/pr.n[a-z]k/", "/n.n-/"],
-                &["-c", "printk"],
-                &["--and", "printk", "hello"],
-            ]
-            .iter()
-            .map(|args| run(&[&["--index", &index][..], args].concat()))
-            .map(|out| (out.status.code(), out.stdout))
-            .collect();
-            cells.push(((files, manifest, answers), (blobs, blob_lens)));
-        }
-        for cell in &cells {
-            assert_eq!(cell.0, cells[0].0, "{store_docs}");
-        }
-        assert_eq!(cells[0].1, cells[1].1, "{store_docs}");
-        assert_ne!(cells[0].1.0, cells[2].1.0, "{store_docs}");
-        assert_ne!(cells[0].1.0, cells[3].1.0, "{store_docs}");
-        assert_ne!(cells[0].1.0, cells[4].1.0, "{store_docs}");
     }
 }
 

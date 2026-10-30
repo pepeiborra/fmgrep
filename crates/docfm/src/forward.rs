@@ -1,10 +1,12 @@
-//! Forward locate: an occurrence at `p` resolves from a mark at `p + i` in
-//! the rows of the tail `path[i..]`, verified by `i` LF steps back.
+//! Forward locate: rows with their own mark first, then an occurrence at `p`
+//! from a mark at `p + i` in a probed tail `path[i..]`, `i` LF steps back.
 
+use crate::build::word_start;
 use crate::{Cursor, DOC_END, RING, View};
 
-/// A tail is used while it holds at most `RATIO * count / rate` marks:
-/// fewer than `RATIO / 2` candidates per occurrence over all depths.
+/// A tail is used while it holds at most `RATIO * count / d` marks, `d` the
+/// text bytes per mark: fewer than `RATIO / 2` candidates per occurrence over
+/// all depths.
 const RATIO: u64 = 32;
 
 /// Deepest tail used.
@@ -20,53 +22,90 @@ impl Cursor<'_> {
             .min(MAX_DEPTH)
     }
 
-    /// The depth a locate uses: within the cap and `rate / 2 - 1`, stopping
-    /// before the first tail whose marks fail the [`RATIO`] gate.
+    /// Whether tail `i` is probed: `path[i]` can start a word, subword or line.
+    pub(super) fn probed(&self, i: usize) -> bool {
+        let (prev, b) = (self.path(i - 1), self.path(i));
+        word_start(prev, b)
+            || matches!(prev, b' ' | b'\t' | b'\r' | b'\n') && !b.is_ascii_whitespace()
+    }
+
+    /// The depth a locate uses, stopping before the first probed tail failing
+    /// the [`RATIO`] gate over the rows without their own mark.
     pub(super) fn forward_depth(&self) -> usize {
-        let rate = self.view.header.sample_rate as usize;
-        let limit = self.depth_cap().min((rate / 2).saturating_sub(1));
-        let marks = self.view.header.marks(self.view.bytes);
-        let budget = RATIO * self.count();
+        let header = self.view.header;
+        let limit = self.depth_cap().min(header.depth_limit());
+        let marks = header.marks(self.view.bytes);
+        let own = marks.get_rank(self.hi).1 - marks.get_rank(self.lo).1;
+        let count = self.count() - own as u64;
+        if count == 0 {
+            return 0;
+        }
+        let (num, den) = header.density();
+        let budget = u128::from(RATIO * count) * u128::from(den);
         (1..=limit)
+            .filter(|&i| self.probed(i))
             .take_while(|&i| {
                 let (from, to) = self.tail(i);
                 let inside = marks.get_rank(to).1 - marks.get_rank(from).1;
-                inside as u64 * rate as u64 <= budget
+                inside as u128 * u128::from(num) <= budget
             })
             .last()
             .unwrap_or(0)
     }
 
-    /// Visits the doc of every occurrence, resolving from tails `1..=depth`
-    /// (clamped to the cap) first.
+    /// Visits the doc of every occurrence: from the rows' own marks, then
+    /// from tails `1..=depth` (clamped to the cap), then by walking back.
     pub(super) fn locate_at(&self, depth: usize, visit: &mut dyn FnMut(usize)) {
         let (lo, hi, view) = (self.lo, self.hi, self.view);
         if self.root || lo == hi {
             return;
         }
-        match self.resolve(depth, visit) {
-            None => view.docs(lo..hi, visit),
-            Some(resolved) => view.docs(
-                (lo..hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
-                visit,
-            ),
+        let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
+        let mut own = 0;
+        for (row, rank) in view.header.marks(view.bytes).range(lo, hi) {
+            resolved[(row - lo) / 64] |= 1 << ((row - lo) % 64);
+            visit(view.sampled(rank));
+            own += 1;
         }
+        if own == hi - lo {
+            return;
+        }
+        if !self.resolve_into(depth, &mut resolved, visit) && own == 0 {
+            return view.docs(lo..hi, visit);
+        }
+        view.docs(
+            (lo..hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
+            visit,
+        );
     }
 
-    /// Visits the doc of each occurrence a tail `1..=depth` (clamped to the
-    /// cap) resolves, once; returns those rows as a bitmap over `lo..hi`,
-    /// `None` at depth 0.
+    /// Visits the doc of each occurrence a probed tail `1..=depth` (clamped
+    /// to the cap) resolves, once; returns those rows as a bitmap over
+    /// `lo..hi`, `None` at depth 0.
+    #[cfg(test)]
     pub(super) fn resolve(&self, depth: usize, visit: &mut dyn FnMut(usize)) -> Option<Vec<u64>> {
+        let mut resolved = vec![0u64; (self.hi - self.lo).div_ceil(64)];
+        self.resolve_into(depth, &mut resolved, visit)
+            .then_some(resolved)
+    }
+
+    /// [`Cursor::resolve`] into `resolved`, skipping rows set there; false
+    /// at depth 0.
+    fn resolve_into(
+        &self,
+        depth: usize,
+        resolved: &mut [u64],
+        visit: &mut dyn FnMut(usize),
+    ) -> bool {
         let (lo, hi, view) = (self.lo, self.hi, self.view);
         let depth = depth.min(self.depth_cap());
         if depth == 0 {
-            return None;
+            return false;
         }
         let codes: [u8; MAX_DEPTH] =
             std::array::from_fn(|j| view.header.code_of[usize::from(self.path(j))].unwrap_or(0));
         let marks = view.header.marks(view.bytes);
-        let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
-        for i in 1..=depth {
+        for i in (1..=depth).filter(|&i| self.probed(i)) {
             let (from, to) = self.tail(i);
             for (row, rank) in marks.range(from, to) {
                 let Some(at) = view.back(row, &codes[..i]) else {
@@ -83,7 +122,7 @@ impl Cursor<'_> {
                 }
             }
         }
-        Some(resolved)
+        true
     }
 
     /// The rows of `path[i..]`, `1 <= i < min(len, RING)`.
