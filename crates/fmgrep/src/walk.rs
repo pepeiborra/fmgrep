@@ -76,8 +76,8 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocMeta {
     /// `/`-separated path relative to the corpus root, lossy-decoded. The
-    /// enumeration reopens documents through it, so a non-UTF-8 or
-    /// backslash-bearing file name is not addressable.
+    /// enumeration reopens documents through it, so a non-UTF-8 file name is
+    /// not addressable.
     pub path: String,
     pub len: u64,
 }
@@ -403,14 +403,17 @@ pub fn discover_index_meta(root: &Path) -> Result<Vec<DocMeta>, String> {
 /// `path` is always built by joining under `root`, so the prefix strip
 /// succeeds; the file name is the fallback (never a panic).
 fn relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
+    let file_name = Path::new(path.file_name().unwrap_or_default());
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(file_name)
+        .to_string_lossy();
+    // Only Windows separates with `\`; elsewhere it is part of a name.
+    if cfg!(windows) {
+        rel.replace('\\', "/")
+    } else {
+        rel.into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -458,6 +461,18 @@ mod tests {
         }
         assert_eq!(docs[0].bytes, b"first");
         assert_eq!(docs[3].bytes, b"fourth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_keeps_a_backslash_in_a_file_name() {
+        let dir = scratch_dir("backslash");
+        std::fs::write(dir.join("str\\\\escape.rs"), b"keep").unwrap();
+        let docs = discover_index_docs(&dir).unwrap();
+        let paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["str\\\\escape.rs"]);
+        assert_eq!(discover_index_meta(&dir).unwrap()[0].path, paths[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
