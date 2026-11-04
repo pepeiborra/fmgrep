@@ -1,6 +1,7 @@
 //! Benchmarks fmgrep against ripgrep, and tgrep and elgrep when installed,
 //! over one corpus.
 
+mod corpus;
 mod elgrep;
 #[cfg(test)]
 mod fake_bin;
@@ -12,16 +13,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use corpus::{CORPORA, corpus_root, query_set};
 use fmgrep::regex_pattern;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
 const USAGE: &str = "\
-usage: bench [--corpus ghc|linux|chromium] [--rows ROWS] [--fixture] [--trace FILE]
+usage: bench [--corpus ghc|linux|chromium|aosp] [--rows ROWS] [--fixture] [--trace FILE]
 
 Stages the corpus, runs every row over its queries, checks that every row
 prints the same lines as the first, and prints the results as markdown.
 
-  --corpus ID    ghc (default), linux or chromium; the checkout is
+  --corpus ID    ghc (default), linux, chromium or aosp; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
   --rows ROWS    comma-separated rg, fmgrep, fmgrep-store-docs,
                  fmgrep-direct (no server: a process per query), tgrep,
@@ -31,8 +33,6 @@ prints the same lines as the first, and prints the results as markdown.
   --trace FILE   write one JSON line per query and per row
 
 Exits 1 when a row fails or the rows disagree, 2 on a usage or corpus error.";
-
-const CORPORA: [&str; 3] = ["ghc", "linux", "chromium"];
 
 /// A row, named in kebab-case by `--rows`, the results and the trace; rows
 /// run and print in this order.
@@ -124,28 +124,6 @@ pub fn leaves(query: &str) -> Vec<&str> {
     query.split(" AND ").collect()
 }
 
-pub struct QuerySet {
-    pub repo_url: String,
-    pub commit: String,
-    pub queries: Vec<String>,
-}
-
-fn query_set(corpus: &str) -> QuerySet {
-    let json = match corpus {
-        "ghc" => include_str!("../queries/ghc.json"),
-        "linux" => include_str!("../queries/linux.json"),
-        _ => include_str!("../queries/chromium.json"),
-    };
-    let v: serde_json::Value = serde_json::from_str(json).expect("query file is JSON");
-    let text = |v: &serde_json::Value| v.as_str().expect("a string").to_string();
-    let queries = v["queries"].as_array().expect("a query list");
-    QuerySet {
-        repo_url: text(&v["repo_url"]),
-        commit: text(&v["commit"]),
-        queries: queries.iter().map(text).collect(),
-    }
-}
-
 /// An error line and the exit code it ends the run with.
 type Fail = (u8, String);
 
@@ -199,22 +177,6 @@ fn fmgrep_bin() -> Option<PathBuf> {
         .chain(std::env::split_paths(&path))
         .map(|d| d.join("fmgrep"));
     bins.find(|p| p.is_file())
-}
-
-fn corpus_root(id: &str) -> Result<PathBuf, String> {
-    let var = format!("FMGREP_CORPUS_{}", id.to_uppercase());
-    let root = match std::env::var_os(&var) {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/bench")).join(id),
-    };
-    if !root.exists() {
-        return Err(format!(
-            "no {id} corpus at {}: run scripts/bench.sh --corpus {id} [--repo-path DIR] \
-             to clone the pinned commit, or set {var}=DIR",
-            root.display()
-        ));
-    }
-    Ok(root)
 }
 
 /// Every row must answer the first row's queries with the same lines.
@@ -332,12 +294,10 @@ fn run() -> Result<(), Fail> {
     }
 
     let diffs = verify(&results);
-    let root_str = root.to_str().filter(|_| !fixture);
-    let head = root_str.and_then(|r| report::run("git", &["-C", r, "rev-parse", "HEAD"]));
     let mut run = report::Run {
         corpus,
         fixture,
-        revision: head,
+        revision: (!fixture).then(|| corpus::revision(&root)).flatten(),
         files: n,
         bytes: docs.iter().map(|d| d.len).sum(),
         stamps: report::stamps(fmgrep.as_deref(), &tgrep, &elgrep),
@@ -374,45 +334,6 @@ fn stage(root: &Path, docs: &[fmgrep::DocMeta]) -> Result<tempfile::TempDir, Str
 mod tests {
     use super::*;
 
-    fn regexes(set: &QuerySet) -> impl Iterator<Item = &str> {
-        set.queries
-            .iter()
-            .flat_map(|q| leaves(q))
-            .filter_map(regex_pattern)
-    }
-
-    #[test]
-    fn query_files_pin_a_commit_and_list_literals_first() {
-        let counts = [
-            ("ghc", 30, 5, 5),
-            ("linux", 92, 13, 8),
-            ("chromium", 30, 8, 8),
-        ];
-        for (id, literals, regexes, intersections) in counts {
-            let QuerySet {
-                repo_url,
-                commit,
-                queries,
-            } = query_set(id);
-            assert!(repo_url.starts_with("https://") && repo_url.ends_with(".git"));
-            assert!(commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()));
-            let kinds: Vec<Kind> = queries.iter().map(|q| Kind::of(q)).collect();
-            let want = [
-                vec![Kind::Literal; literals],
-                vec![Kind::Regex; regexes],
-                vec![Kind::Intersection; intersections],
-            ];
-            assert_eq!(kinds, want.concat(), "{id}");
-            let mut sorted = queries.clone();
-            sorted.sort();
-            sorted.dedup();
-            assert_eq!(sorted.len(), queries.len(), "{id}: duplicate query");
-            assert!(queries.iter().all(|q| !q.trim().is_empty()), "{id}");
-        }
-        let ghc = query_set("ghc").commit;
-        assert_eq!(ghc, "4cf7628aa66f56000c29aef93924b6b8515db8f7");
-    }
-
     #[test]
     fn kind_and_leaves_follow_the_spelling() {
         assert_eq!((Kind::of("a"), leaves("a")), (Kind::Literal, vec!["a"]));
@@ -426,41 +347,6 @@ mod tests {
         }
         let names = Kind::ALL.map(Kind::name);
         assert_eq!(names, ["literal", "regex", "intersection"]);
-    }
-
-    /// The rg, tgrep and elgrep rows' last stage reads literal leaves as regexes.
-    #[test]
-    fn intersection_literals_need_no_escaping() {
-        for id in CORPORA {
-            let set = query_set(id);
-            let ands = set
-                .queries
-                .iter()
-                .filter(|q| Kind::of(q) == Kind::Intersection);
-            for q in ands {
-                assert_eq!(leaves(q).len(), 2, "{id} {q:?}");
-                for l in leaves(q).into_iter().filter(|l| regex_pattern(l).is_none()) {
-                    let plain = !l.contains(char::is_whitespace) && regex::escape(l) == l;
-                    assert!(plain, "{id} {q:?}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn every_regex_set_compiles_and_prefilters() {
-        use regex_syntax::hir::literal::Extractor;
-        for id in CORPORA {
-            let set = query_set(id);
-            for p in regexes(&set) {
-                regex::bytes::Regex::new(p).unwrap_or_else(|e| panic!("{id} {p:?}: {e}"));
-                let seq = Extractor::new().extract(&regex_syntax::parse(p).unwrap());
-                assert!(
-                    matches!(seq.min_literal_len(), Some(n) if n > 0),
-                    "{id} {p:?}"
-                );
-            }
-        }
     }
 
     #[test]
