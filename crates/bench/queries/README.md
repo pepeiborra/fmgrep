@@ -13,6 +13,11 @@ selective.
 patterns rewritten to use `[ \t]` instead of `\s`; the regexes of
 `chromium.json` and all of `ghc.json` are authored here.
 
-The last three regexes and intersections of `linux.json` and `chromium.json`
-are authored worst cases for an FM-index: required literals with many
-occurrences packed into few files, or a short anchor whose walk gives up.
+`aosp.json` pins a platform-manifest release tag, not a sha, and
+`scripts/bench.sh` does not clone it: sync it as docs/benchmark.md says. Its
+queries are authored here.
+
+The last three regexes and intersections of `linux.json`, `chromium.json`
+and `aosp.json` are authored worst cases for an FM-index: required literals
+with many occurrences packed into few files, or a short anchor whose walk
+gives up.

@@ -10,6 +10,7 @@ What each row and column means, and the measured results, are in
 ```sh
 scripts/bench.sh                          # GHC, cloned into target/bench/ghc
 scripts/bench.sh --corpus linux --repo-path ~/src/linux
+scripts/bench.sh --corpus aosp --repo-path ~/aosp   # synced first, see AOSP
 scripts/bench.sh --results bench.md -- --rows rg,fmgrep,fmgrep-store-docs
 ```
 
@@ -23,8 +24,9 @@ with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
 row prints each query's matching lines, and the harness exits 1 unless all
 rows print the same lines. Arguments after `--` go to the harness;
 `target/release/bench --help` lists them. The corpus checkout is
-`FMGREP_CORPUS_GHC`, `FMGREP_CORPUS_LINUX` or `FMGREP_CORPUS_CHROMIUM`,
-by default `target/bench/<corpus>`; the harness exits 2 when it is missing.
+`FMGREP_CORPUS_GHC`, `FMGREP_CORPUS_LINUX`, `FMGREP_CORPUS_CHROMIUM` or
+`FMGREP_CORPUS_AOSP`, by default `target/bench/<corpus>`; the harness exits
+2 when it is missing.
 `--fixture` searches one file of the query set's literals instead, as a smoke
 test.
 
@@ -79,6 +81,28 @@ instance-hours, tool builds and the sync included: about
 $1 or less at on-demand prices, less on spot. `down` deletes every instance,
 security group and key pair tagged `Project=fmgrep-bench` in the region,
 another run's included.
+## AOSP
+
+The `aosp` corpus is the Android Open Source Project's platform source at
+release tag `android-17.0.0_r1`: about a thousand git projects that the
+[repo](https://gerrit.googlesource.com/git-repo) tool assembles from the
+platform manifest. Projects of prebuilt binaries are left out: `prebuilts/`
+and the other paths matching the `EXCLUDE` pattern below. `scripts/bench.sh`
+does not clone it; sync it once, then pass the tree with `--repo-path` or
+`FMGREP_CORPUS_AOSP`:
+
+```sh
+EXCLUDE='(^|/)prebuilts?(/|$)|[-_]prebuilts?$|Prebuilt$|-kernel$|^external/chromium-webview$|^device/google/cuttlefish_vmm$'
+mkdir ~/aosp && cd ~/aosp
+repo init --depth=1 --no-clone-bundle -b android-17.0.0_r1 \
+    -u https://android.googlesource.com/platform/manifest.git
+repo list -a -p | grep -Ev "$EXCLUDE" | xargs repo sync -c --no-tags -j8
+```
+
+The synced tree takes about 48 GB of disk: 1.3 million files, of which
+fmgrep indexes 19 GB of text, 79% of it under `external/`. A run needs
+about 30 GB more for the largest row index (rows run one at a time), plus
+19 GB for the staged copy where the filesystem cannot clone files.
 
 ## tgrep (optional)
 
@@ -110,4 +134,4 @@ Linux, so the default rows include elgrep only there; elsewhere
 Each corpus's queries and pinned commit are in
 `crates/bench/queries/<corpus>.json`; `/.../` entries are regexes and
 `A AND B` entries intersections. To add a corpus, add a query file and name
-it in `crates/bench/src/main.rs`.
+it in `crates/bench/src/corpus.rs`.

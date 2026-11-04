@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::{Kind, QuerySet, Row, RowKind};
+use crate::corpus::QuerySet;
+use crate::{Kind, Row, RowKind};
 
 pub struct Run {
     pub corpus: &'static str,
@@ -353,7 +354,7 @@ mod tests {
             notes,
             date,
         };
-        let (mut set, revision) = (crate::query_set("ghc"), Some(revision.to_string()));
+        let (mut set, revision) = (crate::corpus::query_set("ghc"), Some(revision.to_string()));
         set.queries = TERMS.map(String::from).to_vec();
         let run = Run {
             corpus: "ghc",

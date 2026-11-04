@@ -10,6 +10,7 @@ fn bench(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
         "FMGREP_CORPUS_GHC",
         "FMGREP_CORPUS_LINUX",
         "FMGREP_CORPUS_CHROMIUM",
+        "FMGREP_CORPUS_AOSP",
         "FMGREP_BENCH_TGREP_BIN",
         "FMGREP_BENCH_ELGREP_BIN",
     ] {
@@ -30,35 +31,39 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn assert_refused(out: &Output, id: &str) {
+fn assert_refused(out: &Output, fragments: &[impl AsRef<str>]) {
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
     assert_eq!(out.status.code(), Some(2), "{stdout}\n{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(
-        stderr.contains(&format!("scripts/bench.sh --corpus {id} [--repo-path DIR]")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("FMGREP_CORPUS_{}=DIR", id.to_uppercase())),
-        "{stderr}"
-    );
+    for f in fragments.iter().map(AsRef::as_ref) {
+        assert!(stderr.contains(f), "{f:?} not in {stderr}");
+    }
+}
+
+fn clone_hint(id: &str) -> [String; 2] {
+    let var = format!("FMGREP_CORPUS_{}=DIR", id.to_uppercase());
+    [
+        format!("scripts/bench.sh --corpus {id} [--repo-path DIR]"),
+        var,
+    ]
 }
 
 #[test]
 fn missing_corpus_exits_2_naming_both_ways() {
     let dir = tempfile::tempdir().unwrap();
     let absent = dir.path().join("absent");
-    assert_refused(
-        &bench(dir.path(), &[("FMGREP_CORPUS_GHC", &absent)], &[]),
-        "ghc",
-    );
-    let default_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench/chromium");
-    if !default_root.exists() {
-        assert_refused(
-            &bench(dir.path(), &[], &["--corpus", "chromium"]),
-            "chromium",
-        );
+    let out = bench(dir.path(), &[("FMGREP_CORPUS_GHC", &absent)], &[]);
+    assert_refused(&out, &clone_hint("ghc"));
+    let default_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench");
+    if !default_root.join("chromium").exists() {
+        let out = bench(dir.path(), &[], &["--corpus", "chromium"]);
+        assert_refused(&out, &clone_hint("chromium"));
+    }
+    if !default_root.join("aosp").exists() {
+        let out = bench(dir.path(), &[], &["--corpus", "aosp"]);
+        assert_refused(&out, &["--repo-path DIR", "FMGREP_CORPUS_AOSP=DIR"]);
+        assert!(!text(&out.stderr).contains("to clone"));
     }
 }
 
