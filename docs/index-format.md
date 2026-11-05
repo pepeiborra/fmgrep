@@ -14,7 +14,7 @@ directory.
 |---|---|---|
 | `manifest.json` | always | the document list, length tables and blob inventory |
 | `blobs.shard` | always | one docfm blob per shard, concatenated |
-| `docs.stamps` | default | one mtime per document |
+| `docs.stamps` | default | one mtime per document, and the file length of each UTF-16 one |
 | `dirs.stamps` | default | every walked directory's `(size, mtime)` |
 | `docs.journal` | default, when a change source marks | change-source tokens, rewritten by each search |
 | `docs.shard` | `--store-docs` | the documents, concatenated |
@@ -68,9 +68,14 @@ The walk under PATH defines the document set:
 - names starting with `.` are pruned, files and directories alike, so
   `.git`, `.sl` and `.fmgrep` are never read;
 - symlinked directories are not descended; symlinked files are included;
-- files holding a NUL byte, or that look binary (a known binary magic
-  number, or over 5% control bytes in the first 8 KiB), are skipped, with
-  one summary line on stderr (`-v` lists them);
+- a file starting with a UTF-16LE or UTF-16BE BOM is read as the UTF-8
+  that rg decodes it to; a document is that text, else the file's bytes;
+- binary files are skipped, with one summary line on stderr (`-v` lists
+  them): a document holding a NUL byte, starting with `%PDF-`, or whose
+  first 8 KiB are over 5% control bytes. rg searches the last two and
+  prints their bytes as unreadable lines;
+- a file whose size or text is over 2^31-2 bytes (docfm's bound less a
+  separator) is skipped, with a warning;
 - paths are stored as UTF-8, with `/` separators; a non-UTF-8 name is
   converted lossily.
 
@@ -81,8 +86,8 @@ answer, a load stats every document against its `(size, mtime)` stamp:
 
 - a changed file is scanned in full by every search, so answers equal a
   fresh index of the current tree;
-- a missing, unreadable or now-binary file is excluded, with one warning
-  per process;
+- a missing or unreadable file, or one the walk would now skip, is
+  excluded, with one warning per process;
 - a file the walk's rules find that the index does not list is added:
   scanned in full and printed in path order among the indexed files, with
   no warning. The load stats the directories in `dirs.stamps`, lists only
@@ -159,8 +164,11 @@ bounds.
 ## docs.stamps
 
 `8 x num_docs` bytes: the mtime of each document at index time, as a
-little-endian i64 in nanoseconds since the epoch, by id. With `doc_lens` it
-forms the `(size, mtime)` stamp that a load checks every file against.
+little-endian i64 in nanoseconds since the epoch, by id. Then 16 bytes per
+document read from UTF-16, ascending by id: its id and its file length, as
+little-endian u64s. With `doc_lens`, or that file length, it forms the
+`(size, mtime)` stamp that a load checks every file against. Any other
+size, order or id is refused with exit 2.
 
 ## dirs.stamps
 
@@ -192,7 +200,7 @@ left by an older `fmgrep` is ignored.
 ## docs.shard
 
 The documents concatenated, by id, with no separators; `doc_lens` slices
-them. They are stored as read, BOMs included.
+them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
 
 ## Determinism
 

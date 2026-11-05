@@ -3,7 +3,7 @@
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::{Document, Stamp};
+use crate::Document;
 
 use crate::docs::Cut;
 
@@ -34,24 +34,28 @@ pub fn read_cut(shard: &Path, cut: &Cut) -> Result<Vec<Document>, String> {
 }
 
 /// The documents of `cut` re-read from the files under `root`; a file whose
-/// stamp moved since the walk read it is refused by path.
+/// mtime or text moved since the walk read it is refused by path.
 pub fn read_files(root: &Path, cut: &Cut) -> Result<Vec<Document>, String> {
     let pool = crate::walk::read_pool()?;
     let read = crate::walk::read_batch(&pool, root, &cut.paths, &String::as_str)?;
     let mut out = Vec::with_capacity(read.len());
-    for (at, (id, (bytes, stamp))) in cut.docs.clone().zip(read).enumerate() {
-        let want = Stamp {
-            len: cut.lens[at],
-            mtime_ns: cut.mtimes[at],
-        };
-        if stamp != want || bytes.len() as u64 != want.len {
-            return Err(changed_while_indexing(&root.join(&cut.paths[at])));
+    for (at, (id, (raw, stamp))) in cut.docs.clone().zip(read).enumerate() {
+        let whole = raw.len() as u64 == stamp.len;
+        let text = crate::binary::text(raw).map(|t| t.bytes);
+        match text {
+            Ok(bytes)
+                if whole
+                    && stamp.mtime_ns == cut.mtimes[at]
+                    && bytes.len() as u64 == cut.lens[at] =>
+            {
+                out.push(Document {
+                    id,
+                    path: cut.paths[at].clone(),
+                    bytes,
+                });
+            }
+            _ => return Err(changed_while_indexing(&root.join(&cut.paths[at]))),
         }
-        out.push(Document {
-            id,
-            path: cut.paths[at].clone(),
-            bytes,
-        });
     }
     Ok(out)
 }

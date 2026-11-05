@@ -464,3 +464,54 @@ fn verbose_prints_the_plan_on_stderr_and_leaves_stdout_alone() {
         }
     }
 }
+
+fn utf16(bom: [u8; 2], s: &str) -> Vec<u8> {
+    let be = bom == [0xfe, 0xff];
+    let units = s.encode_utf16();
+    let mut raw = bom.to_vec();
+    raw.extend(units.flat_map(|u| if be { u.to_be_bytes() } else { u.to_le_bytes() }));
+    raw
+}
+
+/// A UTF-16 file with a BOM is searched as UTF-8, as rg decodes it, and
+/// stays fresh until rewritten.
+#[test]
+fn utf16_file_prints_as_utf8_lines() {
+    let le = utf16([0xff, 0xfe], "alpha\r\nthe CLASS ü\r\n");
+    let (tmp, docs) = stage_files(&[("u.txt", &le), ("z.txt", b"no match\n")]);
+    for store_docs in [false, true] {
+        let index_dir = tmp.path().join(format!("idx-{store_docs}"));
+        let out = run(&index_argv(&docs, &index_dir, store_docs, &[]));
+        assert!(out.status.success(), "{}", stderr(&out));
+        let index = index_dir.display().to_string();
+        let out = run(&["--index", &index, "-n", "CLASS"]);
+        assert_eq!(stderr(&out), "");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "u.txt\n2:the CLASS ü\r\n"
+        );
+    }
+    std::fs::write(docs.join("u.txt"), utf16([0xfe, 0xff], "CLASS again\n")).unwrap();
+    let index = tmp.path().join("idx-false").display().to_string();
+    let out = run(&["--index", &index, "-n", "CLASS"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "u.txt\n1:CLASS again\n"
+    );
+}
+
+/// A file docfm cannot hold is skipped with a warning, never failing the tree.
+#[test]
+fn a_file_over_2_gib_is_skipped_with_a_warning() {
+    let (tmp, docs) = stage_files(&[("a.c", b"printk\n")]);
+    let huge = std::fs::File::create(docs.join("huge.log")).unwrap();
+    huge.set_len(1 << 31).unwrap();
+    let index_dir = tmp.path().join("idx");
+    let out = run(&index_argv(&docs, &index_dir, false, &[]));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "warning: skipping huge.log: over 2147483646 bytes\n"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("indexed 1 file (7 bytes)"));
+}

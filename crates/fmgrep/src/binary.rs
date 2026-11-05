@@ -1,185 +1,250 @@
-//! The index-time binary predicate: NUL rule, native object magic, then a
-//! portable control-density fallback.
+//! Which files are searchable text, and their text.
+
+use std::io::Read as _;
+use std::path::Path;
 
 use crate::unified::UNIFIED_SEPARATOR;
 
-/// Prefix window (bytes) the portable control-density sniff inspects; the NUL
-/// rule still covers the whole buffer, so no late NUL slips through.
-const BINARY_SNIFF_PREFIX: usize = 8192;
+/// Leading bytes the control-byte rule inspects.
+const SNIFF_BYTES: usize = 8192;
 
-/// True when `bytes` look binary. Empty is text; any NUL is binary (the
-/// [`UNIFIED_SEPARATOR`] contract); merely-non-UTF-8 text passes.
-pub fn is_binary_doc(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
+/// Longest document: its separator must fit docfm's text bound.
+pub const MAX_DOC_BYTES: u64 = docfm::MAX_TEXT_BYTES - 1;
+
+/// A searchable file's text.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Text {
+    pub bytes: Vec<u8>,
+    /// Decoded from UTF-16: its length is not the file's.
+    pub utf16: bool,
+}
+
+/// Why a file is not searched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Skip {
+    Binary,
+    TooLarge,
+}
+
+impl std::fmt::Display for Skip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Skip::Binary => f.write_str("looks binary"),
+            Skip::TooLarge => write!(f, "over {MAX_DOC_BYTES} bytes"),
+        }
+    }
+}
+
+/// A file's text: UTF-16 with a BOM decoded to UTF-8 as rg decodes it, else
+/// the bytes as they are.
+pub fn text(raw: Vec<u8>) -> Result<Text, Skip> {
+    if raw.len() as u64 > MAX_DOC_BYTES {
+        return Err(Skip::TooLarge);
+    }
+    let text = match utf16(&raw) {
+        Some(bytes) => Text { bytes, utf16: true },
+        None => Text {
+            bytes: raw,
+            utf16: false,
+        },
+    };
+    if text.bytes.len() as u64 > MAX_DOC_BYTES {
+        return Err(Skip::TooLarge);
+    }
+    if is_binary(&text.bytes) {
+        return Err(Skip::Binary);
+    }
+    Ok(text)
+}
+
+/// Whether the file's first bytes allow it to be text: false implies
+/// [`text`] of the whole file is `Err`. An unreadable file is not text.
+pub fn sniff_text(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|m| m.len() <= MAX_DOC_BYTES) {
         return false;
     }
-    if bytes.contains(&UNIFIED_SEPARATOR) {
+    // Enough UTF-16 to decode to the control-byte window.
+    let mut head = Vec::with_capacity(2 * SNIFF_BYTES + 2);
+    if file
+        .take(2 * SNIFF_BYTES as u64 + 2)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    !is_binary(&utf16(&head).unwrap_or(head))
+}
+
+/// The UTF-8 of UTF-16 text after its BOM; `None` without a BOM. Invalid
+/// units become U+FFFD as in WHATWG's decoder, which rg uses.
+fn utf16(raw: &[u8]) -> Option<Vec<u8>> {
+    let unit: fn([u8; 2]) -> u16 = match raw.get(..2)? {
+        [0xff, 0xfe] => u16::from_le_bytes,
+        [0xfe, 0xff] => u16::from_be_bytes,
+        _ => return None,
+    };
+    let (units, odd) = raw[2..].as_chunks::<2>();
+    let mut text = String::with_capacity(raw.len());
+    let chars = char::decode_utf16(units.iter().map(|&u| unit(u)));
+    text.extend(chars.map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)));
+    // An odd last byte is one more U+FFFD, unless it follows an unpaired
+    // lead surrogate, which already got one.
+    let lead = units
+        .last()
+        .is_some_and(|&u| (0xd800..0xdc00).contains(&unit(u)));
+    if !odd.is_empty() && !lead {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    Some(text.into_bytes())
+}
+
+/// A NUL anywhere, a PDF, or over 5% control bytes in the first
+/// [`SNIFF_BYTES`].
+fn is_binary(text: &[u8]) -> bool {
+    if text.contains(&UNIFIED_SEPARATOR) || text.starts_with(b"%PDF-") {
         return true;
     }
-    if platform_is_binary(bytes).unwrap_or(false) {
-        return true;
-    }
-    portable_is_binary(bytes)
-}
-
-/// [`is_binary_doc`] of the file's first [`BINARY_SNIFF_PREFIX`] bytes: true
-/// implies it of the whole file.
-pub fn sniff_binary(path: &std::path::Path) -> std::io::Result<bool> {
-    use std::io::Read as _;
-    let mut prefix = Vec::with_capacity(BINARY_SNIFF_PREFIX);
-    std::fs::File::open(path)?
-        .take(BINARY_SNIFF_PREFIX as u64)
-        .read_to_end(&mut prefix)?;
-    Ok(is_binary_doc(&prefix))
-}
-
-/// Native object magic: `Some(true)` on a hit, `None` = inconclusive, which
-/// defers to [`portable_is_binary`] and never means "text".
-#[cfg(target_os = "macos")]
-fn platform_is_binary(bytes: &[u8]) -> Option<bool> {
-    // Mach-O 32/64-bit, either endianness. (`CAFEBABE` fat/class lives in the
-    // portable table — it is cross-platform.)
-    const MACHO: &[&[u8]] = &[
-        b"\xfe\xed\xfa\xce",
-        b"\xfe\xed\xfa\xcf",
-        b"\xce\xfa\xed\xfe",
-        b"\xcf\xfa\xed\xfe",
-    ];
-    if MACHO.iter().any(|m| bytes.starts_with(m)) {
-        Some(true)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn platform_is_binary(bytes: &[u8]) -> Option<bool> {
-    if bytes.starts_with(b"\x7fELF") {
-        Some(true)
-    } else {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn platform_is_binary(_bytes: &[u8]) -> Option<bool> {
-    None
-}
-
-/// Magic prefixes, else control density. `bytes` is non-empty and NUL-free.
-fn portable_is_binary(bytes: &[u8]) -> bool {
-    const MAGIC: &[&[u8]] = &[
-        b"\xff\xfe", // UTF-16LE BOM
-        b"\xfe\xff", // UTF-16BE BOM
-        b"\x1f\x8b", // gzip
-        // zip (+ empty archive + spanned).
-        b"PK\x03\x04",
-        b"PK\x05\x06",
-        b"PK\x07\x08",
-        b"\x89PNG\r\n\x1a\n", // PNG
-        b"\xff\xd8\xff",      // JPEG
-        b"GIF87a",
-        b"GIF89a",           // GIF
-        b"%PDF-",            // PDF
-        b"\xca\xfe\xba\xbe", // CAFEBABE: Java class or Mach-O fat binary
-    ];
-    if MAGIC.iter().any(|m| bytes.starts_with(m)) {
-        return true;
-    }
-    let window = &bytes[..bytes.len().min(BINARY_SNIFF_PREFIX)];
-    let suspicious = window
+    let window = &text[..text.len().min(SNIFF_BYTES)];
+    let control = window
         .iter()
         .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\x0c' | b'\r')) || b == 0x7f)
         .count();
-    // Over 5% control bytes: binary.
-    suspicious * 20 > window.len()
+    control * 20 > window.len()
+}
+
+/// `s` as UTF-16LE with a BOM.
+#[cfg(test)]
+pub fn utf16le(s: &str) -> Vec<u8> {
+    let mut raw = vec![0xff, 0xfe];
+    raw.extend(s.encode_utf16().flat_map(u16::to_le_bytes));
+    raw
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn is_text(bytes: &[u8]) -> bool {
+        text(bytes.to_vec()).is_ok()
+    }
+
     #[test]
     fn binary_predicate_keeps_text_and_empties() {
-        // Empty docs are structural zeros, not binary — they must survive.
-        assert!(!is_binary_doc(b""));
-        // Plain ASCII / UTF-8 (incl. CJK + emoji), form feeds, and
-        // high-byte-but-control-free Latin-1 prose: all text.
-        assert!(!is_binary_doc(b"printk(KERN_INFO \"hi\");\n"));
-        assert!(!is_binary_doc("kmalloc — 日本語テスト 🎉\n".as_bytes()));
-        assert!(!is_binary_doc(b"int x;\x0c\n"));
-        assert!(!is_binary_doc(b"caf\xe9 na\xefve soup\xe7on\n"));
-        // All-high-byte files are merely non-UTF-8, not control soup: text.
-        assert!(!is_binary_doc(&[0x80u8; 64]));
-        // A lone stray control byte stays text (the density rule needs >5%).
+        assert!(is_text(b""));
+        assert!(is_text(b"printk(KERN_INFO \"hi\");\n"));
+        assert!(is_text("kmalloc — 日本語テスト 🎉\n".as_bytes()));
+        assert!(is_text(b"int x;\x0c\n"));
+        assert!(is_text(b"caf\xe9 na\xefve soup\xe7on\n"));
+        assert!(is_text(&[0x80u8; 64]));
+        assert!(is_text(b"\xef\xbb\xbf%PDF-1.4"), "a PDF starts the file");
         let mut mostly_text = vec![b'x'; 9000];
         mostly_text.extend_from_slice(b"printk(ctx);\n");
         mostly_text[8500] = 0x07;
-        assert!(!is_binary_doc(&mostly_text));
+        assert!(is_text(&mostly_text));
     }
 
     #[test]
-    fn binary_predicate_drops_nul_and_magic_and_soup() {
-        // NUL anywhere (incl. late, past the prefix window) → binary.
+    fn binary_predicate_drops_nul_pdf_and_soup() {
         let mut late = vec![b'x'; 9000];
         late.extend_from_slice(b"printk(ctx);\n");
         late[8500] = 0;
-        assert!(is_binary_doc(&late));
-        // Portable magics (NUL-free) → binary.
-        assert!(is_binary_doc(b"\xff\xfeH\x00i\x00")); // UTF-16LE BOM
-        assert!(is_binary_doc(b"\xfe\xff\x00H")); // UTF-16BE BOM
-        assert!(is_binary_doc(b"\x1f\x8b\x08text")); // gzip
-        assert!(is_binary_doc(b"PK\x03\x04text")); // zip
-        assert!(is_binary_doc(b"%PDF-1.4 binary")); // PDF
-        assert!(is_binary_doc(b"\xca\xfe\xba\xbeABCD")); // CAFEBABE, NUL-free
-        // NUL-free control soup → binary (11 suspicious of 14 ≈ 79%).
-        assert!(is_binary_doc(
-            b"\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0e\x7fabc"
-        ));
+        assert_eq!(text(late), Err(Skip::Binary));
+        assert!(!is_text(b"%PDF-1.4 binary"));
+        assert!(!is_text(b"\x1f\x8b\x08text"), "gzip, as control bytes");
+        assert!(!is_text(b"PK\x03\x04text"), "zip, as control bytes");
+        assert!(!is_text(b"\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0e\x7fabc"));
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn platform_branch_catches_macho_without_nul_or_soup() {
-        // Mach-O magic + printable padding is NUL-free and control-free, so
-        // only the macOS platform branch catches this.
-        let mut header = b"\xcf\xfa\xed\xfe".to_vec();
-        header.extend(vec![b'A'; 64]);
-        assert!(!header.contains(&0));
-        assert!(!portable_is_binary(&header));
-        assert_eq!(platform_is_binary(&header), Some(true));
-        assert!(is_binary_doc(&header));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn platform_branch_catches_elf_without_nul_or_soup() {
-        // ELF magic + printable padding is NUL-free and under the density
-        // threshold, so only the Linux platform branch catches this.
-        let mut header = b"\x7fELF".to_vec();
-        header.extend(vec![b'A'; 64]);
-        assert!(!header.contains(&0));
-        assert!(!portable_is_binary(&header));
-        assert_eq!(platform_is_binary(&header), Some(true));
-        assert!(is_binary_doc(&header));
+    fn decoded(raw: &[u8]) -> Result<Text, Skip> {
+        text(raw.to_vec())
     }
 
     #[test]
-    fn sniff_binary_implies_a_binary_whole() {
+    fn utf16_with_a_bom_reads_as_rg_decodes_it() {
+        let utf8 = |s: &str| {
+            Ok(Text {
+                bytes: s.as_bytes().to_vec(),
+                utf16: true,
+            })
+        };
+        assert_eq!(
+            decoded(&utf16le("hi\r\nCLASS ü 🎉\n")),
+            utf8("hi\r\nCLASS ü 🎉\n")
+        );
+        let mut be = vec![0xfe, 0xff];
+        be.extend("hi ü".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(decoded(&be), utf8("hi ü"));
+        assert_eq!(decoded(&utf16le("")), utf8(""));
+        assert_eq!(decoded(b"\xff\xfe"), utf8(""));
+        // The searcher, not the decoder, strips one more BOM, as for UTF-8.
+        assert_eq!(
+            decoded(&utf16le("\u{feff}hi\u{feff}")),
+            utf8("\u{feff}hi\u{feff}")
+        );
+        let mut odd = utf16le("ab");
+        odd.push(b'Z');
+        assert_eq!(decoded(&odd), utf8("ab\u{fffd}"));
+        let lone = [&utf16le("x")[..], b"\x00\xd8y\x00", b"\x00\xdc"].concat();
+        assert_eq!(decoded(&lone), utf8("x\u{fffd}y\u{fffd}"));
+        let lead_then_odd = [&utf16le("ab")[..], b"\x00\xd8Z"].concat();
+        assert_eq!(decoded(&lead_then_odd), utf8("ab\u{fffd}"));
+        assert_eq!(decoded(&utf16le("a\0b")), Err(Skip::Binary));
+        assert_eq!(
+            decoded(b"\xff\xfe\x00\x00h\x00"),
+            Err(Skip::Binary),
+            "UTF-32LE"
+        );
+        assert_eq!(decoded(&utf16le("\x01\x02\x03")), Err(Skip::Binary));
+        assert_eq!(decoded(&utf16le("%PDF-1.4")), Err(Skip::Binary));
+        assert_eq!(
+            decoded(b"\xffhi"),
+            Ok(Text {
+                bytes: b"\xffhi".to_vec(),
+                utf16: false
+            })
+        );
+    }
+
+    #[test]
+    fn sniff_text_false_implies_a_skipped_whole() {
         let dir = tempfile::tempdir().unwrap();
         let sniff = |name: &str, bytes: &[u8]| {
             std::fs::write(dir.path().join(name), bytes).unwrap();
-            sniff_binary(&dir.path().join(name)).unwrap()
+            sniff_text(&dir.path().join(name))
         };
-        let mut late = vec![b'x'; BINARY_SNIFF_PREFIX + 10];
-        late[BINARY_SNIFF_PREFIX + 1] = 0;
-        assert!(
-            !sniff("late.c", &late) && is_binary_doc(&late),
-            "a NUL past the prefix is found on read"
-        );
-        assert!(sniff("nul.c", b"alpha\0beta"));
-        assert!(sniff("gz.c", b"\x1f\x8btext"));
-        assert!(!sniff("text.c", b"alpha\n") && !sniff("empty.c", b""));
-        assert!(sniff_binary(&dir.path().join("missing.c")).is_err());
+        let mut late = vec![b'x'; 2 * SNIFF_BYTES + 10];
+        late[2 * SNIFF_BYTES + 3] = 0;
+        assert!(sniff("late.c", &late) && !is_text(&late), "found on read");
+        assert!(!sniff("nul.c", b"alpha\0beta"));
+        assert!(!sniff("gz.c", b"\x1f\x8btext"));
+        assert!(sniff("text.c", b"alpha\n") && sniff("empty.c", b""));
+        assert!(sniff("le.c", &utf16le("alpha\n")));
+        assert!(!sniff("le-nul.c", &utf16le("alpha\0")));
+        // A pair cut at the head's end decodes to U+FFFD, never to control.
+        let cut = utf16le(&format!("a{}", "🎉".repeat(SNIFF_BYTES)));
+        assert!(sniff("cut.c", &cut) && is_text(&cut));
+        let soup = utf16le(&format!(
+            "{}{}",
+            "x".repeat(SNIFF_BYTES - 1),
+            "\x01".repeat(1000)
+        ));
+        assert!(sniff("soup.c", &soup) && is_text(&soup), "past the window");
+        assert!(!sniff_text(&dir.path().join("missing.c")));
+    }
+
+    #[test]
+    fn a_file_over_the_doc_bound_is_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        std::fs::write(&path, vec![b'x'; 2 * SNIFF_BYTES + 2]).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_len(MAX_DOC_BYTES).unwrap();
+        assert!(sniff_text(&path));
+        file.set_len(MAX_DOC_BYTES + 1).unwrap();
+        assert!(!sniff_text(&path));
+        assert_eq!(Skip::TooLarge.to_string(), "over 2147483646 bytes");
     }
 }

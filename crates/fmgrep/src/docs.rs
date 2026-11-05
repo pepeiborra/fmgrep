@@ -29,6 +29,8 @@ pub struct Docs {
     pub bom_bytes: u64,
     /// The walk's mtime per doc, ascending by id.
     pub mtimes: Vec<i64>,
+    /// `(id, file length)` of each doc decoded from UTF-16, ascending.
+    pub file_lens: Vec<(u64, u64)>,
     /// Canonical corpus root; files layout only.
     pub root: Option<String>,
     /// What the walk saw besides documents.
@@ -138,13 +140,20 @@ fn stream_into(
         |shard: &Path, e: std::io::Error| format!("error: cannot write {}: {e}", shard.display());
     let mut cutter = Cutter::of(cap);
     let mut bom_bytes = 0u64;
-    let walked = crate::for_each_index_doc(folder, Some(output), |path, bytes, stamp| {
+    let mut file_lens = Vec::new();
+    let mut id = 0u64;
+    let walked = crate::for_each_index_doc(folder, Some(output), |path, text, stamp, read| {
         if writer.aborted() {
             return Err(ABORTED.to_string());
         }
-        if matches!(source, CutSource::Files(_)) && bytes.len() as u64 != stamp.len {
+        if matches!(source, CutSource::Files(_)) && read != stamp.len {
             return Err(read::changed_while_indexing(&folder.join(path)));
         }
+        if text.utf16 {
+            file_lens.push((id, stamp.len));
+        }
+        id += 1;
+        let bytes = text.bytes;
         let stamp = crate::Stamp {
             len: bytes.len() as u64,
             ..stamp
@@ -184,6 +193,7 @@ fn stream_into(
             lens: tables.lens,
             bom_bytes,
             mtimes: tables.mtimes,
+            file_lens,
             root: match source {
                 CutSource::Files(root) => root.to_str().map(str::to_owned),
                 CutSource::Shard(_) => None,

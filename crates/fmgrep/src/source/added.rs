@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 
 use super::{Known, Recorded, parallel};
-use crate::binary::sniff_binary;
+use crate::binary::sniff_text;
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
 #[derive(Default)]
@@ -130,9 +130,9 @@ impl Known {
         }
     }
 
-    /// The paths of `rels` whose first bytes do not look binary, in order.
+    /// The paths of `rels` whose first bytes allow text, in order.
     fn text_only(&self, root: &Path, rels: Vec<String>) -> Vec<String> {
-        let keep = parallel(&rels, |rel| sniff_binary(&root.join(rel)).is_ok_and(|b| !b));
+        let keep = parallel(&rels, |rel| sniff_text(&root.join(rel)));
         rels.into_iter()
             .zip(keep)
             .filter_map(|(rel, k)| k.then_some(rel))
@@ -185,7 +185,7 @@ impl Known {
             Ok(meta) => {
                 let file = meta.is_file()
                     || meta.is_symlink() && std::fs::metadata(path).is_ok_and(|m| m.is_file());
-                file && sniff_binary(path).is_ok_and(|b| !b)
+                file && sniff_text(path)
             }
             Err(_) => false,
         };
@@ -213,9 +213,15 @@ impl Known {
     pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {
         let slot = doc.checked_sub(self.state.len())?;
         let rel = self.added().paths.get(slot)?.clone();
-        match std::fs::read(self.root.join(&rel)) {
-            Ok(bytes) if !crate::is_binary_doc(&bytes) => Some(bytes),
-            _ => {
+        let path = self.root.join(&rel);
+        let text = std::fs::metadata(&path)
+            .is_ok_and(|m| m.len() <= crate::binary::MAX_DOC_BYTES)
+            .then(|| std::fs::read(&path).ok())
+            .flatten()
+            .and_then(|raw| crate::binary::text(raw).ok());
+        match text {
+            Some(text) => Some(text.bytes),
+            None => {
                 if self.added().set(&rel, false) {
                     self.epoch.fetch_add(1, Ordering::AcqRel);
                 }
