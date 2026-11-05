@@ -2,6 +2,7 @@
 //! over one corpus.
 
 mod corpus;
+mod deviations;
 mod elgrep;
 #[cfg(test)]
 mod fake_bin;
@@ -21,9 +22,9 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 const USAGE: &str = "\
 usage: bench [--corpus ghc|linux|chromium|aosp] [--rows ROWS] [--fixture] [--trace FILE]
 
-Runs every row over the checkout in place, checks that the rows print the
-same lines for every file they both searched, lists the files only some
-rows searched, and prints the results as markdown.
+Runs every row over the checkout in place, checks each row's lines from
+every file against rg's, lists the files only some rows searched, and
+prints the results as markdown; tgrep and elgrep differences are notes.
 
   --corpus ID    ghc (default), linux, chromium or aosp; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
@@ -34,7 +35,8 @@ rows searched, and prints the results as markdown.
   --fixture      search one file of the query set's literals instead
   --trace FILE   write one JSON line per query and per row
 
-Exits 1 when a row fails or the rows disagree, 2 on a usage or corpus error.";
+Exits 1 when a row fails or an fmgrep row differs from rg, 2 on a usage or
+corpus error.";
 
 /// A row, named in kebab-case by `--rows`, the results and the trace; rows
 /// run and print in this order.
@@ -51,6 +53,9 @@ pub enum RowKind {
     Tgrep,
     Elgrep,
 }
+
+/// Rows whose differences from the reference are noted, not failures.
+const THIRD_PARTY: [RowKind; 2] = [RowKind::Tgrep, RowKind::Elgrep];
 
 pub struct Query {
     pub term: String,
@@ -267,7 +272,7 @@ fn run() -> Result<(), Fail> {
         results.push(row);
     }
 
-    let (diffs, unsearched) = verify::verify(&paths, &root, &results);
+    let verdict = verify::verify(&paths, &root, &results);
     let mut run = report::Run {
         corpus,
         fixture,
@@ -282,19 +287,27 @@ fn run() -> Result<(), Fail> {
         run.stamps.notes.push(note.to_owned());
     }
     let found = report::Found {
-        diffs: &diffs,
-        unsearched: &unsearched,
+        diffs: &verdict.fatal,
+        unsearched: &verdict.unsearched,
+        deviations: &verdict.deviations,
         paths: &paths,
     };
+    for (name, note) in deviations::notes(run.set.queries.len(), &found) {
+        let row = results.iter_mut().find(|r| r.name == name);
+        row.expect("deviations name run rows").notes.push(note);
+    }
     print!("{}", report::markdown(&run, &results, &found));
     if let Some(path) = &trace {
         let written = std::fs::write(path, report::trace(&run, &results, &found));
         written.map_err(|e| failed(format!("{}: {e}", path.display())))?;
     }
-    if !diffs.is_empty() {
-        return Err((1, format!("verify: FAILED\n{}", diffs.join("\n"))));
+    if !verdict.fatal.is_empty() {
+        return Err((1, format!("verify: FAILED\n{}", verdict.fatal.join("\n"))));
     }
-    eprintln!("verify: OK");
+    match deviations::count(&verdict.deviations) {
+        0 => eprintln!("verify: OK"),
+        k => eprintln!("verify: OK ({})", deviations::differences(k)),
+    }
     Ok(())
 }
 

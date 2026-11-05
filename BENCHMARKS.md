@@ -6,8 +6,10 @@ Linux server.
 
 Every run is `scripts/bench.sh` ([docs/benchmark.md](docs/benchmark.md)).
 Every row searches the checkout itself, one query at a time, and prints
-each matching line as `path:line:text`; a run fails unless the rows that
-searched a file print the same lines from it, by line number.
+each matching line as `path:line:text`. rg is the reference: a run fails
+if fmgrep (served, `--store-docs` or with no server) prints other lines
+than rg from a file both searched, by line number; a tgrep or elgrep row
+that does is noted under its table with the queries and files.
 Files only some rows searched (hidden, symlinked, gitignored, binary) are
 listed under the run's results, not failures.
 

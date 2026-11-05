@@ -216,3 +216,74 @@ fn in_place_run_lists_files_only_some_rows_searched() {
         assert!(md.contains(want), "{want:?} not in\n{md}");
     }
 }
+
+/// An `eg` wrapping rg that prints nothing for `HscEnv`, beside an
+/// `eg-indexd` that only signals readiness.
+fn stand_in_eg(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let eg = r#"#!/bin/bash
+args=()
+for a in "$@"; do
+  case $a in
+    --version) echo 'elgrep (eg) 0.0 (stand-in)'; exit 0 ;;
+    --bench) echo '{"ok":true,"cold_build":true,"timings_ms":{"cold_build_total":1}}'; exit 0 ;;
+    --index-dir=*|--debug) ;;
+    *) args+=("$a") ;;
+  esac
+done
+[[ " ${args[*]} " == *" -e HscEnv "* ]] && exit 1
+exec rg "${args[@]}"
+"#;
+    let daemon = "#!/bin/sh\nmkdir -p \"$2\"\necho $$ >\"$2/daemon.lock\"\n\
+                  echo $$ >\"$2/startup-ready\"\nexec sleep 600\n";
+    for (name, script) in [("eg", eg), ("eg-indexd", daemon)] {
+        let bin = dir.join(name);
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir.join("eg")
+}
+
+#[test]
+fn third_party_row_dropping_a_file_is_a_footnote_not_a_failure() {
+    let fmgrep = Path::new(env!("CARGO_BIN_EXE_bench")).with_file_name("fmgrep");
+    if !fmgrep.is_file() || Command::new("rg").arg("--version").output().is_err() {
+        eprintln!("skipped: needs fmgrep and rg");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let eg = stand_in_eg(dir.path());
+    let out = bench(
+        dir.path(),
+        &[("FMGREP_BENCH_ELGREP_BIN", &eg)],
+        &[
+            "--fixture",
+            "--rows",
+            "rg,fmgrep,elgrep",
+            "--trace",
+            "t.jsonl",
+        ],
+    );
+    let (md, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{md}\n{stderr}");
+    let wants = [
+        "\n- elgrep: 1 of 40 queries differs from rg: `HscEnv`, 1 line missed in 1 file (`ghc.txt`)\n",
+        "\nverify: OK, fmgrep rows agree with rg on 40 queries; 1 third-party difference (see notes)\n",
+    ];
+    for want in wants {
+        assert!(md.contains(want), "{want:?} not in\n{md}");
+    }
+    assert!(
+        stderr.ends_with("verify: OK (1 third-party difference)\n"),
+        "{stderr}"
+    );
+    let trace = std::fs::read_to_string(dir.path().join("t.jsonl")).unwrap();
+    let differs: Vec<(String, String)> = trace
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v["differs"].as_array().is_some_and(|d| !d.is_empty()))
+        .map(|v| (v["index_name"].to_string(), v["differs"].to_string()))
+        .collect();
+    let want = r#"[{"against":"rg","file":"ghc.txt","lines":0,"want":1}]"#;
+    assert_eq!(differs, [(r#""elgrep""#.to_string(), want.to_string())]);
+}
