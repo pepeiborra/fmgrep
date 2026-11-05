@@ -21,11 +21,13 @@ mod watcher;
 pub use journal::{Journal, Knob, marks};
 pub use recorded::{Recorded, write_walk};
 
-/// Per-doc mtimes of a files-layout index, at the index root.
+/// Per-doc mtimes and UTF-16 file lengths of a files-layout index, at the
+/// index root.
 pub const DOCS_STAMPS: &str = "docs.stamps";
 
-/// Write `docs.stamps`: one little-endian i64 mtime (ns) per doc, no header.
-pub fn write_stamps(output: &Path, mtimes: &[i64]) -> Result<(), String> {
+/// Write `docs.stamps`: one little-endian i64 mtime (ns) per doc, then a
+/// little-endian `(u64 id, u64 file length)` per doc decoded from UTF-16.
+pub fn write_stamps(output: &Path, mtimes: &[i64], file_lens: &[(u64, u64)]) -> Result<(), String> {
     let path = output.join(DOCS_STAMPS);
     let failed = |e: std::io::Error| format!("error: cannot write {}: {e}", path.display());
     let file = std::fs::File::create(&path).map_err(failed)?;
@@ -33,32 +35,55 @@ pub fn write_stamps(output: &Path, mtimes: &[i64]) -> Result<(), String> {
     for m in mtimes {
         out.write_all(&m.to_le_bytes()).map_err(failed)?;
     }
+    for (id, len) in file_lens {
+        out.write_all(&id.to_le_bytes()).map_err(failed)?;
+        out.write_all(&len.to_le_bytes()).map_err(failed)?;
+    }
     out.flush().map_err(failed)
 }
 
 /// The mapped `docs.stamps`.
 pub struct Stamps {
     map: memmap2::Mmap,
+    /// `(id, file length)` per doc decoded from UTF-16, ascending.
+    utf16: Vec<(u64, u64)>,
 }
 
 impl Stamps {
-    /// Map `docs.stamps` under `index_dir`; a size other than 8 bytes per doc
-    /// is refused.
+    /// Map `docs.stamps` under `index_dir`; a size or a UTF-16 table other
+    /// than [`write_stamps`] writes for `num_docs` is refused.
     pub fn open(index_dir: &Path, num_docs: usize) -> Result<Self, String> {
         let path = index_dir.join(DOCS_STAMPS);
         let failed = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
         let file = std::fs::File::open(&path).map_err(failed)?;
         // Safety: the index is read-only while loaded, as `blobs.shard` is.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(failed)?;
-        if map.len() as u64 != num_docs as u64 * 8 {
-            return Err(format!(
-                "error: {} holds {} byte(s), want {} for {num_docs} doc(s); refusing a tampered index",
-                path.display(),
-                map.len(),
-                num_docs as u64 * 8
+        let tampered = |why: String| {
+            format!(
+                "error: {} {why}, for {num_docs} doc(s); refusing a tampered index",
+                path.display()
+            )
+        };
+        let want = num_docs as u64 * 8;
+        let len = map.len() as u64;
+        if len < want || !(len - want).is_multiple_of(16) {
+            return Err(tampered(format!(
+                "holds {len} byte(s), want {want} plus 16 per UTF-16 doc"
+            )));
+        }
+        let word = |at: &[u8]| u64::from_le_bytes(at.try_into().expect("8 bytes"));
+        let (pairs, _) = map[want as usize..].as_chunks::<16>();
+        let utf16: Vec<(u64, u64)> = pairs
+            .iter()
+            .map(|p| (word(&p[..8]), word(&p[8..])))
+            .collect();
+        let ordered = utf16.windows(2).all(|w| w[0].0 < w[1].0);
+        if !ordered || utf16.last().is_some_and(|&(id, _)| id >= num_docs as u64) {
+            return Err(tampered(
+                "lists UTF-16 docs out of order or range".to_string(),
             ));
         }
-        Ok(Self { map })
+        Ok(Self { map, utf16 })
     }
 
     pub fn get(&self, doc: usize) -> i64 {
@@ -66,11 +91,19 @@ impl Stamps {
         i64::from_le_bytes(self.map[at..at + 8].try_into().expect("8-byte slot"))
     }
 
-    /// Whether `meta` still matches doc `doc` of recorded length `len`.
+    /// Doc `doc`'s file length when it was decoded from UTF-16.
+    fn utf16(&self, doc: usize) -> Option<u64> {
+        let at = self
+            .utf16
+            .binary_search_by_key(&(doc as u64), |&(id, _)| id);
+        at.ok().map(|at| self.utf16[at].1)
+    }
+
+    /// Whether `meta` still matches doc `doc` of recorded text length `len`.
     fn holds(&self, doc: usize, meta: &std::fs::Metadata, len: u64) -> bool {
         Stamp::of(meta)
             == Stamp {
-                len,
+                len: self.utf16(doc).unwrap_or(len),
                 mtime_ns: self.get(doc),
             }
     }
@@ -396,9 +429,11 @@ impl Files {
         self.known.read_added(doc)
     }
 
-    /// Doc `doc`'s current bytes: `buf` (its recorded length) filled while
-    /// the stamp holds, else the whole file, and the doc turns stale. A file
-    /// that cannot be read or now looks binary is excluded: `None`.
+    /// Doc `doc`'s current text: `buf` (its recorded length) filled while
+    /// the stamp holds and the doc is not UTF-16, else
+    /// [`crate::binary::text`] of the whole file, and the doc turns stale
+    /// unless it is the indexed UTF-16 text. A file that cannot be read or is
+    /// no longer text is excluded: `None`.
     pub fn read(&self, doc: usize, rel: &str, mut buf: Vec<u8>) -> Option<Vec<u8>> {
         use std::io::Read as _;
         let known = &*self.known;
@@ -415,22 +450,36 @@ impl Files {
             Ok(m) => m,
             Err(e) => return failed(e),
         };
-        if known.stamps.holds(doc, &meta, buf.len() as u64) {
+        let holds = known.stamps.holds(doc, &meta, buf.len() as u64);
+        if holds && known.stamps.utf16(doc).is_none() {
             return match file.read_exact(&mut buf) {
                 Ok(()) => Some(buf),
                 Err(e) => failed(e),
             };
         }
-        known.set(doc, STALE);
+        if !holds {
+            known.set(doc, STALE);
+        }
+        if meta.len() > crate::binary::MAX_DOC_BYTES {
+            known.exclude(doc, &path, &crate::binary::Skip::TooLarge.to_string());
+            return None;
+        }
         let mut whole = Vec::with_capacity(meta.len().try_into().unwrap_or(0));
         if let Err(e) = file.read_to_end(&mut whole) {
             return failed(e);
         }
-        if crate::is_binary_doc(&whole) {
-            known.exclude(doc, &path, "looks binary");
-            return None;
+        match crate::binary::text(whole) {
+            Ok(text) => {
+                if text.bytes.len() != buf.len() {
+                    known.set(doc, STALE);
+                }
+                Some(text.bytes)
+            }
+            Err(why) => {
+                known.exclude(doc, &path, &why.to_string());
+                None
+            }
         }
-        Some(whole)
     }
 
     /// Watch the root, recursively; events queue until [`Watch::run`].
@@ -551,12 +600,13 @@ mod tests {
     #[test]
     fn stamps_round_trip_and_size_skew_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        write_stamps(tmp.path(), &[1, -2, i64::MAX]).unwrap();
+        write_stamps(tmp.path(), &[1, -2, i64::MAX], &[]).unwrap();
         let stamps = Stamps::open(tmp.path(), 3).unwrap();
         assert_eq!(
             [stamps.get(0), stamps.get(1), stamps.get(2)],
             [1, -2, i64::MAX]
         );
+        assert_eq!(stamps.utf16(1), None);
         let Err(err) = Stamps::open(tmp.path(), 2) else {
             panic!("a skewed docs.stamps must be refused");
         };
@@ -564,6 +614,24 @@ mod tests {
             err.contains(DOCS_STAMPS) && err.contains("tampered"),
             "got: {err}"
         );
+        write_stamps(tmp.path(), &[1, -2, i64::MAX], &[(0, 7), (2, 9)]).unwrap();
+        let stamps = Stamps::open(tmp.path(), 3).unwrap();
+        assert_eq!(stamps.get(2), i64::MAX);
+        let utf16: Vec<_> = (0..3).map(|doc| stamps.utf16(doc)).collect();
+        assert_eq!(utf16, [Some(7), None, Some(9)]);
+        assert!(Stamps::open(tmp.path(), 4).is_err(), "8 bytes short");
+    }
+
+    #[test]
+    fn stamps_refuse_unordered_or_out_of_range_utf16_pairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        for pairs in [&[(1, 5), (1, 5)][..], &[(2, 5), (1, 5)], &[(3, 5)]] {
+            write_stamps(tmp.path(), &[0, 0, 0], pairs).unwrap();
+            let Err(err) = Stamps::open(tmp.path(), 3) else {
+                panic!("{pairs:?} must be refused");
+            };
+            assert!(err.contains("tampered"), "got: {err}");
+        }
     }
 
     /// One file per doc under `<dir>/corpus`, stamped into `<dir>`.
@@ -583,7 +651,7 @@ mod tests {
             std::fs::write(path.join(name), d).unwrap();
             mtimes.push(Stamp::of(&std::fs::metadata(path.join(name)).unwrap()).mtime_ns);
         }
-        write_stamps(dir, &mtimes).unwrap();
+        write_stamps(dir, &mtimes, &[]).unwrap();
         Fix {
             path,
             index: dir.to_path_buf(),

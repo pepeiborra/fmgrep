@@ -30,16 +30,21 @@ fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&index).unwrap();
     let files: Vec<String> = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
-    let mut mtimes = Vec::new();
-    for (name, d) in files.iter().zip(docs) {
+    let (mut mtimes, mut lens, mut file_lens) = (Vec::new(), Vec::new(), Vec::new());
+    for (id, (name, d)) in files.iter().zip(docs).enumerate() {
         std::fs::write(root.join(name), d).unwrap();
         mtimes.push(Stamp::of(&std::fs::metadata(root.join(name)).unwrap()).mtime_ns);
+        let text = crate::binary::text(d.to_vec()).unwrap();
+        if text.utf16 {
+            file_lens.push((id as u64, d.len() as u64));
+        }
+        lens.push(text.bytes.len() as u64);
     }
-    crate::source::write_stamps(&index, &mtimes).unwrap();
+    crate::source::write_stamps(&index, &mtimes, &file_lens).unwrap();
     Fix {
         store_docs: false,
         path: root,
-        lens: docs.iter().map(|d| d.len() as u64).collect(),
+        lens,
         files,
         index,
     }
@@ -696,6 +701,34 @@ fn stale_doc_turned_binary_is_excluded() {
     store.begin();
     assert!(store.stale().is_empty());
     assert_eq!(store.changed(), [1]);
+}
+
+#[test]
+fn indexed_utf16_doc_stays_fresh_and_reads_as_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let raw = crate::binary::utf16le("hi CLASS ü\r\n");
+    let fix = stage_files(tmp.path(), &[b"printk", &raw]);
+    let mut store = loaded(&fix);
+    assert!(store.stale().is_empty() && store.changed().is_empty());
+    assert_eq!(
+        bytes_of(&mut store, &fix, &[0, 1]).unwrap(),
+        [&b"printk"[..], "hi CLASS ü\r\n".as_bytes()]
+    );
+    store.begin();
+    assert!(store.stale().is_empty());
+}
+
+#[test]
+fn stale_doc_rewritten_as_utf16_reads_as_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
+    std::fs::write(fix.path.join(&fix.files[1]), crate::binary::utf16le("zz ü")).unwrap();
+    let mut store = loaded(&fix);
+    assert_eq!(store.stale(), [1]);
+    assert_eq!(
+        bytes_of(&mut store, &fix, &[0, 1]).unwrap(),
+        [&b"printk"[..], "zz ü".as_bytes()]
+    );
 }
 
 #[test]

@@ -263,3 +263,42 @@ fn the_last_cut_is_handed_over_without_a_reread() {
     assert_eq!(paths, ["a.c", "b.c", "e.c", "sub/c.c"]);
     assert_eq!(read[0].bytes, b"printk hello");
 }
+
+#[test]
+fn index_records_file_lengths_of_utf16_docs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    std::fs::create_dir_all(&folder).unwrap();
+    let utf16le = crate::binary::utf16le;
+    let docs: [(&str, Vec<u8>); 3] = [
+        ("a.c", utf16le("printk ü\r\n")),
+        ("b.c", b"plain".to_vec()),
+        ("c.c", utf16le("€€")),
+    ];
+    for (rel, raw) in &docs {
+        std::fs::write(folder.join(rel), raw).unwrap();
+    }
+    let output = tmp.path().join("idx");
+    std::fs::create_dir_all(&output).unwrap();
+    let (streamed, read) = stream_while(&folder, &output, 1, false, |cuts| {
+        let mut read = Vec::new();
+        let mut slot = 0;
+        while let Some(cut) = cuts.get(slot) {
+            read.extend(cuts.read(&cut).and_then(|_| cuts.read(&cut))?);
+            slot += 1;
+        }
+        Ok(read)
+    })
+    .unwrap();
+    assert_eq!(streamed.file_lens, [(0, 22), (2, 6)], "equal lengths too");
+    assert_eq!(streamed.lens, [11, 5, 6]);
+    let texts: Vec<&[u8]> = read.iter().map(|d| d.bytes.as_slice()).collect();
+    assert_eq!(
+        texts,
+        ["printk ü\r\n".as_bytes(), b"plain", "€€".as_bytes()]
+    );
+    let stored = tmp.path().join("stored");
+    assert_eq!(stream(&folder, &stored).file_lens, [(0, 22), (2, 6)]);
+    let shard = std::fs::read(stored.join(DOCS_SHARD)).unwrap();
+    assert_eq!(shard, "printk ü\r\nplain€€".as_bytes());
+}

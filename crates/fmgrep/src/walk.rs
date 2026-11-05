@@ -6,8 +6,7 @@ use std::sync::{Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::binary::is_binary_doc;
-use crate::unified::UNIFIED_SEPARATOR;
+use crate::binary::{MAX_DOC_BYTES, Skip, Text, text};
 use crate::verbose::verbose;
 
 /// Documents one read batch holds: bounded by count AND by bytes, so a batch
@@ -94,12 +93,13 @@ pub struct WalkNotes {
 
 /// The definition of "indexable": every file under `root`, sorted by relative
 /// path, positional ids. Symlinked dirs are never descended, symlinked files
-/// are included, `.`-prefixed names are pruned, NUL-bearing and
-/// [`is_binary_doc`] files are skipped: one [`skip_summary`] line by default,
-/// a `warning:` each under [`verbose`]. An unreadable root or an all-skipped
-/// tree is `Err`. `f` takes `(rel path, bytes, stamp)`, the stamp being the
-/// read handle's fstat before the read; its `Err` stops the walk at once and
-/// is returned verbatim.
+/// are included, `.`-prefixed names are pruned. A file [`text`] refuses is
+/// skipped: a binary one in one [`skip_summary`] line by default, a
+/// `warning:` each under [`verbose`]; a too-large one with a `warning:`
+/// always. An unreadable root or an all-skipped tree is `Err`. `f` takes
+/// `(rel path, text, stamp, bytes read)`, the stamp being the read handle's
+/// fstat before the read; its `Err` stops the walk at once and is returned
+/// verbatim.
 ///
 /// `exclude` is a directory that is never descended: an index dir written
 /// under `root` is output, not input.
@@ -109,7 +109,7 @@ pub struct WalkNotes {
 pub fn for_each_index_doc(
     root: &Path,
     exclude: Option<&Path>,
-    mut f: impl FnMut(&str, Vec<u8>, Stamp) -> Result<(), String>,
+    mut f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
 ) -> Result<WalkNotes, String> {
     let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
     let mut stack = vec![root.to_path_buf()];
@@ -164,24 +164,25 @@ pub fn for_each_index_doc(
         let end = batch_end(&rels, at);
         let batch = &rels[at..end];
         let read = read_batch(&pool, root, batch, &|(rel, _): &(String, u64)| rel.as_str())?;
-        for ((rel, _), (bytes, stamp)) in batch.iter().zip(read) {
-            if bytes.contains(&UNIFIED_SEPARATOR) {
-                skipped += 1;
-                if verbose() {
-                    eprintln!(
-                        "warning: skipping {rel}: contains NUL (reserved as the unified-corpus separator)"
-                    );
+        for ((rel, _), (raw, stamp)) in batch.iter().zip(read) {
+            let got = raw.len() as u64;
+            let text = if stamp.len > MAX_DOC_BYTES {
+                Err(Skip::TooLarge)
+            } else {
+                text(raw)
+            };
+            let text = match text {
+                Ok(text) => text,
+                Err(why) => {
+                    let binary = why == Skip::Binary;
+                    skipped += usize::from(binary);
+                    if !binary || verbose() {
+                        eprintln!("warning: skipping {rel}: {why}");
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if is_binary_doc(&bytes) {
-                skipped += 1;
-                if verbose() {
-                    eprintln!("warning: skipping {rel}: looks binary (not searchable text)");
-                }
-                continue;
-            }
-            f(rel, bytes, stamp)?;
+            };
+            f(rel, text, stamp, got)?;
             if symlinks.binary_search(rel).is_ok() {
                 links.push(rel.clone());
             }
@@ -191,7 +192,7 @@ pub fn for_each_index_doc(
     }
     if kept == 0 {
         return Err(format!(
-            "error: no indexable files in {} (every file skipped as NUL-containing or binary)",
+            "error: no indexable files in {} (every file skipped as binary or too large)",
             root.display()
         ));
     }
@@ -346,13 +347,17 @@ fn batch_end(rels: &[(String, u64)], at: usize) -> usize {
 /// A document's bytes and the stamp its handle had before the read.
 type Read = (Vec<u8>, Stamp);
 
-/// `fs::read`'s syscalls, with the fstat kept as the stamp.
+/// `fs::read`'s syscalls, with the fstat kept as the stamp. A file over
+/// [`MAX_DOC_BYTES`] is not read: its bytes are empty.
 fn read_doc(root: &Path, rel: &str) -> Result<Read, String> {
     use std::io::Read as _;
     let path = root.join(rel);
     let failed = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
     let mut file = std::fs::File::open(&path).map_err(failed)?;
     let stamp = Stamp::of(&file.metadata().map_err(failed)?);
+    if stamp.len > MAX_DOC_BYTES {
+        return Ok((Vec::new(), stamp));
+    }
     let mut bytes = Vec::with_capacity(stamp.len as usize);
     file.read_to_end(&mut bytes).map_err(failed)?;
     Ok((bytes, stamp))
@@ -374,11 +379,11 @@ pub fn read_batch<T: Sync>(
 #[cfg(test)]
 pub fn discover_index_docs(root: &Path) -> Result<Vec<Document>, String> {
     let mut docs = Vec::new();
-    for_each_index_doc(root, None, |path, bytes, _| {
+    for_each_index_doc(root, None, |path, text, _, _| {
         docs.push(Document {
             id: docs.len(),
             path: path.to_owned(),
-            bytes,
+            bytes: text.bytes,
         });
         Ok(())
     })?;
@@ -389,10 +394,10 @@ pub fn discover_index_docs(root: &Path) -> Result<Vec<Document>, String> {
 /// [`for_each_index_doc`] walk, peak memory one file instead of the corpus.
 pub fn discover_index_meta(root: &Path) -> Result<Vec<DocMeta>, String> {
     let mut metas = Vec::new();
-    for_each_index_doc(root, None, |path, bytes, _| {
+    for_each_index_doc(root, None, |path, text, _, _| {
         metas.push(DocMeta {
             path: path.to_owned(),
-            len: bytes.len() as u64,
+            len: text.bytes.len() as u64,
         });
         Ok(())
     })?;
@@ -556,7 +561,6 @@ mod tests {
         std::fs::write(dir.join("o.o"), &elf).unwrap();
         // NUL-dense blob.
         std::fs::write(dir.join("blob.bin"), b"\x01binary\x00blob\x00dense").unwrap();
-        // UTF-16LE file (BOM + interleaved NULs).
         std::fs::write(
             dir.join("utf16.c"),
             b"\xff\xfe#\x00i\x00n\x00c\x00l\x00u\x00d\x00e\x00",
@@ -570,39 +574,20 @@ mod tests {
         .unwrap();
         let docs = discover_index_docs(&dir).unwrap();
         let paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
-        assert_eq!(paths, vec!["a.c", "empty.c", "formfeed.c"]);
+        assert_eq!(paths, vec!["a.c", "empty.c", "formfeed.c", "utf16.c"]);
+        assert_eq!(docs[3].bytes, b"#include");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn discover_excludes_native_macho_object_from_index_list() {
-        // A Mach-O object with no NUL and no control soup is excluded via the
-        // macOS platform branch.
-        let dir = scratch_dir("binary-filter-macho");
-        std::fs::write(dir.join("keep.c"), b"printk here\n").unwrap();
-        let mut header = b"\xcf\xfa\xed\xfe".to_vec();
-        header.extend(vec![b'A'; 64]);
-        std::fs::write(dir.join("macho.o"), &header).unwrap();
+    fn discover_skips_a_file_over_the_doc_bound_unread() {
+        let dir = scratch_dir("too-large");
+        std::fs::write(dir.join("a.c"), b"keep").unwrap();
+        let file = std::fs::File::create(dir.join("huge.log")).unwrap();
+        file.set_len(MAX_DOC_BYTES + 1).unwrap();
         let docs = discover_index_docs(&dir).unwrap();
         let paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
-        assert_eq!(paths, vec!["keep.c"]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn discover_excludes_native_elf_object_from_index_list() {
-        // An ELF object with no NUL and sub-threshold density is excluded via
-        // the Linux platform branch.
-        let dir = scratch_dir("binary-filter-elf");
-        std::fs::write(dir.join("keep.c"), b"printk here\n").unwrap();
-        let mut header = b"\x7fELF".to_vec();
-        header.extend(vec![b'A'; 64]);
-        std::fs::write(dir.join("elf.o"), &header).unwrap();
-        let docs = discover_index_docs(&dir).unwrap();
-        let paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
-        assert_eq!(paths, vec!["keep.c"]);
+        assert_eq!(paths, vec!["a.c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -717,11 +702,11 @@ mod tests {
         std::fs::write(dir.join("a.c"), b"printk").unwrap();
         std::fs::write(dir.join("b.c"), b"").unwrap();
         let mut walked = Vec::new();
-        for_each_index_doc(&dir, None, |path, bytes, stamp| {
+        for_each_index_doc(&dir, None, |path, text, stamp, read| {
             let meta = std::fs::metadata(dir.join(path)).unwrap();
             assert_eq!(stamp, Stamp::of(&meta), "{path}");
-            assert_eq!(stamp.len, bytes.len() as u64);
-            walked.push((path.to_owned(), bytes, stamp));
+            assert_eq!((stamp.len, read), (text.bytes.len() as u64, stamp.len));
+            walked.push((path.to_owned(), text.bytes, stamp));
             Ok(())
         })
         .unwrap();
@@ -772,7 +757,7 @@ mod tests {
         }
         let exclude = dir.join("idx");
         let mut indexed = Vec::new();
-        for_each_index_doc(&dir, Some(&exclude), |path, _, _| {
+        for_each_index_doc(&dir, Some(&exclude), |path, _, _, _| {
             indexed.push(path.to_owned());
             Ok(())
         })
@@ -819,7 +804,7 @@ mod tests {
         symlink(dir.join("sub"), dir.join("links/linkdir")).unwrap();
         symlink(dir.join("nul.bin"), dir.join("bin-alias.o")).unwrap();
         let mut kept = Vec::new();
-        let notes = for_each_index_doc(&dir, Some(&dir.join("idx")), |rel, _, _| {
+        let notes = for_each_index_doc(&dir, Some(&dir.join("idx")), |rel, _, _, _| {
             kept.push(rel.to_owned());
             Ok(())
         })
@@ -854,7 +839,7 @@ mod tests {
         symlink(dir.join("a.c"), dir.join("alias.c")).unwrap();
         symlink(dir.join("bin.o"), dir.join("bin-alias.o")).unwrap();
         let mut paths = Vec::new();
-        let notes = for_each_index_doc(&dir, None, |path, _, _| {
+        let notes = for_each_index_doc(&dir, None, |path, _, _, _| {
             paths.push(path.to_owned());
             Ok(())
         })

@@ -141,6 +141,21 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     assert_eq!(files.known.state[0].load(Ordering::Acquire) & WARNED, 0);
 }
 
+#[test]
+fn added_utf16_file_is_found_and_read_as_utf8() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    write(&fix.path, "u.c", &crate::binary::utf16le("printk ü\r\n"));
+    write(&fix.path, "z.c", &crate::binary::utf16le("printk\0"));
+    let files = open_files(&fix);
+    files.discover(&fix.files);
+    assert_eq!(live(&files), ["u.c"]);
+    assert_eq!(
+        files.read_added(1).as_deref(),
+        Some("printk ü\r\n".as_bytes())
+    );
+}
+
 /// `stage_files` of `docs` plus the unlisted `extra` files, backdated, with
 /// the walk recorded as `index` records it, the walk having begun `started`.
 #[cfg(unix)]
@@ -157,8 +172,8 @@ fn stage_recorded(
     backdate(&fix.path);
     let first = std::fs::metadata(fix.path.join(&fix.files[0])).unwrap();
     let t0 = crate::Stamp::of(&first).mtime_ns;
-    super::super::write_stamps(dir, &vec![t0; docs.len()]).unwrap();
-    let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _| Ok(())).unwrap();
+    super::super::write_stamps(dir, &vec![t0; docs.len()], &[]).unwrap();
+    let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
     super::super::write_walk(dir, &walk, started).unwrap();
     fix
 }

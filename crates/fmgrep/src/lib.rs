@@ -72,7 +72,6 @@ pub use cli::run;
 pub use term::regex_pattern;
 pub use walk::{DocMeta, discover_index_meta};
 
-use binary::is_binary_doc;
 use term::RegexError;
 use unified::UNIFIED_SEPARATOR;
 use walk::{Document, Stamp, for_each_index_doc};

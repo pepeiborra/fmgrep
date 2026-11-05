@@ -54,7 +54,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             })?;
         let (blobs, blob_lens) = finish_sink(sink)?;
         if !req.store_docs {
-            write_stamps(output, &docs.mtimes)?;
+            write_stamps(output, &docs.mtimes, &docs.file_lens)?;
             write_walk(output, &docs.walk, started)?;
         }
         let build_time_us = start.elapsed().as_micros() as u64;

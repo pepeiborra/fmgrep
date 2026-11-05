@@ -678,6 +678,8 @@ printf 'Alpha One\nBETA\nalpha one\nbeta\n' > "$CORPUS/i.txt"
 printf '\xef\xbb\xbf' > "$CORPUS/e1.txt"
 printf '\xef\xbb\xbfalpha bom\nsecond line\n' > "$CORPUS/e2.txt"
 printf '\xef\xbb\xbfalpha crlf\r\nbeta\r\n' > "$CORPUS/e3.txt"
+# UTF-16 with a BOM: rg decodes it to UTF-8, then strips one more BOM.
+{ printf '\xff\xfe'; printf '\xef\xbb\xbfalpha utf16\r\nbeta \xc3\xbc\r\nALPHA up\r\n' | iconv -f UTF-8 -t UTF-16LE; } > "$CORPUS/u.txt"
 # Consecutive matching lines: under -U rg prints one block per RUN of them.
 printf 'alpha 1\nalpha 2\nzz\nalpha 3\n' > "$CORPUS/f.txt"
 # For the stale pass: a skipped binary alone in its directory (replaced by
@@ -912,6 +914,9 @@ if [[ "$STORE_DOCS" == false ]]; then
     cp -Rp "$WORK/tree/t" "$CORPUS/sub/t"
     printf 'alpha now text\n' > "$CORPUS/kb/k.tmp" && mv -f "$CORPUS/kb/k.tmp" "$CORPUS/kb/k.dat"
     printf 'alpha\0now binary\n' > "$CORPUS/tb.txt"
+    # u.txt rewritten as UTF-16BE, and a UTF-16 file added.
+    { printf '\xfe\xff'; printf 'alpha be\nbeta\n' | iconv -f UTF-8 -t UTF-16BE; } > "$CORPUS/u.txt"
+    { printf '\xff\xfe'; printf 'alpha added utf16\n' | iconv -f UTF-8 -t UTF-16LE; } > "$CORPUS/ub.txt"
     mv "$CORPUS/mw" "$CORPUS/mv2"
     RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
     await_watch
