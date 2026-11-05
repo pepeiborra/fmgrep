@@ -1,4 +1,5 @@
-//! Checks that rows print the same lines for every file they all searched.
+//! Checks each row's lines from every file against the first row that
+//! searched it.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -8,8 +9,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use crate::deviations::Deviation;
 use crate::rows::failure;
-use crate::{Row, RowKind};
+use crate::{Row, RowKind, THIRD_PARTY};
 
 pub struct Paths {
     root: Vec<u8>,
@@ -262,22 +264,31 @@ pub fn rg() -> Command {
     cmd
 }
 
-/// Per query: files searched by all rows but printed differently, and files unsearched by some.
-pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> (Vec<String>, Vec<Unsearched>) {
+/// What verify found: `fatal` fails the run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Verdict {
+    pub fatal: Vec<String>,
+    pub unsearched: Vec<Unsearched>,
+    pub deviations: Vec<Deviation>,
+}
+
+/// Per query: each file's lines against the first row that searched it, and
+/// the files some rows did not search. Only `THIRD_PARTY` rows may deviate.
+pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> Verdict {
+    let mut verdict = Verdict::default();
     let Some(base) = rows.first() else {
-        return (Vec::new(), Vec::new());
+        return verdict;
     };
     let terms = |r: &Row| r.queries.iter().map(|q| q.term.clone()).collect::<Vec<_>>();
-    let mut fatal = Vec::new();
+    let fatal = &mut verdict.fatal;
     for row in &rows[1..] {
         if terms(row) != terms(base) {
             fatal.push(format!("queries: {} and {} differ", base.name, row.name));
         }
     }
     if !fatal.is_empty() {
-        return (fatal, Vec::new());
+        return verdict;
     }
-    let mut unsearched = Vec::new();
     for (q, base_query) in base.queries.iter().enumerate() {
         let term = &base_query.term;
         let hits: Vec<&Hits> = rows.iter().map(|r| &r.queries[q].hits).collect();
@@ -286,32 +297,48 @@ pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> (Vec<String>, Vec<Uns
         let mut missing: BTreeMap<(usize, Class), Vec<u32>> = BTreeMap::new();
         let mut differ = Vec::new();
         for &file in &printed {
-            let mut reference: Option<(usize, Option<&FileHits>)> = None;
+            let listed = |r: usize| rows[r].searched.binary_search(&file).is_ok();
+            let binary = |r: usize| hits[r].binary.binary_search(&file).is_ok();
+            let reference = (0..rows.len()).find(|&r| listed(r) && !binary(r));
+            let b = reference.unwrap_or(0);
+            let key = |r: usize| hits[r].get(file).map_or((0, 0), |h| (h.lines, h.digest));
             for (r, row) in rows.iter().enumerate() {
-                let listed = row.searched.binary_search(&file).is_ok();
+                let third = THIRD_PARTY.contains(&row.name);
                 let got = hits[r].get(file);
-                if got.is_some() && !listed {
+                if got.is_some() && !listed(r) && !third {
                     let path = paths.name(file);
                     fatal.push(format!(
                         "{term:?}: {} prints {path}, not searched",
                         row.name
                     ));
-                } else if !listed || hits[r].binary.binary_search(&file).is_ok() {
+                    continue;
+                }
+                if binary(r) || (got.is_none() && !listed(r)) || reference.is_none() {
                     let class = paths.class(root, file);
                     missing.entry((r, class)).or_default().push(file);
-                } else if let Some((b, want)) = reference {
-                    let key = |h: Option<&FileHits>| h.map_or((0, 0), |h| (h.lines, h.digest));
-                    let ((bc, bd), (rc, rd)) = (key(want), key(got));
-                    let (bn, rn, path) = (rows[b].name, row.name, paths.name(file));
-                    if bc != rc {
-                        differ.push(format!("{term:?}: {path}: {bn} {bc} lines, {rn} {rc}"));
-                    } else if bd != rd {
-                        differ.push(format!(
-                            "{term:?}: {path}: {bn} and {rn} print different lines"
-                        ));
-                    }
+                    continue;
+                }
+                let ((bc, bd), (rc, rd)) = (key(b), key(r));
+                if r == b || (bc, bd) == (rc, rd) {
+                    continue;
+                }
+                let (bn, rn, path) = (rows[b].name, row.name, paths.name(file));
+                if third {
+                    verdict.deviations.push(Deviation {
+                        term: term.clone(),
+                        row: rn,
+                        against: bn,
+                        file,
+                        want: bc,
+                        got: rc,
+                        other: bc == rc,
+                    });
+                } else if bc != rc {
+                    differ.push(format!("{term:?}: {path}: {bn} {bc} lines, {rn} {rc}"));
                 } else {
-                    reference = Some((r, got));
+                    differ.push(format!(
+                        "{term:?}: {path}: {bn} and {rn} print different lines"
+                    ));
                 }
             }
         }
@@ -323,7 +350,7 @@ pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> (Vec<String>, Vec<Uns
         fatal.extend(differ);
         for ((r, class), files) in missing {
             let (term, row) = (term.clone(), rows[r].name);
-            unsearched.push(Unsearched {
+            verdict.unsearched.push(Unsearched {
                 term,
                 row,
                 class,
@@ -331,7 +358,7 @@ pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> (Vec<String>, Vec<Uns
             });
         }
     }
-    (fatal, unsearched)
+    verdict
 }
 
 #[cfg(test)]
@@ -425,14 +452,16 @@ mod tests {
     fn verify_fails_on_files_both_rows_searched_and_lists_the_rest() {
         let (p, root) = (table(), Path::new("/nonexistent"));
         let rg = || row(RowKind::Rg, &[0, 1, 2], &[&[(0, 2, 7), (2, 1, 1)], &[]]);
-        assert_eq!(verify(&p, root, &[rg(), rg()]), (vec![], vec![]));
+        assert_eq!(verify(&p, root, &[rg(), rg()]), Verdict::default());
 
         let fm = row(
             RowKind::Fmgrep,
             &[2, 3, 4],
             &[&[(2, 1, 1), (3, 1, 5)], &[(4, 1, 1)]],
         );
-        let (fatal, unsearched) = verify(&p, root, &[rg(), fm]);
+        let Verdict {
+            fatal, unsearched, ..
+        } = verify(&p, root, &[rg(), fm]);
         assert_eq!(fatal, Vec::<String>::new());
         let missing = |term: &str, row, class, files: &[u32]| Unsearched {
             term: term.to_string(),
@@ -452,7 +481,7 @@ mod tests {
             &[0, 2],
             &[&[(0, 1, 7), (2, 1, 2)], &[(1, 1, 1)]],
         );
-        let (fatal, _) = verify(&p, root, &[rg(), fm]);
+        let fatal = verify(&p, root, &[rg(), fm]).fatal;
         let want = [
             "\"t0\": a/c:1:d.txt: rg 2 lines, fmgrep 1",
             "\"t0\": x.c: rg and fmgrep print different lines",
@@ -463,8 +492,63 @@ mod tests {
         let mut partial = rg();
         partial.name = RowKind::Tgrep;
         partial.queries.remove(1);
-        let (fatal, _) = verify(&p, root, &[rg(), partial]);
+        let fatal = verify(&p, root, &[rg(), partial]).fatal;
         assert_eq!(fatal, ["queries: rg and tgrep differ"]);
+    }
+
+    #[test]
+    fn third_party_differences_are_deviations_and_fmgrep_differences_fail() {
+        let (p, root) = (table(), Path::new("/nonexistent"));
+        let ours = |name| row(name, &[0, 1, 2, 3], &[&[(0, 2, 7), (2, 1, 1), (3, 1, 3)]]);
+        let eg = row(
+            RowKind::Elgrep,
+            &[0, 1, 2, 3],
+            &[&[(1, 1, 9), (2, 1, 2), (3, 1, 3), (4, 1, 1)]],
+        );
+        let v = verify(&p, root, &[ours(RowKind::Rg), ours(RowKind::Fmgrep), eg]);
+        assert_eq!(v.fatal, Vec::<String>::new());
+        let dev = |against, file, want, got, other| Deviation {
+            term: "t0".to_string(),
+            row: RowKind::Elgrep,
+            against,
+            file,
+            want,
+            got,
+            other,
+        };
+        let want = [
+            dev(RowKind::Rg, 0, 2, 0, false),
+            dev(RowKind::Rg, 1, 0, 1, false),
+            dev(RowKind::Rg, 2, 1, 1, true),
+        ];
+        assert_eq!(v.deviations, want);
+        let unsearched = v.unsearched.iter().map(|u| (u.row, &u.files[..]));
+        let unsearched: Vec<_> = unsearched.collect();
+        assert_eq!(
+            unsearched,
+            [
+                (RowKind::Rg, &[4][..]),
+                (RowKind::Fmgrep, &[4]),
+                (RowKind::Elgrep, &[4])
+            ]
+        );
+
+        let fm = row(RowKind::Fmgrep, &[0, 1, 2, 3], &[&[(2, 1, 1), (3, 1, 3)]]);
+        let v = verify(&p, root, &[ours(RowKind::Rg), fm]);
+        assert_eq!(v.fatal, ["\"t0\": a/c:1:d.txt: rg 2 lines, fmgrep 0"]);
+        assert_eq!(v.deviations, []);
+
+        let fm = row(
+            RowKind::Fmgrep,
+            &[0, 1, 2, 3, 4],
+            &[&[(0, 2, 7), (4, 1, 1)]],
+        );
+        let tg = row(RowKind::Tgrep, &[0, 1, 2, 3, 4], &[&[(0, 2, 7), (4, 2, 5)]]);
+        let v = verify(&p, root, &[row(RowKind::Rg, &[0], &[&[(0, 2, 7)]]), fm, tg]);
+        assert_eq!(v.fatal, Vec::<String>::new());
+        let mut want = dev(RowKind::Fmgrep, 4, 1, 2, false);
+        want.row = RowKind::Tgrep;
+        assert_eq!(v.deviations, [want]);
     }
 
     #[test]

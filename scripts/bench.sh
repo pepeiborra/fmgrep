@@ -7,7 +7,7 @@
 # clone; aosp is never cloned and needs --repo-path or FMGREP_CORPUS_AOSP.
 # Builds release, runs the harness over its default rows, and prints the
 # markdown results (default BENCH_DIR/results-<corpus>.md). Exits non-zero
-# when the rows disagree. The corpus is only read.
+# when an fmgrep row disagrees with rg. The corpus is only read.
 #
 # Usage: scripts/bench.sh [--corpus ghc|linux|chromium|aosp] [--repo-path DIR]
 #                         [--results FILE] [--bench-dir DIR] [-- HARNESS_ARGS...]

@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::corpus::QuerySet;
+use crate::deviations::Deviation;
 use crate::verify::{Paths, Unsearched};
 use crate::{Kind, Row, RowKind};
 
@@ -24,6 +25,7 @@ pub struct Run {
 pub struct Found<'a> {
     pub diffs: &'a [String],
     pub unsearched: &'a [Unsearched],
+    pub deviations: &'a [Deviation],
     pub paths: &'a Paths,
 }
 
@@ -250,13 +252,7 @@ pub fn markdown(run: &Run, rows: &[Row], found: &Found) -> String {
          at the row's start and end; `!` marks 4 or more, where timings are likely inflated.\n\n"
     );
     md += &match diffs.len() {
-        0 => format!(
-            "verify: OK, {} on {n} queries\n",
-            match rows.len() {
-                1 => "1 row agrees".to_string(),
-                k => format!("{k} rows agree"),
-            }
-        ),
+        0 => crate::deviations::ok_line(rows, n, found.deviations),
         k => format!(
             "verify: FAILED, {k} difference(s)\n\n```\n{}\n```\n",
             diffs.join("\n")
@@ -371,6 +367,7 @@ pub fn trace(run: &Run, rows: &[Row], found: &Found) -> String {
                 "lines": q.hits.lines(),
                 "files": q.hits.files(),
                 "not_searched": not_searched(r.name, &q.term),
+                "differs": crate::deviations::trace(found, r.name, &q.term),
             }));
         }
         lines.push(json!({
@@ -464,6 +461,7 @@ mod tests {
         let found = Found {
             diffs,
             unsearched: &unsearched,
+            deviations: &[],
             paths: &paths,
         };
         markdown(&run, &rows, &found)
@@ -558,6 +556,7 @@ mod tests {
         let found = Found {
             diffs: &[],
             unsearched: &[],
+            deviations: &[],
             paths: &paths,
         };
         let md = markdown(&run, &rows[1..], &found);
@@ -598,6 +597,7 @@ mod tests {
         let found = Found {
             diffs: &[],
             unsearched: &unsearched,
+            deviations: &[],
             paths: &paths,
         };
         let md = markdown(&run, &rows, &found);
