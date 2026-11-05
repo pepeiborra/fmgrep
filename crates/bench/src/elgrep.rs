@@ -1,6 +1,7 @@
 //! The optional elgrep row: one `eg-indexd` owned by the row, then one
 //! `eg -n` per query reading its index; an intersection is the rg pipe with
-//! `eg`. The index answers only on Linux; elsewhere every query scans.
+//! `eg`, each stage's stderr apart. The index answers only on Linux;
+//! elsewhere every query scans.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -103,6 +104,8 @@ fn quote(s: &str) -> String {
 pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let (index, runtime) = (dir.path().join("index"), dir.path().join("runtime"));
+    let stderr = dir.path().join("stderr");
+    std::fs::create_dir(&stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
     // One walk for every eg: the daemon builds the index with the first one's.
     let flags = [format!("--index-dir={}", index.display())];
     let eg = |args: &[&str]| {
@@ -132,26 +135,32 @@ pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
     let (prog, quoted) = (quote(&e.bin.to_string_lossy()), quoted.join(" "));
     let mut scans = Scans::default();
     for term in terms {
-        let mut cmd = match &leaves(term)[..] {
+        let (mut cmd, stages) = match &leaves(term)[..] {
             [_] => {
                 let (pattern, fixed) =
                     regex_pattern(term).map_or((term.as_str(), Some("-F")), |p| (p, None));
                 let mut cmd = eg(&["--debug", "--with-filename"]);
                 cmd.args(LINES).args(fixed).args(["-e", pattern, "--"]);
                 cmd.arg(root);
-                cmd
+                (cmd, 0)
             }
             all => {
-                let mut cmd = and_pipe(&prog, &quoted, root, all);
+                let mut cmd = and_pipe(&prog, &quoted, root, all, Some(&stderr));
                 env(&mut cmd, &runtime);
-                cmd
+                (cmd, all.len() + 1)
             }
         };
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let what = format!("eg {term:?}");
-        scans
-            .add(&out.stderr)
-            .map_err(|l| failure(&what, &out) + &l)?;
+        let stage = |k: usize| {
+            let f = stderr.join(k.to_string());
+            std::fs::read(&f).map_err(|e| failure(&format!("{what}: {}: {e}", f.display()), &out))
+        };
+        let files = (1..=stages).map(stage).collect::<Result<Vec<_>, _>>()?;
+        let stderrs: Vec<&[u8]> = std::iter::once(&out.stderr[..])
+            .chain(files.iter().map(Vec::as_slice))
+            .collect();
+        scans.add(&stderrs).map_err(|l| failure(&what, &out) + &l)?;
         row.footprint = row.footprint.max(peak.map(|p| p.footprint));
         row.query_rss = row.query_rss.max(peak.map(|p| p.rss));
         let hits = paths.hits(&what, &out)?;
@@ -198,19 +207,22 @@ struct Scans {
 }
 
 impl Scans {
-    /// Tallies one query's stderr; `Err` is a line that is not `--debug`'s.
-    fn add(&mut self, stderr: &[u8]) -> Result<(), String> {
+    /// Tallies one query's stderrs, each written one whole line at a time;
+    /// `Err` is a line that is not `--debug`'s.
+    fn add(&mut self, stderrs: &[&[u8]]) -> Result<(), String> {
         let mut reasons = BTreeSet::new();
-        let text = String::from_utf8_lossy(stderr);
-        for line in text.lines().filter(|l| !l.is_empty()) {
-            if line.starts_with("eg: ") && line.ends_with(FALLBACK) {
-                continue;
-            }
-            if !line.starts_with("eg: DEBUG|") {
-                return Err(format!("\nnot a --debug line: {line}"));
-            }
-            if let Some((_, reason)) = line.split_once(SCAN) {
-                reasons.insert(reason.trim().to_string());
+        for stderr in stderrs {
+            let text = String::from_utf8_lossy(stderr);
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                if line.starts_with("eg: ") && line.ends_with(FALLBACK) {
+                    continue;
+                }
+                if !line.starts_with("eg: DEBUG|") {
+                    return Err(format!("\nnot a --debug line: {line}"));
+                }
+                if let Some((_, reason)) = line.split_once(SCAN) {
+                    reasons.insert(reason.trim().to_string());
+                }
             }
         }
         self.queries += usize::from(!reasons.is_empty());
@@ -407,25 +419,68 @@ mod tests {
             "a pattern with no selective n-gram",
         );
         let mut scans = Scans::default();
-        scans.add(debug.as_bytes()).unwrap();
+        scans.add(&[debug.as_bytes()]).unwrap();
         assert_eq!(scans.note(1), "0 of 1 queries scanned without the index");
         let notice = format!("eg: the sparse index cannot serve a pattern{FALLBACK}\n");
-        scans.add((notice + &scan(a)).as_bytes()).unwrap();
+        scans.add(&[(notice + &scan(a)).as_bytes()]).unwrap();
         assert_eq!(
             scans.note(1),
             format!("1 of 1 queries scanned without the index: {a}")
         );
         let mut scans = Scans::default();
-        scans.add((scan(a) + &scan(a)).as_bytes()).unwrap();
+        scans.add(&[(scan(a) + &scan(a)).as_bytes()]).unwrap();
         assert_eq!(
             scans.note(2),
             format!("1 of 2 queries scanned without the index: {a}")
         );
-        scans.add((scan(b) + debug + &scan(a)).as_bytes()).unwrap();
+        scans
+            .add(&[(scan(b) + debug + &scan(a)).as_bytes()])
+            .unwrap();
         let want = format!("2 of 3 queries scanned without the index: {b} (1); {a} (2)");
         assert_eq!(scans.note(3), want);
-        let err = scans.add(b"eg: /s/x.c: Permission denied\n").unwrap_err();
+        let err = scans
+            .add(&[b"eg: /s/x.c: Permission denied\n"])
+            .unwrap_err();
         assert!(err.ends_with("eg: /s/x.c: Permission denied"), "{err}");
+    }
+
+    #[test]
+    fn interleaved_stage_stderr_is_rejected_with_its_text_and_read_apart_when_split() {
+        let reg = "/mnt/work/cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
+        let file = "/mnt/work/aosp/external/libwebm/webm_parser/fuzzing/corpus/a823a019c0b19c97a1d35722cd843109ab016c17";
+        let binary = format!(":686: ignoring {file}: found binary data at offset 18605");
+        let merged = format!(
+            "eg: DEBUG|eg::index|{reg}/elgrep-1.0.0/src/index/mod.rs:119eg: : eg index: \
+             mode=autoDEBUG backend=|Postingsgrep_printer::summary threads=|\
+             {reg}/grep-printer-0.3.1/src/summary.rs12\n{binary}\n"
+        );
+        let stage1 = format!(
+            "eg: DEBUG|grep_printer::summary|{reg}/grep-printer-0.3.1/src/summary.rs{binary}\n"
+        );
+        let stage2 = format!(
+            "eg: DEBUG|eg::index|{reg}/elgrep-1.0.0/src/index/mod.rs:119: eg index: \
+             mode=auto backend=Postings threads=12\n"
+        );
+        let mut scans = Scans::default();
+        let err = scans.add(&[b"", merged.as_bytes()]).unwrap_err();
+        assert!(
+            err.ends_with(&format!("not a --debug line: {binary}")),
+            "{err}"
+        );
+        scans
+            .add(&[b"", stage1.as_bytes(), stage2.as_bytes()])
+            .unwrap();
+        assert_eq!(scans.note(1), "0 of 1 queries scanned without the index");
+
+        let scan = |r: &str| format!("eg: DEBUG|eg::index|r.rs:9: eg index: {SCAN}{r}\n");
+        let (a, b) = (scan("a"), scan("b"));
+        scans
+            .add(&[b"", stage1.as_bytes(), a.as_bytes(), a.as_bytes()])
+            .unwrap();
+        assert_eq!(scans.note(2), "1 of 2 queries scanned without the index: a");
+        scans.add(&[a.as_bytes(), b.as_bytes()]).unwrap();
+        let want = "2 of 3 queries scanned without the index: a (2); b (1)";
+        assert_eq!(scans.note(3), want);
     }
 
     #[test]
