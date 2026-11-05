@@ -31,7 +31,7 @@ pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
                 cmd
             }
             all => {
-                let mut cmd = and_pipe("rg", "", root, all);
+                let mut cmd = and_pipe("rg", "", root, all, None);
                 cmd.env_remove("RIPGREP_CONFIG_PATH");
                 cmd
             }
@@ -52,7 +52,14 @@ pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
 
 /// Lists the files holding every leaf, one `prog flags` per leaf, then
 /// prints their lines matching any leaf; `prog` and `flags` are shell words.
-pub fn and_pipe(prog: &str, flags: &str, root: &Path, leaves: &[&str]) -> Command {
+/// With `stderr`, stage k (from 1) writes its stderr to `stderr/k`.
+pub fn and_pipe(
+    prog: &str,
+    flags: &str,
+    root: &Path,
+    leaves: &[&str],
+    stderr: Option<&Path>,
+) -> Command {
     let flags = if flags.is_empty() {
         String::new()
     } else {
@@ -63,16 +70,21 @@ pub fn and_pipe(prog: &str, flags: &str, root: &Path, leaves: &[&str]) -> Comman
         format!("{prog}{flags} --files-with-matches --null{fixed} -e \"${{{k}}}\" --")
     };
     let n = leaves.len();
-    let mut script = format!("{} \"${{{}}}\"", list(1, leaves[0]), n + 1);
+    let to = |k: usize| stderr.map_or(String::new(), |_| format!(" 2>\"${{{}}}/{k}\"", n + 2));
+    let mut script = format!("{} \"${{{}}}\"{}", list(1, leaves[0]), n + 1, to(1));
     for (k, leaf) in leaves.iter().enumerate().skip(1) {
-        script += &format!(" | xargs -0 -r {}", list(k + 1, leaf));
+        script += &format!(" | xargs -0 -r {}{}", list(k + 1, leaf), to(k + 1));
     }
     let any: String = (1..=n).map(|k| format!(" -e \"${{{k}}}\"")).collect();
     let lines = LINES.join(" ");
     script += &format!(" | xargs -0 -r {prog} {lines} --with-filename{flags}{any} --");
+    script += &to(n + 1);
     let mut cmd = Command::new("sh");
     let patterns = leaves.iter().map(|l| regex_pattern(l).unwrap_or(l));
-    cmd.args(["-c", &script, "sh"]).args(patterns).arg(root);
+    cmd.args(["-c", &script, "sh"])
+        .args(patterns)
+        .arg(root)
+        .args(stderr);
     cmd
 }
 
@@ -358,12 +370,45 @@ mod tests {
 
     #[test]
     fn rg_pipe_script_is_unchanged() {
-        let cmd = and_pipe("rg", "", Path::new("/s"), &["a", "/b+/"]);
+        let cmd = and_pipe("rg", "", Path::new("/s"), &["a", "/b+/"], None);
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
         let script = "rg --files-with-matches --null -F -e \"${1}\" -- \"${3}\" \
              | xargs -0 -r rg --files-with-matches --null -e \"${2}\" -- \
              | xargs -0 -r rg -n --no-heading --color never --with-filename -e \"${1}\" -e \"${2}\" --";
         assert_eq!(args, ["-c", script, "sh", "a", "b+", "/s"]);
+    }
+
+    #[test]
+    fn pipe_writes_each_stage_stderr_to_its_own_file() {
+        if rg_cmd().arg("--version").output().is_err() {
+            eprintln!("skipped: rg is not on PATH");
+            return;
+        }
+        let (_dir, root) = crate::tgrep::tests::tree();
+        let stderr = tempfile::tempdir().unwrap();
+        let run = |stderr: Option<&Path>| {
+            let mut cmd = and_pipe("rg", "--debug", &root, &["alpha", "beta"], stderr);
+            timed(cmd.env_remove("RIPGREP_CONFIG_PATH"), None)
+                .unwrap()
+                .0
+        };
+        let (split, merged) = (run(Some(stderr.path())), run(None));
+        assert!(split.stderr.is_empty() && !merged.stderr.is_empty());
+        let lines = |o: &Output| {
+            let mut l: Vec<_> = o
+                .stdout
+                .split(|&b| b == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect();
+            l.sort();
+            l
+        };
+        assert!(!split.stdout.is_empty() && lines(&split) == lines(&merged));
+        for k in 1..=3 {
+            let text = std::fs::read_to_string(stderr.path().join(k.to_string())).unwrap();
+            assert!(!text.is_empty(), "stage {k}");
+            assert!(text.lines().all(|l| l.starts_with("rg: DEBUG|")), "{text}");
+        }
     }
 
     #[test]
