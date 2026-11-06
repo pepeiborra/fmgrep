@@ -182,7 +182,7 @@ check() {
 filtered() {
     RG_PATHS="${4-.}"
     [[ "${5:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
-    check "$1 [lines]" "$2" "--heading -n $3"
+    check "$1 [lines]" "--heading -n $2" "--heading -n $3"
     check "$1 [-l]" "$2 -l" "-l $3"
     RG_PATHS=.
     WANT=""
@@ -195,7 +195,7 @@ pathed() {
     PATHS="$3"
     RG_HERE=1
     [[ "${4:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
-    check "$1 [lines]" "$2" "--heading -n $2"
+    check "$1 [lines]" "--heading -n $2" "--heading -n $2"
     check "$1 [-l]" "$2 -l" "-l $2"
     AT=""
     PATHS=""
@@ -387,25 +387,25 @@ check_flags() {
 flag_cases() {
     local label="$1" m="$2"
     shift 2
-    check_flags "flags-lines    [$label]" "$m"                   "--heading -n"      "$@"
-    check_flags "flags-no-head  [$label]" "$m --no-heading"      "--no-heading -n"   "$@"
+    check_flags "flags-lines    [$label]" "--heading -n $m"      "--heading -n"      "$@"
+    check_flags "flags-no-head  [$label]" "$m --no-heading -n"   "--no-heading -n"   "$@"
     check_flags "flags-count    [$label]" "$m -c"                "-c"                "$@"
     check_flags "flags-countm   [$label]" "$m --count-matches"   "--count-matches"   "$@"
     check_flags "flags-files    [$label]" "$m -l"                "-l"                "$@"
-    check_flags "flags-only     [$label]" "$m -o"                "--heading -n -o"   "$@"
-    check_flags "flags-context  [$label]" "$m -C 1"              "--heading -n -C 1" "$@"
+    check_flags "flags-only     [$label]" "--heading -n $m -o"   "--heading -n -o"   "$@"
+    check_flags "flags-context  [$label]" "--heading -n $m -C 1" "--heading -n -C 1" "$@"
 }
 
 expr_cases() {
     local label="$1"
     shift
-    check_expr "expr-lines     [$label]" ""                "--heading -n"      "$@"
-    check_expr "expr-no-head   [$label]" "--no-heading"    "--no-heading -n"   "$@"
+    check_expr "expr-lines     [$label]" "--heading -n"    "--heading -n"      "$@"
+    check_expr "expr-no-head   [$label]" "--no-heading -n" "--no-heading -n"   "$@"
     check_expr "expr-count     [$label]" "-c"              "-c"                "$@"
     check_expr "expr-countm    [$label]" "--count-matches" "--count-matches"   "$@"
     check_expr "expr-files     [$label]" "-l"              "-l"                "$@"
-    check_expr "expr-only      [$label]" "-o"              "--heading -n -o"   "$@"
-    check_expr "expr-context   [$label]" "-C 1"            "--heading -n -C 1" "$@"
+    check_expr "expr-only      [$label]" "--heading -n -o" "--heading -n -o"   "$@"
+    check_expr "expr-context   [$label]" "--heading -n -C 1" "--heading -n -C 1" "$@"
 }
 
 # Exits 2 unless the manifest in index dir $1 records STORE_DOCS.
@@ -715,56 +715,58 @@ start_server() {
 
 cases() {
 
-check default          ""                "--heading -n"
-check no-heading       "--no-heading"    "--no-heading -n"
-check no-line-number   "-N"              "--heading -N"
+check default          ""                ""
+check default-context  "-C 1"            "-C 1"
+check heading          "--heading -n"    "--heading -n"
+check no-heading       "--no-heading -n" "--no-heading -n"
+check no-line-number   "--heading -N"    "--heading -N"
 check count-lines      "-c"              "-c"
 check count-matches    "--count-matches" "--count-matches"
 check files-with-match "-l"              "-l"
-check only-matching    "-o"              "--heading -n -o"
-check after-1          "-A 1"            "--heading -n -A 1"
-check before-1         "-B 1"            "--heading -n -B 1"
-check context-2        "-C 2"            "--heading -n -C 2"
-check color-always     "--color always"  "--heading -n --color always"
-check color-no-heading "--no-heading --color always" "--no-heading -n --color always"
+check only-matching    "--heading -n -o" "--heading -n -o"
+check after-1          "--heading -n -A 1" "--heading -n -A 1"
+check before-1         "--heading -n -B 1" "--heading -n -B 1"
+check context-2        "--heading -n -C 2" "--heading -n -C 2"
+check color-always     "--heading -n --color always" "--heading -n --color always"
+check color-no-heading "--no-heading -n --color always" "--no-heading -n --color always"
 check color-count      "-c --color always"          "-c --color always"
-check context-0        "-C 0"                       "--heading -n -C 0"
-check context-no-head  "--no-heading -C 1"          "--no-heading -n -C 1"
+check context-0        "--heading -n -C 0"          "--heading -n -C 0"
+check context-no-head  "--no-heading -n -C 1"       "--no-heading -n -C 1"
 check context-no-num   "--no-heading -N -C 1"       "--no-heading -N -C 1"
-check only-no-heading  "-o --no-heading"            "--no-heading -n -o"
-check only-context     "-o -C 1"                    "--heading -n -o -C 1"
-check regex-lines      "--regex"                    "--heading -n"                'alpha \w+'
-check regex-only       "--regex -o"                 "--heading -n -o"             'alpha \w+'
+check only-no-heading  "-o --no-heading -n"         "--no-heading -n -o"
+check only-context     "--heading -n -o -C 1"       "--heading -n -o -C 1"
+check regex-lines      "--heading -n --regex"       "--heading -n"                'alpha \w+'
+check regex-only       "--heading -n --regex -o"    "--heading -n -o"             'alpha \w+'
 
 # -i: our bare terms are literals, so the fixture terms carry no metachar and
 # `rg -i` is the same question. The last two pin the Unicode fold classes.
 for term in alpha ALPHA Alpha printk PRINTK class; do
-    check "ci-lines       [$term]" "-i"                 "--heading -n -i"    "$term"
-    check "ci-only        [$term]" "-i -o"              "--heading -n -i -o" "$term"
+    check "ci-lines       [$term]" "--heading -n -i"    "--heading -n -i"    "$term"
+    check "ci-only        [$term]" "--heading -n -i -o" "--heading -n -i -o" "$term"
     check "ci-count       [$term]" "-i -c"              "-c -i"              "$term"
     check "ci-countm      [$term]" "-i --count-matches" "--count-matches -i" "$term"
     check "ci-files       [$term]" "-i -l"              "-l -i"              "$term"
 done
-check ci-regex-lines   "--regex -i"                 "--heading -n -i"             'alpha \w+'
-check ci-regex-only    "--regex -i -o"              "--heading -n -i -o"          'ALPHA \w+'
+check ci-regex-lines   "--heading -n --regex -i"    "--heading -n -i"             'alpha \w+'
+check ci-regex-only    "--heading -n --regex -i -o" "--heading -n -i -o"          'ALPHA \w+'
 
 # -i x -U: the multiline test runs on the FOLDED pattern, so a term reaches
 # rg's multiline core under -i exactly where it does without it.
 for pat in 'alpha one\nbeta' 'ALPHA ONE\nBETA' '\nBeta' 'alpha\z' 'PRINTK' '(?s)alpha.*\z'; do
-    check "ci-multi-lines [$pat]" "--regex -i -U"                 "--heading -n -i -U"      "$pat"
-    check "ci-multi-only  [$pat]" "--regex -i -U -o"              "--heading -n -i -U -o"   "$pat"
+    check "ci-multi-lines [$pat]" "--heading -n --regex -i -U"    "--heading -n -i -U"      "$pat"
+    check "ci-multi-only  [$pat]" "--heading -n --regex -i -U -o" "--heading -n -i -U -o"   "$pat"
     check "ci-multi-count [$pat]" "--regex -i -U -c"              "-i -U -c"                "$pat"
     check "ci-multi-countm[$pat]" "--regex -i -U --count-matches" "-i -U --count-matches"   "$pat"
     check "ci-multi-files [$pat]" "--regex -i -U -l"              "-i -U -l"                "$pat"
 done
 # A bare term holding a terminator: -U lifts the refusal, -i folds it.
-check ci-multi-bare    "-i -U"                      "-i -U -F --heading -n"       'ALPHA ONE
+check ci-multi-bare    "--heading -n -i -U"         "-i -U -F --heading -n"       'ALPHA ONE
 beta'
 
 # A leading BOM never shows in the text, the columns or the counts.
 for pat in '^alpha' 'alpha' '^' '$'; do
-    check "bom-lines      [$pat]" "--regex"                 "--heading -n"     "$pat"
-    check "bom-only       [$pat]" "--regex -o"              "--heading -n -o"  "$pat"
+    check "bom-lines      [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
+    check "bom-only       [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
     check "bom-count      [$pat]" "--regex -c"              "-c"               "$pat"
     check "bom-countm     [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
     check "bom-files      [$pat]" "--regex -l"              "-l"               "$pat"
@@ -772,55 +774,55 @@ done
 
 # Zero-width matches, including the unterminated last line of d.txt.
 for pat in '$' 'a*$' '^' 'x*' 'x$'; do
-    check "eol-lines      [$pat]" "--regex"                 "--heading -n"     "$pat"
-    check "eol-only       [$pat]" "--regex -o"              "--heading -n -o"  "$pat"
+    check "eol-lines      [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
+    check "eol-only       [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
     check "eol-count      [$pat]" "--regex -c"              "-c"               "$pat"
     check "eol-countm     [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
     check "eol-files      [$pat]" "--regex -l"              "-l"               "$pat"
-    check "eol-context    [$pat]" "--regex -C 1"            "--heading -n -C 1" "$pat"
+    check "eol-context    [$pat]" "--heading -n --regex -C 1" "--heading -n -C 1" "$pat"
 done
 
 # -U/--multiline. rg only searches whole documents when the pattern can hold
 # a terminator (a \n in a literal or class, or any anchor); every other term
 # keeps the line scan even under -U, so both paths are checked here.
 for pat in 'alpha one\nbeta' '\nbeta' 'head\nalpha last' 'alpha last\z' 'alpha[^x]*\nzz' 'alpha 1\n' 'a\n?' '(?s)$' '(?s)alpha.*\z'; do
-    check "multi-lines    [$pat]" "--regex -U"                 "--heading -n -U"       "$pat"
-    check "multi-only     [$pat]" "--regex -U -o"              "--heading -n -U -o"    "$pat"
+    check "multi-lines    [$pat]" "--heading -n --regex -U"    "--heading -n -U"       "$pat"
+    check "multi-only     [$pat]" "--heading -n --regex -U -o" "--heading -n -U -o"    "$pat"
     check "multi-count    [$pat]" "--regex -U -c"              "-U -c"                 "$pat"
     check "multi-countm   [$pat]" "--regex -U --count-matches" "-U --count-matches"    "$pat"
     check "multi-files    [$pat]" "--regex -U -l"              "-U -l"                 "$pat"
-    check "multi-context  [$pat]" "--regex -U -C 1"            "--heading -n -U -C 1"  "$pat"
-    check "multi-color    [$pat]" "--regex -U --color always"  "--heading -n -U --color always" "$pat"
+    check "multi-context  [$pat]" "--heading -n --regex -U -C 1" "--heading -n -U -C 1"  "$pat"
+    check "multi-color    [$pat]" "--heading -n --regex -U --color always" "--heading -n -U --color always" "$pat"
     check "multi-flat     [$pat]" "--regex -U --no-heading -N" "--no-heading -N -U"    "$pat"
 done
 
 # The same terms under -U that rg keeps on its line scan, plus the anchored
 # ones, which take the multiline path and merge adjacent matched lines.
 for pat in 'alpha' '^alpha' 'alpha$' 'x*' '$'; do
-    check "multi-line-core[$pat]" "--regex -U"                 "--heading -n -U"       "$pat"
-    check "multi-lc-only  [$pat]" "--regex -U -o"              "--heading -n -U -o"    "$pat"
+    check "multi-line-core[$pat]" "--heading -n --regex -U"    "--heading -n -U"       "$pat"
+    check "multi-lc-only  [$pat]" "--heading -n --regex -U -o" "--heading -n -U -o"    "$pat"
     check "multi-lc-count [$pat]" "--regex -U -c"              "-U -c"                 "$pat"
     check "multi-lc-countm[$pat]" "--regex -U --count-matches" "-U --count-matches"    "$pat"
-    check "multi-lc-ctx   [$pat]" "--regex -U -C 1"            "--heading -n -U -C 1"  "$pat"
+    check "multi-lc-ctx   [$pat]" "--heading -n --regex -U -C 1" "--heading -n -U -C 1"  "$pat"
 done
 
 # Anchorless / short-anchor patterns: the automaton candidate route.
 for pat in '[a-z]+ha' '(alp|bet)a' 'al[a-z]{3}'; do
-    check "auto-lines     [$pat]" "--regex"                 "--heading -n"     "$pat"
-    check "auto-only      [$pat]" "--regex -o"              "--heading -n -o"  "$pat"
+    check "auto-lines     [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
+    check "auto-only      [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
     check "auto-count     [$pat]" "--regex -c"              "-c"               "$pat"
     check "auto-countm    [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
     check "auto-files     [$pat]" "--regex -l"              "-l"               "$pat"
 done
 # The same route under -U, where the plan follows the multiline flags.
-check auto-multi       "--regex -U"    "--heading -n -U"   '[a-z]+ 1\n[a-z]+ 2'
-check auto-multi-only  "--regex -U -o" "--heading -n -U -o" '[a-z]+ 1\n[a-z]+ 2'
+check auto-multi       "--heading -n --regex -U" "--heading -n -U"   '[a-z]+ 1\n[a-z]+ 2'
+check auto-multi-only  "--heading -n --regex -U -o" "--heading -n -U -o" '[a-z]+ 1\n[a-z]+ 2'
 
 # --multiline-dotall: `.` spans the terminator only with it.
 for pat in 'one.beta' 'alpha.*zz'; do
-    check "dotall-lines   [$pat]" "--regex -U --multiline-dotall" "--heading -n -U --multiline-dotall" "$pat"
-    check "dotall-only    [$pat]" "--regex -U --multiline-dotall -o" "--heading -n -U --multiline-dotall -o" "$pat"
-    check "dotall-off     [$pat]" "--regex -U"                    "--heading -n -U"    "$pat"
+    check "dotall-lines   [$pat]" "--heading -n --regex -U --multiline-dotall" "--heading -n -U --multiline-dotall" "$pat"
+    check "dotall-only    [$pat]" "--heading -n --regex -U --multiline-dotall -o" "--heading -n -U --multiline-dotall -o" "$pat"
+    check "dotall-off     [$pat]" "--heading -n --regex -U"       "--heading -n -U"    "$pat"
 done
 
 # Expressions: AND, OR, nesting, regex leaves, an empty intersection.
@@ -831,10 +833,10 @@ expr_cases "(alpha AND beta) OR head"      'or{' 'and{' t:alpha t:beta '}' t:hea
 expr_cases "alpha AND (beta OR /^z+$/)"    'and{' t:alpha 'or{' t:beta 'r:^z+$' '}' '}'
 expr_cases "zeta AND first"                'and{' t:zeta t:first '}'
 expr_cases "bom AND /crlf$/ OR sub"        'or{' 'and{' t:bom 'r:crlf$' '}' t:sub '}'
-check_expr "expr-ci-lines  [ALPHA AND one]"      "-i"    "--heading -n -i" 'and{' t:ALPHA t:one '}'
+check_expr "expr-ci-lines  [ALPHA AND one]"      "--heading -n -i" "--heading -n -i" 'and{' t:ALPHA t:one '}'
 check_expr "expr-ci-files  [ALPHA AND one]"      "-i -l" "-l -i"           'and{' t:ALPHA t:one '}'
 check_expr "expr-ci-count  [printk OR /KELVIN/]" "-i -c" "-c -i"           'or{' t:printk r:KELVIN '}'
-check_expr "expr-multi     [/alpha one\nbeta/ OR zz]" "-U" "--heading -n -U" 'or{' 'r:alpha one\nbeta' t:zz '}'
+check_expr "expr-multi     [/alpha one\nbeta/ OR zz]" "--heading -n -U" "--heading -n -U" 'or{' 'r:alpha one\nbeta' t:zz '}'
 check_expr "expr-multi-files [/alpha 1\n/ AND 3]"     "-U -l" "-U -l"      'and{' 'r:alpha 1\n' t:3 '}'
 
 # --and / --or: the same truth through the term flags.
@@ -844,9 +846,9 @@ flag_cases "--and alpha /\w+ one/"          ""        and t:alpha 'r:\w+ one'
 flag_cases "--or alpha beta head"           ""        or t:alpha t:beta t:head
 flag_cases "--and zeta first"               ""        and t:zeta t:first
 flag_cases "--regex --and 'alpha \w+' beta" "--regex" and 'r:alpha \w+' r:beta
-check_flags "flags-ci-lines [--and ALPHA one]"          "-i"    "--heading -n -i" and t:ALPHA t:one
+check_flags "flags-ci-lines [--and ALPHA one]"          "--heading -n -i" "--heading -n -i" and t:ALPHA t:one
 check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"           and t:ALPHA t:one
-check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "-U"    "--heading -n -U" or 'r:alpha one\nbeta' t:zz
+check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "--heading -n -U" "--heading -n -U" or 'r:alpha one\nbeta' t:zz
 
 # -g, --iglob and PATHs; from the root, then from sub/ with and without PATHs.
 filtered "glob-txt      " "-g *.txt"                  "-g *.txt"                  . tb
@@ -880,16 +882,17 @@ pathed "cwd-glob-root " "-g /c.txt"    ""
 pathed "cwd-glob-up   " "-g sub/**"    ""
 pathed "cwd-not-c     " "-g !c.txt"    ""
 pathed "cwd-no-t      " "-g !t"        ""
+alone "one-file       " ""                ""
 alone "one-file-count " "-c"              "-c"
 alone "one-file-countm" "--count-matches" "--count-matches"
-alone "one-file-flat  " "--no-heading"    "--no-heading -n"
-alone "one-file-ctx   " "-C 1"            "--heading -n -C 1"
-alone "one-file-only  " "-o"              "--heading -n -o"
+alone "one-file-flat  " "--no-heading -n" "--no-heading -n"
+alone "one-file-ctx   " "--heading -n -C 1" "--heading -n -C 1"
+alone "one-file-only  " "--heading -n -o" "--heading -n -o"
 alone "cwd-count      " "-c"              "-c"                ""
 alone "cwd-countm     " "--count-matches" "--count-matches"   ""
-alone "cwd-flat       " "--no-heading"    "--no-heading -n"   ""
-alone "cwd-ctx        " "-C 1"            "--heading -n -C 1" ""
-alone "cwd-only       " "-o"              "--heading -n -o"   ""
+alone "cwd-flat       " "--no-heading -n" "--no-heading -n"   ""
+alone "cwd-ctx        " "--heading -n -C 1" "--heading -n -C 1" ""
+alone "cwd-only       " "--heading -n -o" "--heading -n -o"   ""
 }
 
 # Under --serve, wait until the server's watch agrees with a local search.

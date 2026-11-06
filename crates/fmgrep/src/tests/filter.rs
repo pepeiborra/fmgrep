@@ -244,7 +244,8 @@ fn a_single_file_path_prints_no_file_name() {
         let (all, _) = trees(tmp.path(), store_docs);
         let c = all.join("sub/c.c").display().to_string();
         let one = |flags: &[&str]| printed(&all, flags, &["printk", &c]);
-        assert_eq!(one(&[]), "2:printk three alpha\n");
+        assert_eq!(one(&[]), "printk three alpha\n");
+        assert_eq!(one(&["-n"]), "2:printk three alpha\n");
         assert_eq!(one(&["-c"]), "1\n");
         assert_eq!(one(&["-l"]), format!("{c}\n"));
         let begin = timeless_lines(&one(&["--json", "--matches"]))[0].clone();

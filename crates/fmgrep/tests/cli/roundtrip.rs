@@ -14,7 +14,7 @@ fn human_output_is_readable() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.starts_with("== printk ==\na.bin\n1:printk hello printk\n"),
+        stdout.starts_with("== printk ==\na.bin:printk hello printk\n"),
         "{stdout}"
     );
     assert!(stdout.ends_with("\n== missing ==\n"), "{stdout}");
@@ -324,10 +324,7 @@ fn no_path_searches_the_cwd_subtree_as_rg() {
     };
     let ok = |s: &str| (Some(0), s.to_owned());
     assert_eq!(found(&sub, &["-l", "printk"]), ok("c.c\nd.h\n"));
-    assert_eq!(
-        found(&sub, &["printk"]),
-        ok("c.c\n1:printk c\n\nd.h\n1:printk d\n")
-    );
+    assert_eq!(found(&sub, &["printk"]), ok("c.c:printk c\nd.h:printk d\n"));
     assert_eq!(found(&sub, &["-c", "printk"]), ok("c.c:1\nd.h:1\n"));
     assert_eq!(found(&sub, &["-l", "-g", "/c.c", "printk"]), ok("c.c\n"));
     assert_eq!(found(&sub, &["-l", "-g", "!*.c", "printk"]), ok("d.h\n"));
@@ -351,6 +348,26 @@ fn no_path_searches_the_cwd_subtree_as_rg() {
             format!("error: no files were searched: {why}\n"),
             "{args:?}"
         );
+    }
+}
+
+/// Each expectation is rg 15.2.0's from the same directory, stdout piped.
+#[test]
+fn piped_output_prints_as_rg() {
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    assert!(run_in(&docs, &["index"]).status.success());
+    for (args, want) in [
+        (&["printk"][..], "a.c:printk a\nb.h:printk b\n"),
+        (&["-n", "printk"], "a.c:1:printk a\nb.h:1:printk b\n"),
+        (&["--heading", "printk"], "a.c\nprintk a\n\nb.h\nprintk b\n"),
+        (
+            &["-n", "--heading", "printk"],
+            "a.c\n1:printk a\n\nb.h\n1:printk b\n",
+        ),
+    ] {
+        let out = run_in(&docs, args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "{args:?}");
     }
 }
 
@@ -474,7 +491,7 @@ fn utf16_file_prints_as_utf8_lines() {
         assert_eq!(stderr(&out), "");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "u.txt\n2:the CLASS ü\r\n"
+            "u.txt:2:the CLASS ü\r\n"
         );
     }
     std::fs::write(docs.join("u.txt"), utf16([0xfe, 0xff], "CLASS again\n")).unwrap();
@@ -482,7 +499,7 @@ fn utf16_file_prints_as_utf8_lines() {
     let out = run(&["--index", &index, "-n", "CLASS"]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "u.txt\n1:CLASS again\n"
+        "u.txt:1:CLASS again\n"
     );
 }
 

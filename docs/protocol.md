@@ -173,10 +173,10 @@ Serving continues after any error.
 `fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
 `--index` and prints what the local search prints. It sends one `query`
 (all terms, or the expression) with `stream: true`. `--json` alone and
-`--approx-counts` send `mode` `counts`. `--color auto` follows the
-client's stdout. `--status` prints the status object and `--shutdown`
-stops the server. An error response exits 2, as `error: server:
-<message>`, after any output already received.
+`--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
+headings follow the client's stdout, as in rg. `--status` prints the
+status object and `--shutdown` stops the server. An error response exits
+2, as `error: server: <message>`, after any output already received.
 
 ## CLI --json
 
