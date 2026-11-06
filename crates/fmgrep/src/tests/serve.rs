@@ -274,7 +274,7 @@ fn serve_tcp_round_trip() {
         );
         let (_, lines) = client(&addr, &["-i", "--", "PRINTK"]).unwrap();
         assert_eq!(
-            lines, "a.c\n1:printk one\n3:printk two printk\n\nb.c\n2:tail printk\n",
+            lines, "a.c:printk one\na.c:printk two printk\nb.c:tail printk\n",
             "store_docs={store_docs}"
         );
 

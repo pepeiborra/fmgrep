@@ -197,7 +197,7 @@ pub struct Search {
     /// Lines of context around each match
     #[arg(short = 'C', long, value_name = "NUM", help_heading = "Output")]
     pub context: Option<usize>,
-    /// Show line numbers (default)
+    /// Show line numbers (default on a terminal)
     #[arg(
         short = 'n',
         long,
@@ -213,7 +213,7 @@ pub struct Search {
         help_heading = "Output"
     )]
     pub no_line_number: bool,
-    /// Group matches per file (default)
+    /// Group matches per file (default on a terminal)
     #[arg(long, overrides_with = "no_heading", help_heading = "Output")]
     pub heading: bool,
     /// One match per line, prefixed by its path
@@ -307,8 +307,9 @@ impl Search {
                 before: self.before_context.or(self.context).unwrap_or(0),
                 after: self.after_context.or(self.context).unwrap_or(0),
             };
-            p.line_numbers = self.line_number || !self.no_line_number;
-            p.heading = self.heading || !self.no_heading;
+            p.line_numbers =
+                self.line_number || (!self.no_line_number && (tty || mode == Mode::JsonMatches));
+            p.heading = self.heading || (tty && !self.no_heading);
             p.color = match (self.color, tty) {
                 (ColorChoice::Always, _) | (ColorChoice::Auto, true) => Color::Always,
                 _ => Color::Never,

@@ -10,7 +10,7 @@ anywhere below the indexed root:
 
 ```sh
 fmgrep index .                  # once: writes ./.fmgrep (add it to .gitignore)
-fmgrep HscEnv                   # lines, grouped per file, as rg prints them
+fmgrep HscEnv                   # lines as rg prints them; -n adds line numbers
 fmgrep -l HscEnv                # files only; -c counts lines per file
 fmgrep -i hscenv                # case-insensitive
 fmgrep '/Dyn[A-Z]\w+/'          # /../ is a regex; --regex makes every TERM one

@@ -125,7 +125,7 @@ fn served_non_utf8_output_is_base64_bytes() {
     );
     let result = &got[0]["result"];
     assert!(result.get("text").is_none(), "{result}");
-    let here = output(&local(&index, &[], &["printk"]), false).unwrap();
+    let here = output(&local(&index, &["-n", "--heading"], &["printk"]), false).unwrap();
     assert!(std::str::from_utf8(&here).is_err());
     assert_eq!(result["bytes"], crate::base64::encode(&here));
     assert_eq!(result["report"]["queries"][0]["term"], "printk");
@@ -224,7 +224,7 @@ fn streamed_output_is_framed_before_the_response() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage(tmp.path(), true);
     let cases: [(&str, &[&str]); 3] = [
-        ("lines", &[]),
+        ("lines", &["-n", "--heading"]),
         ("count", &["-c"]),
         ("json_matches", &["--json", "--matches"]),
     ];
@@ -275,7 +275,7 @@ fn stage_big(tmp: &Path, n: usize) -> PathBuf {
 fn streamed_output_splits_into_bounded_frames() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage_big(tmp.path(), 16_000);
-    let here = output(&local(&index, &[], &["printk"]), false).unwrap();
+    let here = output(&local(&index, &["-n", "--heading"], &["printk"]), false).unwrap();
     let got = serve_frames(&index, &[&streamed(r#""terms":["printk"],"mode":"lines""#)]);
     let frames = &got[0].0;
     assert!(frames.len() > 10, "{}", frames.len());
@@ -283,7 +283,10 @@ fn streamed_output_splits_into_bounded_frames() {
     assert_eq!(frames.concat(), here);
     let (addr, server) = spawn_server(&index, &[]);
     let served = output(&words(&["--server", &addr], &[], &["printk"]), false).unwrap();
-    assert_eq!(served, here);
+    assert_eq!(
+        served,
+        output(&local(&index, &[], &["printk"]), false).unwrap()
+    );
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }

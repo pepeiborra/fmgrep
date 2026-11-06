@@ -45,6 +45,8 @@ type Edit = fn(&mut QueryParams);
 fn lines(edit: Edit) -> QueryParams {
     let mut p = QueryParams {
         mode: Mode::Lines,
+        line_numbers: false,
+        heading: false,
         ..QueryParams::default()
     };
     edit(&mut p);
@@ -72,10 +74,10 @@ fn rg_flags_set_the_params() {
         (&["a", "--", "--json"], |p| {
             p.terms = vec!["a".into(), "--json".into()]
         }),
-        (&["-N"], |p| p.line_numbers = false),
-        (&["-N", "-n"], |_| {}),
-        (&["--no-heading"], |p| p.heading = false),
-        (&["--no-heading", "--heading"], |_| {}),
+        (&["-n"], |p| p.line_numbers = true),
+        (&["-n", "-N"], |_| {}),
+        (&["--heading"], |p| p.heading = true),
+        (&["--heading", "--no-heading"], |_| {}),
         (&["--color", "always"], |p| p.color = Color::Always),
         (&["-c"], |p| p.mode = Mode::Count),
         (&["--count-matches"], |p| p.mode = Mode::CountMatches),
@@ -167,6 +169,7 @@ fn params_pick_the_mode() {
         },
         "a counts request carries no printer fields"
     );
+    assert!(params(&["--json", "--matches"]).json_config().line_numbers);
     let json = params(&["--json", "-N", "--matches"]);
     assert!(json.mode == Mode::JsonMatches && !json.json_config().line_numbers);
     let p = params(&["-U", "x"]);
@@ -190,15 +193,19 @@ fn context_flags_follow_rg_precedence() {
 }
 
 #[test]
-fn color_auto_follows_the_terminal_only() {
+fn terminal_defaults_follow_rg() {
     for (words, tty, want) in [
-        (&["-i"][..], false, false),
-        (&["-i"], true, true),
-        (&["--color", "never"], true, false),
-        (&["--color", "always"], false, true),
+        (&["-i"][..], false, (false, false, false)),
+        (&["-i"], true, (true, true, true)),
+        (&["-n"], false, (false, true, false)),
+        (&["--heading"], false, (false, false, true)),
+        (&["-N"], true, (true, false, true)),
+        (&["--no-heading"], true, (true, true, false)),
+        (&["--color", "never"], true, (false, true, true)),
+        (&["--color", "always"], false, (true, false, false)),
     ] {
-        let color = params_in(words, "", true, tty).output_config().color;
-        assert_eq!(color, want, "{words:?}");
+        let c = params_in(words, "", true, tty).output_config();
+        assert_eq!((c.color, c.line_numbers, c.heading), want, "{words:?}");
     }
 }
 
