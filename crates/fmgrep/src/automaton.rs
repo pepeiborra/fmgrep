@@ -43,10 +43,6 @@ const DFA_BYTES: usize = 8 << 20;
 /// Longest required literal whose pattern plans its walk at prepare time.
 pub const MAX_ANCHOR: usize = 3;
 
-/// Shard-wide anchor occurrences at which a longer anchor's pattern
-/// walks its [`DeferredPlan`] instead of locating the anchor.
-pub const MIN_ANCHOR_COUNT: u64 = 256;
-
 /// A regex as a branching backward search: a reversed, anchored byte DFA
 /// stepped while the FM interval is extended front-to-back.
 pub struct RegexPlan {
@@ -157,8 +153,7 @@ fn checked(dfa: dense::DFA<Vec<u32>>) -> Option<RegexPlan> {
     Some(RegexPlan { dfa, start })
 }
 
-/// A plan compiled on first demand: only a shard where the pattern's anchor
-/// is common walks it.
+/// A plan compiled once, on first demand by a shard holding the anchor.
 pub struct DeferredPlan {
     core: Hir,
     plan: OnceLock<Option<RegexPlan>>,

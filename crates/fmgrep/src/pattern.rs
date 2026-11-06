@@ -250,7 +250,7 @@ pub fn others(p: &PreparedPattern) -> &[Vec<u8>] {
     &p.others
 }
 
-/// The plan a shard walks where `p`'s longer anchor is common.
+/// The plan a shard walks where `p`'s longer anchor occurs.
 pub fn deferred(p: &PreparedPattern) -> Option<&DeferredPlan> {
     p.deferred.as_ref()
 }

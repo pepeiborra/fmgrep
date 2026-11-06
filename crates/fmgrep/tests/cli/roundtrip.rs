@@ -201,39 +201,25 @@ fn dotdir_output_outside_the_folder_is_refused() {
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
-/// Files source: where a pattern's anchor is common, a document holding the
-/// anchor but no match is never read.
+/// Files source: a document holding a long anchor but no match is never
+/// read.
 #[test]
-fn a_common_anchor_reads_only_matching_docs() {
+fn a_long_anchor_reads_only_matching_docs() {
     use std::os::unix::fs::PermissionsExt;
-    const PATTERN: &str = "union[ \\t]+\\{";
-    // fmgrep's `MIN_ANCHOR_COUNT`: from this many anchors a shard walks.
-    const WALKS: usize = 256;
-    let stage = |copies: usize| {
-        let common = b"union x {\n".repeat(copies);
-        let (tmp, docs) =
-            stage_files(&[("a.c", &common), ("b.c", b"union {\n"), ("c.c", b"none\n")]);
-        let index_dir = do_index(&docs, false);
-        let unread = std::fs::Permissions::from_mode(0o000);
-        std::fs::set_permissions(docs.join("a.c"), unread).unwrap();
-        (tmp, index_dir)
-    };
-    let (_tmp, index_dir) = stage(WALKS);
-    let out = run(&query_argv(&index_dir, true, &[PATTERN]));
+    let (_tmp, docs) = stage_files(&[
+        ("a.c", b"union x {\n"),
+        ("b.c", b"union {\n"),
+        ("c.c", b"none\n"),
+    ]);
+    let index_dir = do_index(&docs, false);
+    std::fs::set_permissions(docs.join("a.c"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run(&query_argv(&index_dir, true, &["union[ \\t]+\\{"]));
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(counts(&out.stdout), [(1, 1)]);
-    let (index, regex) = (index_dir.display().to_string(), format!("/{PATTERN}/"));
-    let out = run(&["--index", &index, "-c", &regex]);
+    let index = index_dir.display().to_string();
+    let out = run(&["--index", &index, "-c", "/union[ \\t]+\\{/"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b.c:1\n");
     assert!(!stderr(&out).contains("excluding"));
-    // Control arm: the literal prune reads `a.c`, which is excluded.
-    let (_tmp, index_dir) = stage(8);
-    let out = run(&query_argv(&index_dir, true, &[PATTERN]));
-    let stderr = stderr(&out);
-    assert!(
-        stderr.contains("warning: excluding") && stderr.contains("a.c"),
-        "{stderr}"
-    );
 }
 
 #[test]
