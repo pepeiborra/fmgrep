@@ -3,7 +3,6 @@
 use std::io::Write;
 
 use crate::output::WRITE_FAILED;
-use crate::output::writer::Pipe;
 use crate::wire::{IndexSummary, OutputReport};
 
 /// A closed stdout ends the report silently, as it does for matches.
@@ -13,11 +12,6 @@ pub fn line(out: &mut dyn Write, text: &str) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(e) => Err(format!("{WRITE_FAILED} report: {e}")),
     }
-}
-
-/// Served output, verbatim.
-pub fn bytes(out: &mut dyn Write, b: &[u8]) -> Result<(), String> {
-    Pipe::new(out).raw(b)
 }
 
 fn encoded<T: serde::Serialize>(what: &str, value: &T) -> Result<String, String> {

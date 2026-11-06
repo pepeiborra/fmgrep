@@ -58,6 +58,9 @@ pub struct QueryParams {
     /// False for one file PATH, as in rg.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub filename: bool,
+    /// Rendering modes: send the output as byte frames before the response.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -136,6 +139,7 @@ impl Default for QueryParams {
             paths: Vec::new(),
             cwd: String::new(),
             filename: true,
+            stream: false,
         }
     }
 }

@@ -13,6 +13,7 @@ use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::manifest::{DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
+use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
 use crate::remote::{Conn, RpcError};
 use crate::sharded::DocfmIndex;
@@ -27,7 +28,7 @@ const INVALID_PARAMS: i64 = -32602;
 const QUERY_FAILED: i64 = -32000;
 
 /// A rendering mode's result: the local stdout, as `text` when it is UTF-8
-/// and standard base64 `bytes` otherwise.
+/// and standard base64 `bytes` otherwise; neither when streamed.
 #[derive(Serialize, Deserialize)]
 struct Rendered {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,14 +50,53 @@ impl Rendered {
             report,
         }
     }
+}
 
-    fn into_parts(self) -> Result<(Vec<u8>, OutputReport), String> {
-        let out = match (self.text, self.bytes) {
-            (Some(t), None) => t.into_bytes(),
-            (None, Some(b)) => crate::base64::decode(&b)?,
-            _ => return Err("want exactly one of text and bytes".to_owned()),
-        };
-        Ok((out, self.report))
+const FRAME: usize = 64 << 10;
+/// Room for the longest header in front of a frame.
+const HEAD: usize = 8;
+
+/// `stream` output: `<len>\n<len bytes>` frames of at most [`FRAME`] bytes,
+/// each one write.
+struct Frames<'a> {
+    out: &'a mut dyn Write,
+    buf: Vec<u8>,
+}
+
+impl<'a> Frames<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        let mut buf = Vec::with_capacity(HEAD + FRAME);
+        buf.resize(HEAD, 0);
+        Self { out, buf }
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        let len = self.buf.len() - HEAD;
+        if len == 0 {
+            return Ok(());
+        }
+        let head = format!("{len}\n");
+        let start = HEAD - head.len();
+        self.buf[start..HEAD].copy_from_slice(head.as_bytes());
+        let sent = self.out.write_all(&self.buf[start..]);
+        self.buf.truncate(HEAD);
+        sent
+    }
+}
+
+impl Write for Frames<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = b.len().min(HEAD + FRAME - self.buf.len());
+        self.buf.extend_from_slice(&b[..n]);
+        if self.buf.len() == HEAD + FRAME {
+            self.emit()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit()?;
+        self.out.flush()
     }
 }
 
@@ -99,7 +139,7 @@ struct Served<'m> {
 }
 
 impl Served<'_> {
-    fn query(&mut self, p: &mut QueryParams) -> Result<Answer, RpcError> {
+    fn query(&mut self, p: &mut QueryParams, out: &mut dyn Write) -> Result<Answer, RpcError> {
         p.scope(super::served_tree(&self.root, self.manifest.store_docs));
         let req = p
             .request(self.index_dir, self.manifest, None)
@@ -111,6 +151,20 @@ impl Served<'_> {
         let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
         let answered = match p.mode {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
+            // Output so far precedes an error, as in a local search.
+            _ if p.stream => {
+                let mut frames = Frames::new(out);
+                let rendered = render(p, false, &mut frames, run);
+                let sent = frames.flush();
+                rendered.and_then(|report| {
+                    sent.map_err(|e| format!("{WRITE_FAILED} matches: {e}"))?;
+                    Ok(Answer::Rendered(Rendered {
+                        text: None,
+                        bytes: None,
+                        report,
+                    }))
+                })
+            }
             _ => {
                 let mut out = Vec::new();
                 render(p, false, &mut out, run).map(|r| Answer::Rendered(Rendered::new(out, r)))
@@ -174,8 +228,9 @@ fn failure(id: &Value, code: i64, message: String) -> String {
     .unwrap_or_default()
 }
 
-/// One request line to its response line, and whether it asked to shut down.
-fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
+/// One request line to its response line, after any frames on `out`, and
+/// whether it asked to shut down.
+fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String, bool) {
     let null = Value::Null;
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -239,7 +294,7 @@ fn respond(session: &mut Served<'_>, line: &str) -> (String, bool) {
                     false,
                 );
             }
-            match session.query(&mut p) {
+            match session.query(&mut p, out) {
                 Ok(answer) => (success(id, answer), false),
                 Err(e) => (failure(id, e.code, e.message), false),
             }
@@ -274,7 +329,7 @@ fn serve_lines(
         }
         let (response, shutdown) = match std::str::from_utf8(&buf) {
             Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => respond(session, line),
+            Ok(line) => respond(session, line, out),
             Err(e) => (
                 failure(&Value::Null, PARSE_ERROR, format!("parse error: {e}")),
                 false,
@@ -398,13 +453,11 @@ pub fn manage(addr: &str, shutdown: bool, out: &mut dyn Write) -> Result<Outcome
     Ok(Outcome::Done)
 }
 
-/// One method without params; `Err` is printable.
+/// One method without params.
 fn ask<T: serde::de::DeserializeOwned>(addr: &str, method: &str) -> Result<T, String> {
-    let mut conn = Conn::open(addr).map_err(|e| format!("error: {e}"))?;
-    let result = conn.call(method, serde_json::json!({}));
-    result
-        .and_then(|r| conn.decode(r))
-        .map_err(|e| format!("error: {e}"))
+    let mut conn = Conn::open(addr)?;
+    let result = conn.call(method, serde_json::json!({}), &mut |_| Ok(()))?;
+    conn.decode(result)
 }
 
 pub fn status(addr: &str) -> Result<ServeStatus, String> {
@@ -420,32 +473,20 @@ pub fn run_client(
 ) -> Result<Outcome, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let mut conn = Conn::open(addr).map_err(|e| format!("error: {e}"))?;
-    let result = conn
-        .call("query", sent)
-        .map_err(|e| format!("error: {e}"))?;
-    print_result(out, json, p, &conn, result).map(Outcome::Query)
-}
-
-/// A `query` result as the local search prints it.
-fn print_result(
-    out: &mut dyn Write,
-    json: bool,
-    p: &QueryParams,
-    conn: &Conn,
-    result: Value,
-) -> Result<OutputReport, String> {
-    let bad = |e: String| format!("error: {e}");
-    let report = if p.mode == Mode::Counts {
-        conn.decode(result).map_err(bad)?
-    } else {
-        let rendered: Rendered = conn.decode(result).map_err(bad)?;
-        let (stdout, report) = rendered.into_parts().map_err(|e| conn.unexpected(&e))?;
-        if !json || p.mode == Mode::JsonMatches {
-            print::bytes(out, &stdout)?;
-            return Ok(report);
-        }
-        report
+    let mut conn = Conn::open(addr)?;
+    let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
+    let mut pipe = Pipe::new(&mut *out);
+    let result = conn.call("query", sent, &mut |b| match printed {
+        true => pipe.raw(b),
+        false => Ok(()),
+    })?;
+    pipe.finish()?;
+    let report = match p.mode {
+        Mode::Counts => conn.decode(result)?,
+        _ => conn.decode::<Rendered>(result)?.report,
     };
-    render(p, json, out, |_| Ok(report))
+    if printed {
+        return Ok(Outcome::Query(report));
+    }
+    render(p, json, out, |_| Ok(report)).map(Outcome::Query)
 }
