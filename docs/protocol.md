@@ -12,7 +12,7 @@ tree; `*_us` timings vary from run to run.
 
 `fmgrep serve [PATH]` loads the index once, the same way a search does, and
 then answers newline-delimited JSON-RPC 2.0: one request per line, one
-response line each.
+response line each, after any [frames](#streamed-output).
 
 - `--listen ADDR` (default `127.0.0.1:0`): TCP. The bound address is the
   only line on stdout, printed once the index is loaded and the tree
@@ -31,7 +31,7 @@ response line each.
 
 | method | params | result |
 |---|---|---|
-| `query` | below | an `OutputReport`, or `{text, report}` |
+| `query` | below | an `OutputReport`, `{text, report}`, or frames then `{report}` |
 | `status` | none | `{store_docs, files, num_bytes, index_size_bytes, load_us, root}` |
 | `shutdown` | none | `{"status":"shutting down"}`, then the server exits 0 |
 
@@ -56,6 +56,7 @@ response line each.
 | `paths` | [{path, name}] | [] | PATH arguments: `path` relative to the indexed root (`""` the root), `name` as typed (`""`: the cwd of a search without PATH), which its files print under |
 | `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
+| `stream` | bool | false | send the output as [frames](#streamed-output) |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -65,23 +66,43 @@ response line each.
 `OutputReport`.
 Every other mode answers `{"text", "report"}`: `text` is what the local
 search prints, byte for byte, and `report` its `OutputReport`. When that
-output is not UTF-8, `bytes` (standard base64) replaces `text`. The whole
-output is built in memory and sent as one line; other connections wait for
-it.
+output is not UTF-8, `bytes` (standard base64) replaces `text`.
+`json_matches` gives the matches as structured events.
 
 ```text
 > {"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["greet","/hel+o/"]}}
-< {"jsonrpc":"2.0","id":1,"result":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":11,"total_matches":7,"docs_matched":3},{"term":"/hel+o/","latency_us":81,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}
+< {"jsonrpc":"2.0","id":1,"result":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":37,"total_matches":6,"docs_matched":3},{"term":"/hel+o/","latency_us":90,"total_matches":2,"docs_matched":2,"counts_exact":false}]}}
 > {"jsonrpc":"2.0","id":3,"method":"query","params":{"terms":["hello"],"mode":"lines"}}
-< {"jsonrpc":"2.0","id":3,"result":{"text":"README.md\n3:Say hello with greet.\n\nsrc/Lib.hs\n4:greet name = \"hello \" ++ name\n","report":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":47,"total_matches":2,"docs_matched":2}]}}}
+< {"jsonrpc":"2.0","id":3,"result":{"text":"README.md\n3:Say hello with greet.\n\nsrc/Lib.hs\n4:greet name = \"hello \" ++ name\n","report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":47,"total_matches":2,"docs_matched":2}]}}}
 > {"jsonrpc":"2.0","id":4,"method":"query","params":{"terms":["greet"],"mode":"files"}}
-< {"jsonrpc":"2.0","id":4,"result":{"text":"README.md\napp/Main.hs\nsrc/Lib.hs\n","report":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":6,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}}
+< {"jsonrpc":"2.0","id":4,"result":{"text":"README.md\napp/Main.hs\nsrc/Lib.hs\n","report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":26,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}}
 > {"jsonrpc":"2.0","id":5,"method":"status"}
-< {"jsonrpc":"2.0","id":5,"result":{"store_docs":false,"files":3,"num_bytes":208,"index_size_bytes":34448,"load_us":801,"root":"/src/demo"}}
+< {"jsonrpc":"2.0","id":5,"result":{"store_docs":false,"files":3,"num_bytes":197,"index_size_bytes":34456,"load_us":4305,"root":"/src/demo"}}
 ```
 
 `root` is where the server reads the documents: the tree, or the index
 directory holding `docs.shard`.
+
+### Streamed output
+
+With `stream: true`, a rendering mode sends its output while the search
+runs, as frames before the response line. A frame is its length in ASCII
+decimal, `\n`, then that many bytes, at most 64 KiB; a response line starts
+with `{` instead. The frames concatenated are the local stdout, and the
+result is `{"report"}`. A search that fails after output started sends the
+frames so far, then the error. `counts` ignores `stream`. Connections are
+still served one at a time.
+
+```text
+> {"jsonrpc":"2.0","id":6,"method":"query","params":{"terms":["hello"],"mode":"lines","stream":true}}
+< 78
+< README.md
+< 3:Say hello with greet.
+<
+< src/Lib.hs
+< 4:greet name = "hello " ++ name
+< {"jsonrpc":"2.0","id":6,"result":{"report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":82,"total_matches":2,"docs_matched":2}]}}}
+```
 
 ## Expressions
 
@@ -96,7 +117,7 @@ caps nesting at 60.
 
 ```text
 > {"jsonrpc":"2.0","id":2,"method":"query","params":{"expr":{"and":[{"term":"greet"},{"or":[{"term":"hello"},{"regex":"sort[A-Z]"}]}]}}}
-< {"jsonrpc":"2.0","id":2,"result":{"index_time_us":801,"index_size_bytes":34448,"num_files_indexed":3,"queries":[{"term":"greet AND (hello OR /sort[A-Z]/)","latency_us":45,"total_matches":7,"docs_matched":2,"counts_exact":false,"leaves":[{"term":"greet","total_matches":5},{"term":"hello","total_matches":2},{"term":"/sort[A-Z]/","total_matches":0}]}]}}
+< {"jsonrpc":"2.0","id":2,"result":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet AND (hello OR /sort[A-Z]/)","latency_us":63,"total_matches":6,"docs_matched":2,"counts_exact":false,"leaves":[{"term":"greet","total_matches":4},{"term":"hello","total_matches":2},{"term":"/sort[A-Z]/","total_matches":0}]}]}}
 ```
 
 ## Reports
@@ -151,10 +172,11 @@ Serving continues after any error.
 
 `fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
 `--index` and prints what the local search prints. It sends one `query`
-(all terms, or the expression). `--json` alone and `--approx-counts` send
-`mode` `counts`. `--color auto` follows the client's stdout. `--status`
-prints the status object and `--shutdown` stops the server. An error
-response exits 2, as `error: server: <message>`.
+(all terms, or the expression) with `stream: true`. `--json` alone and
+`--approx-counts` send `mode` `counts`. `--color auto` follows the
+client's stdout. `--status` prints the status object and `--shutdown`
+stops the server. An error response exits 2, as `error: server:
+<message>`, after any output already received.
 
 ## CLI --json
 
@@ -169,7 +191,7 @@ build_time_us}`:
 
 ```text
 $ fmgrep index --json
-{"store_docs":false,"path":"./.fmgrep","num_files":3,"num_bytes":208,"index_size_bytes":34448,"build_time_us":2060}
+{"store_docs":false,"path":"./.fmgrep","num_files":3,"num_bytes":197,"index_size_bytes":34456,"build_time_us":4145}
 ```
 
 The event stream is rg 15.2.0's, byte for byte: `begin`, one `match` or

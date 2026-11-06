@@ -150,6 +150,7 @@ fn client(
         let root = Path::new(&status.root);
         rebase(&mut p, typed, served_tree(root, status.store_docs))?;
     }
+    p.stream = true;
     run_client(addr, &p, json, out)
 }
 

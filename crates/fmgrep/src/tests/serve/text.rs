@@ -1,5 +1,7 @@
 //! Rendering modes: `--server` prints exactly what a local search prints.
 
+use std::io::BufRead;
+
 use super::*;
 
 const FILES: [(&str, &[u8]); 4] = [
@@ -123,12 +125,9 @@ fn served_non_utf8_output_is_base64_bytes() {
     );
     let result = &got[0]["result"];
     assert!(result.get("text").is_none(), "{result}");
-    let bytes = crate::base64::decode(result["bytes"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        bytes,
-        output(&local(&index, &[], &["printk"]), false).unwrap()
-    );
-    assert!(std::str::from_utf8(&bytes).is_err());
+    let here = output(&local(&index, &[], &["printk"]), false).unwrap();
+    assert!(std::str::from_utf8(&here).is_err());
+    assert_eq!(result["bytes"], crate::base64::encode(&here));
     assert_eq!(result["report"]["queries"][0]["term"], "printk");
     assert_eq!(got[1]["result"]["text"], "b.c:1:aaaa\n");
     assert!(got[1]["result"].get("bytes").is_none());
@@ -187,6 +186,161 @@ fn served_stale_file_equals_local() {
         let (here, served) = both(&index, &addr, flags, &["printk"]);
         assert_eq!(served, here, "changed while serving {flags:?}");
     }
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+/// `serve --stdio` over `requests`: each response with the frames before it.
+fn serve_frames(index: &Path, requests: &[&str]) -> Vec<(Vec<Vec<u8>>, serde_json::Value)> {
+    let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
+    let mut out = Vec::new();
+    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
+    let (mut rest, mut got, mut frames) = (&out[..], Vec::new(), Vec::new());
+    while let Some(eol) = rest.iter().position(|&b| b == b'\n') {
+        let line = std::str::from_utf8(&rest[..eol]).unwrap();
+        rest = &rest[eol + 1..];
+        match line.parse::<usize>() {
+            Ok(len) => {
+                frames.push(rest[..len].to_vec());
+                rest = &rest[len..];
+            }
+            Err(_) => got.push((
+                std::mem::take(&mut frames),
+                serde_json::from_str(line).unwrap(),
+            )),
+        }
+    }
+    assert!(rest.is_empty() && frames.is_empty());
+    got
+}
+
+fn streamed(params: &str) -> String {
+    format!(r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{{params},"stream":true}}}}"#)
+}
+
+#[test]
+fn streamed_output_is_framed_before_the_response() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage(tmp.path(), true);
+    let cases: [(&str, &[&str]); 3] = [
+        ("lines", &[]),
+        ("count", &["-c"]),
+        ("json_matches", &["--json", "--matches"]),
+    ];
+    let requests: Vec<String> = cases
+        .iter()
+        .map(|(mode, _)| streamed(&format!(r#""terms":["printk"],"mode":"{mode}""#)))
+        .chain([streamed(r#""terms":["printk"]"#)])
+        .collect();
+    let got = serve_frames(
+        &index,
+        &requests.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    for ((frames, response), (mode, flags)) in got.iter().zip(cases) {
+        let here = output(&local(&index, flags, &["printk"]), false).unwrap();
+        let served = frames.concat();
+        assert_eq!(
+            untimed(flags, &String::from_utf8_lossy(&served)),
+            untimed(flags, &String::from_utf8_lossy(&here)),
+            "{mode}"
+        );
+        if mode != "json_matches" {
+            assert_eq!(served, here, "{mode}");
+        }
+        let result = response["result"].as_object().unwrap();
+        assert_eq!(result.keys().collect::<Vec<_>>(), ["report"], "{mode}");
+    }
+    assert!(std::str::from_utf8(&got[0].0.concat()).is_err());
+    let (frames, response) = &got[3];
+    assert!(frames.is_empty());
+    assert_eq!(
+        result_report(response),
+        timeless(query_it(&index, false, &["printk"]))
+    );
+}
+
+/// One file of `n` matched lines, 64 bytes each.
+fn stage_big(tmp: &Path, n: usize) -> PathBuf {
+    let big: Vec<u8> = (0..n)
+        .flat_map(|i| format!("printk {i:08} {}\n", "x".repeat(47)).into_bytes())
+        .collect();
+    let folder = stage_corpus(tmp, &[("big.c", &big)]);
+    let output = tmp.join("idx");
+    index_it(&folder, &output, true);
+    output
+}
+
+#[test]
+fn streamed_output_splits_into_bounded_frames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage_big(tmp.path(), 16_000);
+    let here = output(&local(&index, &[], &["printk"]), false).unwrap();
+    let got = serve_frames(&index, &[&streamed(r#""terms":["printk"],"mode":"lines""#)]);
+    let frames = &got[0].0;
+    assert!(frames.len() > 10, "{}", frames.len());
+    assert!(frames.iter().all(|f| f.len() <= 64 << 10));
+    assert_eq!(frames.concat(), here);
+    let (addr, server) = spawn_server(&index, &[]);
+    let served = output(&words(&["--server", &addr], &[], &["printk"]), false).unwrap();
+    assert_eq!(served, here);
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+/// A one-connection server that answers any request with `reply`.
+fn fake_server(reply: &[u8]) -> String {
+    let reply = reply.to_vec();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .unwrap();
+        (&stream).write_all(&reply).unwrap();
+    });
+    addr
+}
+
+#[test]
+fn a_server_error_after_output_keeps_the_output() {
+    for (reply, printed, error) in [
+        (
+            &b"5\nhello1\n!{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n"[..],
+            &b"hello!"[..],
+            "server: boom",
+        ),
+        (b"10\nabc", b"abc", "{addr}: connection closed mid-frame"),
+    ] {
+        let addr = fake_server(reply);
+        let mut out = Vec::new();
+        let words = argv(&["--server", &addr, "printk"]);
+        let got = dispatch_to(&words, &mut &b""[..], &mut out, false).err().unwrap();
+        assert_eq!(got, format!("error: {}", error.replace("{addr}", &addr)));
+        assert_eq!(out, printed);
+    }
+}
+
+#[test]
+fn a_client_leaving_mid_stream_leaves_the_server_serving() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage_big(tmp.path(), 16_000);
+    let (addr, server) = spawn_server(&index, &[]);
+    let stream = std::net::TcpStream::connect(&addr).unwrap();
+    let request = streamed(r#""terms":["printk"],"mode":"lines""#);
+    (&stream)
+        .write_all(format!("{request}\n").as_bytes())
+        .unwrap();
+    let mut header = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut header)
+        .unwrap();
+    assert_eq!(header, format!("{}\n", 64 << 10));
+    drop(stream);
+    let (_, counted) = client(&addr, &["-c", "--", "printk"]).unwrap();
+    assert_eq!(counted, printed(&index, &["-c"], &["printk"]));
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }
