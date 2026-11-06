@@ -1,11 +1,10 @@
-//! ripgrep-format match output, byte for byte rg 15.2.0's; `output/tests.rs`
-//! carries the rg command behind every expectation.
+//! rg's human output around each document's printed bytes: banners,
+//! headings, file separators, and the count and `-l` lines.
 
 use std::io::Write;
 
 pub mod writer;
 
-use crate::matching::LineHit;
 use crate::sink::{DocMatches, MatchSink};
 use writer::Pipe;
 
@@ -16,14 +15,10 @@ pub const WRITE_FAILED: &str = "error: failed to write";
 /// What each matching document prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
-    /// Matched lines (rg default) and any context lines.
+    /// Its lines, as printed: rg's default and `-o`.
     Lines,
-    /// rg `-o`: one line per match, matched bytes only.
-    OnlyMatching,
-    /// rg `-c`.
-    CountLines,
-    /// rg `--count-matches`.
-    CountMatches,
+    /// `path:` and the printed count: rg `-c` and `--count-matches`.
+    Count,
     /// rg `-l`.
     FilesWithMatches,
 }
@@ -32,12 +27,8 @@ pub enum Format {
 pub struct OutputConfig {
     pub format: Format,
     pub heading: bool,
-    pub line_numbers: bool,
-    /// `before > 0 || after > 0`: gates the `--` separator, which rg omits
-    /// under `-C0`.
+    /// Context lines are on: files are separated by `--` without headings.
     pub context: bool,
-    /// rg `-U`, which only changes `-o`: see [`MatchWriter::only_matching`].
-    pub multiline: bool,
     pub color: bool,
     /// Print a `== term ==` banner: set when the query has several terms.
     pub banner: bool,
@@ -45,27 +36,25 @@ pub struct OutputConfig {
     pub filename: bool,
 }
 
-/// rg's default palette, raw ANSI. Every field opens with a reset, as rg
-/// emits; separators and counts are uncoloured.
-const PATH: &str = "\x1b[0m\x1b[35m";
-const LINE_NO: &str = "\x1b[0m\x1b[32m";
-const MATCHED: &str = "\x1b[0m\x1b[1m\x1b[31m";
-const RESET: &str = "\x1b[0m";
+/// `path` in rg's path colour.
+pub fn path_field(out: &mut Vec<u8>, path: &str, color: bool) {
+    if color {
+        out.extend_from_slice(b"\x1b[0m\x1b[35m");
+    }
+    out.extend_from_slice(path.as_bytes());
+    if color {
+        out.extend_from_slice(b"\x1b[0m");
+    }
+}
 
 /// Streams one query's matches in rg's formats.
-///
-/// Relies on the [`MatchSink`] contract that each document arrives exactly
-/// once, ascending by path: every `doc` call is a new file, so no
-/// current-file state is needed.
 pub struct MatchWriter<W: Write> {
     pipe: Pipe<W>,
     cfg: OutputConfig,
-    /// Anything written for this term yet: gates the blank line before a
-    /// heading and the `--` before a new file in no-heading context mode.
+    /// Anything written for this term yet.
     wrote: bool,
-    /// Previous printed line number of the current document.
-    last_line: Option<u64>,
     terms: usize,
+    field: Vec<u8>,
 }
 
 impl<W: Write> MatchWriter<W> {
@@ -74,8 +63,8 @@ impl<W: Write> MatchWriter<W> {
             pipe: Pipe::new(out),
             cfg,
             wrote: false,
-            last_line: None,
             terms: 0,
+            field: Vec::new(),
         }
     }
 
@@ -83,109 +72,22 @@ impl<W: Write> MatchWriter<W> {
         self.pipe.finish()
     }
 
-    fn raw(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.pipe.raw(bytes)
-    }
-
-    fn field(&mut self, bytes: &[u8], color: &str) -> Result<(), String> {
-        if !self.cfg.color {
-            return self.raw(bytes);
-        }
-        self.raw(color.as_bytes())?;
-        self.raw(bytes)?;
-        self.raw(RESET.as_bytes())
-    }
-
-    /// rg `-l` (no count) and `-c` / `--count-matches`.
-    fn count_line(&mut self, path: &str, count: Option<u64>) -> Result<(), String> {
-        if self.cfg.filename || count.is_none() {
-            self.field(path.as_bytes(), PATH)?;
-        }
-        if let Some(n) = count {
-            if self.cfg.filename {
-                self.raw(b":")?;
-            }
-            self.raw(n.to_string().as_bytes())?;
-        }
-        self.raw(b"\n")
-    }
-
-    fn heading(&mut self, path: &str) -> Result<(), String> {
-        if self.wrote {
-            self.raw(b"\n")?;
-        }
-        self.field(path.as_bytes(), PATH)?;
-        self.raw(b"\n")
-    }
-
-    /// The `path:`/`N:` fields of one output line; `-` separators on a
-    /// context line.
-    fn prefix(&mut self, path: &str, line: u64, matched: bool) -> Result<(), String> {
-        let sep: &[u8] = if matched { b":" } else { b"-" };
-        if self.cfg.filename && !self.cfg.heading {
-            self.field(path.as_bytes(), PATH)?;
-            self.raw(sep)?;
-        }
-        if self.cfg.line_numbers {
-            self.field(line.to_string().as_bytes(), LINE_NO)?;
-            self.raw(sep)?;
-        }
-        Ok(())
-    }
-
-    fn body(&mut self, raw: &[u8], hit: &LineHit) -> Result<(), String> {
-        let line = &raw[hit.start..hit.end];
-        if !self.cfg.color || hit.spans.is_empty() {
-            return self.raw(line);
-        }
-        let mut at = 0usize;
-        for &(off, len) in &hit.spans {
-            // Clamped: no span may reach behind the last one or past the line.
-            let off = (off as usize).max(at).min(line.len());
-            let end = (off + len as usize).min(line.len());
-            self.raw(&line[at..off])?;
-            if end > off {
-                self.field(&line[off..end], MATCHED)?;
-            }
-            at = end;
-        }
-        self.raw(&line[at..])
-    }
-
-    /// rg `-o`: one output line per span, the matched bytes alone. A line
-    /// with no spans — context, or a spanless match — prints whole, except
-    /// under `-U`, where a matched line the match only reaches through its
-    /// terminator (and a zero-width match anywhere) prints nothing at all.
-    fn only_matching(&mut self, path: &str, raw: &[u8], hit: &LineHit) -> Result<(), String> {
-        let line = &raw[hit.start..hit.end];
-        if hit.spans.is_empty() {
-            if self.cfg.multiline && hit.matched {
-                return Ok(());
-            }
-            self.prefix(path, hit.line, hit.matched)?;
-            self.raw(line)?;
-            return self.raw(b"\n");
-        }
-        for &(off, len) in &hit.spans {
-            let off = (off as usize).min(line.len());
-            let end = (off + len as usize).min(line.len());
-            self.prefix(path, hit.line, true)?;
-            self.field(&line[off..end], MATCHED)?;
-            self.raw(b"\n")?;
-        }
-        Ok(())
+    fn path(&mut self, path: &str, then: &[u8]) -> Result<(), String> {
+        self.field.clear();
+        path_field(&mut self.field, path, self.cfg.color);
+        self.field.extend_from_slice(then);
+        self.pipe.raw(&self.field)
     }
 }
 
 impl<W: Write> MatchSink for MatchWriter<W> {
     fn term_start(&mut self, term: &str) -> Result<(), String> {
-        self.last_line = None;
         self.wrote = false;
         if self.cfg.banner {
             if self.terms > 0 {
-                self.raw(b"\n")?;
+                self.pipe.raw(b"\n")?;
             }
-            self.raw(format!("== {term} ==\n").as_bytes())?;
+            self.pipe.raw(format!("== {term} ==\n").as_bytes())?;
         }
         self.terms += 1;
         Ok(())
@@ -193,35 +95,20 @@ impl<W: Write> MatchSink for MatchWriter<W> {
 
     fn doc(&mut self, m: DocMatches<'_>) -> Result<(), String> {
         match self.cfg.format {
-            Format::FilesWithMatches => return self.count_line(m.path, None),
-            Format::CountLines => return self.count_line(m.path, Some(m.outcome.count_lines())),
-            Format::CountMatches => {
-                return self.count_line(m.path, Some(m.outcome.count_matches()));
+            Format::FilesWithMatches => self.path(m.path, b"\n")?,
+            Format::Count if self.cfg.filename => self.path(m.path, b":")?,
+            Format::Count => {}
+            Format::Lines if self.cfg.heading && self.cfg.filename => {
+                if self.wrote {
+                    self.pipe.raw(b"\n")?;
+                }
+                self.path(m.path, b"\n")?;
             }
-            Format::Lines | Format::OnlyMatching => {}
-        }
-        if self.cfg.heading && self.cfg.filename {
-            self.heading(m.path)?;
-        } else if self.cfg.context && self.wrote {
-            // rg separates files too once context is on and headings are off.
-            self.raw(b"--\n")?;
-        }
-        self.last_line = None;
-        for hit in &m.outcome.lines {
-            if self.cfg.context && self.last_line.is_some_and(|p| p + 1 != hit.line) {
-                self.raw(b"--\n")?;
-            }
-            if self.cfg.format == Format::OnlyMatching {
-                self.only_matching(m.path, m.raw, hit)?;
-            } else {
-                self.prefix(m.path, hit.line, hit.matched)?;
-                self.body(m.raw, hit)?;
-                self.raw(b"\n")?;
-            }
-            self.last_line = Some(hit.line);
+            Format::Lines if self.cfg.context && self.wrote => self.pipe.raw(b"--\n")?,
+            Format::Lines => {}
         }
         self.wrote = true;
-        Ok(())
+        self.pipe.raw(m.printed)
     }
 }
 

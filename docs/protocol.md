@@ -137,7 +137,7 @@ caps nesting at 60.
 |---|---|
 | `term` | the term as given, or the expression's text form |
 | `latency_us` | this term's probe and fetch |
-| `total_matches` | matches (see below) |
+| `total_matches` | matches, or matched lines under `-c` (see below) |
 | `docs_matched` | documents matched |
 | `counts_exact` | present, as `false`, only when the counts may differ from rg's |
 | `leaves` | expressions only, in counting modes: `[{term, total_matches}]` per leaf |
@@ -148,9 +148,11 @@ Counting semantics:
   numbers: document-wide, with overlapping literal matches, and a pattern
   may match across lines. `counts_exact` is false for every pattern, and
   for a literal that is empty, overlaps itself or holds `\n`.
-- **`-c`, `--count-matches` and `-l`** with `--json` print the report
-  with rg's counts, line-anchored and non-overlapping. `-l` proves
+- **`--count-matches` and `-l`** with `--json` print the report with
+  rg's counts, line-anchored and non-overlapping. `-l` proves
   membership only, so its `counts_exact` is false.
+- **`-c`** reports in `total_matches` the sum of the counts it prints:
+  matched lines, as `rg -c` counts them.
 - **An expression** has an exact `docs_matched`. Its `total_matches` is
   the sum of the leaves' counts within those documents, exact only for
   plain literals that cannot overlap.
@@ -203,9 +205,8 @@ deliberate:
 1. N terms produce N concatenated streams in argv order, each closed by
    its own `summary`. A foreign event type would break rg-schema consumers
    worse than a repeated one.
-2. Each file's `stats.elapsed` is zero, because the scan reads the index,
-   not the file. `summary.stats.elapsed` is the term's latency, and
-   `elapsed_total` its wall clock.
+2. `summary.stats.elapsed` is the term's latency, and `elapsed_total` its
+   wall clock.
 3. `binary_offset` is always null, because binary files are skipped at
    index time.
 4. `searches` and `bytes_searched` cover the whole index, which is what rg

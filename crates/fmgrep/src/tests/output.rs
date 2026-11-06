@@ -2,15 +2,14 @@
 
 use super::*;
 
+use crate::matching::Print;
 use crate::output::{Format, MatchWriter, OutputConfig};
 
 fn cfg(format: Format) -> OutputConfig {
     OutputConfig {
         format,
         heading: false,
-        line_numbers: true,
         context: false,
-        multiline: false,
         color: false,
         banner: false,
         filename: true,
@@ -28,11 +27,24 @@ fn written(index: &Path, terms: &[&str], output: QueryOutput, cfg: OutputConfig)
     String::from_utf8(buf).unwrap()
 }
 
-const MATCHES: QueryOutput = QueryOutput::Matches {
+/// rg `--no-heading -n`.
+const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     before: 0,
     after: 0,
     line_numbers: true,
-};
+    only_matching: false,
+    color: false,
+    path: true,
+    json: false,
+});
+
+const ONLY: QueryOutput = QueryOutput::Matches(Print {
+    only_matching: true,
+    ..match MATCHES {
+        QueryOutput::Matches(p) => p,
+        _ => unreachable!(),
+    }
+});
 
 #[test]
 fn matches_mode_prints_every_matched_line() {
@@ -45,7 +57,7 @@ fn matches_mode_prints_every_matched_line() {
             "store_docs={store_docs}"
         );
         assert_eq!(
-            written(&index, &["printk"], MATCHES, cfg(Format::OnlyMatching)),
+            written(&index, &["printk"], ONLY, cfg(Format::Lines)),
             "a.c:1:printk\na.c:3:printk\na.c:3:printk\nb.c:2:printk\n",
             "store_docs={store_docs}"
         );
@@ -94,7 +106,7 @@ fn probe_only_documents_still_print_counts() {
             &index,
             &["printk"],
             QueryOutput::CountMatches,
-            cfg(Format::CountMatches)
+            cfg(Format::Count)
         ),
         "a.c:3\nb.c:1\n"
     );
@@ -110,7 +122,7 @@ fn count_lines_prints_rgs_line_counts() {
                 &index,
                 &["printk"],
                 QueryOutput::CountLines,
-                cfg(Format::CountLines)
+                cfg(Format::Count)
             ),
             "a.c:2\nb.c:1\n",
             "store_docs={store_docs}"

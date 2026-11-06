@@ -11,12 +11,16 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::time::Instant;
 
-use super::{Loaded, QueryRequest, in_index, line_matcher, path_of, prepare};
+use grep_printer::Stats;
+use grep_regex::RegexMatcher;
+
+use super::{Loaded, QueryRequest, in_index, prepare, printed, searched};
 use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::filter::PathFilter;
 use crate::manifest::Manifest;
-use crate::matching::{self, DocOutcome, LineMatcher, QueryOutput};
+use crate::matching::{self, DocSearch, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
@@ -39,7 +43,8 @@ struct Leaf<'a> {
     src: &'a str,
     pattern: Option<Cow<'a, str>>,
     prep: Option<PreparedPattern>,
-    matcher: LineMatcher,
+    /// `None` for the empty term.
+    matcher: Option<RegexMatcher>,
     probe: Probe,
 }
 
@@ -57,11 +62,7 @@ fn leaves<'a>(expr: &'a Expr, req: &QueryRequest<'_>) -> Result<Vec<Leaf<'a>>, S
             Expr::And(_) | Expr::Or(_) => unreachable!("leaves() yields leaves"),
         };
         let prep = prepare(pattern.as_deref(), req.mode)?;
-        let matcher = line_matcher(
-            src.as_bytes(),
-            pattern.as_deref().zip(prep.as_ref()),
-            req.mode,
-        )?;
+        let matcher = matching::matcher(src, pattern.as_deref(), req.mode)?;
         let probe = match prep.as_ref() {
             None if src.is_empty() => Probe::Never,
             None => Probe::Literal(src.as_bytes().to_vec()),
@@ -369,12 +370,9 @@ pub fn answer_expr(
 
     let vleaves: Vec<verify::Leaf<'_>> = leaves
         .iter()
-        .map(|l| match (&l.probe, &l.pattern) {
-            (Probe::Literal(lit), _) => verify::Leaf::Literal(lit),
-            (Probe::Regex, Some(src)) => verify::Leaf::Pattern {
-                src,
-                matcher: &l.matcher,
-            },
+        .map(|l| match (&l.probe, &l.pattern, &l.matcher) {
+            (Probe::Literal(lit), ..) => verify::Leaf::Literal(lit),
+            (Probe::Regex, Some(src), Some(matcher)) => verify::Leaf::Pattern { src, matcher },
             _ => verify::Leaf::Never,
         })
         .collect();
@@ -403,6 +401,7 @@ pub fn answer_expr(
         sink.corpus(num_docs, manifest.num_bytes - manifest.bom_bytes)?;
         sink.term_start(&report.term)?;
     }
+    let filter = req.filter.as_ref();
     let mut docs_matched = 0usize;
     let mut leaf_totals = vec![0u64; leaves.len()];
     let fetch = match (req.output, alternation.as_ref()) {
@@ -493,7 +492,7 @@ pub fn answer_expr(
                 while *n < root.yes.len()
                     && below.is_none_or(|b| paths.cmp(root.yes[*n], b).is_lt())
                 {
-                    listed(sink, &paths, root.yes[*n], &[])?;
+                    listed(sink, &paths, filter, root.yes[*n])?;
                     *n += 1;
                     docs_matched += 1;
                 }
@@ -508,11 +507,11 @@ pub fn answer_expr(
                 &maybe,
                 fetch_threads(),
                 &map,
-                &mut |doc, bytes, member| {
+                &mut |doc, _, member| {
                     emit_yes(sink, Some(doc), &mut next_yes)?;
                     if member {
                         members += 1;
-                        listed(sink, &paths, doc, matching::strip_bom(bytes))?;
+                        listed(sink, &paths, filter, doc)?;
                     }
                     Ok(())
                 },
@@ -528,24 +527,30 @@ pub fn answer_expr(
             );
             let mut fetch = fetch;
             paths.sort(&mut fetch);
-            let output = req.output;
+            let counters: Vec<Option<DocSearch>> = match per_leaf {
+                true => leaves
+                    .iter()
+                    .map(|l| {
+                        let m = l.matcher.clone();
+                        m.map(|m| DocSearch::new(m, QueryOutput::CountMatches, req.mode))
+                    })
+                    .collect(),
+                false => Vec::new(),
+            };
             let map = |doc: usize, raw: &[u8]| {
                 if !judge.member(doc, raw) {
-                    return None;
+                    return Ok::<_, String>(None);
                 }
                 let bytes = matching::strip_bom(raw);
-                let counts: Vec<u64> = match per_leaf {
-                    true => leaves
-                        .iter()
-                        .map(|l| {
-                            l.matcher
-                                .scan(bytes, QueryOutput::CountMatches)
-                                .count_matches()
-                        })
-                        .collect(),
-                    false => Vec::new(),
+                let Some(found) = searched(alt, &paths, filter, req.output, doc, bytes)? else {
+                    return Ok(None);
                 };
-                Some((alt.scan(bytes, output), counts))
+                let mut counts = Vec::with_capacity(counters.len());
+                for c in &counters {
+                    let found = c.as_ref().map(|c| c.doc("", bytes)).transpose()?.flatten();
+                    counts.push(found.map_or(0, |f| f.stats.matches()));
+                }
+                Ok(Some((found, counts)))
             };
             fetch_stream_parallel(
                 docs,
@@ -553,20 +558,20 @@ pub fn answer_expr(
                 &fetch,
                 fetch_threads(),
                 &map,
-                &mut |doc, bytes, scanned| {
-                    let Some((o, counts)) = scanned.filter(|(o, _)| o.matched_lines > 0) else {
+                &mut |_, _, scanned| {
+                    let Some(((path, f), counts)) = scanned? else {
                         return Ok(());
                     };
                     docs_matched += 1;
-                    report.total_matches += o.count_matches();
+                    report.total_matches += f.stats.matches().max(1);
                     leaf_totals
                         .iter_mut()
                         .zip(counts)
                         .for_each(|(t, c)| *t += c);
                     sink.doc(DocMatches {
-                        path: path_of(&paths, doc)?,
-                        raw: matching::strip_bom(bytes),
-                        outcome: &o,
+                        path: &path,
+                        printed: &f.printed,
+                        stats: &f.stats,
                     })
                 },
             )?;
@@ -672,7 +677,7 @@ fn queries<'a>(leaves: &'a [Leaf<'_>], plan: &'a demote::Plan, ids: &[usize]) ->
 fn alternation_of(
     leaves: &[Leaf<'_>],
     req: &QueryRequest<'_>,
-) -> Result<Option<LineMatcher>, String> {
+) -> Result<Option<DocSearch>, String> {
     let parts: Vec<String> = leaves
         .iter()
         .filter(|l| !matches!(l.probe, Probe::Never))
@@ -684,30 +689,21 @@ fn alternation_of(
     if parts.is_empty() {
         return Ok(None);
     }
-    LineMatcher::regex(&parts.join("|"), None, req.mode)
-        .map(Some)
-        .map_err(|e| format!("error: {e}"))
+    let m = matching::matcher("", Some(&parts.join("|")), req.mode)?;
+    Ok(m.map(|m| DocSearch::new(m, req.output, req.mode)))
 }
 
 /// A `-l` line: membership only.
 fn listed(
     sink: &mut dyn MatchSink,
     paths: &Paths<'_>,
+    filter: Option<&PathFilter>,
     doc: usize,
-    raw: &[u8],
 ) -> Result<(), String> {
-    let outcome = DocOutcome {
-        matched_lines: 0,
-        matched_spans: 0,
-        spanless_lines: 0,
-        multiline: false,
-        lines: Vec::new(),
-        spans: Vec::new(),
-    };
     sink.doc(DocMatches {
-        path: path_of(paths, doc)?,
-        raw,
-        outcome: &outcome,
+        path: &printed(paths, filter, doc)?,
+        printed: &[],
+        stats: &Stats::new(),
     })
 }
 

@@ -1,16 +1,21 @@
 use super::*;
 
-use crate::matching::MatchMode;
+use crate::matching::{MatchMode, Print};
 use crate::query::QueryRequest;
 use crate::sink::DocMatches;
 use crate::sink::MatchSink;
 use crate::wire::QueryReport;
 
-const MATCHES: QueryOutput = QueryOutput::Matches {
+/// `--json`, whose events carry each line's number, columns and text.
+const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     before: 0,
     after: 0,
     line_numbers: true,
-};
+    only_matching: false,
+    color: false,
+    path: false,
+    json: true,
+});
 
 /// One `doc` call: the document, its counts, and `(line, match columns,
 /// text)` per emitted line.
@@ -42,22 +47,28 @@ impl MatchSink for Recorder {
         Ok(())
     }
     fn doc(&mut self, m: DocMatches<'_>) -> Result<(), String> {
+        let events = m
+            .printed
+            .split(|&b| b == b'\n')
+            .filter(|l| l.starts_with(b"{"));
+        let lines = events
+            .map(|l| serde_json::from_slice::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["type"] == "match" || e["type"] == "context")
+            .map(|e| {
+                let d = &e["data"];
+                let cols = d["submatches"].as_array().unwrap().iter();
+                (
+                    d["line_number"].as_u64().unwrap_or(0),
+                    cols.map(|c| c["start"].as_u64().unwrap() + 1).collect(),
+                    d["lines"]["text"].as_str().unwrap().trim_end().to_owned(),
+                )
+            })
+            .collect();
         self.seen.push(Seen {
             path: m.path.to_owned(),
-            matched_lines: m.outcome.matched_lines,
-            matched_spans: m.outcome.matched_spans,
-            lines: m
-                .outcome
-                .lines
-                .iter()
-                .map(|l| {
-                    (
-                        l.line,
-                        l.spans.iter().map(|&(off, _)| u64::from(off) + 1).collect(),
-                        String::from_utf8_lossy(&m.raw[l.start..l.end]).into_owned(),
-                    )
-                })
-                .collect(),
+            matched_lines: m.stats.matched_lines(),
+            matched_spans: m.stats.matches(),
+            lines,
         });
         Ok(())
     }
@@ -223,8 +234,8 @@ fn count_lines_counts_matched_lines_not_matches() {
             .iter()
             .map(|s| (s.matched_lines, s.matched_spans))
             .collect();
-        assert_eq!(got, vec![(2, 3), (1, 1)], "store_docs={store_docs}");
-        assert_eq!(out.queries[0].total_matches, 4, "store_docs={store_docs}");
+        assert_eq!(got, vec![(2, 2), (1, 1)], "store_docs={store_docs}");
+        assert_eq!(out.queries[0].total_matches, 3, "store_docs={store_docs}");
         assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
         assert!(rec.emitted().is_empty(), "store_docs={store_docs}");
     }

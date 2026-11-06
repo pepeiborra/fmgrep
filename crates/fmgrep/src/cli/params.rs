@@ -4,11 +4,10 @@ use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::events::JsonConfig;
 use crate::expr::Expr;
 use crate::filter::{PathFilter, SearchPath};
 use crate::manifest::Manifest;
-use crate::matching::{MatchMode, QueryOutput};
+use crate::matching::{MatchMode, Print, QueryOutput};
 use crate::output::{Format, OutputConfig};
 use crate::query::QueryRequest;
 
@@ -208,11 +207,15 @@ impl QueryParams {
     fn output(&self) -> QueryOutput {
         match self.mode {
             Mode::Counts => QueryOutput::Counts,
-            Mode::Lines | Mode::Only | Mode::JsonMatches => QueryOutput::Matches {
+            Mode::Lines | Mode::Only | Mode::JsonMatches => QueryOutput::Matches(Print {
                 before: self.context.before,
                 after: self.context.after,
                 line_numbers: self.line_numbers,
-            },
+                only_matching: self.mode == Mode::Only,
+                color: self.color == Color::Always,
+                path: self.filename && !self.heading,
+                json: self.mode == Mode::JsonMatches,
+            }),
             Mode::Files => QueryOutput::FilesWithMatches,
             Mode::Count => QueryOutput::CountLines,
             Mode::CountMatches => QueryOutput::CountMatches,
@@ -223,26 +226,15 @@ impl QueryParams {
     pub fn output_config(&self) -> OutputConfig {
         OutputConfig {
             format: match self.mode {
-                Mode::Only => Format::OnlyMatching,
-                Mode::Count => Format::CountLines,
-                Mode::CountMatches => Format::CountMatches,
+                Mode::Count | Mode::CountMatches => Format::Count,
                 Mode::Files => Format::FilesWithMatches,
                 _ => Format::Lines,
             },
             heading: self.heading,
-            line_numbers: self.line_numbers,
             context: !self.context.is_zero(),
-            multiline: self.multiline,
             color: self.color == Color::Always,
             banner: self.terms.len() > 1,
             filename: self.filename,
-        }
-    }
-
-    pub fn json_config(&self) -> JsonConfig {
-        JsonConfig {
-            line_numbers: self.line_numbers,
-            multiline: self.multiline,
         }
     }
 }

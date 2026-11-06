@@ -136,16 +136,17 @@ fn json_counts_mode_prints_the_report() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
+        // -c reports matched lines: one line holds two matches.
         let all = [
-            &["--json"][..],
-            &["--json", "--approx-counts"][..],
-            &["--json", "-c"][..],
+            (&["--json"][..], 4),
+            (&["--json", "--approx-counts"][..], 4),
+            (&["--json", "-c"][..], 3),
         ];
-        for flags in all {
+        for (flags, want) in all {
             let got = printed(&index, flags, &["printk"]);
             let v: serde_json::Value = serde_json::from_str(got.trim_end()).unwrap();
             assert_eq!(
-                v["queries"][0]["total_matches"], 4,
+                v["queries"][0]["total_matches"], want,
                 "store_docs={store_docs} {flags:?}"
             );
             assert!(

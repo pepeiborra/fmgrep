@@ -16,7 +16,7 @@ use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
-use crate::sink::{Discard, MatchSink, Named};
+use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
 use args::{Cli, Command, Search, ServeArgs};
 use locate::{Located, locate};
@@ -226,8 +226,8 @@ fn render(
 ) -> Result<OutputReport, String> {
     Ok(match p.mode {
         Mode::JsonMatches => {
-            let mut sink = JsonSink::new(out, p.json_config());
-            let report = run(&mut Named::new(&mut sink, p.filter()?.as_ref()))?;
+            let mut sink = JsonSink::new(out);
+            let report = run(&mut sink)?;
             sink.finish()?;
             report
         }
@@ -243,7 +243,7 @@ fn render(
         }
         _ => {
             let mut writer = MatchWriter::new(out, p.output_config());
-            let report = run(&mut Named::new(&mut writer, p.filter()?.as_ref()))?;
+            let report = run(&mut writer)?;
             writer.finish()?;
             report
         }

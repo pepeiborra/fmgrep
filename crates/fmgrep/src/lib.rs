@@ -21,8 +21,7 @@
 //!    case-folding walk, a pattern by its required literal or a reversed-DFA
 //!    walk. The result is exact documents or candidates.
 //! 4. Candidates, changed and added files are read from the tree (or
-//!    `docs.shard`), verified by the regex crate and printed as rg prints
-//!    them.
+//!    `docs.shard`), then searched and printed by ripgrep's own crates.
 //!
 //! Reference, as paths in the repository:
 //!

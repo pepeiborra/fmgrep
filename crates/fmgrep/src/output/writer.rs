@@ -4,27 +4,15 @@ use std::io::Write;
 
 use super::WRITE_FAILED;
 
-/// Byte sink that ends silently once the reader hangs up and counts exactly
-/// what reached `out`. `written` is the only source rg's `bytes_printed`
-/// may use, so no output path may bypass this type.
+/// Byte sink that ends silently once the reader hangs up.
 pub struct Pipe<W: Write> {
     out: W,
-    /// The reader hung up: output stops, silently.
     closed: bool,
-    written: u64,
 }
 
 impl<W: Write> Pipe<W> {
     pub fn new(out: W) -> Self {
-        Self {
-            out,
-            closed: false,
-            written: 0,
-        }
-    }
-
-    pub fn written(&self) -> u64 {
-        self.written
+        Self { out, closed: false }
     }
 
     pub fn raw(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -32,10 +20,7 @@ impl<W: Write> Pipe<W> {
             return Ok(());
         }
         match self.out.write_all(bytes) {
-            Ok(()) => {
-                self.written += bytes.len() as u64;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => self.fail(e),
         }
     }

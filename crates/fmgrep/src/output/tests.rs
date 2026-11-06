@@ -1,6 +1,7 @@
 use super::*;
 
-use crate::matching::{LineMatcher, MatchMode, QueryOutput, strip_bom};
+use crate::matching::{MatchMode, Print, QueryOutput, strip_bom};
+use crate::tests::support::search;
 
 /// Every expectation is rg 15.2.0's stdout for the quoted command, with the
 /// directory prefix rg echoes stripped: our paths are manifest-relative.
@@ -13,70 +14,72 @@ const FIXTURE: [(&str, &[u8]); 2] = [
     ("sub/b.txt", b"first\nalpha in sub\nthird\n"),
 ];
 
-const MATCHES: QueryOutput = QueryOutput::Matches {
+const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     before: 0,
     after: 0,
     line_numbers: true,
-};
+    only_matching: false,
+    color: false,
+    path: false,
+    json: false,
+});
 
 fn cfg(format: Format) -> OutputConfig {
     OutputConfig {
         format,
         heading: true,
-        line_numbers: true,
         context: false,
-        multiline: false,
         color: false,
         banner: false,
         filename: true,
     }
 }
 
-/// A `/.../`-wrapped term is a pattern, as on the CLI.
-fn matcher_for(term: &str, mode: MatchMode) -> LineMatcher {
-    match crate::regex_pattern(term) {
-        Some(p) => LineMatcher::regex(p, None, mode).unwrap(),
-        None => LineMatcher::literal(term.as_bytes(), mode).unwrap(),
+/// Render `terms` over `docs` the way the drive does, `output`'s colour and
+/// per-line path taken from `cfg`.
+fn render_in(
+    cfg: OutputConfig,
+    output: QueryOutput,
+    mode: MatchMode,
+    docs: &[(&str, &[u8])],
+    terms: &[&str],
+) -> Vec<u8> {
+    let output = match output {
+        QueryOutput::Matches(p) => QueryOutput::Matches(Print {
+            color: cfg.color,
+            path: cfg.filename && !cfg.heading,
+            ..p
+        }),
+        o => o,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = MatchWriter::new(&mut buf, cfg);
+    for term in terms {
+        w.term_start(term).unwrap();
+        let s = search(term, output, mode);
+        for (path, raw) in docs {
+            if let Some(f) = s.doc(path, strip_bom(raw)).unwrap() {
+                let (printed, stats) = (&f.printed, &f.stats);
+                w.doc(DocMatches {
+                    path,
+                    printed,
+                    stats,
+                })
+                .unwrap();
+            }
+        }
     }
+    w.finish().unwrap();
+    buf
 }
 
-/// Render `terms` over `docs` the way the drive does: real extraction, one
-/// ascending `doc` call per matching document.
 fn render(
     cfg: OutputConfig,
     output: QueryOutput,
     docs: &[(&str, &[u8])],
     terms: &[&str],
 ) -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut w = MatchWriter::new(&mut buf, cfg);
-    for term in terms {
-        w.term_start(term).unwrap();
-        let matcher = matcher_for(
-            term,
-            MatchMode {
-                multiline: cfg.multiline,
-                dotall: false,
-                ignore_case: false,
-            },
-        );
-        for (path, raw) in docs {
-            // The drive's view of a document: BOM stripped.
-            let raw = &strip_bom(raw);
-            let outcome = matcher.scan(raw, output);
-            if outcome.matched_lines == 0 {
-                continue;
-            }
-            w.doc(DocMatches {
-                path,
-                raw,
-                outcome: &outcome,
-            })
-            .unwrap();
-        }
-    }
-    w.finish().unwrap();
-    buf
+    render_in(cfg, output, MatchMode::default(), docs, terms)
 }
 
 fn alpha(cfg: OutputConfig, output: QueryOutput) -> String {
@@ -84,11 +87,25 @@ fn alpha(cfg: OutputConfig, output: QueryOutput) -> String {
 }
 
 fn context(before: usize, after: usize) -> QueryOutput {
-    QueryOutput::Matches {
+    QueryOutput::Matches(Print {
         before,
         after,
-        line_numbers: true,
+        ..unwrap(MATCHES)
+    })
+}
+
+fn unwrap(output: QueryOutput) -> Print {
+    match output {
+        QueryOutput::Matches(p) => p,
+        _ => unreachable!(),
     }
+}
+
+fn only(output: QueryOutput) -> QueryOutput {
+    QueryOutput::Matches(Print {
+        only_matching: true,
+        ..unwrap(output)
+    })
 }
 
 fn with_context(format: Format, heading: bool, on: bool) -> OutputConfig {
@@ -122,64 +139,15 @@ fn no_heading_matches_rg() {
 }
 
 #[test]
-fn no_line_numbers_drops_the_field() {
-    // rg --heading -N alpha
-    let c = OutputConfig {
-        line_numbers: false,
-        ..cfg(Format::Lines)
-    };
-    assert_eq!(
-        alpha(c, MATCHES),
-        "a.txt\nalpha one\nalpha two\nalpha and alpha\n\nsub/b.txt\nalpha in sub\n"
-    );
-    // rg --no-heading -N alpha
-    let c = OutputConfig {
-        heading: false,
-        ..c
-    };
-    assert_eq!(
-        alpha(c, MATCHES),
-        "a.txt:alpha one\na.txt:alpha two\na.txt:alpha and alpha\nsub/b.txt:alpha in sub\n"
-    );
-}
-
-#[test]
-fn only_matching_prints_one_line_per_span() {
-    // rg --heading -n -o alpha  (line 7 holds two matches)
-    assert_eq!(
-        alpha(cfg(Format::OnlyMatching), MATCHES),
-        "a.txt\n1:alpha\n3:alpha\n7:alpha\n7:alpha\n\nsub/b.txt\n2:alpha\n"
-    );
-    // rg --no-heading -n -o alpha
-    let c = OutputConfig {
-        heading: false,
-        ..cfg(Format::OnlyMatching)
-    };
-    assert_eq!(
-        alpha(c, MATCHES),
-        "a.txt:1:alpha\na.txt:3:alpha\na.txt:7:alpha\na.txt:7:alpha\nsub/b.txt:2:alpha\n"
-    );
-    // rg --heading -N -o alpha
-    let c = OutputConfig {
-        line_numbers: false,
-        ..cfg(Format::OnlyMatching)
-    };
-    assert_eq!(
-        alpha(c, MATCHES),
-        "a.txt\nalpha\nalpha\nalpha\nalpha\n\nsub/b.txt\nalpha\n"
-    );
-}
-
-#[test]
 fn counts_modes_print_path_and_number() {
     // rg -c alpha
     assert_eq!(
-        alpha(cfg(Format::CountLines), QueryOutput::CountLines),
+        alpha(cfg(Format::Count), QueryOutput::CountLines),
         "a.txt:3\nsub/b.txt:1\n"
     );
     // rg --count-matches alpha
     assert_eq!(
-        alpha(cfg(Format::CountMatches), QueryOutput::CountMatches),
+        alpha(cfg(Format::Count), QueryOutput::CountMatches),
         "a.txt:4\nsub/b.txt:1\n"
     );
     // rg -l alpha
@@ -212,18 +180,12 @@ fn no_file_name_for_one_file_matches_rg() {
     );
     // rg --heading -n -o alpha a.txt
     assert_eq!(
-        one(Format::OnlyMatching, true, MATCHES),
+        one(Format::Lines, true, only(MATCHES)),
         "1:alpha\n3:alpha\n7:alpha\n7:alpha\n"
     );
     // rg -c alpha a.txt; rg --count-matches alpha a.txt; rg -l alpha a.txt
-    assert_eq!(
-        one(Format::CountLines, true, QueryOutput::CountLines),
-        "3\n"
-    );
-    assert_eq!(
-        one(Format::CountMatches, true, QueryOutput::CountMatches),
-        "4\n"
-    );
+    assert_eq!(one(Format::Count, true, QueryOutput::CountLines), "3\n");
+    assert_eq!(one(Format::Count, true, QueryOutput::CountMatches), "4\n");
     assert_eq!(
         one(
             Format::FilesWithMatches,
@@ -270,10 +232,7 @@ fn context_separators_follow_rg() {
     );
     // rg --heading -n -o -C1 alpha: context lines print whole, matches alone.
     assert_eq!(
-        alpha(
-            with_context(Format::OnlyMatching, true, true),
-            context(1, 1)
-        ),
+        alpha(with_context(Format::Lines, true, true), only(context(1, 1))),
         "a.txt\n1:alpha\n2-beta\n3:alpha\n4-delta\n--\n6-zeta\n7:alpha\n7:alpha\n8-eta\n\n\
          sub/b.txt\n1-first\n2:alpha\n3-third\n"
     );
@@ -318,7 +277,7 @@ fn color_palette_is_rgs() {
     // rg -c --color always alpha / rg -l --color always alpha
     let c = OutputConfig {
         color: true,
-        ..cfg(Format::CountLines)
+        ..cfg(Format::Count)
     };
     assert_eq!(
         alpha(c, QueryOutput::CountLines),
@@ -331,33 +290,6 @@ fn color_palette_is_rgs() {
     assert_eq!(
         alpha(c, QueryOutput::FilesWithMatches),
         "\x1b[0m\x1b[35ma.txt\x1b[0m\n\x1b[0m\x1b[35msub/b.txt\x1b[0m\n"
-    );
-}
-
-#[test]
-fn non_utf8_and_crlf_lines_pass_through_verbatim() {
-    // rg --no-heading -n alpha over these two files: the `\r` of a CRLF line
-    // is kept and the high bytes are not replaced.
-    let docs: [(&str, &[u8]); 2] = [
-        ("bin.txt", b"alpha \xff\xfe caf\xc3\xa9\nplain\n"),
-        ("crlf.txt", b"x\n\nalpha\r\ny\n"),
-    ];
-    let c = OutputConfig {
-        heading: false,
-        ..cfg(Format::Lines)
-    };
-    assert_eq!(
-        render(c, MATCHES, &docs, &["alpha"]),
-        b"bin.txt:1:alpha \xff\xfe caf\xc3\xa9\ncrlf.txt:3:alpha\r\n".to_vec()
-    );
-    // -o writes the matched bytes, multi-byte span included.
-    let c = OutputConfig {
-        heading: false,
-        ..cfg(Format::OnlyMatching)
-    };
-    assert_eq!(
-        render(c, MATCHES, &docs, &["café"]),
-        b"bin.txt:1:caf\xc3\xa9\n".to_vec()
     );
 }
 
@@ -378,35 +310,6 @@ fn banner_only_with_several_terms() {
     );
 }
 
-/// A last line with no terminator: rg reports its zero-width match as a
-/// matched line with no span. Fixture: `printf 'hello\nworld' > b.txt`.
-const NOEOL: [(&str, &[u8]); 1] = [("b.txt", b"hello\nworld")];
-
-#[test]
-fn spanless_match_at_an_unterminated_eof_prints_as_a_match() {
-    let dollar = |c| String::from_utf8(render(c, MATCHES, &NOEOL, &["/$/"])).unwrap();
-    // rg --heading -n '$'
-    assert_eq!(dollar(cfg(Format::Lines)), "b.txt\n1:hello\n2:world\n");
-    // rg --no-heading -n '$'
-    let no_heading = OutputConfig {
-        heading: false,
-        ..cfg(Format::Lines)
-    };
-    assert_eq!(dollar(no_heading), "b.txt:1:hello\nb.txt:2:world\n");
-    // rg --heading -n -o '$': the spanless line prints whole, `:` separator.
-    assert_eq!(dollar(cfg(Format::OnlyMatching)), "b.txt\n1:\n2:world\n");
-    // rg --no-heading -n -o '$'
-    let only_flat = OutputConfig {
-        heading: false,
-        ..cfg(Format::OnlyMatching)
-    };
-    assert_eq!(dollar(only_flat), "b.txt:1:\nb.txt:2:world\n");
-    // rg -c '$' / rg --count-matches '$' / rg -l '$'
-    assert_eq!(dollar(cfg(Format::CountLines)), "b.txt:2\n");
-    assert_eq!(dollar(cfg(Format::CountMatches)), "b.txt:2\n");
-    assert_eq!(dollar(cfg(Format::FilesWithMatches)), "b.txt\n");
-}
-
 #[test]
 fn a_leading_bom_is_absent_from_the_printed_line() {
     // rg --heading -n '^module' bom.c plain.c, and the same with -o 'o+'.
@@ -419,7 +322,7 @@ fn a_leading_bom_is_absent_from_the_printed_line() {
         "bom.c\n1:module Foo where\n\nplain.c\n1:module Bar where\n"
     );
     assert_eq!(
-        String::from_utf8(render(cfg(Format::OnlyMatching), MATCHES, &DOCS, &["/o+/"])).unwrap(),
+        String::from_utf8(render(cfg(Format::Lines), only(MATCHES), &DOCS, &["/o+/"])).unwrap(),
         "bom.c\n1:o\n1:oo\n2:o\n\nplain.c\n1:o\n"
     );
 }
@@ -440,88 +343,17 @@ fn broken_pipe_is_not_an_error() {
 
     let feed = |sink: Fail| {
         let mut w = MatchWriter::new(sink, cfg(Format::Lines));
-        let matcher = matcher_for("alpha", MatchMode::default());
-        let outcome = matcher.scan(FIXTURE[0].1, MATCHES);
+        let s = search("alpha", MATCHES, MatchMode::default());
+        let f = s.doc(FIXTURE[0].0, FIXTURE[0].1)?.unwrap();
         w.term_start("alpha")?;
         w.doc(DocMatches {
             path: FIXTURE[0].0,
-            raw: FIXTURE[0].1,
-            outcome: &outcome,
+            printed: &f.printed,
+            stats: &f.stats,
         })?;
         w.finish()
     };
     assert_eq!(feed(Fail(std::io::ErrorKind::BrokenPipe)), Ok(()));
     let err = feed(Fail(std::io::ErrorKind::PermissionDenied)).unwrap_err();
     assert!(err.starts_with(WRITE_FAILED), "got: {err}");
-}
-
-/// rg `-U`, whose only printing change is `-o`.
-fn multi(format: Format) -> OutputConfig {
-    OutputConfig {
-        multiline: true,
-        ..cfg(format)
-    }
-}
-
-fn multi_render(c: OutputConfig, output: QueryOutput, term: &str) -> String {
-    String::from_utf8(render(c, output, &FIXTURE, &[term])).unwrap()
-}
-
-#[test]
-fn multiline_prints_every_line_the_match_touches() {
-    // rg --heading -n -U 'alpha one\nbeta'
-    assert_eq!(
-        multi_render(multi(Format::Lines), MATCHES, "/alpha one\\nbeta/"),
-        "a.txt\n1:alpha one\n2:beta\n"
-    );
-    // rg --heading -n -U '\nbeta': line 1 is matched through its terminator.
-    assert_eq!(
-        multi_render(multi(Format::Lines), MATCHES, "/\\nbeta/"),
-        "a.txt\n1:alpha one\n2:beta\n"
-    );
-}
-
-#[test]
-fn multiline_only_matching_prints_the_per_line_pieces() {
-    // rg --heading -n -U -o 'one\nbeta'
-    assert_eq!(
-        multi_render(multi(Format::OnlyMatching), MATCHES, "/one\\nbeta/"),
-        "a.txt\n1:one\n2:beta\n"
-    );
-    // rg --heading -n -U -o '\nbeta': the line the match only reaches
-    // through its terminator prints nothing at all.
-    assert_eq!(
-        multi_render(multi(Format::OnlyMatching), MATCHES, "/\\nbeta/"),
-        "a.txt\n2:beta\n"
-    );
-}
-
-#[test]
-fn multiline_colours_the_per_line_pieces_only() {
-    // rg --heading -n -U --color always '\nbeta'
-    let c = OutputConfig {
-        color: true,
-        ..multi(Format::Lines)
-    };
-    assert_eq!(
-        multi_render(c, MATCHES, "/\\nbeta/"),
-        "\u{1b}[0m\u{1b}[35ma.txt\u{1b}[0m\n\u{1b}[0m\u{1b}[32m1\u{1b}[0m:alpha one\n\u{1b}[0m\u{1b}[32m2\u{1b}[0m:\u{1b}[0m\u{1b}[1m\u{1b}[31mbeta\u{1b}[0m\n"
-    );
-}
-
-#[test]
-fn multiline_counts_are_match_counts() {
-    // rg -U -c 'a\n' and rg -U --count-matches 'a\n'
-    assert_eq!(
-        multi_render(multi(Format::CountLines), QueryOutput::CountLines, "/a\\n/"),
-        "a.txt:5\n"
-    );
-    assert_eq!(
-        multi_render(
-            multi(Format::CountMatches),
-            QueryOutput::CountMatches,
-            "/a\\n/"
-        ),
-        "a.txt:5\n"
-    );
 }

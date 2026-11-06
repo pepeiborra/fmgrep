@@ -169,11 +169,11 @@ fn params_pick_the_mode() {
         },
         "a counts request carries no printer fields"
     );
-    assert!(params(&["--json", "--matches"]).json_config().line_numbers);
+    assert!(params(&["--json", "--matches"]).line_numbers);
     let json = params(&["--json", "-N", "--matches"]);
-    assert!(json.mode == Mode::JsonMatches && !json.json_config().line_numbers);
+    assert!(json.mode == Mode::JsonMatches && !json.line_numbers);
     let p = params(&["-U", "x"]);
-    assert!(p.multiline && p.json_config().multiline && p.output_config().multiline);
+    assert!(p.multiline);
 }
 
 #[test]
@@ -204,8 +204,9 @@ fn terminal_defaults_follow_rg() {
         (&["--color", "never"], true, (false, true, true)),
         (&["--color", "always"], false, (true, false, false)),
     ] {
-        let c = params_in(words, "", true, tty).output_config();
-        assert_eq!((c.color, c.line_numbers, c.heading), want, "{words:?}");
+        let p = params_in(words, "", true, tty);
+        let c = p.output_config();
+        assert_eq!((c.color, p.line_numbers, c.heading), want, "{words:?}");
     }
 }
 
