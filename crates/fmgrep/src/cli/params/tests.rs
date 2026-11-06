@@ -48,7 +48,7 @@ fn defaults_are_local_defaults() {
         (Context::default(), true, true, Color::Never)
     );
     let cfg = p.output_config();
-    assert!(cfg.heading && cfg.line_numbers && !cfg.context && !cfg.color && !cfg.banner);
+    assert!(cfg.heading && !cfg.context && !cfg.color && !cfg.banner);
     let p = parse(r#"{"terms":["a","b"],"mode":"only","context":{"after":2},"line_numbers":false,"heading":false,"color":"always"}"#).unwrap();
     assert_eq!(
         p.context,
@@ -58,8 +58,12 @@ fn defaults_are_local_defaults() {
         }
     );
     let cfg = p.output_config();
-    assert!(!cfg.heading && !cfg.line_numbers && cfg.context && cfg.color && cfg.banner);
-    assert_eq!(cfg.format, Format::OnlyMatching);
+    assert!(!cfg.heading && cfg.context && cfg.color && cfg.banner);
+    assert_eq!(cfg.format, Format::Lines);
+    let QueryOutput::Matches(print) = p.output() else {
+        panic!("{:?}", p.output())
+    };
+    assert!(print.only_matching && print.path && print.color && !print.line_numbers);
     assert!(parse(r#"{"terms":["a"],"context":{"before":-1}}"#).is_err());
     assert!(parse(r#"{"terms":["a"],"context":{"around":1}}"#).is_err());
 }
@@ -76,27 +80,33 @@ fn text_modes_map_to_query_outputs() {
         before: 1,
         after: 2,
     };
-    let lines = QueryOutput::Matches {
+    let print = Print {
         before: 1,
         after: 2,
         line_numbers: true,
+        ..Print::default()
     };
+    let lines = QueryOutput::Matches(print);
+    let only = QueryOutput::Matches(Print {
+        only_matching: true,
+        ..print
+    });
+    let json = QueryOutput::Matches(Print {
+        json: true,
+        ..print
+    });
     for (mode, output, format) in [
         (Mode::Counts, QueryOutput::Counts, Format::Lines),
         (Mode::Lines, lines, Format::Lines),
-        (Mode::Only, lines, Format::OnlyMatching),
-        (Mode::JsonMatches, lines, Format::Lines),
+        (Mode::Only, only, Format::Lines),
+        (Mode::JsonMatches, json, Format::Lines),
         (
             Mode::Files,
             QueryOutput::FilesWithMatches,
             Format::FilesWithMatches,
         ),
-        (Mode::Count, QueryOutput::CountLines, Format::CountLines),
-        (
-            Mode::CountMatches,
-            QueryOutput::CountMatches,
-            Format::CountMatches,
-        ),
+        (Mode::Count, QueryOutput::CountLines, Format::Count),
+        (Mode::CountMatches, QueryOutput::CountMatches, Format::Count),
     ] {
         let p = QueryParams {
             mode,
@@ -107,15 +117,7 @@ fn text_modes_map_to_query_outputs() {
         assert_eq!(p.output_config().format, format, "{mode:?}");
     }
     let unnumbered = parse(r#"{"terms":["a"],"mode":"lines","line_numbers":false}"#).unwrap();
-    assert_eq!(
-        unnumbered.output(),
-        QueryOutput::Matches {
-            before: 0,
-            after: 0,
-            line_numbers: false,
-        }
-    );
-    assert!(!unnumbered.output_config().line_numbers && !unnumbered.json_config().line_numbers);
+    assert_eq!(unnumbered.output(), QueryOutput::Matches(Print::default()));
 }
 
 #[test]

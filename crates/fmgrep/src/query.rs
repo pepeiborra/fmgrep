@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use grep_printer::Stats;
+
 use crate::regex_pattern;
 
 use crate::blobs::BlobSlots;
@@ -9,7 +11,7 @@ use crate::expr::Expr;
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
 use crate::manifest::Manifest;
-use crate::matching::{self, DocOutcome, LineMatcher, MatchMode, QueryOutput};
+use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
@@ -234,17 +236,35 @@ fn prepare(pattern: Option<&str>, mode: MatchMode) -> Result<Option<PreparedPatt
         .transpose()
 }
 
-/// The matcher the matching pass scans `literal`, or its pattern, with.
-fn line_matcher(
-    literal: &[u8],
-    pattern: Option<(&str, &PreparedPattern)>,
-    mode: MatchMode,
-) -> Result<LineMatcher, String> {
-    match pattern {
-        Some((src, p)) => LineMatcher::regex(src, crate::pattern::anchor(p), mode)
-            .map_err(|e| format!("error: {e}")),
-        None => LineMatcher::literal(literal, mode).map_err(|e| format!("error: {e}")),
+/// `path` as `filter` prints it.
+fn printed<'a>(
+    paths: &'a Paths<'_>,
+    filter: Option<&PathFilter>,
+    doc: usize,
+) -> Result<Cow<'a, str>, String> {
+    let path = path_of(paths, doc)?;
+    Ok(match filter {
+        Some(f) => Cow::Owned(f.printed(path).into_owned()),
+        None => Cow::Borrowed(path),
+    })
+}
+
+/// `doc` searched by `s`, with the path it prints under when it matches.
+fn searched<'a>(
+    s: &DocSearch,
+    paths: &'a Paths<'_>,
+    filter: Option<&PathFilter>,
+    output: QueryOutput,
+    doc: usize,
+    bytes: &[u8],
+) -> Result<Option<(Cow<'a, str>, Found)>, String> {
+    if output.names_lines() {
+        let path = printed(paths, filter, doc)?;
+        return Ok(s.doc(&path, bytes)?.map(|f| (path, f)));
     }
+    (s.doc("", bytes)?)
+        .map(|f| Ok((printed(paths, filter, doc)?, f)))
+        .transpose()
 }
 
 /// Answer `terms` from `index` and `loaded` with one probe pass, then fetch
@@ -265,23 +285,17 @@ fn answer_terms(
 
     // Every pattern is prepared before any probing.
     let mut prepared: Vec<Option<PreparedPattern>> = Vec::with_capacity(terms.len());
-    let mut matchers: Vec<Option<LineMatcher>> = Vec::with_capacity(terms.len());
+    let mut searches: Vec<Option<DocSearch>> = Vec::with_capacity(terms.len());
     let emit = req.output != QueryOutput::Counts;
     for t in terms {
         let pattern = t.pattern.as_deref();
         let prep = prepare(pattern, req.mode)?;
-        // A line matcher exists only outside counts mode: its newline refusal
-        // must not change what the harness path accepts. Built before any
-        // fetch, so a refused pattern costs no I/O.
-        matchers.push(if emit {
-            Some(line_matcher(
-                t.literal,
-                pattern.zip(prep.as_ref()),
-                req.mode,
-            )?)
-        } else {
-            None
-        });
+        // Outside counts mode only, so its newline refusal does not change
+        // what the harness path accepts; built before any fetch.
+        if emit {
+            let m = matching::matcher(&t.name, pattern, req.mode)?;
+            searches.push(m.map(|m| DocSearch::new(m, req.output, req.mode)));
+        }
         prepared.push(prep);
     }
     let probes: Vec<Query<'_>> = terms
@@ -357,9 +371,10 @@ fn answer_terms(
         )?;
     }
     let mut queries = Vec::with_capacity(terms.len());
-    let membership = req.output == QueryOutput::FilesWithMatches;
-    let each = terms.iter().zip(&prepared).zip(answers).zip(&matchers);
-    for ((((t, pattern), answer), matcher), read) in each.zip(reading) {
+    let filter = req.filter.as_ref();
+    let each = terms.iter().zip(&prepared).zip(answers).zip(reading);
+    for (i, (((t, pattern), answer), read)) in each.enumerate() {
+        let search = searches.get(i).and_then(Option::as_ref);
         let (term, literal) = (&*t.name, t.literal);
         let fetch_start = Instant::now();
         let mut exact = answer.exact;
@@ -395,18 +410,17 @@ fn answer_terms(
                 counts.add(c);
             }
         }
-        // A matcher exists exactly in the emit modes, which own their own
-        // numbers; counts mode fetches regex candidates and stale docs, and
-        // counts them as the index would. Every other path sees the document
-        // as rg's searcher does, BOM stripped.
+        // Counts mode counts regex candidates and stale docs as the index
+        // would; the emit modes search them as rg does, BOM stripped.
         let needle = memchr::memmem::Finder::new(literal);
-        let map = |_: usize, raw: &[u8]| {
+        let map = |doc: usize, raw: &[u8]| {
             let bytes = matching::strip_bom(raw);
-            match (matcher.as_ref(), pattern.as_ref()) {
-                (Some(m), _) => (0, Some(m.scan(bytes, req.output))),
-                (None, Some(p)) => (p.count(bytes), None),
-                (None, None) => (count_overlapping(raw, &needle), None),
-            }
+            Ok::<_, String>(match (emit, search, pattern.as_ref()) {
+                (true, Some(s), _) => (0, searched(s, &paths, filter, req.output, doc, bytes)?),
+                (true, None, _) => (0, None),
+                (false, _, Some(p)) => (p.count(bytes), None),
+                (false, _, None) => (count_overlapping(raw, &needle), None),
+            })
         };
         // Two-pointer merge of the probe-exact documents this mode did not
         // fetch into the path-ordered stream; a fetched doc wins its id.
@@ -417,7 +431,8 @@ fn answer_terms(
             &scan,
             fetch_threads(),
             &map,
-            &mut |doc, bytes, (count, outcome)| {
+            &mut |doc, _, scanned| {
+                let (count, found) = scanned?;
                 if !emit {
                     counts.add(count);
                     return Ok(());
@@ -425,32 +440,29 @@ fn answer_terms(
                 while next_exact < exact.len() && paths.cmp(exact[next_exact].0, doc).is_lt() {
                     let (i, c) = exact[next_exact];
                     next_exact += 1;
-                    counts.add(emit_probe_exact(sink, &paths, req.output, literal, i, c)?);
+                    counts.add(emit_probe_exact(
+                        sink, &paths, filter, req.output, literal, i, c,
+                    )?);
                 }
                 if exact.get(next_exact).is_some_and(|&(i, _)| i == doc) {
                     next_exact += 1;
                 }
-                let Some(mut o) = outcome else { return Ok(()) };
-                if o.matched_lines == 0 {
+                let Some((path, f)) = found else {
                     return Ok(());
-                }
-                counts.add(o.count_matches());
-                if membership {
-                    // Membership is the whole answer under rg `-l`.
-                    o.matched_lines = 0;
-                    o.matched_spans = 0;
-                    o.spanless_lines = 0;
-                }
+                };
+                counts.add(f.stats.matches().max(1));
                 sink.doc(DocMatches {
-                    path: path_of(&paths, doc)?,
-                    raw: matching::strip_bom(bytes),
-                    outcome: &o,
+                    path: &path,
+                    printed: &f.printed,
+                    stats: &f.stats,
                 })
             },
         )?;
         if emit {
             for &(i, c) in &exact[next_exact..] {
-                counts.add(emit_probe_exact(sink, &paths, req.output, literal, i, c)?);
+                counts.add(emit_probe_exact(
+                    sink, &paths, filter, req.output, literal, i, c,
+                )?);
             }
         }
         let report = QueryReport {
@@ -521,7 +533,7 @@ fn reads_exact(output: QueryOutput, term: &[u8]) -> bool {
     match output {
         QueryOutput::Counts | QueryOutput::FilesWithMatches => false,
         QueryOutput::CountMatches => !probe_count_is_rgs(output, term),
-        QueryOutput::CountLines | QueryOutput::Matches { .. } => true,
+        QueryOutput::CountLines | QueryOutput::Matches(_) => true,
     }
 }
 
@@ -553,6 +565,7 @@ fn scan_ids(
 fn emit_probe_exact(
     sink: &mut dyn MatchSink,
     paths: &Paths<'_>,
+    filter: Option<&PathFilter>,
     output: QueryOutput,
     term: &[u8],
     doc: usize,
@@ -561,25 +574,21 @@ fn emit_probe_exact(
     if count == 0 {
         return Ok(0);
     }
-    let spans = if probe_count_is_rgs(output, term) {
-        count
-    } else {
-        0
+    let exact = probe_count_is_rgs(output, term);
+    let printed_count = match exact {
+        true => format!("{count}\n"),
+        false => String::new(),
     };
-    let outcome = DocOutcome {
-        matched_lines: 0,
-        matched_spans: spans,
-        spanless_lines: 0,
-        multiline: false,
-        lines: Vec::new(),
-        spans: Vec::new(),
-    };
+    let mut stats = Stats::new();
+    if exact {
+        stats.add_matches(count);
+    }
     sink.doc(DocMatches {
-        path: path_of(paths, doc)?,
-        raw: &[],
-        outcome: &outcome,
+        path: &printed(paths, filter, doc)?,
+        printed: printed_count.as_bytes(),
+        stats: &stats,
     })?;
-    Ok(spans.max(1))
+    Ok(if exact { count } else { 1 })
 }
 
 fn path_of<'a>(paths: &'a Paths<'_>, doc: usize) -> Result<&'a str, String> {

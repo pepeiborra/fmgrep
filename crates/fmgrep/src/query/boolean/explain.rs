@@ -100,7 +100,7 @@ impl fmt::Display for Explain<'_> {
             QueryOutput::FilesWithMatches => "-l",
             QueryOutput::CountLines => "-c",
             QueryOutput::CountMatches => "--count-matches",
-            QueryOutput::Matches { .. } => "lines",
+            QueryOutput::Matches(_) => "lines",
         };
         writeln!(
             f,

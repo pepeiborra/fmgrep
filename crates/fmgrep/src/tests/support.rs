@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::cli::{Outcome, dispatch, dispatch_to};
 use crate::expr::Expr;
 use crate::manifest::{BLOBS_SHARD, DOCS_SHARD, Manifest, read_manifest, shard_offsets};
-use crate::matching::QueryOutput;
+use crate::matching::{DocSearch, MatchMode, QueryOutput, matcher};
 use crate::query::QueryRequest;
 use crate::wire::{IndexSummary, OutputReport};
 
@@ -234,4 +234,13 @@ pub(crate) fn backdate(path: &Path) {
     if !meta.is_symlink() {
         set_mtime(path, T0);
     }
+}
+
+/// `term`'s search; a `/.../`-wrapped term is a pattern, as on the CLI.
+pub(crate) fn search(term: &str, output: QueryOutput, mode: MatchMode) -> DocSearch {
+    let m = match crate::regex_pattern(term) {
+        Some(p) => matcher("", Some(p), mode),
+        None => matcher(term, None, mode),
+    };
+    DocSearch::new(m.unwrap().unwrap(), output, mode)
 }

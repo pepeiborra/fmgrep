@@ -5,7 +5,7 @@ mod demote;
 use super::*;
 
 use crate::expr::Expr;
-use crate::matching::{LineMatcher, MatchMode, QueryOutput, strip_bom};
+use crate::matching::{DocSearch, MatchMode, QueryOutput, matcher, strip_bom};
 use crate::wire::QueryReport;
 
 const FILES: [(&str, &[u8]); 7] = [
@@ -70,29 +70,30 @@ fn leaf_pattern(leaf: &Expr, mode: MatchMode) -> Option<String> {
     }
 }
 
-fn leaf_matcher(leaf: &Expr, mode: MatchMode) -> LineMatcher {
-    match (leaf, leaf_pattern(leaf, mode)) {
-        (_, Some(p)) => LineMatcher::regex(&p, None, mode).unwrap(),
-        (Expr::Term(s), None) => LineMatcher::literal(s.as_bytes(), mode).unwrap(),
+/// `None` for the empty term, which matches nothing.
+fn leaf_search(leaf: &Expr, mode: MatchMode) -> Option<DocSearch> {
+    let m = match (leaf, leaf_pattern(leaf, mode)) {
+        (_, Some(p)) => matcher("", Some(&p), mode),
+        (Expr::Term(s), None) => matcher(s, None, mode),
         _ => unreachable!(),
-    }
+    };
+    let m = m.unwrap()?;
+    Some(DocSearch::new(m, QueryOutput::FilesWithMatches, mode))
 }
 
-/// The member paths: each leaf's line matcher per document, then the tree.
+/// The member paths: each leaf's search per document, then the tree.
 fn members(files: &[(&str, &[u8])], expr: &Expr, mode: MatchMode) -> Vec<String> {
-    let matchers: Vec<LineMatcher> = expr
+    let searches: Vec<Option<DocSearch>> = expr
         .leaves()
         .into_iter()
-        .map(|l| leaf_matcher(l, mode))
+        .map(|l| leaf_search(l, mode))
         .collect();
     let mut out: Vec<String> = files
         .iter()
         .filter(|(_, raw)| {
             expr.eval(&mut |i| {
-                matchers[i]
-                    .scan(strip_bom(raw), QueryOutput::FilesWithMatches)
-                    .matched_lines
-                    > 0
+                let s = searches[i].as_ref();
+                s.is_some_and(|s| s.doc("", strip_bom(raw)).unwrap().is_some())
             })
         })
         .map(|(p, _)| p.to_string())

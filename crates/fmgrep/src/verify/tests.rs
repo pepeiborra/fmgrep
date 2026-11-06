@@ -48,15 +48,16 @@ const PATTERNS: [&str; 24] = [
     r"^\s*$",
 ];
 
-fn scan(src: &str, mode: MatchMode, doc: &[u8]) -> bool {
-    LineMatcher::regex(src, None, mode)
-        .unwrap()
-        .scan(doc, QueryOutput::FilesWithMatches)
-        .matched_lines
-        > 0
+fn re(src: &str, mode: MatchMode) -> RegexMatcher {
+    matching::matcher("", Some(src), mode).unwrap().unwrap()
 }
 
-fn set_of<'a>(srcs: &[&'a str], matchers: &'a [LineMatcher], mode: MatchMode) -> LeafSet<'a> {
+fn scan(src: &str, mode: MatchMode, doc: &[u8]) -> bool {
+    let search = DocSearch::new(re(src, mode), QueryOutput::FilesWithMatches, mode);
+    search.doc("", doc).unwrap().is_some()
+}
+
+fn set_of<'a>(srcs: &[&'a str], matchers: &'a [RegexMatcher], mode: MatchMode) -> LeafSet<'a> {
     let leaves: Vec<Leaf<'a>> = srcs
         .iter()
         .zip(matchers)
@@ -78,10 +79,7 @@ fn set_membership_equals_line_scan() {
             ignore_case,
             ..MatchMode::default()
         };
-        let matchers: Vec<LineMatcher> = PATTERNS
-            .iter()
-            .map(|p| LineMatcher::regex(p, None, mode).unwrap())
-            .collect();
+        let matchers: Vec<RegexMatcher> = PATTERNS.iter().map(|p| re(p, mode)).collect();
         let set = set_of(&PATTERNS, &matchers, mode);
         assert!(set.set.is_some());
         for doc in DOCS {
@@ -102,10 +100,7 @@ fn set_membership_equals_line_scan() {
         ..MatchMode::default()
     };
     let srcs = [r"\bword\b", r"alpha \w+", r"[a-z]{3}"];
-    let matchers: Vec<LineMatcher> = srcs
-        .iter()
-        .map(|p| LineMatcher::regex(p, None, mode).unwrap())
-        .collect();
+    let matchers: Vec<RegexMatcher> = srcs.iter().map(|p| re(p, mode)).collect();
     let set = set_of(&srcs, &matchers, mode);
     assert!(set.tests.iter().all(|t| matches!(t, Test::Set(..))));
     for doc in DOCS {
@@ -144,7 +139,7 @@ fn crlf_and_multiline_leaves_use_their_own_scan() {
         ),
     ];
     for (src, mode) in cases {
-        let matchers = [LineMatcher::regex(src, None, mode).unwrap()];
+        let matchers = [re(src, mode)];
         let set = set_of(&[src], &matchers, mode);
         assert!(matches!(set.tests[0], Test::Own(_)), "{src}");
         for doc in DOCS {

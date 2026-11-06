@@ -1,8 +1,6 @@
-//! Per-document leaf membership. Each answer equals the leaf's
-//! [`LineMatcher`] finding a match in the BOM-stripped document. Line-path
-//! patterns share one `RegexSet` pass, rewritten so no match crosses a line;
-//! multiline-path patterns and CRLF anchors keep their own scan; literals test
-//! containment.
+//! Per-document leaf membership: whether rg finds the leaf in the
+//! BOM-stripped document. Line-scan patterns share one `RegexSet` pass,
+//! rewritten so no match crosses a line; the rest search on their own.
 
 use memchr::memmem;
 use regex_syntax::hir::{
@@ -10,25 +8,27 @@ use regex_syntax::hir::{
     Repetition,
 };
 
-use crate::matching::{LineMatcher, MatchMode, QueryOutput};
+use grep_regex::RegexMatcher;
+
+use crate::matching::{self, DocSearch, MatchMode, QueryOutput};
 
 /// One leaf as verification sees it.
 pub enum Leaf<'a> {
     /// The empty term, which matches nothing.
     Never,
     Literal(&'a [u8]),
-    /// `matcher` is `src` compiled by [`LineMatcher::regex`].
+    /// `matcher` is `src` compiled by [`matching::matcher`].
     Pattern {
         src: &'a str,
-        matcher: &'a LineMatcher,
+        matcher: &'a RegexMatcher,
     },
 }
 
 enum Test<'a> {
     Never,
     Literal(Box<memmem::Finder<'a>>),
-    Set(usize, &'a LineMatcher),
-    Own(&'a LineMatcher),
+    Set(usize, &'a RegexMatcher),
+    Own(Box<DocSearch>),
 }
 
 pub struct LeafSet<'a> {
@@ -50,7 +50,7 @@ impl<'a> LeafSet<'a> {
                         members.push(p);
                         Test::Set(members.len() - 1, matcher)
                     }
-                    None => Test::Own(matcher),
+                    None => own(matcher, mode),
                 },
             })
             .collect();
@@ -61,7 +61,7 @@ impl<'a> LeafSet<'a> {
         if set.is_none() {
             for t in &mut tests {
                 if let Test::Set(_, m) = *t {
-                    *t = Test::Own(m);
+                    *t = own(m, mode);
                 }
             }
         }
@@ -93,19 +93,24 @@ impl<'a> LeafSet<'a> {
                 Test::Never => false,
                 Test::Literal(f) => f.find(doc).is_some(),
                 Test::Set(i, _) => hits.as_ref().is_some_and(|h| h.matched(*i)),
-                Test::Own(m) => m.scan(doc, QueryOutput::FilesWithMatches).matched_lines > 0,
+                Test::Own(s) => s.doc("", doc).is_ok_and(|f| f.is_some()),
             });
         }
     }
 }
 
+fn own<'a>(m: &RegexMatcher, mode: MatchMode) -> Test<'a> {
+    Test::Own(Box::new(DocSearch::new(
+        m.clone(),
+        QueryOutput::FilesWithMatches,
+        mode,
+    )))
+}
+
 /// `src` rewritten to match a multi-line haystack exactly where it matches
-/// one of its lines, or `None` where only its own scan is exact.
-fn line_pattern(src: &str, matcher: &LineMatcher, mode: MatchMode) -> Option<String> {
-    if !matches!(
-        matcher,
-        LineMatcher::Regex { .. } | LineMatcher::LocalRegex(_)
-    ) {
+/// one of its lines, or `None` where only its own search is exact.
+fn line_pattern(src: &str, matcher: &RegexMatcher, mode: MatchMode) -> Option<String> {
+    if !matching::line_scan(matcher, mode) {
         return None;
     }
     let hir = regex_syntax::ParserBuilder::new()
