@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::Document;
 
-use crate::automaton::{DeferredPlan, MIN_ANCHOR_COUNT, RegexPlan, automaton_locate};
+use crate::automaton::{DeferredPlan, RegexPlan, automaton_locate};
 use crate::blobs::Blob;
 use crate::cursor::{BackwardCursor, LocatingCursor};
 use crate::fold::{FoldPlan, fold_locate};
@@ -144,8 +144,9 @@ impl ShardMeta {
     }
 
     /// Ascending global doc ids that may hold a match of `pattern`: a walk
-    /// where one is planned, else by its required literals, rarest first;
-    /// empty when `pattern` does not [`narrows`](crate::pattern::narrows).
+    /// where one is planned, else (or when the walk gives up) by its required
+    /// literals, rarest first; empty when `pattern` does not
+    /// [`narrows`](crate::pattern::narrows).
     pub fn regex_docs(&self, structure: &Structure, pattern: &PreparedPattern) -> Vec<usize> {
         let anchor = anchor(pattern);
         if let Some(plan) = pattern.fold() {
@@ -162,11 +163,14 @@ impl ShardMeta {
             return self.term_docs(structure, term);
         }
         let count = self.count(structure, term);
-        if let Some(plan) = deferred(pattern)
-            .filter(|_| count >= MIN_ANCHOR_COUNT)
+        if count == 0 {
+            return Vec::new();
+        }
+        if let Some(hits) = deferred(pattern)
             .and_then(DeferredPlan::plan)
+            .and_then(|plan| automaton_locate(structure.cursor(), plan))
         {
-            return self.automaton_docs(structure, plan, anchor);
+            return self.docs_at(structure, Some(hits), None);
         }
         let terms: Vec<&[u8]> = std::iter::once(term)
             .chain(others.iter().map(Vec::as_slice))
