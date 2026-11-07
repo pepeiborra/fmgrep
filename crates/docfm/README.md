@@ -24,9 +24,11 @@ document.
   a sample a few bytes into the pattern is reached from there and verified
   by a few LF steps back; the rest walk back to the nearest sample. At most
   31 steps per occurrence, about half a step on average for identifiers.
-* No suffix array is ever built. libsais writes the BWT directly and returns
-  the rows the samples need; peak memory is about six times the text,
-  well under what building and then sampling a suffix array takes.
+* No suffix array is ever built. msbwt, a pure-Rust multi-string BWT by
+  induced sorting, writes the BWT directly and returns the rows the samples
+  need; peak memory is about six times the text, well under what building
+  and then sampling a suffix array takes. Each document sorts as a cyclic
+  string, so no row reads into another document.
 * A compressed BWT. The BWT is a 16-ary wavelet matrix, two levels of
   4-bit digits for a byte alphabet, each cut into blocks of 256 digits
   stored as nothing (one digit throughout), plain digits or runs: about 3.2
@@ -55,11 +57,11 @@ the occurrences' own samples, resolves more from samples a few bytes into
 the pattern, then walks LF from the rest to the nearest sample, at most 31
 steps; none crosses into another document.
 
-Construction builds no suffix array: libsais writes the BWT over the text
-and returns the row of every 4th position; the sampled rows are LF walks
-of at most 3 steps from those over the finished wavelet levels. Peak
-live heap is about six times the text, mostly libsais's `i32` temporary
-array.
+Construction builds no suffix array: msbwt (`crates/msbwt`) sorts the
+rotations of every document, each a cyclic string, by induced sorting and
+returns the BWT with the row of every sampled position, which it carries
+down its levels as it sorts. Peak live heap is about six times the text,
+msbwt's working arrays.
 
 The blob (`src/layout.rs`) is the query structure:
 `FmIndex::view` works over any `AsRef<[u8]>`, a mapped file slice included,

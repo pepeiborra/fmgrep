@@ -37,8 +37,8 @@ mod wt;
 use crate::layout::{Config, Header};
 use crate::wt::Wt;
 
-/// Longest text [`FmIndex::build`] accepts: libsais's `i32` temporary array
-/// and rows bound it.
+/// Longest text [`FmIndex::build`] accepts, the bound libsais once set; the
+/// format's `u32` rows would allow up to twice it.
 pub const MAX_TEXT_BYTES: u64 = i32::MAX as u64;
 
 /// Ends every document, the last included.
@@ -78,7 +78,7 @@ pub enum Error {
     TextTooLong(usize),
     /// The text does not end in [`DOC_END`].
     Unterminated,
-    /// libsais refused the text.
+    /// The BWT construction refused the text.
     Construction(String),
     /// Writing the blob failed.
     Io(std::io::Error),

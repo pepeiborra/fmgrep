@@ -297,36 +297,35 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Digests of the blobs the sequential encoder wrote (the k-ary format's
-/// first): the parallel encoder must reproduce them byte for byte, on any
-/// number of threads.
+/// Digests of the blobs over msbwt's BWT, as the encoder first wrote them:
+/// it must reproduce them byte for byte, on any number of threads.
 #[test]
 fn blobs_match_the_pinned_encoder() {
     const PINNED: [u64; 24] = [
-        0x288450ab293bf8e6,
-        0xd6724145d3dc27f5,
-        0xfc49bd71b389233b,
-        0xa965f4b5c1520b40,
-        0xe0b5b9c6cda14f1f,
-        0x27ffdfcb572b749c,
-        0x45592b9ca3183041,
-        0x465a17e9d02440d2,
-        0x4960f67b3e4d52f0,
-        0xbeeb6f58a20eaccf,
-        0x1d91469063b449af,
-        0x343dc44be9923234,
-        0x036dcf7fa39bad43,
-        0xf6ca93df77d24928,
-        0x516007eed0f4b4c1,
-        0x81316149e94a3b72,
-        0x852f4b228f101f28,
-        0xd1be2bf4e98e60ef,
-        0x22722f925af957cb,
-        0x1eee83ec31b2e56c,
-        0x48998c8aa76d890d,
-        0x95866150b31b1042,
-        0x949a89c7c968ee77,
-        0x2a362bd1e34bab0c,
+        0x224929b4ed10b659,
+        0xe0216694c5ca67b5,
+        0x995109b1fbf246fb,
+        0x36d6ec4e73be6cdf,
+        0x2b3504897049f37d,
+        0x24da22dda009292d,
+        0x7d6b2b988c21fad7,
+        0x2677ff9075e37083,
+        0xda40a28d46b4b6da,
+        0xebcb12e019d7cda3,
+        0x628b16e82b403ab0,
+        0xce16e934b3f18175,
+        0xc3704b655c04495f,
+        0x4f150f1ad72e491a,
+        0xae392c828b1a9288,
+        0x9e2a33d9087bf775,
+        0x399f7191fee6a2e5,
+        0x959a9ce0617681a0,
+        0x0c538c0ae8e4ac77,
+        0xd29fa43c28c89dda,
+        0xa2113aef4a63e3d2,
+        0x3bdb84af2c8439c3,
+        0x1970fa607847d7d9,
+        0x6921a45676216b58,
     ];
     let mut rng = Rng(53);
     let runs: Vec<u8> = (0..300_000)
