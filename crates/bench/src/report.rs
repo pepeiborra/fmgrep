@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::{Kind, QuerySet, Row};
+use crate::{Kind, QuerySet, Row, RowKind};
 
 pub struct Run {
     pub corpus: &'static str,
@@ -141,10 +141,11 @@ fn opt<T>(v: Option<T>, f: impl Fn(T) -> String) -> String {
     v.map_or_else(|| "-".to_string(), f)
 }
 
-fn label(name: &str) -> &str {
+fn label(name: RowKind) -> &'static str {
     match name {
-        "fmgrep-store-docs" => "fmgrep `--store-docs`",
-        name => name,
+        RowKind::FmgrepStoreDocs => "fmgrep `--store-docs`",
+        RowKind::FmgrepDirect => "fmgrep, no server",
+        RowKind::Rg | RowKind::Fmgrep | RowKind::Tgrep | RowKind::Elgrep => name.into(),
     }
 }
 
@@ -206,7 +207,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     if !notes.is_empty() {
         md += &format!("\n{notes}");
     }
-    let tgrep = if rows.iter().any(|r| r.name == "tgrep") {
+    let tgrep = if rows.iter().any(|r| r.name == RowKind::Tgrep) {
         ", or a `tgrep` client against one `tgrep serve`"
     } else {
         ""
@@ -216,13 +217,18 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     } else {
         ", or several `tgrep` clients"
     };
-    let has_eg = rows.iter().any(|r| r.name == "elgrep");
+    let direct = if rows.iter().any(|r| r.name == RowKind::FmgrepDirect) {
+        ", or one `fmgrep --index` process with no server"
+    } else {
+        ""
+    };
+    let has_eg = rows.iter().any(|r| r.name == RowKind::Elgrep);
     let eg = [", or `eg` beside one `eg-indexd`", ", or an `eg` pipe"];
     let [elgrep, elgrep_and] = eg.map(|s| if has_eg { s } else { "" });
     md += &format!(
         "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
          `rg` over a staged copy of the corpus, or `fmgrep --server` against one \
-         `fmgrep serve`{tgrep}{elgrep}. \
+         `fmgrep serve`{direct}{tgrep}{elgrep}. \
          An intersection is an `rg` pipe{tgrep_and}{elgrep_and}. \
          Footprint is the peak anonymous memory while querying; RSS also counts \
          file-backed pages such as the mapped index. load1 is the 1-minute load average \
@@ -297,7 +303,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
         for q in &r.queries {
             lines.push(json!({
                 "type": "query",
-                "index_name": r.name,
+                "index_name": r.name.to_string(),
                 "corpus": run.corpus,
                 "corpus_revision": run.revision,
                 "fixture": run.fixture,
@@ -310,7 +316,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
         }
         lines.push(json!({
             "type": "index",
-            "index_name": r.name,
+            "index_name": r.name.to_string(),
             "corpus": run.corpus,
             "corpus_revision": run.revision,
             "fixture": run.fixture,
@@ -358,7 +364,10 @@ mod tests {
             bytes: 9,
             stamps,
         };
-        let (mut rg, mut docs) = (Row::new("rg", 1), Row::new("fmgrep-store-docs", 1));
+        let (mut rg, mut docs) = (
+            Row::new(RowKind::Rg, 1),
+            Row::new(RowKind::FmgrepStoreDocs, 1),
+        );
         for term in TERMS {
             let rows = if term.contains(" AND ") {
                 vec![&mut rg]

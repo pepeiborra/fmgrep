@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use fmgrep::regex_pattern;
+use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
 const USAGE: &str = "\
 usage: bench [--corpus ghc|linux|chromium] [--rows ROWS] [--fixture] [--trace FILE]
@@ -20,7 +21,8 @@ prints the same lines as the first, and prints the results as markdown.
 
   --corpus ID    ghc (default), linux or chromium; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
-  --rows ROWS    comma-separated rg, fmgrep, fmgrep-store-docs, tgrep,
+  --rows ROWS    comma-separated rg, fmgrep, fmgrep-store-docs,
+                 fmgrep-direct (no server: a process per query), tgrep,
                  elgrep; default rg,fmgrep, tgrep when it is on PATH, and
                  elgrep when it is on PATH on Linux, where its index answers
   --fixture      search one file of the query set's literals instead
@@ -29,7 +31,22 @@ prints the same lines as the first, and prints the results as markdown.
 Exits 1 when a row fails or the rows disagree, 2 on a usage or corpus error.";
 
 const CORPORA: [&str; 3] = ["ghc", "linux", "chromium"];
-const ROWS: [&str; 5] = ["rg", "fmgrep", "fmgrep-store-docs", "tgrep", "elgrep"];
+
+/// A row, named in kebab-case by `--rows`, the results and the trace; rows
+/// run and print in this order.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Display, EnumIter, EnumString, IntoStaticStr,
+)]
+#[strum(serialize_all = "kebab-case")]
+pub enum RowKind {
+    #[default]
+    Rg,
+    Fmgrep,
+    FmgrepStoreDocs,
+    FmgrepDirect,
+    Tgrep,
+    Elgrep,
+}
 
 pub struct Query {
     pub term: String,
@@ -39,7 +56,7 @@ pub struct Query {
 
 #[derive(Default)]
 pub struct Row {
-    pub name: &'static str,
+    pub name: RowKind,
     pub files: usize,
     pub queries: Vec<Query>,
     pub index_time: Option<Duration>,
@@ -64,7 +81,7 @@ impl Query {
 }
 
 impl Row {
-    fn new(name: &'static str, files: usize) -> Self {
+    fn new(name: RowKind, files: usize) -> Self {
         Row {
             name,
             files,
@@ -142,23 +159,33 @@ fn select_rows(
     spec: Option<&str>,
     tgrep: &Result<tgrep::Tgrep, String>,
     elgrep: &Result<elgrep::Elgrep, String>,
-) -> Result<Vec<&'static str>, String> {
-    let eg = elgrep.is_ok() && cfg!(target_os = "linux");
-    let found = [(tgrep.is_ok(), ",tgrep"), (eg, ",elgrep")];
-    let default: String = found.iter().filter(|f| f.0).map(|f| f.1).collect();
-    let default = format!("rg,fmgrep{default}");
-    let spec = spec.unwrap_or(&default);
-    let wanted: Vec<&str> = spec.split(',').map(str::trim).collect();
-    if let Some(bad) = wanted.iter().find(|w| !ROWS.contains(w)) {
-        return Err(format!("--rows: {bad:?} is not one of {}", ROWS.join(", ")));
-    }
-    if let (true, Err(note)) = (wanted.contains(&"tgrep"), tgrep) {
+) -> Result<Vec<RowKind>, String> {
+    let by_default = |r: &RowKind| match r {
+        RowKind::Rg | RowKind::Fmgrep => true,
+        RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect => false,
+        RowKind::Tgrep => tgrep.is_ok(),
+        RowKind::Elgrep => elgrep.is_ok() && cfg!(target_os = "linux"),
+    };
+    let parse = |w: &str| {
+        let names: Vec<&str> = RowKind::iter().map(<&str>::from).collect();
+        let bad = format!("--rows: {w:?} is not one of {}", names.join(", "));
+        w.parse::<RowKind>().map_err(|_| bad)
+    };
+    let wanted: Vec<RowKind> = match spec {
+        Some(spec) => spec
+            .split(',')
+            .map(str::trim)
+            .map(parse)
+            .collect::<Result<_, _>>()?,
+        None => RowKind::iter().filter(by_default).collect(),
+    };
+    if let (true, Err(note)) = (wanted.contains(&RowKind::Tgrep), tgrep) {
         return Err(format!("--rows names tgrep, but {note}"));
     }
-    if let (true, Err(note)) = (wanted.contains(&"elgrep"), elgrep) {
+    if let (true, Err(note)) = (wanted.contains(&RowKind::Elgrep), elgrep) {
         return Err(format!("--rows names elgrep, but {note}"));
     }
-    Ok(ROWS.into_iter().filter(|r| wanted.contains(r)).collect())
+    Ok(RowKind::iter().filter(|r| wanted.contains(r)).collect())
 }
 
 /// `fmgrep` next to this executable, else on `PATH`.
@@ -254,7 +281,13 @@ fn run() -> Result<(), Fail> {
     let eg_dropped = rows.is_none() && elgrep.is_ok() && !cfg!(target_os = "linux");
     let rows = select_rows(rows.as_deref(), &tgrep, &elgrep).map_err(usage)?;
     let fmgrep = fmgrep_bin();
-    if fmgrep.is_none() && rows.iter().any(|r| r.starts_with("fmgrep")) {
+    let fmgrep_row = |r: &RowKind| {
+        matches!(
+            r,
+            RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect
+        )
+    };
+    if fmgrep.is_none() && rows.iter().any(fmgrep_row) {
         return Err(usage("no fmgrep next to bench or on PATH"));
     }
     let set = query_set(corpus);
@@ -283,10 +316,12 @@ fn run() -> Result<(), Fail> {
         eprintln!("running {name}");
         let before = rows::load1();
         let row = match (name, &fmgrep, &tgrep, &elgrep) {
-            ("rg", ..) => rows::rg(staged, n, terms),
-            ("tgrep", _, Ok(t), _) => tgrep::row(&t.bin, staged, n, terms),
-            ("elgrep", _, _, Ok(e)) => elgrep::row(e, staged, n, terms),
-            (_, Some(bin), ..) => rows::fmgrep(bin, staged, name == "fmgrep-store-docs", terms),
+            (RowKind::Rg, ..) => rows::rg(staged, n, terms),
+            (RowKind::Tgrep, _, Ok(t), _) => tgrep::row(&t.bin, staged, n, terms),
+            (RowKind::Elgrep, _, _, Ok(e)) => elgrep::row(e, staged, n, terms),
+            (RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect, Some(bin), ..) => {
+                rows::fmgrep(bin, staged, name, terms)
+            }
             _ => unreachable!("rows are checked above"),
         };
         let mut row = row.map_err(|e| failed(format!("row {name}: {e}")))?;
@@ -444,20 +479,24 @@ mod tests {
             version,
         });
         let elgrep = if cfg!(target_os = "linux") {
-            vec!["elgrep"]
+            vec![RowKind::Elgrep]
         } else {
             vec![]
         };
         assert_eq!(
             select_rows(None, &absent(), &absent()).unwrap(),
-            ["rg", "fmgrep"]
+            [RowKind::Rg, RowKind::Fmgrep]
         );
         let all = select_rows(None, &t, &e).unwrap();
-        assert_eq!(all, [&["rg", "fmgrep", "tgrep"][..], &elgrep].concat());
+        let found = [RowKind::Rg, RowKind::Fmgrep, RowKind::Tgrep];
+        assert_eq!(all, [&found[..], &elgrep].concat());
         let picked = select_rows(Some("elgrep,rg"), &absent(), &e).unwrap();
-        assert_eq!(picked, ["rg", "elgrep"]);
+        assert_eq!(picked, [RowKind::Rg, RowKind::Elgrep]);
         let err = select_rows(Some("rg,elgrep"), &t, &absent()).unwrap_err();
         assert_eq!(err, "--rows names elgrep, but absent");
+        let err = select_rows(Some("rg,x"), &t, &e).unwrap_err();
+        let names = "rg, fmgrep, fmgrep-store-docs, fmgrep-direct, tgrep, elgrep";
+        assert_eq!(err, format!("--rows: \"x\" is not one of {names}"));
     }
 
     #[test]
@@ -475,13 +514,13 @@ mod tests {
             }
             row
         };
-        let rg = || row("rg", 5, &[(3, 2, 7), (0, 0, 0), (2, 1, 8)]);
+        let rg = || row(RowKind::Rg, 5, &[(3, 2, 7), (0, 0, 0), (2, 1, 8)]);
         assert!(verify(&[rg(), rg()]).is_empty());
         let mut partial = rg();
-        partial.name = "tgrep";
+        partial.name = RowKind::Tgrep;
         partial.queries.remove(1);
         assert_eq!(verify(&[rg(), partial]), ["queries: rg and tgrep differ"]);
-        let other = row("fmgrep", 4, &[(3, 2, 7), (1, 1, 1), (2, 1, 9)]);
+        let other = row(RowKind::Fmgrep, 4, &[(3, 2, 7), (1, 1, 1), (2, 1, 9)]);
         let diffs = verify(&[rg(), other]);
         let t1 = "\"t1\": rg 0 lines in 0 files, fmgrep 1 in 1";
         let t2 = "\"t2\": rg and fmgrep print different lines";

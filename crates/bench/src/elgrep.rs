@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::report::bytes;
 use crate::rows::{LINES, Peak, Sampler, and_pipe, failure, hits, memory, timed};
 use crate::tgrep::dir_size;
-use crate::{Query, Row, leaves};
+use crate::{Query, Row, RowKind, leaves};
 
 pub struct Elgrep {
     pub bin: PathBuf,
@@ -119,7 +119,7 @@ pub fn row(e: &Elgrep, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
     if !out.status.success() || listed != n {
         return Err(format!("eg --files lists {listed} of the {n} staged files"));
     }
-    let mut row = Row::new("elgrep", n);
+    let mut row = Row::new(RowKind::Elgrep, n);
 
     let daemon = if cfg!(target_os = "linux") {
         let start = Instant::now();
