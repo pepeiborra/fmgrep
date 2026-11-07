@@ -15,7 +15,7 @@ use fmgrep::regex_pattern;
 use serde_json::Value;
 
 use crate::rows::{Guard, LINES, Sampler, failure, hits, run_measured, timed};
-use crate::{Query, Row, leaves};
+use crate::{Query, Row, RowKind, leaves};
 
 pub struct Tgrep {
     pub bin: PathBuf,
@@ -95,7 +95,7 @@ pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
     };
     let start = Instant::now();
     let (status, _, peak) = run_measured(&mut tgrep(&["index"]))?;
-    let mut row = Row::new("tgrep", n);
+    let mut row = Row::new(RowKind::Tgrep, n);
     row.index_time = Some(start.elapsed());
     if !status.success() {
         return Err(format!("tgrep index: {status}"));

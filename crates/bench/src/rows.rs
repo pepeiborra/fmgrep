@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use fmgrep::regex_pattern;
 
-use crate::{Query, Row, leaves};
+use crate::{Query, Row, RowKind, leaves};
 
 pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
     let mut walk = Command::new("rg");
@@ -23,7 +23,7 @@ pub fn rg(staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
     if listed.count() != n {
         return Err(format!("rg --files does not list the {n} staged files"));
     }
-    let mut row = Row::new("rg", n);
+    let mut row = Row::new(RowKind::Rg, n);
     for term in terms {
         let mut cmd = match &leaves(term)[..] {
             [_] => {
@@ -119,17 +119,15 @@ fn staged_line(line: &[u8]) -> Option<(u32, u32)> {
     })
 }
 
-pub fn fmgrep(
-    bin: &Path,
-    staged: &Path,
-    store_docs: bool,
-    terms: &[String],
-) -> Result<Row, String> {
+/// The `fmgrep` rows: `fmgrep-store-docs` indexes with `--store-docs`;
+/// `fmgrep-direct` runs each query as a fresh process over the index, with
+/// no server.
+pub fn fmgrep(bin: &Path, staged: &Path, name: RowKind, terms: &[String]) -> Result<Row, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let index = dir.path().join("index");
     let mut cmd = Command::new(bin);
     cmd.arg("index").arg(staged).arg("--output").arg(&index);
-    if store_docs {
+    if name == RowKind::FmgrepStoreDocs {
         cmd.arg("--store-docs");
     }
     let (status, stdout, peak) = run_measured(cmd.arg("--json"))?;
@@ -139,15 +137,14 @@ pub fn fmgrep(
     let summary: serde_json::Value =
         serde_json::from_slice(&stdout).map_err(|e| format!("fmgrep index --json: {e}"))?;
     let field = |k: &str| summary[k].as_u64().ok_or(format!("no {k} in {summary}"));
-    let name = if store_docs {
-        "fmgrep-store-docs"
-    } else {
-        "fmgrep"
-    };
     let mut row = Row::new(name, field("num_files")? as usize);
     row.index_time = Some(Duration::from_micros(field("build_time_us")?));
     row.index_bytes = Some(field("index_size_bytes")?);
     row.index_peak_rss = peak;
+    if name == RowKind::FmgrepDirect {
+        direct(bin, staged, &index, terms, &mut row)?;
+        return Ok(row);
+    }
 
     let start = Instant::now();
     let mut serve = Command::new(bin);
@@ -192,6 +189,40 @@ pub fn fmgrep(
     } else {
         Err(format!("fmgrep serve: {status} after shutdown"))
     }
+}
+
+/// Each query as its own `fmgrep --index` from the staged root, as an agent
+/// without a server runs it; the footprint and RSS are the largest query's.
+fn direct(
+    bin: &Path,
+    staged: &Path,
+    index: &Path,
+    terms: &[String],
+    row: &mut Row,
+) -> Result<(), String> {
+    let mut largest: Option<Peak> = None;
+    for term in terms {
+        let mut cmd = Command::new(bin);
+        let leaves = leaves(term);
+        cmd.current_dir(staged)
+            .arg("--index")
+            .arg(index)
+            .args(LINES);
+        cmd.args((leaves.len() > 1).then_some("--and"));
+        cmd.arg("--").args(leaves);
+        let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
+        let hits = hits(&format!("fmgrep {term:?}"), &out)?;
+        row.queries.push(Query::new(term, latency, hits));
+        if let Some(p) = peak {
+            let l = largest.get_or_insert(Peak {
+                footprint: 0,
+                rss: 0,
+            });
+            (l.footprint, l.rss) = (l.footprint.max(p.footprint), l.rss.max(p.rss));
+        }
+    }
+    (row.footprint, row.query_rss) = (largest.map(|p| p.footprint), largest.map(|p| p.rss));
+    Ok(())
 }
 
 pub fn failure(what: &str, out: &Output) -> String {

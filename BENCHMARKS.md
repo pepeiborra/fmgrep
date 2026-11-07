@@ -15,6 +15,11 @@ answer.
   (`ready`: spawn to its readiness line, the load and its
   [check of the tree](docs/index-format.md#staleness) included), then one
   `fmgrep --server ADDR -n --no-heading` process per query.
+- **fmgrep, no server** (`--rows fmgrep-direct`, not in the tables
+  below): the same index, then one `fmgrep --index DIR -n --no-heading`
+  process per query from the corpus root, as an agent without a server
+  runs it; each process loads the index and checks the tree itself, so
+  there is no `ready`, and the footprint and RSS are the largest query's.
 - **fmgrep `--store-docs`**: the same over `index --store-docs`, which keeps
   a copy of every file: a printed line is read from the copy, and `serve`
   does not check the tree.

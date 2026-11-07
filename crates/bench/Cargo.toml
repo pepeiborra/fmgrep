@@ -12,6 +12,7 @@ authors.workspace = true
 fmgrep = { path = "../fmgrep" }
 libc = "0.2"
 serde_json = "1"
+strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
 
 [dev-dependencies]
