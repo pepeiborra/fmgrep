@@ -26,15 +26,16 @@
 #![warn(missing_docs)]
 
 mod build;
+mod digits;
 mod forward;
 mod layout;
 mod marks;
-mod occ;
 #[cfg(test)]
 mod tests;
+mod wt;
 
-use crate::layout::{Gaps, Header};
-use crate::occ::Occ;
+use crate::layout::{Config, Header};
+use crate::wt::Wt;
 
 /// Longest text [`FmIndex::build`] accepts: libsais's `i32` temporary array
 /// and rows bound it.
@@ -107,10 +108,10 @@ impl std::error::Error for Error {}
 impl FmIndex<Vec<u8>> {
     /// `text` is documents, each followed by one [`DOC_END`]. Samples the doc
     /// id at document, word, subword and line starts, so a locate walks at
-    /// most 63 LF steps. Runs on the current rayon pool; the blob does not
+    /// most 31 LF steps. Runs on the current rayon pool; the blob does not
     /// depend on it.
     pub fn build(text: Vec<u8>) -> Result<Self, Error> {
-        Self::view(build::build(text, Gaps::WORDS)?)
+        Self::view(build::build(text, Config::DEFAULT)?)
     }
 
     /// The blob, for storing and a later [`FmIndex::view`].
@@ -177,8 +178,8 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    fn bwt(&self) -> Occ<'_> {
-        Occ::new(self.bytes, self.header)
+    fn bwt(&self) -> Wt<'_> {
+        self.header.bwt(self.bytes)
     }
 
     /// Rows before `row` in the sentinel-free BWT.

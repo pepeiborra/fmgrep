@@ -1,41 +1,72 @@
-//! Blob v7, all little-endian. The occurrence blocks start on a 16 KiB
-//! boundary and the blob length is a multiple of 16 KiB, so blobs laid end
-//! to end from a page-aligned offset keep every block page-aligned.
+//! Blob v8, all little-endian. The blob length is a multiple of 16 KiB, so
+//! blobs laid end to end from a page-aligned offset stay page-aligned.
 //!
 //! | offset | field |
 //! |---|---|
-//! | 0 | magic `DOCFM\0\x07\0` |
+//! | 0 | magic `DOCFM\0\x08\0` |
 //! | 8 | `n` u64: text bytes; rows are `n + 1` |
 //! | 16 | sentinel row u64 |
 //! | 24 | `max` gap u32, sigma u32 (alphabet popcount) |
 //! | 32 | alphabet `[u64; 4]` |
-//! | 64 | positions per occurrence block u32 |
+//! | 64 | digits per wavelet block u32, a power of two in 256..=4096 |
 //! | 68 | scheme u32 = 1; gaps `min`, `max`, `ws` u32 |
 //! | 84 | walk bound u32 = `ws - 1`; 88..96 reserved zero |
 //! | 96 | `c` `[u32; 257]`: first row per code, `c[sigma] = n + 1` |
-//! | 1124 | reserved zero |
+//! | 1124 | `bottom` `[u32; 256]`: where each code starts below the last level, zero from sigma |
 //! | 2148 | `num_docs` u32, `num_samples` u32; 2156..2176 reserved zero |
-//! | 2176 | supers, then at the next 16 KiB boundary the occurrence blocks (`occ`) |
+//! | 2176 | digit starts `[u32; 32]`: entry `l * k + x`, the positions of level `l` holding a digit below `x`, zero from `depth * k` |
+//! | 2304 | payload bytes `[u32; 8]` of each level, padding included, zero from the depth |
+//! | 2336 | bits per digit `d` u32: 1, 2 or 4 (`k = 1 << d`); 2340..2368 reserved zero |
+//! | 2368 | levels (`wt`): each its supers, heads and payload (`digits`), 64-byte aligned |
 //! | | marks (`marks`) over `n + 1` rows |
-//! | | samples: u32 doc id per marked row, in row order |
+//! | | samples: doc id per marked row, in row order, `ceil(log2 num_docs)` bits each (at least 1), packed |
 //!
 //! A row is marked iff its text position `p < n` starts a document, or
 //! starts a word, subword or line at least `min` past the previous mark, or
 //! is `max` past it (`ws` on whitespace); see `build::doc_samples`.
 
-use crate::marks::{Marks, section_bytes};
-use crate::occ::{BLOCK, Occ, SUPER};
+use crate::digits;
+use crate::marks::{Marks, bits_at, section_bytes};
+use crate::wt::{MAX_DEPTH, MAX_STARTS, Shape, Wt, bits_for, depth_for};
 use crate::{DOC_END, Error, MAX_TEXT_BYTES};
 
-const MAGIC: [u8; 8] = *b"DOCFM\0\x07\0";
+const MAGIC: [u8; 8] = *b"DOCFM\0\x08\0";
 const SCHEME: u32 = 1;
 const BLOCK_AT: usize = 64;
 const SCHEME_AT: usize = 68;
 const RESERVED_END: usize = 96;
 const C_AT: usize = 96;
+const BOTTOM_AT: usize = 1124;
 const DOCS_AT: usize = 2148;
-pub const HEADER_BYTES: usize = 2176;
+const STARTS_AT: usize = 2176;
+const PAYLOAD_AT: usize = 2304;
+const DIGIT_AT: usize = 2336;
+const LEVELS_RESERVED: usize = 2340;
+pub const HEADER_BYTES: usize = 2368;
 pub const PAGE: usize = 16384;
+/// log2 of the digits per wavelet block a build writes.
+pub const BLOCK_LOG: u32 = 8;
+/// Bits per wavelet digit a build writes.
+pub const DIGIT_BITS: u32 = 4;
+
+/// What a build writes: its sampling gaps and its wavelet shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub gaps: Gaps,
+    /// Bits per wavelet digit: 1, 2 or 4.
+    pub d: u32,
+    /// log2 of the digits per wavelet block, 8..=12.
+    pub lb: u32,
+}
+
+impl Config {
+    /// What [`crate::FmIndex::build`] writes.
+    pub const DEFAULT: Self = Self {
+        gaps: Gaps::WORDS,
+        d: DIGIT_BITS,
+        lb: BLOCK_LOG,
+    };
+}
 
 /// Sampling gaps, in text bytes past the previous sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,9 +82,9 @@ pub struct Gaps {
 impl Gaps {
     /// What every build samples at.
     pub const WORDS: Self = Self {
-        min: 8,
-        max: 16,
-        ws: 64,
+        min: 4,
+        max: 8,
+        ws: 32,
     };
 
     /// Most LF steps from a row to a marked one.
@@ -66,6 +97,18 @@ impl Gaps {
     }
 }
 
+/// The wavelet levels as a build encoded them.
+pub struct Levels {
+    /// log2 of the bits per block.
+    pub lb: u32,
+    /// Bits per digit.
+    pub d: u32,
+    pub starts: [u32; MAX_STARTS],
+    /// Payload bytes of each level, padding included.
+    pub payload: [u32; MAX_DEPTH],
+    pub bottom: [u32; 256],
+}
+
 /// The parsed header plus the section offsets it implies.
 pub struct Header {
     pub n: usize,
@@ -74,23 +117,16 @@ pub struct Header {
     pub alphabet: [u64; 4],
     pub code_of: [Option<u8>; 256],
     pub sigma: usize,
-    /// Bit planes per occurrence block.
-    pub bits: usize,
     pub c: [u32; 257],
-    pub super_stride: usize,
-    pub counts_bytes: usize,
-    pub block_stride: usize,
-    pub blocks_at: usize,
+    pub payload: [u32; MAX_DEPTH],
+    pub wt: Shape,
     pub marks_at: usize,
     pub samples_at: usize,
+    /// Bits per packed doc id.
+    pub sample_bits: u32,
     pub num_docs: usize,
     pub num_samples: usize,
     pub blob_len: usize,
-}
-
-/// Planes needed for `sigma` codes; one code needs none.
-pub fn bits_for(sigma: usize) -> usize {
-    (usize::BITS - sigma.saturating_sub(1).leading_zeros()) as usize
 }
 
 fn corrupt(why: String) -> Error {
@@ -103,6 +139,12 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 
 fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*b[at..].first_chunk().expect("in bounds"))
+}
+
+fn put_u32s(out: &mut [u8], at: usize, values: &[u32]) {
+    for (dst, v) in out[at..].as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
 }
 
 /// The gaps of a header with this version's magic.
@@ -122,7 +164,7 @@ fn gaps_at(b: &[u8]) -> Result<Gaps, Error> {
         || !tail_zero
     {
         return Err(corrupt(format!(
-            "v7 sampling fields {:?} with max gap {max}",
+            "v8 sampling fields {:?} with max gap {max}",
             [0, 1, 2, 3, 4].map(field)
         )));
     }
@@ -136,8 +178,8 @@ impl Header {
         sampling: Gaps,
         alphabet: [u64; 4],
         c: [u32; 257],
-        num_docs: usize,
-        num_samples: usize,
+        (num_docs, num_samples): (usize, usize),
+        levels: &Levels,
     ) -> Self {
         let mut code_of = [None; 256];
         let mut sigma = 0;
@@ -147,13 +189,16 @@ impl Header {
                 sigma += 1;
             }
         }
-        let bits = bits_for(sigma);
-        let super_stride = (4 * sigma.max(1)).next_multiple_of(64);
-        let counts_bytes = (2 * sigma.max(1)).next_multiple_of(64);
-        let block_stride = counts_bytes + BLOCK / 8 * bits;
-        let blocks_at = (HEADER_BYTES + (n / SUPER + 1) * super_stride).next_multiple_of(PAGE);
-        let marks_at = blocks_at + (n / BLOCK + 1) * block_stride;
+        let depth = depth_for(sigma, levels.d);
+        let (wt, marks_at) =
+            Shape::new(n, depth, levels.d, levels.lb, &levels.payload, HEADER_BYTES);
+        let wt = Shape {
+            starts: levels.starts,
+            bottom: levels.bottom,
+            ..wt
+        };
         let samples_at = marks_at + section_bytes(n + 1, num_samples);
+        let sample_bits = bits_for(num_docs).max(1) as u32;
         Self {
             n,
             sentinel_row,
@@ -161,18 +206,22 @@ impl Header {
             alphabet,
             code_of,
             sigma,
-            bits,
             c,
-            super_stride,
-            counts_bytes,
-            block_stride,
-            blocks_at,
+            payload: levels.payload,
+            wt,
             marks_at,
             samples_at,
+            sample_bits,
             num_docs,
             num_samples,
-            blob_len: (samples_at + num_samples * 4).next_multiple_of(PAGE),
+            blob_len: (samples_at + 8 * (num_samples * sample_bits as usize).div_ceil(64))
+                .next_multiple_of(PAGE),
         }
+    }
+
+    /// The BWT's wavelet levels in `bytes`.
+    pub fn bwt<'a>(&'a self, bytes: &'a [u8]) -> Wt<'a> {
+        Wt::new(bytes, &self.wt)
     }
 
     /// Most LF steps from a row to a marked one.
@@ -201,25 +250,22 @@ impl Header {
 
     /// Sample `k`, clamped to the last; `num_samples` must be positive.
     pub fn sample(&self, bytes: &[u8], k: usize) -> usize {
-        u32_at(bytes, self.samples_at + 4 * k.min(self.num_samples - 1)) as usize
+        let k = k.min(self.num_samples - 1);
+        let w = self.sample_bits;
+        bits_at(bytes, 8 * self.samples_at + k * w as usize, w) as usize
     }
 
     pub fn write(&self, out: &mut [u8]) {
         out[..8].copy_from_slice(&MAGIC);
         let Gaps { min, max, ws } = self.sampling;
-        let fields = [SCHEME, min, max, ws, self.sampling.walk_bound()];
-        for (dst, v) in out[SCHEME_AT..]
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(fields)
-        {
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
+        put_u32s(
+            out,
+            SCHEME_AT,
+            &[SCHEME, min, max, ws, self.sampling.walk_bound()],
+        );
         out[8..16].copy_from_slice(&(self.n as u64).to_le_bytes());
         out[16..24].copy_from_slice(&(self.sentinel_row as u64).to_le_bytes());
-        out[24..28].copy_from_slice(&self.sampling.max.to_le_bytes());
-        out[28..32].copy_from_slice(&(self.sigma as u32).to_le_bytes());
+        put_u32s(out, 24, &[self.sampling.max, self.sigma as u32]);
         for (dst, w) in out[32..64]
             .as_chunks_mut::<8>()
             .0
@@ -228,12 +274,17 @@ impl Header {
         {
             dst.copy_from_slice(&w.to_le_bytes());
         }
-        out[BLOCK_AT..BLOCK_AT + 4].copy_from_slice(&(BLOCK as u32).to_le_bytes());
-        for (dst, v) in out[C_AT..].as_chunks_mut::<4>().0.iter_mut().zip(&self.c) {
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
-        out[DOCS_AT..DOCS_AT + 4].copy_from_slice(&(self.num_docs as u32).to_le_bytes());
-        out[DOCS_AT + 4..DOCS_AT + 8].copy_from_slice(&(self.num_samples as u32).to_le_bytes());
+        put_u32s(out, BLOCK_AT, &[1 << self.wt.lb]);
+        put_u32s(out, C_AT, &self.c);
+        put_u32s(out, BOTTOM_AT, &self.wt.bottom);
+        put_u32s(
+            out,
+            DOCS_AT,
+            &[self.num_docs as u32, self.num_samples as u32],
+        );
+        put_u32s(out, STARTS_AT, &self.wt.starts);
+        put_u32s(out, PAYLOAD_AT, &self.payload);
+        put_u32s(out, DIGIT_AT, &[self.wt.d]);
     }
 
     pub fn parse(b: &[u8]) -> Result<Self, Error> {
@@ -249,12 +300,17 @@ impl Header {
         if b.len() < HEADER_BYTES {
             return Err(corrupt("truncated".into()));
         }
-        let block = u32_at(b, BLOCK_AT) as usize;
-        if block != BLOCK {
+        let block = u32_at(b, BLOCK_AT);
+        if !block.is_power_of_two() || !(256..=4096).contains(&block) {
             return Err(corrupt(format!(
-                "{block} positions per block, want {BLOCK}"
+                "{block} digits per block, want a power of two in 256..=4096"
             )));
         }
+        let d = u32_at(b, DIGIT_AT);
+        if ![1, 2, 4].contains(&d) {
+            return Err(corrupt(format!("{d} bits per digit, want 1, 2 or 4")));
+        }
+        let lb = block.ilog2();
         let n = u64_at(b, 8);
         if n > MAX_TEXT_BYTES {
             return Err(corrupt(format!("text length {n} over the bound")));
@@ -274,16 +330,53 @@ impl Header {
                 "{num_docs} docs and {num_samples} samples over {n} bytes"
             )));
         }
+        let sigma = u32_at(b, 28) as usize;
+        let depth = depth_for(sigma.min(256), d);
+        let k = 1usize << d;
+        let levels = Levels {
+            lb,
+            d,
+            starts: std::array::from_fn(|x| u32_at(b, STARTS_AT + 4 * x)),
+            payload: std::array::from_fn(|l| u32_at(b, PAYLOAD_AT + 4 * l)),
+            bottom: std::array::from_fn(|k| u32_at(b, BOTTOM_AT + 4 * k)),
+        };
+        let max_payload = digits::max_payload(n, d, lb);
+        for l in 0..MAX_DEPTH {
+            let payload = levels.payload[l] as usize;
+            let starts = levels.starts.get(l * k..(l + 1) * k).unwrap_or(&[]);
+            let fits = if l < depth {
+                (8..=max_payload).contains(&payload)
+                    && starts[0] == 0
+                    && starts.is_sorted()
+                    && starts[k - 1] as usize <= n
+            } else {
+                payload == 0 && starts.iter().all(|&s| s == 0)
+            };
+            if !fits {
+                return Err(corrupt(format!(
+                    "level {l} of {depth}: digit starts {starts:?}, {payload} payload bytes"
+                )));
+            }
+        }
+        if levels.bottom.iter().enumerate().any(
+            |(k, &at)| {
+                if k < sigma { at as usize > n } else { at != 0 }
+            },
+        ) || levels.starts[depth * k..].iter().any(|&s| s != 0)
+            || b[DOCS_AT + 8..STARTS_AT].iter().any(|&x| x != 0)
+            || b[LEVELS_RESERVED..HEADER_BYTES].iter().any(|&x| x != 0)
+        {
+            return Err(corrupt("code starts or reserved bytes".into()));
+        }
         let h = Self::new(
             n,
             sentinel_row as usize,
             sampling,
             alphabet,
             c,
-            num_docs,
-            num_samples,
+            (num_docs, num_samples),
+            &levels,
         );
-        let sigma = u32_at(b, 28) as usize;
         if sigma != h.sigma || (sigma == 0) != (n == 0) {
             return Err(corrupt(format!(
                 "sigma {sigma}, alphabet of {} symbols, over {n} bytes",
@@ -314,7 +407,20 @@ impl Header {
                 "{num_docs} docs but not as many DOC_END bytes"
             )));
         }
-        let bwt = Occ::new(b, &h);
+        let bwt = h.bwt(b);
+        for l in 0..depth {
+            for x in 0..k {
+                let start = h.wt.starts[l * k + x] as usize;
+                let end = h.wt.starts.get(l * k + x + 1).filter(|_| x + 1 < k);
+                let want = end.map_or(n, |&e| e as usize) - start;
+                let got = bwt.level_rank(l, x, n);
+                if got != want {
+                    return Err(corrupt(format!(
+                        "level {l}: {got} digits {x}, the starts say {want}"
+                    )));
+                }
+            }
+        }
         for code in 0..sigma {
             let (got, want) = (
                 bwt.rank(code as u8, n),

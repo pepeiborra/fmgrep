@@ -185,12 +185,11 @@ impl View<'_> {
             if row == self.header.sentinel_row {
                 return None;
             }
-            let at = self.bwt_index(row);
-            if bwt.access(at) != want {
+            let (code, rank) = bwt.access_rank(self.bwt_index(row));
+            if code != want {
                 return None;
             }
-            row =
-                (self.header.c[usize::from(want)] as usize + bwt.rank(want, at)).min(self.header.n);
+            row = (self.header.c[usize::from(want)] as usize + rank).min(self.header.n);
         }
         Some(row)
     }

@@ -1,12 +1,16 @@
 use libsais::BwtConstruction;
 use libsais::bwt::AuxIndicesSamplingRate;
 
-use crate::layout::{Gaps, HEADER_BYTES, Header};
-use crate::occ::{SUPER, write_occ};
-use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks};
+use rayon::slice::ParallelSliceMut;
+
+use crate::layout::{Config, Gaps, HEADER_BYTES, Header, Levels};
+use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks, wt};
 
 /// Text positions per aux row: a sample costs fewer LF steps to place.
 const AUX_RATE: usize = 4;
+
+/// Bytes per parallel unit of work.
+const SUPER: usize = 65536;
 
 /// `f` of every item, one job per item on the current rayon pool; a lone
 /// item runs inline. `f` runs no parallel work, so no thread ever waits
@@ -32,11 +36,81 @@ pub fn check_len(len: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// What the encoder needs of a text besides its BWT.
+#[derive(Clone, Copy, Debug)]
+pub struct Text {
+    /// The sentinel's row among the `n + 1` rows.
+    pub sentinel_row: usize,
+    /// The bytes the text uses; codes are their ranks.
+    pub alphabet: [u64; 4],
+    /// First row per code, `c[sigma] = n + 1`.
+    pub c: [u32; 257],
+    pub num_docs: usize,
+}
+
+/// The blob of `bwt` (the sentinel-free BWT over codes, all below the
+/// alphabet's size) with its wavelet levels written, sized for
+/// `num_samples` samples; [`encode_samples`] completes it. The levels are
+/// encoded on the current rayon pool with one scratch copy of the BWT (two
+/// past four levels).
+pub fn encode_bwt(
+    bwt: &[u8],
+    text: &Text,
+    num_samples: usize,
+    config: Config,
+) -> (Vec<u8>, Header) {
+    let Config { gaps, d, lb } = config;
+    let n = bwt.len();
+    let sigma = text.alphabet.iter().map(|w| w.count_ones() as usize).sum();
+    let (levels, digit_starts, bottom) = wt::encode(bwt, sigma, d, lb);
+    let header = Header::new(
+        n,
+        text.sentinel_row,
+        gaps,
+        text.alphabet,
+        text.c,
+        (text.num_docs, num_samples),
+        &Levels {
+            lb,
+            d,
+            starts: digit_starts,
+            payload: wt::payloads(&levels, n, d, lb),
+            bottom,
+        },
+    );
+    let mut out = vec![0u8; header.blob_len];
+    wt::write(&levels, &header.wt, &mut out);
+    (out, header)
+}
+
+/// Completes a blob [`encode_bwt`] began: its marks, its doc ids and its
+/// header. `samples` holds `row << 32 | doc` per sampled row, ascending, as
+/// many as `encode_bwt` was told.
+pub fn encode_samples(out: &mut [u8], header: &Header, samples: &[u64]) {
+    debug_assert_eq!(samples.len(), header.num_samples);
+    let rows = header.n + 1;
+    let mut bits = vec![0u64; rows.div_ceil(64)];
+    for &x in samples {
+        let row = (x >> 32) as usize;
+        bits[row / 64] |= 1 << (row % 64);
+    }
+    let marked = marks::write(&mut out[header.marks_at..header.samples_at], rows, &bits);
+    debug_assert_eq!(marked, header.num_samples);
+    marks::pack(
+        &mut out[header.samples_at..],
+        samples.iter().map(|&x| u64::from(x as u32)),
+        header.sample_bits,
+    );
+    header.write(&mut out[..HEADER_BYTES]);
+}
+
 /// The blob of `text`: libsais runs on one thread, the other phases in
 /// `SUPER`-byte units on the current rayon pool. Peak live heap: the text
 /// (replaced by the BWT), libsais's `i32` temporary array, the aux rows and
-/// the sampled positions. `gaps` passes [`Gaps::check`].
-pub fn build(mut text: Vec<u8>, gaps: Gaps) -> Result<Vec<u8>, Error> {
+/// the sampled positions; the wavelet levels take a scratch copy of the BWT
+/// once libsais is done. `gaps` passes [`Gaps::check`].
+pub fn build(mut text: Vec<u8>, config: Config) -> Result<Vec<u8>, Error> {
+    let gaps = config.gaps;
     check_len(text.len())?;
     if text.last().is_some_and(|&b| b != DOC_END) {
         return Err(Error::Unterminated);
@@ -79,19 +153,13 @@ pub fn build(mut text: Vec<u8>, gaps: Gaps) -> Result<Vec<u8>, Error> {
         bwt_in_place(&mut text, AUX_RATE)?
     };
     let sentinel_row = aux.first().map_or(0, |&row| row as usize);
-
-    let num_samples = positions.len();
-    let header = Header::new(
-        n,
+    let meta = Text {
         sentinel_row,
-        gaps,
         alphabet,
         c,
-        starts.len(),
-        num_samples,
-    );
-    let mut out = vec![0u8; header.blob_len];
-    write_occ(&text, &header, &mut out);
+        num_docs: starts.len(),
+    };
+    let (mut out, header) = encode_bwt(&text, &meta, positions.len(), config);
     drop(text);
 
     let view = View {
@@ -128,25 +196,9 @@ pub fn build(mut text: Vec<u8>, gaps: Gaps) -> Result<Vec<u8>, Error> {
     let mut found = units.concat();
     drop(aux);
     drop(positions);
-    found.sort_unstable();
-    debug_assert_eq!(found.len(), num_samples);
-
-    let mut bits = vec![0u64; (n + 1).div_ceil(64)];
-    for &x in &found {
-        let row = (x >> 32) as usize;
-        bits[row / 64] |= 1 << (row % 64);
-    }
-    let marked = marks::write(&mut out[header.marks_at..header.samples_at], n + 1, &bits);
-    debug_assert_eq!(marked, num_samples);
-    for (dst, x) in out[header.samples_at..]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(&found)
-    {
-        dst.copy_from_slice(&(*x as u32).to_le_bytes());
-    }
-    header.write(&mut out[..HEADER_BYTES]);
+    found.par_sort_unstable();
+    debug_assert_eq!(found.len(), header.num_samples);
+    encode_samples(&mut out, &header, &found);
     Ok(out)
 }
 
@@ -211,7 +263,7 @@ fn doc_samples(doc: &[u8], at: u32, gaps: Gaps, found: &mut Vec<u32>) {
 
 /// Replaces the non-empty `text` by its sentinel-free BWT; returns the rows
 /// of every `r`-th text position.
-fn bwt_in_place(text: &mut [u8], r: usize) -> Result<Vec<i32>, Error> {
+pub fn bwt_in_place(text: &mut [u8], r: usize) -> Result<Vec<i32>, Error> {
     let n = text.len();
     let rate = AuxIndicesSamplingRate::from(r as i32);
     let (_, aux, _) = BwtConstruction::replace_text(text)
