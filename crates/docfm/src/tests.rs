@@ -589,9 +589,9 @@ fn foreign_or_truncated_blob_is_refused() {
         refuse(&patched(2336, &d.to_le_bytes()), "bits per digit");
     }
     refuse(&patched(2340, &[1]), "reserved");
-    let depth = h.wavelet.depth;
+    let depth = h.wavelet.depth();
     // Level 0's start of digit 1 moves.
-    let start = h.wavelet.starts[1];
+    let start = h.wavelet.starts()[1];
     refuse(&patched(2176 + 4, &(start + 1).to_le_bytes()), "digits");
     refuse(&patched(2176, &1u32.to_le_bytes()), "level 0");
     refuse(
@@ -605,10 +605,10 @@ fn foreign_or_truncated_blob_is_refused() {
     refuse(&patched(2304, &(1u32 << 30).to_le_bytes()), "level 0");
     // Level 0's first super counts one more digit 1 before it.
     refuse(
-        &patched(h.wavelet.levels[0].supers + 4, &1u32.to_le_bytes()),
+        &patched(h.wavelet.level_at(0) + 4, &1u32.to_le_bytes()),
         "digits",
     );
-    let bottom = |k: usize| h.wavelet.bottom[k];
+    let bottom = |k: usize| h.wavelet.bottom()[k];
     refuse(
         &patched(1124 + 4, &(bottom(1) + 1).to_le_bytes()),
         "code 1: ",
@@ -638,9 +638,11 @@ fn foreign_or_truncated_blob_is_refused() {
         b
     };
     let sentinel_rank = row_marks.get_rank(h.sentinel_row).1;
-    let sample_bit = 8 * h.samples_at + sentinel_rank * h.sample_bits as usize;
+    let sample_bit = 8 * h.samples_at + sentinel_rank * h.ids.width() as usize;
     refuse(&flipped(sample_bit), "not in doc 0");
-    let (low, highs_at) = marks::layout_of(h.n + 1, h.num_samples);
+    // The marks' format: the low bits per mark, then the high bits, in words.
+    let low = ((h.n + 1) / h.num_samples).max(1).ilog2().min(32);
+    let highs_at = 8 * (h.num_samples * low as usize).div_ceil(64);
     // One more high bit set: a mark the header does not count.
     let unset = (0..)
         .map(|p| 8 * (h.marks_at + highs_at) + p)
@@ -696,9 +698,8 @@ fn blob_is_page_aligned() {
         let index = Built::build(text).unwrap();
         let h = &index.header;
         assert_eq!(h.blob_len % layout::PAGE, 0);
-        let lines: Vec<usize> = h.wavelet.levels[..h.wavelet.depth]
-            .iter()
-            .map(|l| l.supers)
+        let lines: Vec<usize> = (0..h.wavelet.depth())
+            .map(|l| h.wavelet.level_at(l))
             .chain([layout::HEADER_BYTES, h.marks_at, h.samples_at])
             .collect();
         assert!(lines.iter().all(|at| at % 64 == 0), "{lines:?}");
@@ -714,12 +715,10 @@ fn rank_overhead_is_bounded() {
     let n = text.len();
     let index = Built::build(text).unwrap();
     let h = &index.header;
-    let (d, lb) = (h.wavelet.d, h.wavelet.lb);
-    let (s, heads) = digits::index_bytes(n, d, lb);
-    let level = s + heads + digits::max_payload(n, d, lb) + 64;
+    let level = wavelet::max_level_bytes(n, h.wavelet.params()) + 64;
     let levels = h.marks_at - layout::HEADER_BYTES;
     assert!(
-        levels <= h.wavelet.depth * level,
+        levels <= h.wavelet.depth() * level,
         "{levels} vs {level} per level"
     );
     let n = n as f64;
@@ -729,93 +728,6 @@ fn rank_overhead_is_bounded() {
     // 64 zeros.
     let want = m * (((n + 1.0) / m).log2().floor() + 4.0) + 1024.0;
     assert!(marks_bits <= want, "{marks_bits} vs {want}");
-}
-
-/// Codes below `sigma`: runs, then uniform noise.
-fn occ_codes(n: usize, sigma: usize, rng: &mut Rng) -> Vec<u8> {
-    (0..n)
-        .map(|i| {
-            if i % 3000 < 1500 {
-                (i / 3000 % sigma) as u8
-            } else {
-                rng.below(sigma as u64) as u8
-            }
-        })
-        .collect()
-}
-
-#[test]
-fn select_in_word_matches_naive() {
-    let mut rng = Rng(41);
-    let words = [
-        0u64,
-        1,
-        1 << 63,
-        u64::MAX,
-        0x8000_0001,
-        0xff00,
-        0x0100_0000_0000_0080,
-    ];
-    for w in words
-        .into_iter()
-        .chain((0..2000).map(|_| rng.below(u64::MAX) ^ rng.below(u64::MAX) << 32))
-    {
-        let ones: Vec<usize> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
-        for (r, &want) in ones.iter().enumerate() {
-            assert_eq!(marks::select_in_word(w, r), want, "{w:#x} {r}");
-        }
-    }
-}
-
-#[test]
-fn sparse_marks_match_naive() {
-    let mut rng = Rng(3);
-    for len in [0usize, 1, 4095, 4096, 4097, 70_001] {
-        for fill in 0..7 {
-            let bits: Vec<bool> = (0..len)
-                .map(|i| match fill {
-                    0 => rng.below(2) == 1,
-                    1 => true,
-                    2 => false,
-                    3 => i % 32 == 0,
-                    // Sparse: low bits and empty buckets.
-                    4 => rng.below(13) == 0,
-                    5 => rng.below(1000) == 0,
-                    // Clustered: long gaps between dense runs.
-                    _ => i % 20_000 < 300 && rng.below(3) == 0,
-                })
-                .collect();
-            let mut words = vec![0u64; len.div_ceil(64) + 1];
-            for (i, _) in bits.iter().enumerate().filter(|&(_, &b)| b) {
-                words[i / 64] |= 1 << (i % 64);
-            }
-            words[len / 64] |= u64::MAX << (len % 64);
-            let ones = bits.iter().filter(|&&b| b).count();
-            let mut out = vec![0u8; marks::section_bytes(len, ones)];
-            assert_eq!(
-                marks::write(&mut out, len, &words),
-                ones,
-                "bits past len are ignored"
-            );
-            let marks = marks::Marks::new(&out, len, ones);
-            assert_eq!(marks.total(), ones);
-            let mut before = 0;
-            for (i, &bit) in bits.iter().enumerate() {
-                assert_eq!(
-                    marks.get_rank(i),
-                    (bit, before),
-                    "len {len} fill {fill} i {i}"
-                );
-                before += usize::from(bit);
-            }
-            assert_eq!(marks.get_rank(len), (false, ones), "len {len} fill {fill}");
-            assert_eq!(
-                marks.get_rank(len + 5000),
-                (false, ones),
-                "clamped past the end"
-            );
-        }
-    }
 }
 
 #[test]

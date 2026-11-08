@@ -20,23 +20,26 @@
 //! Reads clamp to the bytes given: tampered heads miscount, never read out
 //! of bounds or decode past a block.
 
-use crate::build::each;
+use crate::par::each;
+use crate::word::{BitWriter, equal, gamma_decode, u16_at, u32_at, u64_at};
 
 /// Bits per super, over the digit width.
-pub const SUPER_BITS: usize = 65536;
+const SUPER_BITS: usize = 65536;
 
 const ONE: u16 = 0;
 const PLAIN: u16 = 2;
 const RUNS: u16 = 3;
 
 /// Digits per super.
-pub fn super_len(d: u32) -> usize {
+#[inline]
+pub(super) fn super_len(d: u32) -> usize {
     SUPER_BITS >> d.trailing_zeros()
 }
 
 /// Bytes of the supers and of the heads of `len` digits of `d` bits in
 /// blocks of `1 << lb`.
-pub fn index_bytes(len: usize, d: u32, lb: u32) -> (usize, usize) {
+#[inline]
+pub(super) fn index_bytes(len: usize, d: u32, lb: u32) -> (usize, usize) {
     let k = 1usize << d;
     (
         4 * k * (len / super_len(d) + 1),
@@ -46,81 +49,42 @@ pub fn index_bytes(len: usize, d: u32, lb: u32) -> (usize, usize) {
 
 /// Most payload bytes of `len` digits of `d` bits in blocks of `1 << lb`,
 /// padding included.
-pub fn max_payload(len: usize, d: u32, lb: u32) -> usize {
+#[inline]
+pub(super) fn max_payload(len: usize, d: u32, lb: u32) -> usize {
     len.div_ceil(1 << lb) * ((d as usize) << lb) / 8 + 8
 }
 
 /// Where one sequence's sections start in a blob.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Digits {
-    pub supers: usize,
-    pub heads: usize,
-    pub payload: usize,
-}
-
-#[inline]
-fn u16_at(b: &[u8], at: usize) -> usize {
-    match b.get(at..at.wrapping_add(2)) {
-        Some(w) => usize::from(u16::from_le_bytes(w.try_into().expect("2 bytes"))),
-        None => 0,
-    }
-}
-
-#[inline]
-fn u32_at(b: &[u8], at: usize) -> usize {
-    match b.get(at..at.wrapping_add(4)) {
-        Some(w) => u32::from_le_bytes(w.try_into().expect("4 bytes")) as usize,
-        None => 0,
-    }
-}
-
-/// The 64 bits from byte `at`, zero past the end.
-#[inline]
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    match b.get(at..at.wrapping_add(8)) {
-        Some(w) => u64::from_le_bytes(w.try_into().expect("8 bytes")),
-        None => {
-            let mut w = [0u8; 8];
-            let tail = b.get(at..).unwrap_or(&[]);
-            w[..tail.len()].copy_from_slice(tail);
-            u64::from_le_bytes(w)
-        }
-    }
-}
-
-/// One bit at the bottom of each `D`-bit slot of `w` that holds `x`.
-#[inline(always)]
-fn equal<const D: u32>(w: u64, x: usize) -> u64 {
-    match D {
-        1 => {
-            if x & 1 == 1 {
-                w
-            } else {
-                !w
-            }
-        }
-        2 => {
-            let m = !(w ^ ((x as u64 & 3) * 0x5555_5555_5555_5555));
-            m & m >> 1 & 0x5555_5555_5555_5555
-        }
-        _ => {
-            let m = !(w ^ ((x as u64 & 15) * 0x1111_1111_1111_1111));
-            let m = m & m >> 1;
-            m & m >> 2 & 0x1111_1111_1111_1111
-        }
-    }
+pub(super) struct Digits {
+    supers: usize,
+    heads: usize,
+    payload: usize,
 }
 
 impl Digits {
     /// The sections of `len` digits of `d` bits in blocks of `1 << lb`
     /// from `at`.
-    pub fn at(at: usize, len: usize, d: u32, lb: u32) -> Self {
+    #[inline]
+    pub(super) fn at(at: usize, len: usize, d: u32, lb: u32) -> Self {
         let (s, h) = index_bytes(len, d, lb);
         Self {
             supers: at,
             heads: at + s,
             payload: at + s + h,
         }
+    }
+
+    /// Where the sequence starts.
+    #[inline]
+    pub(super) fn start(&self) -> usize {
+        self.supers
+    }
+
+    /// Where its payloads start.
+    #[inline]
+    pub(super) fn payload_at(&self) -> usize {
+        self.payload
     }
 
     /// Occurrences of digit `x` before block `i >> lb`, given its head.
@@ -152,7 +116,7 @@ impl Digits {
 
     /// Occurrences of digit `x` in `0..i`.
     #[inline]
-    pub fn rank<const D: u32>(&self, bytes: &[u8], lb: u32, i: usize, x: usize) -> usize {
+    pub(super) fn rank<const D: u32>(&self, bytes: &[u8], lb: u32, i: usize, x: usize) -> usize {
         let off = i & ((1 << lb) - 1);
         let base = self.before::<D>(bytes, lb, i, x);
         if off == 0 {
@@ -174,7 +138,12 @@ impl Digits {
 
     /// The digit at `i` and its occurrences in `0..i`.
     #[inline]
-    pub fn access_rank<const D: u32>(&self, bytes: &[u8], lb: u32, i: usize) -> (usize, usize) {
+    pub(super) fn access_rank<const D: u32>(
+        &self,
+        bytes: &[u8],
+        lb: u32,
+        i: usize,
+    ) -> (usize, usize) {
         let off = i & ((1 << lb) - 1);
         let (word, at) = self.head::<D>(bytes, lb, i);
         let (x, here) = match word & 3 {
@@ -244,9 +213,7 @@ fn runs<const D: u32>(
             digit ^= 1;
         }
         first = false;
-        let z = window.trailing_zeros().min(15);
-        let len = (1usize << z) | ((window >> (z + 1)) as usize & ((1 << z) - 1));
-        let used = 2 * z + 1;
+        let (len, used) = gamma_decode(window);
         window >>= used;
         avail -= used;
         pos += used as usize;
@@ -262,43 +229,6 @@ fn runs<const D: u32>(
         }
         seen[digit] += len;
         start = end;
-    }
-}
-
-/// Appends bit fields to a byte vector, least significant bit first.
-struct BitWriter<'a> {
-    out: &'a mut Vec<u8>,
-    acc: u64,
-    held: u32,
-}
-
-impl BitWriter<'_> {
-    /// Appends the low `n <= 32` bits of `v`.
-    #[inline]
-    fn put(&mut self, v: u64, n: u32) {
-        self.acc |= v << self.held;
-        self.held += n;
-        while self.held >= 8 {
-            self.out.push(self.acc as u8);
-            self.acc >>= 8;
-            self.held -= 8;
-        }
-    }
-
-    /// Appends the Elias-gamma code of `x >= 1`: `z` zeros, a one, the low
-    /// `z` bits of `x`.
-    #[inline]
-    fn gamma(&mut self, x: usize) {
-        let z = x.ilog2();
-        let code = ((x as u64 & ((1 << z) - 1)) << 1 | 1) << z;
-        self.put(code, 2 * z + 1);
-    }
-
-    /// Flushes the last partial byte.
-    fn finish(self) {
-        if self.held > 0 {
-            self.out.push(self.acc as u8);
-        }
     }
 }
 
@@ -335,11 +265,7 @@ fn encode_block(
     let plain = (block.len() * d as usize).div_ceil(8);
     let at = payload.len();
     let kind = if (digit_bits + gamma).div_ceil(8) < plain {
-        let mut bits = BitWriter {
-            out: payload,
-            acc: 0,
-            held: 0,
-        };
+        let mut bits = BitWriter::new(payload);
         for (j, &(x, r)) in runs.iter().enumerate() {
             if j == 0 || d > 1 {
                 bits.put(u64::from(x), d);
@@ -365,7 +291,7 @@ fn encode_block(
 /// The supers, heads and payload of the `d`-bit digits at bit `shift` of
 /// each of `seq` in blocks of `1 << lb`, one job per super on the current
 /// rayon pool; the payload ends in 8 zero bytes.
-pub fn encode(seq: &[u8], d: u32, shift: u32, lb: u32) -> Vec<u8> {
+pub(super) fn encode(seq: &[u8], d: u32, shift: u32, lb: u32) -> Vec<u8> {
     let (len, k, block) = (seq.len(), 1usize << d, 1usize << lb);
     let span = super_len(d);
     // Per super: its heads, its payload and its count per digit.
@@ -428,3 +354,6 @@ pub fn encode(seq: &[u8], d: u32, shift: u32, lb: u32) -> Vec<u8> {
     out.extend_from_slice(&[0; 8]);
     out
 }
+
+#[cfg(test)]
+mod tests;

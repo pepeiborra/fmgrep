@@ -1,0 +1,15 @@
+[package]
+name = "docfm-bits"
+description = "Succinct structures over plain bytes: wavelet levels of compressed digits, Elias-Fano marks, packed integers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rayon = "1"
+
+[dev-dependencies]
+dicetest = "0.3"
