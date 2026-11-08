@@ -1,7 +1,7 @@
 use dicetest::prelude::*;
 
 use super::*;
-use crate::test_util::{Rng, edges, in_pool};
+use crate::test_util::{edges, in_pool};
 
 fn params(d: u32, lb: u32) -> Params {
     Params::new(d, lb).unwrap()
@@ -25,27 +25,27 @@ fn tree_of(codes: &[u8], sigma: usize, params: Params) -> (Vec<u8>, Shape) {
 }
 
 /// Codes below `sigma`: runs, then uniform noise.
-fn occ_codes(n: usize, sigma: usize, rng: &mut Rng) -> Vec<u8> {
+fn occ_codes(n: usize, sigma: usize, fate: &mut Fate) -> Vec<u8> {
     (0..n)
         .map(|i| {
             if i % 3000 < 1500 {
                 (i / 3000 % sigma) as u8
             } else {
-                rng.below(sigma as u64) as u8
+                fate.roll(dice::uni_usize(0..sigma)) as u8
             }
         })
         .collect()
 }
 
 /// Codes below `sigma`: long runs, then noise.
-fn run_codes(n: usize, sigma: usize, rng: &mut Rng) -> Vec<u8> {
+fn run_codes(n: usize, sigma: usize, fate: &mut Fate) -> Vec<u8> {
     let mut codes = Vec::with_capacity(n);
     while codes.len() < n {
-        let code = rng.below(sigma as u64) as u8;
-        let run = if rng.below(2) == 0 {
+        let code = fate.roll(dice::uni_usize(0..sigma)) as u8;
+        let run = if fate.roll(dice::bool()) {
             1
         } else {
-            rng.below(500) as usize
+            fate.roll(dice::uni_usize(0..500))
         };
         codes.extend(std::iter::repeat_n(code, run.min(n - codes.len())));
     }
@@ -81,29 +81,38 @@ fn check_tree(tree: &WaveletMatrix<'_>, codes: &[u8], sigma: usize, positions: &
     }
 }
 
+/// Every length and alphabet below at once: the sizes around a level's
+/// blocks and supers, up to several supers, that small dice do not reach.
 #[test]
 fn wavelet_rank_matches_naive() {
-    let mut rng = Rng(23);
-    for n in [0, 1, 63, 64, 1023, 1024, 1025, 65536, 65537, 200_000] {
-        for sigma in [1usize, 2, 3, 5, 17, 100, 200, 256] {
-            if n == 0 && sigma > 1 {
-                continue;
-            }
-            for codes in [occ_codes(n, sigma, &mut rng), run_codes(n, sigma, &mut rng)] {
-                for (d, lb) in [(1, 8), (1, 10), (2, 9), (2, 12), (4, 8), (4, 10)] {
-                    let p = params(d, lb);
-                    let (bytes, shape) = in_pool(3, || tree_of(&codes, sigma, p));
-                    assert_eq!(shape.depth(), depth_for(sigma, p));
-                    let tree = WaveletMatrix::new(&bytes, &shape);
-                    let positions: Vec<usize> = edges(n.max(1), digits::super_len(d), lb, &mut rng)
-                        .into_iter()
-                        .chain([n + 1, usize::MAX])
-                        .collect();
-                    check_tree(&tree, &codes, sigma, &positions);
+    Dicetest::repeatedly().passes(1).run(|mut fate| {
+        for n in [0, 1, 63, 64, 1023, 1024, 1025, 65536, 65537, 200_000] {
+            for sigma in [1usize, 2, 3, 5, 17, 100, 200, 256] {
+                if n == 0 && sigma > 1 {
+                    continue;
+                }
+                let seqs = [
+                    occ_codes(n, sigma, &mut fate),
+                    run_codes(n, sigma, &mut fate),
+                ];
+                for codes in &seqs {
+                    for (d, lb) in [(1, 8), (1, 10), (2, 9), (2, 12), (4, 8), (4, 10)] {
+                        hint!("n {n} sigma {sigma} d {d} lb {lb}");
+                        let p = params(d, lb);
+                        let (bytes, shape) = in_pool(3, || tree_of(codes, sigma, p));
+                        assert_eq!(shape.depth(), depth_for(sigma, p));
+                        let tree = WaveletMatrix::new(&bytes, &shape);
+                        let positions: Vec<usize> =
+                            edges(n.max(1), digits::super_len(d), lb, &mut fate)
+                                .into_iter()
+                                .chain([n + 1, usize::MAX])
+                                .collect();
+                        check_tree(&tree, codes, sigma, &positions);
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 /// Runs and noise over `sigma` codes, every code at least once when it fits.
@@ -130,8 +139,7 @@ fn wavelet_matches_naive(sigma: usize) {
         let codes = rolled_codes(&mut fate, n, sigma);
         let (bytes, shape) = tree_of(&codes, sigma, params(d, lb));
         let tree = WaveletMatrix::new(&bytes, &shape);
-        let mut rng = Rng(fate.roll(dice::u64(1..)));
-        let positions: Vec<usize> = edges(n, digits::super_len(d), lb, &mut rng)
+        let positions: Vec<usize> = edges(n, digits::super_len(d), lb, &mut fate)
             .into_iter()
             .chain([n + 1, usize::MAX])
             .collect();
