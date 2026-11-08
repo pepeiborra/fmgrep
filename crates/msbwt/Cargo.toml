@@ -1,0 +1,20 @@
+[package]
+name = "msbwt"
+description = "Multi-string BWT of NUL-terminated documents by induced sorting, without a suffix array"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+atomic = { version = "0.6", default-features = false }
+bytemuck = "1"
+rayon = "1"
+rustc-hash = "2"
+safe_arch = "0.7"
+thiserror = "2"
+
+[dev-dependencies]
+dicetest = "0.3"
