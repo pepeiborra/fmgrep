@@ -325,7 +325,8 @@ impl Header {
         let c = std::array::from_fn(|k| u32_at(b, C_AT + 4 * k));
         let num_docs = u32_at(b, DOCS_AT) as usize;
         let num_samples = u32_at(b, DOCS_AT + 4) as usize;
-        if (num_docs == 0) != (n == 0) || num_docs > num_samples || num_samples > n {
+        // At most one sample per row, of which there are n + 1.
+        if (num_docs == 0) != (n == 0) || num_docs > num_samples || num_samples > n + 1 {
             return Err(corrupt(format!(
                 "{num_docs} docs and {num_samples} samples over {n} bytes"
             )));
