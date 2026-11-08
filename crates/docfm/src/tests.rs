@@ -1,4 +1,5 @@
 use super::*;
+use crate::layout::Gaps;
 
 fn naive_positions(text: &[u8], pattern: &[u8]) -> Vec<usize> {
     if pattern.is_empty() || text.len() < pattern.len() {
@@ -28,7 +29,13 @@ fn naive_docs(text: &[u8], pattern: &[u8]) -> Vec<usize> {
 type Built = FmIndex<Vec<u8>>;
 
 fn build_with(text: Vec<u8>, gaps: Gaps) -> Result<Built, Error> {
-    FmIndex::view(build::build(text, gaps)?)
+    FmIndex::view(build::build(
+        text,
+        layout::Config {
+            gaps,
+            ..layout::Config::DEFAULT
+        },
+    )?)
 }
 
 /// `f` inside a rayon pool of `threads` threads.
@@ -493,7 +500,7 @@ fn foreign_or_truncated_blob_is_refused() {
     refuse(&[blob.as_slice(), &[0]].concat(), "trailing");
     refuse(&patched(8, &u64::MAX.to_le_bytes()), "over the bound");
     refuse(&patched(16, &99u64.to_le_bytes()), "sentinel row");
-    refuse(&patched(24, &0u32.to_le_bytes()), "v7 sampling");
+    refuse(&patched(24, &0u32.to_le_bytes()), "v8 sampling");
     refuse(&patched(28, &(h.sigma as u32 + 1).to_le_bytes()), "sigma");
     // One more alphabet symbol than the header's sigma.
     let mut extra = blob.clone();
@@ -504,19 +511,47 @@ fn foreign_or_truncated_blob_is_refused() {
         &patched(96 + 4 * h.sigma, &99u32.to_le_bytes()),
         "not increasing",
     );
+    for block in [0u32, 128, 768, 8192] {
+        refuse(&patched(64, &block.to_le_bytes()), "digits per block");
+    }
+    for d in [0u32, 3, 8] {
+        refuse(&patched(2336, &d.to_le_bytes()), "bits per digit");
+    }
+    refuse(&patched(2340, &[1]), "reserved");
+    let depth = h.wavelet.depth;
+    // Level 0's start of digit 1 moves.
+    let start = h.wavelet.starts[1];
+    refuse(&patched(2176 + 4, &(start + 1).to_le_bytes()), "digits");
+    refuse(&patched(2176, &1u32.to_le_bytes()), "level 0");
     refuse(
-        &patched(64, &(2 * occ::BLOCK as u32).to_le_bytes()),
-        "positions per block",
+        &patched(2176 + 4, &(h.n as u32 + 1).to_le_bytes()),
+        "level 0",
     );
-    // Padding position `n` flips from code 0 to code 1.
-    let mut plane = blob.clone();
-    plane[h.blocks_at + h.counts_bytes + h.n / 8] ^= 1 << (h.n % 8);
-    refuse(&plane, "occurrences");
+    // Starts past the depth's digits.
+    refuse(&patched(2176 + 8 * depth, &1u32.to_le_bytes()), "level");
+    refuse(&patched(2304, &0u32.to_le_bytes()), "level 0");
+    refuse(&patched(2304 + 4 * depth, &8u32.to_le_bytes()), "level");
+    refuse(&patched(2304, &(1u32 << 30).to_le_bytes()), "level 0");
+    // Level 0's first super counts one more digit 1 before it.
     refuse(
-        &patched(layout::HEADER_BYTES + 4, &99u32.to_le_bytes()),
+        &patched(h.wavelet.levels[0].supers + 4, &1u32.to_le_bytes()),
+        "digits",
+    );
+    let bottom = |k: usize| h.wavelet.bottom[k];
+    refuse(
+        &patched(1124 + 4, &(bottom(1) + 1).to_le_bytes()),
         "code 1: ",
     );
-    refuse(&patched(h.blocks_at + 2, &99u16.to_le_bytes()), "code 1: ");
+    refuse(
+        &patched(1124 + 4, &(h.n as u32 + 1).to_le_bytes()),
+        "code starts",
+    );
+    refuse(
+        &patched(1124 + 4 * h.sigma, &1u32.to_le_bytes()),
+        "code starts",
+    );
+    refuse(&patched(2156, &[1]), "reserved");
+    refuse(&patched(2366, &[1]), "reserved");
     let docs = h.num_docs as u32;
     refuse(&patched(2148, &0u32.to_le_bytes()), "docs and");
     refuse(&patched(2148, &(docs + 1).to_le_bytes()), "DOC_END bytes");
@@ -526,22 +561,25 @@ fn foreign_or_truncated_blob_is_refused() {
     );
     refuse(&patched(2152, &(docs - 1).to_le_bytes()), "samples over");
     let row_marks = h.marks(&blob);
-    let sentinel_sample = h.samples_at + 4 * row_marks.get_rank(h.sentinel_row).1;
+    let flipped = |bit: usize| {
+        let mut b = blob.clone();
+        b[bit / 8] ^= 1 << (bit % 8);
+        b
+    };
+    let sentinel_rank = row_marks.get_rank(h.sentinel_row).1;
+    let sample_bit = 8 * h.samples_at + sentinel_rank * h.sample_bits as usize;
+    refuse(&flipped(sample_bit), "not in doc 0");
+    let (low, highs_at) = marks::layout_of(h.n + 1, h.num_samples);
+    // One more high bit set: a mark the header does not count.
+    let unset = (0..)
+        .map(|p| 8 * (h.marks_at + highs_at) + p)
+        .find(|&bit| blob[bit / 8] >> (bit % 8) & 1 == 0)
+        .unwrap();
+    refuse(&flipped(unset), "marked rows");
+    // The sentinel row's mark moves within its bucket.
+    assert!(low > 0);
     refuse(
-        &patched(sentinel_sample, &1u32.to_le_bytes()),
-        "not in doc 0",
-    );
-    let total_at = h.marks_at + 4 * ((h.n + 1) / marks::BUCKET + 1);
-    refuse(
-        &patched(total_at, &(h.num_samples as u32 + 1).to_le_bytes()),
-        "marked rows",
-    );
-    // Move the sentinel row's mark to an unmarked row.
-    let other = (0..=h.n).find(|&r| !row_marks.get_rank(r).0).unwrap();
-    let at =
-        h.marks_at + 4 * ((h.n + 1) / marks::BUCKET + 2) + 2 * row_marks.get_rank(h.sentinel_row).1;
-    refuse(
-        &patched(at, &((other % marks::BUCKET) as u16).to_le_bytes()),
+        &flipped(8 * h.marks_at + sentinel_rank * low as usize),
         "sentinel row is not sampled",
     );
     // A flip that still views may miscount, but only our own locate
@@ -586,18 +624,12 @@ fn blob_is_page_aligned() {
     for text in texts() {
         let index = Built::build(text).unwrap();
         let h = &index.header;
-        assert_eq!(
-            (h.blocks_at % layout::PAGE, h.blob_len % layout::PAGE),
-            (0, 0)
-        );
-        let lines = [
-            layout::HEADER_BYTES,
-            h.super_stride,
-            h.counts_bytes,
-            h.block_stride,
-            h.marks_at,
-            h.samples_at,
-        ];
+        assert_eq!(h.blob_len % layout::PAGE, 0);
+        let lines: Vec<usize> = h.wavelet.levels[..h.wavelet.depth]
+            .iter()
+            .map(|l| l.supers)
+            .chain([layout::HEADER_BYTES, h.marks_at, h.samples_at])
+            .collect();
         assert!(lines.iter().all(|at| at % 64 == 0), "{lines:?}");
         assert_eq!(encode(&index).len(), h.blob_len);
     }
@@ -608,19 +640,24 @@ fn rank_overhead_is_bounded() {
     let mut rng = Rng(5);
     let text: Vec<u8> = (0..100_000).map(|_| rng.below(256) as u8).collect();
     let text = terminated(text);
-    let n = text.len() as f64;
+    let n = text.len();
     let index = Built::build(text).unwrap();
     let h = &index.header;
-    let raw = (h.bits as f64 * n + 16.0 * h.sigma as f64 * n / occ::BLOCK as f64) / 8.0;
-    let supers = 4.0 * h.sigma as f64 * (n / occ::SUPER as f64 + 1.0);
-    let occ = (h.marks_at - h.blocks_at) as f64;
+    let (d, lb) = (h.wavelet.d, h.wavelet.lb);
+    let (s, heads) = digits::index_bytes(n, d, lb);
+    let level = s + heads + digits::max_payload(n, d, lb) + 64;
+    let levels = h.marks_at - layout::HEADER_BYTES;
     assert!(
-        occ <= raw + supers + h.block_stride as f64,
-        "{occ} vs {raw}"
+        levels <= h.wavelet.depth * level,
+        "{levels} vs {level} per level"
     );
-    let marks_len = (h.samples_at - h.marks_at) as f64;
-    let want = 2.0 * h.num_samples as f64 + 4.0 * ((n + 1.0) / marks::BUCKET as f64 + 2.0) + 64.0;
-    assert!(marks_len <= want, "{marks_len} vs {want}");
+    let n = n as f64;
+    let marks_bits = 8.0 * (h.samples_at - h.marks_at) as f64;
+    let m = h.num_samples as f64;
+    // Low bits, a one and at most two zeros per mark, a select sample per
+    // 64 zeros.
+    let want = m * (((n + 1.0) / m).log2().floor() + 4.0) + 1024.0;
+    assert!(marks_bits <= want, "{marks_bits} vs {want}");
 }
 
 /// Codes below `sigma`: runs, then uniform noise.
@@ -637,60 +674,24 @@ fn occ_codes(n: usize, sigma: usize, rng: &mut Rng) -> Vec<u8> {
 }
 
 #[test]
-fn occ_rank_matches_naive_across_block_boundaries() {
-    use occ::{BLOCK, Occ, SUPER};
-    let mut rng = Rng(13);
-    let ns = [
-        0, 1, 63, 64, 1023, 1024, 1025, 2047, 2048, 2049, 65535, 65536, 65537, 200_000,
+fn select_in_word_matches_naive() {
+    let mut rng = Rng(41);
+    let words = [
+        0u64,
+        1,
+        1 << 63,
+        u64::MAX,
+        0x8000_0001,
+        0xff00,
+        0x0100_0000_0000_0080,
     ];
-    for n in ns {
-        for sigma in [1usize, 2, 3, 100, 200, 256] {
-            if n == 0 && sigma > 1 {
-                continue;
-            }
-            let codes = occ_codes(n, sigma, &mut rng);
-            let mut alphabet = [0u64; 4];
-            for b in 0..sigma {
-                alphabet[b / 64] |= 1 << (b % 64);
-            }
-            let h = layout::Header::new(n, 0, Gaps::WORDS, alphabet, [0; 257], 0, 0);
-            let mut blob = vec![0u8; h.blob_len];
-            in_pool(1, || occ::write_occ(&codes, &h, &mut blob));
-            let mut threaded = vec![0u8; h.blob_len];
-            in_pool(3, || occ::write_occ(&codes, &h, &mut threaded));
-            assert!(blob == threaded, "n {n} sigma {sigma}");
-            let bwt = Occ::new(&blob, &h);
-            let mut edges: Vec<usize> = (0..=n / BLOCK + 1)
-                .flat_map(|k| [k * BLOCK, k * BLOCK + BLOCK / 2])
-                .flat_map(|e| [e.saturating_sub(1), e, e + 1])
-                .chain((0..50).map(|_| rng.below(n as u64 + 1) as usize))
-                .chain([n, n + 1, SUPER - 1, SUPER, usize::MAX])
-                .collect();
-            edges.sort_unstable();
-            edges.dedup();
-            let mut before = vec![0usize; sigma];
-            let mut at = 0;
-            for &i in &edges {
-                while at < i.min(n) {
-                    before[usize::from(codes[at])] += 1;
-                    at += 1;
-                }
-                for (code, &want) in before.iter().enumerate() {
-                    assert_eq!(
-                        bwt.rank(code as u8, i),
-                        want,
-                        "n {n} sigma {sigma} code {code} i {i}"
-                    );
-                }
-                if i < n {
-                    let code = codes[i];
-                    assert_eq!(
-                        bwt.access_rank(i),
-                        (code, before[usize::from(code)]),
-                        "n {n} sigma {sigma} i {i}"
-                    );
-                }
-            }
+    for w in words
+        .into_iter()
+        .chain((0..2000).map(|_| rng.below(u64::MAX) ^ rng.below(u64::MAX) << 32))
+    {
+        let ones: Vec<usize> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
+        for (r, &want) in ones.iter().enumerate() {
+            assert_eq!(marks::select_in_word(w, r), want, "{w:#x} {r}");
         }
     }
 }
@@ -699,13 +700,18 @@ fn occ_rank_matches_naive_across_block_boundaries() {
 fn sparse_marks_match_naive() {
     let mut rng = Rng(3);
     for len in [0usize, 1, 4095, 4096, 4097, 70_001] {
-        for fill in 0..4 {
+        for fill in 0..7 {
             let bits: Vec<bool> = (0..len)
                 .map(|i| match fill {
                     0 => rng.below(2) == 1,
                     1 => true,
                     2 => false,
-                    _ => i % 32 == 0,
+                    3 => i % 32 == 0,
+                    // Sparse: low bits and empty buckets.
+                    4 => rng.below(13) == 0,
+                    5 => rng.below(1000) == 0,
+                    // Clustered: long gaps between dense runs.
+                    _ => i % 20_000 < 300 && rng.below(3) == 0,
                 })
                 .collect();
             let mut words = vec![0u64; len.div_ceil(64) + 1];
@@ -888,23 +894,23 @@ fn text_blob_header_is_checked() {
     for (at, value) in [
         (68, 2),
         (72, 0),
-        (72, 17),
-        (80, 15),
-        (84, 62),
+        (72, 9),
+        (80, 7),
+        (84, 30),
         (88, 1),
         (92, 1),
-        (24, 8),
+        (24, 16),
     ] {
-        refuse(&patched(&blob, at, &u32s(value)), "v7 sampling");
+        refuse(&patched(&blob, at, &u32s(value)), "v8 sampling");
     }
-    refuse(&patched(&blob, 6, &[6]), "magic/version");
+    refuse(&patched(&blob, 6, &[7]), "magic/version");
 }
 
 #[test]
-fn blobs_are_v7_with_their_gaps() {
+fn blobs_are_v8_with_their_gaps() {
     for sampling in samplings() {
         let blob = encode(&build_with(code_text(), sampling).unwrap());
-        assert_eq!(&blob[..8], b"DOCFM\0\x07\0", "{sampling:?}");
+        assert_eq!(&blob[..8], b"DOCFM\0\x08\0", "{sampling:?}");
         let Gaps { min, max, ws } = sampling;
         let got: Vec<u32> = blob[68..96]
             .chunks(4)
@@ -1060,3 +1066,6 @@ fn locate_stats_count_the_probes() {
 
 #[path = "forward_tests.rs"]
 mod forward_tests;
+
+#[path = "wavelet_tests.rs"]
+mod wavelet_tests;

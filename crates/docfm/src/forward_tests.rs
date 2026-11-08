@@ -194,13 +194,18 @@ fn forward_resolves_occurrences() {
 fn marks_range_matches_get_rank() {
     let mut rng = Rng(31);
     for len in [0usize, 1, 4095, 4096, 4097, 70_001] {
-        for fill in 0..4 {
+        for fill in 0..7 {
             let bits: Vec<bool> = (0..len)
                 .map(|i| match fill {
                     0 => rng.below(2) == 1,
                     1 => true,
                     2 => false,
-                    _ => i % 32 == 0,
+                    3 => i % 32 == 0,
+                    // Sparse: low bits and empty buckets.
+                    4 => rng.below(13) == 0,
+                    5 => rng.below(1000) == 0,
+                    // Clustered: long gaps between dense runs.
+                    _ => i % 20_000 < 300 && rng.below(3) == 0,
                 })
                 .collect();
             let mut words = vec![0u64; len.div_ceil(64) + 1];
@@ -232,31 +237,6 @@ fn marks_range_matches_get_rank() {
                     .collect();
                 let got: Vec<(usize, usize)> = marks.range(lo, hi).collect();
                 assert_eq!(got, want, "len {len} fill {fill} {lo}..{hi}");
-            }
-        }
-    }
-}
-
-#[test]
-fn occ_access_matches_access_rank() {
-    let mut rng = Rng(37);
-    for n in [1, 63, 64, 4095, 4096, 4097, 70_000] {
-        for sigma in [1usize, 2, 3, 100, 256] {
-            let codes = occ_codes(n, sigma, &mut rng);
-            let mut alphabet = [0u64; 4];
-            for b in 0..sigma {
-                alphabet[b / 64] |= 1 << (b % 64);
-            }
-            let h = layout::Header::new(n, 0, Gaps::WORDS, alphabet, [0; 257], 0, 0);
-            let mut blob = vec![0u8; h.blob_len];
-            occ::write_occ(&codes, &h, &mut blob);
-            let bwt = occ::Occ::new(&blob, &h);
-            for i in 0..n {
-                assert_eq!(
-                    bwt.access(i),
-                    bwt.access_rank(i).0,
-                    "n {n} sigma {sigma} i {i}"
-                );
             }
         }
     }
