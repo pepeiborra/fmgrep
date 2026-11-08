@@ -275,12 +275,10 @@ mod tests {
     /// A `tgrep` script in a fresh directory, printing `help` for any `--help`.
     fn fake(help: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("tgrep");
         let script = format!(
             "#!/bin/sh\ncase \"$*\" in --version) echo 'tgrep 9.9';; *--help) printf '%s\\n' '{help}';; esac\n"
         );
-        std::fs::write(&bin, script).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::fake_bin::write(&dir.path().join("tgrep"), &script);
         dir
     }
 

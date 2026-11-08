@@ -376,9 +376,7 @@ mod tests {
             bins.push(("eg-indexd", "#!/bin/sh\n".to_string()));
         }
         for (name, script) in bins {
-            let bin = dir.path().join(name);
-            std::fs::write(&bin, script).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::fake_bin::write(&dir.path().join(name), &script);
         }
         dir
     }
