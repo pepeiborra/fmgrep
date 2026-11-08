@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["crates/fmgrep"]
-members = ["crates/docfm", "crates/fmgrep", "crates/bench"]
+members = ["crates/docfm", "crates/fmgrep", "crates/bench", "crates/msbwt"]
 resolver = "3"
 
 [workspace.package]
