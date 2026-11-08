@@ -18,3 +18,6 @@ targets = ["x86_64-unknown-linux-gnu"]
 docfm-bits = { path = "../docfm-bits", version = "0.1.0" }
 msbwt = { path = "../msbwt", version = "0.1.0" }
 rayon = "1"
+
+[dev-dependencies]
+dicetest = "0.3"

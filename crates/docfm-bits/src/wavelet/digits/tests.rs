@@ -1,26 +1,43 @@
 use dicetest::prelude::*;
 
 use super::*;
-use crate::test_util::{Rng, edges, in_pool};
+use crate::test_util::{edges, in_pool};
+
+/// What one stretch of [`mixed_digits`] holds.
+#[derive(Clone, Copy)]
+enum Stretch {
+    OneDigit,
+    TwoInRuns,
+    SparseNoise,
+    Noise,
+}
 
 /// `len` digits below `1 << d`: stretches of one digit, of two alternating
 /// in runs, of sparse noise over one digit, and of uniform noise, so blocks
 /// of every kind occur.
-fn mixed_digits(len: usize, d: u32, rng: &mut Rng) -> Vec<u8> {
-    let k = 1u64 << d;
+fn mixed_digits(len: usize, d: u32, fate: &mut Fate) -> Vec<u8> {
+    let k = 1u8 << d;
+    let style_die = dice::one_of().four(
+        Stretch::OneDigit,
+        Stretch::TwoInRuns,
+        Stretch::SparseNoise,
+        Stretch::Noise,
+    );
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
-        let stretch = (1 + rng.below(3000) as usize).min(len - out.len());
-        let (a, b) = (rng.below(k) as u8, rng.below(k) as u8);
-        let style = rng.below(4);
+        let stretch = fate.roll(dice::uni_usize(1..=3000)).min(len - out.len());
+        let (a, b) = (fate.roll(dice::uni_u8(0..k)), fate.roll(dice::uni_u8(0..k)));
+        let style = fate.roll(&style_die);
         let run = 1 + stretch / 7;
         for j in 0..stretch {
             out.push(match style {
-                0 => a,
-                1 => [a, b][j / run % 2],
-                2 if rng.below(40) == 0 => rng.below(k) as u8,
-                2 => a,
-                _ => rng.below(k) as u8,
+                Stretch::OneDigit => a,
+                Stretch::TwoInRuns => [a, b][j / run % 2],
+                Stretch::SparseNoise if fate.roll(dice::uni_u8(0..40)) == 0 => {
+                    fate.roll(dice::uni_u8(0..k))
+                }
+                Stretch::SparseNoise => a,
+                Stretch::Noise => fate.roll(dice::uni_u8(0..k)),
             });
         }
     }
@@ -90,62 +107,67 @@ fn check_positions(seq: &[u8], d: u32, lb: u32, bytes: &[u8], positions: &[usize
     }
 }
 
+/// Lengths around the block and super boundaries, and over several supers,
+/// each pass reaching all of them.
 #[test]
 fn digits_rank_matches_naive() {
-    let mut rng = Rng(17);
-    for d in [1u32, 2, 4] {
-        let k = 1usize << d;
-        let span = super_len(d);
-        for len in [
-            1,
-            63,
-            255,
-            256,
-            257,
-            1024,
-            4097,
-            span - 1,
-            span,
-            span + 1,
-            300_000,
-        ] {
-            let all = |x: u8| vec![x; len];
-            for seq in [
-                mixed_digits(len, d, &mut rng),
-                all(0),
-                all(k as u8 - 1),
-                (0..len).map(|_| rng.below(k as u64) as u8).collect(),
+    Dicetest::repeatedly().passes(1).run(|mut fate| {
+        for d in [1u32, 2, 4] {
+            let k = 1u8 << d;
+            let span = super_len(d);
+            for len in [
+                1,
+                63,
+                255,
+                256,
+                257,
+                1024,
+                4097,
+                span - 1,
+                span,
+                span + 1,
+                300_000,
             ] {
-                for lb in [8, 9, 10, 12] {
-                    let bytes = digits_of(&seq, d, lb);
-                    let positions = edges(len, span, lb, &mut rng);
-                    check_positions(&seq, d, lb, &bytes, &positions);
+                let seqs = [
+                    mixed_digits(len, d, &mut fate),
+                    vec![0; len],
+                    vec![k - 1; len],
+                    (0..len).map(|_| fate.roll(dice::uni_u8(0..k))).collect(),
+                ];
+                for (shape, seq) in seqs.iter().enumerate() {
+                    for lb in [8, 9, 10, 12] {
+                        hint!("d {d} len {len} shape {shape} lb {lb}");
+                        let bytes = digits_of(seq, d, lb);
+                        let positions = edges(len, span, lb, &mut fate);
+                        check_positions(seq, d, lb, &bytes, &positions);
+                    }
                 }
             }
         }
-    }
+    });
 }
 
 #[test]
 fn digits_use_every_kind_and_shrink_runs() {
-    let mut rng = Rng(19);
-    let len = 1 << 20;
-    for d in [1u32, 2, 4] {
-        let seq = mixed_digits(len, d, &mut rng);
-        let bytes = digits_of(&seq, d, 10);
-        let at = Digits::at(0, len, d, 10);
-        let stride = 2 << d;
-        let mut kinds = [0usize; 4];
-        for h in bytes[at.heads..at.payload].chunks(stride) {
-            kinds[usize::from(h[0] & 3)] += 1;
+    Dicetest::repeatedly().passes(1).run(|mut fate| {
+        let len = 1 << 20;
+        for d in [1u32, 2, 4] {
+            let seq = mixed_digits(len, d, &mut fate);
+            let bytes = digits_of(&seq, d, 10);
+            let at = Digits::at(0, len, d, 10);
+            let stride = 2 << d;
+            let mut kinds = [0usize; 4];
+            for h in bytes[at.heads..at.payload].chunks(stride) {
+                kinds[usize::from(h[0] & 3)] += 1;
+            }
+            assert!(
+                kinds[0] > 0 && kinds[2] > 0 && kinds[3] > 0,
+                "d {d}: {kinds:?}"
+            );
+            let payload = bytes.len() - at.payload;
+            assert!(payload < len * d as usize / 8, "d {d}: {payload} bytes");
         }
-        assert!(
-            kinds[0] > 0 && kinds[2] > 0 && kinds[3] > 0,
-            "d {d}: {kinds:?}"
-        );
-        let payload = bytes.len() - at.payload;
-        assert!(payload < len * d as usize / 8, "d {d}: {payload} bytes");
-    }
+    });
 }
 
 /// Every digit width and block log the format allows.
@@ -165,43 +187,64 @@ fn head_of(bytes: &[u8], len: usize, d: u32, lb: u32, b: usize) -> u16 {
 fn block_of(fate: &mut Fate, k: u8, block: usize) -> Vec<u8> {
     let a = fate.roll(dice::u8(0..k));
     let b = (a + 1 + fate.roll(dice::u8(0..k - 1))) % k;
-    match fate.roll(dice::u8(0..=3)) {
-        0 => vec![a; block],
-        1 => {
-            let split = fate.roll(dice::usize(1..block));
-            let mut out = vec![a; split];
-            out.resize(block, b);
-            out
+    let one_digit = dice::from_fn(|_| vec![a; block]);
+    let two_runs = dice::from_fn(|mut fate| {
+        let split = fate.roll(dice::usize(1..block));
+        let mut out = vec![a; split];
+        out.resize(block, b);
+        out
+    });
+    let short_runs = dice::from_fn(|mut fate| {
+        let mut out = Vec::with_capacity(block);
+        while out.len() < block {
+            let digit = if fate.roll(dice::bool()) { a } else { b };
+            let run = fate.roll(dice::usize(1..=9));
+            out.extend(std::iter::repeat_n(digit, run.min(block - out.len())));
         }
-        2 => {
-            let mut out = Vec::with_capacity(block);
-            while out.len() < block {
-                let digit = if fate.roll(dice::bool()) { a } else { b };
-                let run = fate.roll(dice::usize(1..=9));
-                out.extend(std::iter::repeat_n(digit, run.min(block - out.len())));
-            }
-            out
-        }
-        _ => (0..block).map(|_| fate.roll(dice::u8(0..k))).collect(),
-    }
+        out
+    });
+    let noise = dice::from_fn(|mut fate| {
+        (0..block)
+            .map(|_| fate.roll(dice::u8(0..k)))
+            .collect::<Vec<u8>>()
+    });
+    fate.roll(dice::one_of_die().four(one_digit, two_runs, short_runs, noise))
+}
+
+/// How long a sequence of [`block_of`]s is.
+#[derive(Clone, Copy, Debug)]
+enum SeqLen {
+    WholeBlocks,
+    OneSuper,
+    AroundASuper,
+    PastASuper,
+    UnderFourBlocks,
 }
 
 /// Plain, runs and one-digit blocks, at lengths on and around the block and
 /// super boundaries, for every digit width and block log.
 #[test]
 fn blocks_of_every_kind_match_naive_across_boundaries() {
+    let seq_len_die = dice::one_of().five(
+        SeqLen::WholeBlocks,
+        SeqLen::OneSuper,
+        SeqLen::AroundASuper,
+        SeqLen::PastASuper,
+        SeqLen::UnderFourBlocks,
+    );
     Dicetest::repeatedly().passes(40).run(|mut fate| {
         for (d, lb) in every_shape() {
             let (block, span) = (1usize << lb, super_len(d));
             let k = 1u8 << d;
-            let len = match fate.roll(dice::u8(0..=4)) {
-                0 => block * (1 + fate.roll(dice::usize(0..8))),
-                1 => span,
-                2 => span - 1 + fate.roll(dice::usize(0..=2)),
-                3 => span + block * (1 + fate.roll(dice::usize(0..4))),
-                _ => 1 + fate.roll(dice::usize(0..4 * block)),
+            let seq_len = fate.roll(&seq_len_die);
+            let len = match seq_len {
+                SeqLen::WholeBlocks => block * (1 + fate.roll(dice::usize(0..8))),
+                SeqLen::OneSuper => span,
+                SeqLen::AroundASuper => span - 1 + fate.roll(dice::usize(0..=2)),
+                SeqLen::PastASuper => span + block * (1 + fate.roll(dice::usize(0..4))),
+                SeqLen::UnderFourBlocks => 1 + fate.roll(dice::usize(0..4 * block)),
             };
-            hint!("d {d} lb {lb} len {len}");
+            hint!("d {d} lb {lb} len {len} ({seq_len:?})");
             let mut seq = Vec::with_capacity(len + block);
             while seq.len() < len {
                 seq.extend(block_of(&mut fate, k, block));
@@ -209,8 +252,7 @@ fn blocks_of_every_kind_match_naive_across_boundaries() {
             seq.truncate(len);
             let bytes = encode(&seq, d, 0, lb);
             check_size(&bytes, len, d, lb);
-            let mut rng = Rng(fate.roll(dice::u64(1..)));
-            let positions = edges(len, span, lb, &mut rng);
+            let positions = edges(len, span, lb, &mut fate);
             check_positions(&seq, d, lb, &bytes, &positions);
         }
     });
@@ -330,10 +372,11 @@ fn digits_at_a_shift_read_the_same() {
 
 #[test]
 fn encoding_does_not_depend_on_the_pool() {
-    let mut rng = Rng(29);
-    for d in [1u32, 2, 4] {
-        let seq = mixed_digits(3 * super_len(d) + 5, d, &mut rng);
-        let one = in_pool(1, || encode(&seq, d, 0, 8));
-        assert!(one == in_pool(3, || encode(&seq, d, 0, 8)), "d {d}");
-    }
+    Dicetest::repeatedly().passes(2).run(|mut fate| {
+        for d in [1u32, 2, 4] {
+            let seq = mixed_digits(3 * super_len(d) + 5, d, &mut fate);
+            let one = in_pool(1, || encode(&seq, d, 0, 8));
+            assert!(one == in_pool(3, || encode(&seq, d, 0, 8)), "d {d}");
+        }
+    });
 }
