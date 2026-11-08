@@ -1,7 +1,6 @@
 use dicetest::prelude::*;
 
 use super::*;
-use crate::test_util::Rng;
 
 /// Slot by slot: one bit at the bottom of each `D`-bit slot holding `x`.
 fn equal_by_slots<const D: u32>(w: u64, x: usize) -> u64 {
@@ -102,10 +101,16 @@ fn gamma_streams_round_trip() {
     });
 }
 
+fn check_select(w: u64) {
+    for (r, want) in (0..64).filter(|&b| w >> b & 1 == 1).enumerate() {
+        assert_eq!(select_in_word(w, r), want, "{w:#x} r {r}");
+    }
+}
+
+/// The extreme words, then arbitrary ones.
 #[test]
 fn select_in_word_matches_naive() {
-    let mut rng = Rng(41);
-    let words = [
+    for w in [
         0u64,
         1,
         1 << 63,
@@ -113,20 +118,9 @@ fn select_in_word_matches_naive() {
         0x8000_0001,
         0xff00,
         0x0100_0000_0000_0080,
-    ];
-    for w in words
-        .into_iter()
-        .chain((0..2000).map(|_| rng.below(u64::MAX) ^ rng.below(u64::MAX) << 32))
-    {
-        let ones: Vec<usize> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
-        for (r, &want) in ones.iter().enumerate() {
-            assert_eq!(select_in_word(w, r), want, "{w:#x} {r}");
-        }
+    ] {
+        check_select(w);
     }
-}
-
-#[test]
-fn select_in_word_matches_naive_on_arbitrary_words() {
     Dicetest::repeatedly().passes(50_000).run(|mut fate| {
         let mut w = fate.roll(dice::u64(..));
         // Sparse words too: most select paths want empty bytes.
@@ -134,9 +128,7 @@ fn select_in_word_matches_naive_on_arbitrary_words() {
             w &= fate.roll(dice::u64(..));
         }
         hint!("w {w:#x}");
-        for (r, want) in (0..64).filter(|&b| w >> b & 1 == 1).enumerate() {
-            assert_eq!(select_in_word(w, r), want, "r {r}");
-        }
+        check_select(w);
     });
 }
 
