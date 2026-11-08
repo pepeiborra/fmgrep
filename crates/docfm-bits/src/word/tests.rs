@@ -1,7 +1,6 @@
 use dicetest::prelude::*;
 
 use super::*;
-use crate::test_util::Rng;
 
 /// Slot by slot: one bit at the bottom of each `D`-bit slot holding `x`.
 fn equal_by_slots<const D: u32>(w: u64, x: usize) -> u64 {
@@ -102,10 +101,16 @@ fn gamma_streams_round_trip() {
     });
 }
 
+fn check_select(w: u64) {
+    for (r, want) in (0..64).filter(|&b| w >> b & 1 == 1).enumerate() {
+        assert_eq!(select_in_word(w, r), want, "{w:#x} r {r}");
+    }
+}
+
+/// The extreme words, then arbitrary ones.
 #[test]
 fn select_in_word_matches_naive() {
-    let mut rng = Rng(41);
-    let words = [
+    for w in [
         0u64,
         1,
         1 << 63,
@@ -113,20 +118,9 @@ fn select_in_word_matches_naive() {
         0x8000_0001,
         0xff00,
         0x0100_0000_0000_0080,
-    ];
-    for w in words
-        .into_iter()
-        .chain((0..2000).map(|_| rng.below(u64::MAX) ^ rng.below(u64::MAX) << 32))
-    {
-        let ones: Vec<usize> = (0..64).filter(|&b| w >> b & 1 == 1).collect();
-        for (r, &want) in ones.iter().enumerate() {
-            assert_eq!(select_in_word(w, r), want, "{w:#x} {r}");
-        }
+    ] {
+        check_select(w);
     }
-}
-
-#[test]
-fn select_in_word_matches_naive_on_arbitrary_words() {
     Dicetest::repeatedly().passes(50_000).run(|mut fate| {
         let mut w = fate.roll(dice::u64(..));
         // Sparse words too: most select paths want empty bytes.
@@ -134,9 +128,7 @@ fn select_in_word_matches_naive_on_arbitrary_words() {
             w &= fate.roll(dice::u64(..));
         }
         hint!("w {w:#x}");
-        for (r, want) in (0..64).filter(|&b| w >> b & 1 == 1).enumerate() {
-            assert_eq!(select_in_word(w, r), want, "r {r}");
-        }
+        check_select(w);
     });
 }
 
@@ -171,13 +163,11 @@ fn pack_round_trips_through_bits_at() {
         for width in 1..=57u32 {
             let count = fate.roll(dice::usize(0..=40));
             let max = (1u64 << width) - 1;
-            let values: Vec<u64> = (0..count)
-                .map(|_| match fate.roll(dice::u8(0..=3)) {
-                    0 => max,
-                    1 => 0,
-                    _ => fate.roll(dice::u64(..)) & max,
-                })
-                .collect();
+            let all_ones = dice::just(max);
+            let zero = dice::just(0);
+            let noise = dice::u64(..).map(move |v| v & max);
+            let value_die = dice::weighted_one_of_die().three((1, all_ones), (1, zero), (2, noise));
+            let values: Vec<u64> = (0..count).map(|_| fate.roll(&value_die)).collect();
             let bits = count * width as usize;
             let mut out = vec![0u8; bits.div_ceil(8)];
             pack(&mut out, values.iter().copied(), width);

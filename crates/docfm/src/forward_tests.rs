@@ -32,13 +32,12 @@ fn depths(text: &[u8]) -> Vec<usize> {
 
 /// [`patterns`] plus random lengths up to 12, doc-start and doc-end ones,
 /// separator-spanning, text-prefix tails and the empty pattern.
-fn forward_patterns(text: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
+fn forward_patterns(text: &[u8], fate: &mut Fate) -> Vec<Vec<u8>> {
     let mut out = patterns(text);
     out.push(Vec::new());
-    let len = text.len() as u64;
     for _ in 0..12 {
-        let start = rng.below(len) as usize;
-        let n = 1 + rng.below(12) as usize;
+        let start = fate.roll(dice::uni_usize(0..text.len()));
+        let n = fate.roll(dice::uni_usize(1..=12));
         out.push(text[start..(start + n).min(text.len())].to_vec());
     }
     let ends: Vec<usize> = (0..text.len())
@@ -61,9 +60,8 @@ fn forward_patterns(text: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
 
 #[test]
 fn forward_depths_equal_naive() {
-    let mut rng = Rng(23);
-    for text in texts() {
-        let want: Vec<(Vec<u8>, Vec<usize>)> = forward_patterns(&text, &mut rng)
+    on_texts(|fate, text| {
+        let want: Vec<(Vec<u8>, Vec<usize>)> = forward_patterns(&text, fate)
             .into_iter()
             .map(|p| {
                 let docs = naive_docs(&text, &p);
@@ -81,18 +79,19 @@ fn forward_depths_equal_naive() {
                 assert_eq!(&located(&index, pattern), docs, "{sampling:?} {pattern:?}");
             }
         }
-    }
+    });
 }
 
 /// Tails of the pattern that start the text sit on the sentinel row.
 #[test]
 fn forward_walk_stops_at_the_text_start() {
-    let mut rng = Rng(41);
-    for _ in 0..200 {
-        let text: Vec<u8> = (0..2 + rng.below(10))
-            .map(|_| b'a' + rng.below(2) as u8)
+    Dicetest::repeatedly().passes(200).run(|mut fate| {
+        let len = fate.roll(dice::uni_usize(2..12));
+        let text: Vec<u8> = (0..len)
+            .map(|_| b'a' + fate.roll(dice::uni_u8(0..2)))
             .chain([DOC_END])
             .collect();
+        hint!("{text:?}");
         for rate in [1, 2, 3, 4] {
             let index = build_with(text.clone(), gaps(rate, rate, rate)).unwrap();
             for k in 1..text.len() - 1 {
@@ -107,7 +106,7 @@ fn forward_walk_stops_at_the_text_start() {
                 }
             }
         }
-    }
+    });
 }
 
 /// The gate's depth from the text alone: probed tails' marks, its
@@ -137,9 +136,8 @@ fn naive_depth(text: &[u8], pattern: &[u8], gaps: Gaps, marked: &[bool]) -> usiz
 
 #[test]
 fn mark_gate_matches_naive() {
-    let mut rng = Rng(59);
-    for text in texts() {
-        let patterns = forward_patterns(&text, &mut rng);
+    on_texts(|fate, text| {
+        let patterns = forward_patterns(&text, fate);
         for sampling in samplings() {
             let index = build_with(text.clone(), sampling).unwrap();
             let marked = naive_marked(&text, sampling);
@@ -151,7 +149,7 @@ fn mark_gate_matches_naive() {
                 );
             }
         }
-    }
+    });
     let depth = |text: &[u8], pattern: &[u8], rate| {
         let index = build_with(text.to_vec(), gaps(rate, rate, rate)).unwrap();
         index.cursor().extend_front(pattern).forward_depth()
@@ -173,31 +171,31 @@ fn mark_gate_matches_naive() {
 /// Some occurrences resolve forward, none twice.
 #[test]
 fn forward_resolves_occurrences() {
-    let mut rng = Rng(29);
-    let (mut deepest, mut gate) = (0, 0);
-    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
+    let (deepest, gate) = (AtomicU64::new(0), AtomicU64::new(0));
+    on_small_texts(|fate, text| {
         for sampling in samplings() {
             let index = build_with(text.clone(), sampling).unwrap();
-            for pattern in forward_patterns(&text, &mut rng) {
+            for pattern in forward_patterns(&text, fate) {
                 let cursor = index.cursor().extend_front(&pattern);
                 let (docs, forward) = at_depth(&cursor, forward::MAX_DEPTH);
                 assert!(forward <= docs.len(), "{sampling:?} {pattern:?}");
-                deepest += forward;
-                gate += at_depth(&cursor, cursor.forward_depth()).1;
+                deepest.fetch_add(forward as u64, Relaxed);
+                gate.fetch_add(at_depth(&cursor, cursor.forward_depth()).1 as u64, Relaxed);
             }
         }
-    }
+    });
+    let (deepest, gate) = (deepest.into_inner(), gate.into_inner());
     assert!(deepest > 0 && gate > 0, "{deepest} {gate}");
 }
 
-/// `pattern` prepended one byte at a time, or in random chunks if `rng`.
-fn chained<'a>(index: &'a Built, pattern: &[u8], rng: Option<&mut Rng>) -> Cursor<'a> {
+/// `pattern` prepended one byte at a time, or in random chunks if `fate`.
+fn chained<'a>(index: &'a Built, pattern: &[u8], fate: Option<&mut Fate>) -> Cursor<'a> {
     let mut cursor = index.cursor();
     let mut end = pattern.len();
-    let mut rng = rng;
+    let mut fate = fate;
     while end > 0 {
-        let n = match rng.as_deref_mut() {
-            Some(rng) => 1 + rng.below(end as u64) as usize,
+        let n = match fate.as_deref_mut() {
+            Some(fate) => fate.roll(dice::uni_usize(1..=end)),
             None => 1,
         };
         cursor = cursor.extend_front(&pattern[end - n..end]);
@@ -208,12 +206,11 @@ fn chained<'a>(index: &'a Built, pattern: &[u8], rng: Option<&mut Rng>) -> Curso
 
 /// [`forward_patterns`] plus chains past the ring, separator-spanning
 /// ones and dead branches.
-fn chain_patterns(text: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
-    let mut out = forward_patterns(text, rng);
-    let len = text.len() as u64;
+fn chain_patterns(text: &[u8], fate: &mut Fate) -> Vec<Vec<u8>> {
+    let mut out = forward_patterns(text, fate);
     for _ in 0..8 {
-        let start = rng.below(len) as usize;
-        let n = 16 + rng.below(16) as usize;
+        let start = fate.roll(dice::uni_usize(0..text.len()));
+        let n = fate.roll(dice::uni_usize(16..32));
         let tail = text[start..(start + n).min(text.len())].to_vec();
         out.push([b"\xfe".as_slice(), &tail].concat());
         out.push([&tail[..1], &tail].concat());
@@ -224,16 +221,15 @@ fn chain_patterns(text: &[u8], rng: &mut Rng) -> Vec<Vec<u8>> {
 
 #[test]
 fn cursor_chains_equal_naive() {
-    let mut rng = Rng(43);
-    for text in texts() {
-        let patterns = chain_patterns(&text, &mut rng);
+    on_texts(|fate, text| {
+        let patterns = chain_patterns(&text, fate);
         for sampling in samplings() {
             let index = build_with(text.clone(), sampling).unwrap();
             for pattern in &patterns {
                 let docs = naive_docs(&text, pattern);
                 for cursor in [
                     chained(&index, pattern, None),
-                    chained(&index, pattern, Some(&mut rng)),
+                    chained(&index, pattern, Some(&mut *fate)),
                 ] {
                     for depth in depths(&text) {
                         let (got, _) = at_depth(&cursor, depth);
@@ -243,21 +239,20 @@ fn cursor_chains_equal_naive() {
                 }
             }
         }
-    }
+    });
 }
 
 #[test]
 fn cursor_chunking_does_not_change_locates() {
-    let mut rng = Rng(47);
-    for text in texts().into_iter().filter(|t| t.len() < 10_000) {
-        let patterns = chain_patterns(&text, &mut rng);
+    on_small_texts(|fate, text| {
+        let patterns = chain_patterns(&text, fate);
         for sampling in samplings() {
             let index = build_with(text.clone(), sampling).unwrap();
             for pattern in &patterns {
                 let whole = index.cursor().extend_front(pattern);
                 for cursor in [
                     chained(&index, pattern, None),
-                    chained(&index, pattern, Some(&mut rng)),
+                    chained(&index, pattern, Some(&mut *fate)),
                 ] {
                     assert_eq!(cursor.forward_depth(), whole.forward_depth(), "{pattern:?}");
                     for depth in [0, 3, forward::MAX_DEPTH] {
@@ -270,56 +265,53 @@ fn cursor_chunking_does_not_change_locates() {
                 }
             }
         }
-    }
+    });
 }
 
 #[test]
 fn rows_drops_the_ancestors() {
-    let mut rng = Rng(53);
-    let mut rebuilt = 0;
-    for (text, sampling) in texts()
-        .into_iter()
-        .filter(|t| t.len() < 10_000)
-        .flat_map(|t| samplings().into_iter().map(move |s| (t.clone(), s)))
-    {
-        let index = build_with(text.clone(), sampling).unwrap();
-        for pattern in forward_patterns(&text, &mut rng) {
-            let cursor = chained(&index, &pattern, None);
-            for within in [0..1, 1..3, 2..u64::MAX] {
-                let narrowed = cursor.rows(within.clone());
-                for extended in [
-                    narrowed,
-                    narrowed.extend_front(&pattern[..1.min(pattern.len())]),
-                ] {
+    let rebuilt = AtomicU64::new(0);
+    on_small_texts(|fate, text| {
+        for sampling in samplings() {
+            let index = build_with(text.clone(), sampling).unwrap();
+            for pattern in forward_patterns(&text, fate) {
+                let cursor = chained(&index, &pattern, None);
+                for within in [0..1, 1..3, 2..u64::MAX] {
+                    let narrowed = cursor.rows(within.clone());
+                    for extended in [
+                        narrowed,
+                        narrowed.extend_front(&pattern[..1.min(pattern.len())]),
+                    ] {
+                        let (want, _) = at_depth(&extended, 0);
+                        assert_eq!(extended.forward_depth(), 0, "{pattern:?} rows {within:?}");
+                        assert_eq!(
+                            at_depth(&extended, forward::MAX_DEPTH),
+                            (want.clone(), 0),
+                            "{pattern:?} rows {within:?}"
+                        );
+                        assert_eq!(gated(&extended), want, "{pattern:?} rows {within:?}");
+                    }
+                    // Tails rebuilt after `rows` resolve forward again.
+                    let Some(ahead) = text
+                        .windows(pattern.len() + 3)
+                        .find(|w| w.ends_with(&pattern))
+                        .map(|w| &w[..3])
+                    else {
+                        continue;
+                    };
+                    let extended = narrowed.extend_front(ahead);
                     let (want, _) = at_depth(&extended, 0);
-                    assert_eq!(extended.forward_depth(), 0, "{pattern:?} rows {within:?}");
+                    let (docs, forward) = at_depth(&extended, forward::MAX_DEPTH);
+                    assert_eq!(docs, want, "{ahead:?} {pattern:?} rows {within:?}");
                     assert_eq!(
-                        at_depth(&extended, forward::MAX_DEPTH),
-                        (want.clone(), 0),
-                        "{pattern:?} rows {within:?}"
+                        gated(&extended),
+                        want,
+                        "{ahead:?} {pattern:?} rows {within:?}"
                     );
-                    assert_eq!(gated(&extended), want, "{pattern:?} rows {within:?}");
+                    rebuilt.fetch_add(forward as u64, Relaxed);
                 }
-                // Tails rebuilt after `rows` resolve forward again.
-                let Some(ahead) = text
-                    .windows(pattern.len() + 3)
-                    .find(|w| w.ends_with(&pattern))
-                    .map(|w| &w[..3])
-                else {
-                    continue;
-                };
-                let extended = narrowed.extend_front(ahead);
-                let (want, _) = at_depth(&extended, 0);
-                let (docs, forward) = at_depth(&extended, forward::MAX_DEPTH);
-                assert_eq!(docs, want, "{ahead:?} {pattern:?} rows {within:?}");
-                assert_eq!(
-                    gated(&extended),
-                    want,
-                    "{ahead:?} {pattern:?} rows {within:?}"
-                );
-                rebuilt += forward;
             }
         }
-    }
-    assert!(rebuilt > 0);
+    });
+    assert!(rebuilt.load(Relaxed) > 0);
 }

@@ -156,6 +156,7 @@ dependencies = [
 name = "docfm"
 version = "0.1.0"
 dependencies = [
+ "dicetest",
  "docfm-bits",
  "msbwt",
  "rayon",

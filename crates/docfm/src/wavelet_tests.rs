@@ -73,45 +73,48 @@ fn fnv(bytes: &[u8]) -> u64 {
 }
 
 /// Digests of the blobs over msbwt's BWT, as the encoder first wrote them:
-/// it must reproduce them byte for byte, on any number of threads.
+/// it must reproduce them byte for byte, on any number of threads. They
+/// depend on dicetest's generator too, which rolls the texts, so a dicetest
+/// upgrade can change them with no encoder change.
 #[test]
 fn blobs_match_the_pinned_encoder() {
     const PINNED: [u64; 24] = [
-        0x224929b4ed10b659,
-        0xe0216694c5ca67b5,
-        0x995109b1fbf246fb,
-        0x36d6ec4e73be6cdf,
-        0x2b3504897049f37d,
-        0x24da22dda009292d,
-        0x7d6b2b988c21fad7,
-        0x2677ff9075e37083,
-        0xda40a28d46b4b6da,
-        0xebcb12e019d7cda3,
-        0x628b16e82b403ab0,
-        0xce16e934b3f18175,
-        0xc3704b655c04495f,
-        0x4f150f1ad72e491a,
-        0xae392c828b1a9288,
-        0x9e2a33d9087bf775,
-        0x399f7191fee6a2e5,
-        0x959a9ce0617681a0,
-        0x0c538c0ae8e4ac77,
-        0xd29fa43c28c89dda,
-        0xa2113aef4a63e3d2,
-        0x3bdb84af2c8439c3,
-        0x1970fa607847d7d9,
-        0x6921a45676216b58,
+        0x16a5c187440ac58f,
+        0xda237f3ce29779a9,
+        0x2a48ac705bae37ed,
+        0x3499f1e50d67e32f,
+        0x7ea99bf23fb5fc83,
+        0x2550a47e48d6885d,
+        0x233ef7f32af0e412,
+        0x0ca373e6fcec06f4,
+        0xc18bedc94b454959,
+        0x0657038826e54216,
+        0x5bb81d10bb3fe29c,
+        0x32aee2b285395cb7,
+        0xd81e19963157afc3,
+        0x8abd525197a5a854,
+        0x3772823fe84d6d36,
+        0x199fde98d24f8915,
+        0xd25a04803ddb139a,
+        0x38fe7609f39040ff,
+        0x30251d7a1ab45a35,
+        0x111f47d47937e02c,
+        0x194f833f67d8080b,
+        0x351131cfa0d5999a,
+        0xa23e9e6b883738d7,
+        0x063cf7152ee2da3e,
     ];
-    let mut rng = Rng(53);
-    let runs: Vec<u8> = (0..300_000)
-        .map(|i| {
-            if i % 7000 < 3000 {
-                b'a' + (i / 7000 % 20) as u8
-            } else {
-                rng.below(256) as u8
-            }
-        })
-        .collect();
+    let runs: Vec<u8> = pinned(53, |fate| {
+        (0..300_000)
+            .map(|i| {
+                if i % 7000 < 3000 {
+                    b'a' + (i / 7000 % 20) as u8
+                } else {
+                    fate.roll(dice::uni_u8(..))
+                }
+            })
+            .collect()
+    });
     let texts = [code_text(), large_text(), terminated(runs)];
     let mut got = Vec::new();
     for text in &texts {
