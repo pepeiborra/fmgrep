@@ -1,11 +1,10 @@
-use rayon::slice::ParallelSliceMut;
-
 use crate::layout::{Config, Gaps, HEADER_BYTES, Header, Levels};
+use crate::samples::{DocSamples, MsbwtRows, TextRows};
 use crate::wavelet::Params;
 use crate::{DOC_END, Error, MAX_TEXT_BYTES, marks, wavelet};
 
 /// Bytes per parallel unit of work.
-const SUPER: usize = 65536;
+pub const SUPER: usize = 65536;
 
 /// `f` of every item, one job per item on the current rayon pool; a lone
 /// item runs inline. `f` runs no parallel work, so no thread ever waits
@@ -79,22 +78,19 @@ pub fn encode_bwt(
 }
 
 /// Completes a blob [`encode_bwt`] began: its marks, its doc ids and its
-/// header. `samples` holds `row << 32 | doc` per sampled row, ascending, as
-/// many as `encode_bwt` was told.
-pub fn encode_samples(out: &mut [u8], header: &Header, samples: &[u64]) {
+/// header. `samples` holds as many as `encode_bwt` was told.
+pub fn encode_samples(out: &mut [u8], header: &Header, samples: &DocSamples) {
     debug_assert_eq!(samples.len(), header.num_samples);
     let rows = header.n + 1;
     let mut bits = vec![0u64; rows.div_ceil(64)];
-    for &x in samples {
-        let row = (x >> 32) as usize;
+    for row in samples.rows() {
         bits[row / 64] |= 1 << (row % 64);
     }
     let marked = marks::write(&mut out[header.marks_at..header.samples_at], rows, &bits);
     debug_assert_eq!(marked, header.num_samples);
-    header.ids.write(
-        &mut out[header.samples_at..],
-        samples.iter().map(|&x| u64::from(x as u32)),
-    );
+    header
+        .ids
+        .write(&mut out[header.samples_at..], samples.docs());
     header.write(&mut out[..HEADER_BYTES]);
 }
 
@@ -148,8 +144,8 @@ pub fn build(mut text: Vec<u8>, config: Config) -> Result<Vec<u8>, Error> {
     // The sentinel row's sample, in document 0, beside the positions'.
     let num_samples = positions.len() + usize::from(n > 0);
     drop(positions);
-    let (bwt, mut found) = if n == 0 {
-        (text, Vec::new())
+    let (bwt, found) = if n == 0 {
+        (text, TextRows::default())
     } else {
         bwt_and_rows(text, &wanted)?
     };
@@ -162,19 +158,9 @@ pub fn build(mut text: Vec<u8>, config: Config) -> Result<Vec<u8>, Error> {
     };
     let (mut out, header) = encode_bwt(&bwt, &meta, num_samples, config);
     drop(bwt);
-    // `row << 32 | position` to `row << 32 | doc`.
-    each(found.chunks_mut(SUPER), |chunk| {
-        for x in chunk {
-            let doc = starts.partition_point(|&s| s <= *x as u32) - 1;
-            *x = *x >> 32 << 32 | doc as u64;
-        }
-    });
-    if n > 0 {
-        found.push(0);
-    }
-    found.par_sort_unstable();
-    debug_assert_eq!(found.len(), header.num_samples);
-    encode_samples(&mut out, &header, &found);
+    let samples = found.into_doc_samples(&starts, n > 0);
+    debug_assert_eq!(samples.len(), header.num_samples);
+    encode_samples(&mut out, &header, &samples);
     Ok(out)
 }
 
@@ -237,17 +223,9 @@ fn doc_samples(doc: &[u8], at: u32, gaps: Gaps, found: &mut Vec<u32>) {
     }
 }
 
-/// The BWT of the non-empty `text`, its rows counted from 1 (row 0 is the
-/// sentinel's), and `row << 32 | position` for each position set in
-/// `sampled`, in no particular order.
-pub fn bwt_and_rows(text: Vec<u8>, sampled: &[u64]) -> Result<(Vec<u8>, Vec<u64>), Error> {
-    let n = text.len();
-    let (bwt, mut rows) = msbwt::bwt_sampled(text, sampled)
-        .map_err(|e| Error::Construction(format!("msbwt failed on {n} bytes: {e}")))?;
-    each(rows.chunks_mut(SUPER), |chunk| {
-        for x in chunk {
-            *x += 1 << 32;
-        }
-    });
-    Ok((bwt, rows))
+/// The BWT of the non-empty `text` and the row of each position set in
+/// `sampled`.
+pub fn bwt_and_rows(text: Vec<u8>, sampled: &[u64]) -> Result<(Vec<u8>, TextRows), Error> {
+    let (bwt, rows) = msbwt::bwt_sampled(text, sampled).map_err(Error::Construction)?;
+    Ok((bwt, MsbwtRows::new(rows).into_text_rows()))
 }

@@ -223,7 +223,16 @@ fn levels_refuse_another_shape() {
 fn level_rank_past_the_last_level_is_zero() {
     let (bytes, shape) = tree_of(&[0, 1, 1, 0], 2, params(1, 8));
     let tree = WaveletMatrix::new(&bytes, &shape);
-    assert_eq!(tree.level_rank(0, 1, 4), 2);
-    assert_eq!(tree.level_rank(shape.depth(), 1, 4), 0);
-    assert_eq!(tree.level_rank(usize::MAX, 1, 4), 0);
+    let one = params(1, 8).digit(1).unwrap();
+    assert_eq!(tree.level_rank(0, 4, one), 2);
+    assert_eq!(tree.level_rank(shape.depth(), 4, one), 0);
+    assert_eq!(tree.level_rank(usize::MAX, 4, one), 0);
+}
+
+#[test]
+fn a_digit_is_below_its_base() {
+    assert_eq!(params(1, 8).digit(2), None);
+    assert_eq!(params(2, 8).digit(4), None);
+    assert_eq!(params(4, 8).digit(16), None);
+    assert!(params(4, 8).digit(15).is_some());
 }
