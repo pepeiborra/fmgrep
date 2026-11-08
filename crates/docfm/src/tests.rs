@@ -1,13 +1,78 @@
 use super::*;
 use crate::layout::Gaps;
 
+/// Where `pattern` occurs, each document read as a cyclic string with its
+/// DOC_END, as the index's rows are: a pattern without DOC_END never wraps,
+/// so it occurs as in the text; one with it wraps to its document's start.
 fn naive_positions(text: &[u8], pattern: &[u8]) -> Vec<usize> {
-    if pattern.is_empty() || text.len() < pattern.len() {
+    if pattern.is_empty() {
         return Vec::new();
     }
-    (0..=text.len() - pattern.len())
-        .filter(|&i| &text[i..i + pattern.len()] == pattern)
-        .collect()
+    let mut found = Vec::new();
+    let mut start = 0;
+    for doc in text.split_inclusive(|&b| b == DOC_END) {
+        found.extend(
+            (0..doc.len())
+                .filter(|&i| (0..pattern.len()).all(|k| doc[(i + k) % doc.len()] == pattern[k]))
+                .map(|i| start + i),
+        );
+        start += doc.len();
+    }
+    found
+}
+
+/// The rows past the sentinel's by definition: every position's rotation,
+/// each document a cyclic string with its DOC_END, sorted by its infinite
+/// repetition; each row as its text position, with the run of rows whose
+/// rotations are equal (identical documents), which may trade places.
+fn naive_rows(text: &[u8]) -> Vec<(usize, std::ops::Range<usize>)> {
+    let mut start_of = vec![0; text.len()];
+    let mut start = 0;
+    for doc in text.split_inclusive(|&b| b == DOC_END) {
+        start_of[start..start + doc.len()].fill(start);
+        start += doc.len();
+    }
+    let doc_at = |p: usize| {
+        let s = start_of[p];
+        let len = text[s..].iter().position(|&b| b == DOC_END).unwrap() + 1;
+        (s, len, p - s)
+    };
+    let cmp = |a: usize, b: usize| {
+        let ((sa, la, oa), (sb, lb, ob)) = (doc_at(a), doc_at(b));
+        (0..la + lb)
+            .map(|k| text[sa + (oa + k) % la].cmp(&text[sb + (ob + k) % lb]))
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut rows: Vec<usize> = (0..text.len()).collect();
+    rows.sort_by(|&a, &b| cmp(a, b));
+    let mut out = Vec::with_capacity(rows.len());
+    let mut from = 0;
+    for (i, &p) in rows.iter().enumerate() {
+        if i > 0 && cmp(rows[i - 1], p).is_ne() {
+            from = i;
+        }
+        out.push((p, from..0));
+    }
+    // Close each run at the next run's start.
+    let mut end = out.len();
+    for i in (0..out.len()).rev() {
+        out[i].1.end = end;
+        if out[i].1.start == i {
+            end = i;
+        }
+    }
+    out
+}
+
+/// The byte cyclically before position `p` in its document.
+fn naive_before(text: &[u8], p: usize) -> u8 {
+    if p == 0 || text[p - 1] == DOC_END {
+        let len = text[p..].iter().position(|&b| b == DOC_END).unwrap();
+        text[p + len]
+    } else {
+        text[p - 1]
+    }
 }
 
 /// The doc of each occurrence start: the DOC_END bytes before it.
@@ -298,36 +363,39 @@ fn threads_do_not_change_the_blob() {
     }
 }
 
-/// Marks and samples by definition, from a naive suffix sort.
+/// Marks and samples by definition: row 0, the sentinel's, in document 0,
+/// then [`naive_rows`]', each run of equal rotations as a multiset.
 #[test]
 fn samples_match_suffix_order() {
     for sampling in samplings() {
         for text in texts().into_iter().filter(|t| t.len() < 10_000) {
             let index = build_with(text.clone(), sampling).unwrap();
             let marked = naive_marked(&text, sampling);
-            let mut rows: Vec<usize> = (0..=text.len()).collect();
-            rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
-            let doc_of: Vec<usize> = text
-                .iter()
-                .scan(0, |docs, &b| {
-                    let here = *docs;
-                    *docs += usize::from(b == DOC_END);
-                    Some(here)
-                })
-                .collect();
-            let want: Vec<Option<usize>> = rows
-                .iter()
-                .map(|&p| (p < text.len() && marked[p]).then(|| doc_of[p]))
-                .collect();
+            let doc_of = doc_of(&text);
             let view = index.cursor().view;
             let marks = index.header.marks(view.bytes);
-            let got: Vec<Option<usize>> = (0..=text.len())
-                .map(|row| {
-                    let (marked, rank) = marks.get_rank(row);
-                    marked.then(|| view.sampled(rank))
-                })
-                .collect();
-            assert_eq!(got, want, "{sampling:?} len {}", text.len());
+            let got = |row: usize| {
+                let (marked, rank) = marks.get_rank(row);
+                marked.then(|| view.sampled(rank))
+            };
+            if !text.is_empty() {
+                assert_eq!(got(0), Some(0), "{sampling:?} sentinel row");
+            }
+            let rows = naive_rows(&text);
+            for (i, (_, run)) in rows
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, run))| run.start == *i)
+            {
+                let mut want: Vec<Option<usize>> = rows[run.clone()]
+                    .iter()
+                    .map(|&(p, _)| marked[p].then(|| doc_of[p]))
+                    .collect();
+                let mut have: Vec<Option<usize>> = run.clone().map(|r| got(r + 1)).collect();
+                want.sort_unstable();
+                have.sort_unstable();
+                assert_eq!(have, want, "{sampling:?} len {} rows from {i}", text.len());
+            }
         }
     }
 }
@@ -356,7 +424,9 @@ fn sample_count_matches_the_rule() {
     for sampling in samplings() {
         for text in texts().into_iter().chain([large_text()]) {
             let index = build_with(text.clone(), sampling).unwrap();
-            let want = naive_marked(&text, sampling).iter().filter(|&&m| m).count();
+            // The sentinel row's sample beside the positions'.
+            let want = naive_marked(&text, sampling).iter().filter(|&&m| m).count()
+                + usize::from(!text.is_empty());
             assert_eq!(
                 index.header.num_samples,
                 want,
@@ -371,11 +441,12 @@ fn sample_count_matches_the_rule() {
 fn bwt_matches_naive_rotation_sort() {
     for text in texts().into_iter().filter(|t| t.len() < 10_000) {
         let index = Built::build(text.clone()).unwrap();
-        let mut rows: Vec<usize> = (0..=text.len()).collect();
-        rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
-        let want: Vec<Option<u8>> = rows
-            .iter()
-            .map(|&p| p.checked_sub(1).map(|q| text[q]))
+        let want: Vec<Option<u8>> = std::iter::once(None)
+            .chain(
+                naive_rows(&text)
+                    .iter()
+                    .map(|&(p, _)| Some(naive_before(&text, p))),
+            )
             .collect();
         let mut byte_of = [0u8; 256];
         for (byte, code) in index.header.code_of.iter().enumerate() {
@@ -556,7 +627,7 @@ fn foreign_or_truncated_blob_is_refused() {
     refuse(&patched(2148, &0u32.to_le_bytes()), "docs and");
     refuse(&patched(2148, &(docs + 1).to_le_bytes()), "DOC_END bytes");
     refuse(
-        &patched(2152, &(h.n as u32 + 1).to_le_bytes()),
+        &patched(2152, &(h.n as u32 + 2).to_le_bytes()),
         "samples over",
     );
     refuse(&patched(2152, &(docs - 1).to_le_bytes()), "samples over");
@@ -848,8 +919,7 @@ fn naive_walks(text: &[u8], gaps: Gaps) -> Vec<usize> {
 #[test]
 fn text_walks_stay_within_bound() {
     for text in [code_text(), terminated(all_bytes()), tiny_docs()] {
-        let mut rows: Vec<usize> = (0..=text.len()).collect();
-        rows.sort_by(|&a, &b| text[a..].cmp(&text[b..]));
+        let rows = naive_rows(&text);
         let docs = doc_of(&text);
         for sampling in samplings() {
             for (p, walk) in naive_walks(&text, sampling).into_iter().enumerate() {
@@ -862,8 +932,17 @@ fn text_walks_stay_within_bound() {
             }
             let index = build_with(text.clone(), sampling).unwrap();
             let view = index.cursor().view;
-            for (row, &p) in rows.iter().enumerate().skip(1) {
-                assert_eq!(view.doc(row), docs[p], "{sampling:?} row {row}");
+            for (i, (_, run)) in rows
+                .iter()
+                .enumerate()
+                .filter(|(i, (_, run))| run.start == *i)
+            {
+                let mut want: Vec<usize> =
+                    rows[run.clone()].iter().map(|&(p, _)| docs[p]).collect();
+                let mut have: Vec<usize> = run.clone().map(|r| view.doc(r + 1)).collect();
+                want.sort_unstable();
+                have.sort_unstable();
+                assert_eq!(have, want, "{sampling:?} rows from {}", i + 1);
             }
         }
     }
