@@ -1,13 +1,7 @@
-use libsais::BwtConstruction;
-use libsais::bwt::AuxIndicesSamplingRate;
-
 use rayon::slice::ParallelSliceMut;
 
 use crate::layout::{Config, Gaps, HEADER_BYTES, Header, Levels};
-use crate::{DOC_END, Error, MAX_TEXT_BYTES, View, marks, wavelet};
-
-/// Text positions per aux row: a sample costs fewer LF steps to place.
-const AUX_RATE: usize = 4;
+use crate::{DOC_END, Error, MAX_TEXT_BYTES, marks, wavelet};
 
 /// Bytes per parallel unit of work.
 const SUPER: usize = 65536;
@@ -104,11 +98,12 @@ pub fn encode_samples(out: &mut [u8], header: &Header, samples: &[u64]) {
     header.write(&mut out[..HEADER_BYTES]);
 }
 
-/// The blob of `text`: libsais runs on one thread, the other phases in
-/// `SUPER`-byte units on the current rayon pool. Peak live heap: the text
-/// (replaced by the BWT), libsais's `i32` temporary array, the aux rows and
-/// the sampled positions; the wavelet levels take a scratch copy of the BWT
-/// once libsais is done. `gaps` passes [`Gaps::check`].
+/// The blob of `text`, every phase on the current rayon pool. msbwt sorts
+/// each document as a cyclic string, so no row reads into another document,
+/// and finds the rows of the sampled positions as it goes; its rows are
+/// rows 1.. here. Row 0, the sentinel's, is no rotation's, so no LF step
+/// reaches it. Peak live heap is msbwt's; the wavelet levels then take a
+/// scratch copy of the BWT. `gaps` passes [`Gaps::check`].
 pub fn build(mut text: Vec<u8>, config: Config) -> Result<Vec<u8>, Error> {
     let gaps = config.gaps;
     check_len(text.len())?;
@@ -146,56 +141,37 @@ pub fn build(mut text: Vec<u8>, config: Config) -> Result<Vec<u8>, Error> {
             *b = code_of[usize::from(*b)];
         }
     });
-    // aux[k] is the row of text position k * AUX_RATE; aux[0] is the sentinel row.
-    let aux = if n == 0 {
-        Vec::new()
+    let mut wanted = vec![0u64; n.div_ceil(64)];
+    for &p in &positions {
+        wanted[p as usize / 64] |= 1 << (p % 64);
+    }
+    // The sentinel row's sample, in document 0, beside the positions'.
+    let num_samples = positions.len() + usize::from(n > 0);
+    drop(positions);
+    let (bwt, mut found) = if n == 0 {
+        (text, Vec::new())
     } else {
-        bwt_in_place(&mut text, AUX_RATE)?
+        bwt_and_rows(text, &wanted)?
     };
-    let sentinel_row = aux.first().map_or(0, |&row| row as usize);
+    drop(wanted);
     let meta = Text {
-        sentinel_row,
+        sentinel_row: 0,
         alphabet,
         c,
         num_docs: starts.len(),
     };
-    let (mut out, header) = encode_bwt(&text, &meta, positions.len(), config);
-    drop(text);
-
-    let view = View {
-        bytes: &out,
-        header: &header,
-    };
-    // Walks from the aux row at or after `p`, or from row 0 (position `n`).
-    let row_of = |p: usize| {
-        let q = p.next_multiple_of(AUX_RATE);
-        let mut row = aux.get(q / AUX_RATE).map_or(0, |&row| row as usize);
-        for _ in p..q.min(n) {
-            row = view.lf(row);
+    let (mut out, header) = encode_bwt(&bwt, &meta, num_samples, config);
+    drop(bwt);
+    // `row << 32 | position` to `row << 32 | doc`.
+    each(found.chunks_mut(SUPER), |chunk| {
+        for x in chunk {
+            let doc = starts.partition_point(|&s| s <= *x as u32) - 1;
+            *x = *x >> 32 << 32 | doc as u64;
         }
-        row as u64
-    };
-    // `row << 32 | doc` for each sampled position of unit `i`.
-    let sampled = |i: usize| {
-        let span = i * SUPER..(i * SUPER + SUPER).min(n);
-        let first = starts.partition_point(|&s| s as usize <= span.start) - 1;
-        let from = positions.partition_point(|&p| (p as usize) < span.start);
-        let to = positions.partition_point(|&p| (p as usize) < span.end);
-        let mut doc = first;
-        let mut found = Vec::with_capacity(to - from);
-        for &p in &positions[from..to] {
-            while starts.get(doc + 1).is_some_and(|&s| s <= p) {
-                doc += 1;
-            }
-            found.push(row_of(p as usize) << 32 | doc as u64);
-        }
-        found
-    };
-    let mut units = vec![Vec::new(); n.div_ceil(SUPER)];
-    each(units.iter_mut().enumerate(), |(i, unit)| *unit = sampled(i));
-    let mut found = units.concat();
-    drop(aux);
-    drop(positions);
+    });
+    if n > 0 {
+        found.push(0);
+    }
     found.par_sort_unstable();
     debug_assert_eq!(found.len(), header.num_samples);
     encode_samples(&mut out, &header, &found);
@@ -261,17 +237,17 @@ fn doc_samples(doc: &[u8], at: u32, gaps: Gaps, found: &mut Vec<u32>) {
     }
 }
 
-/// Replaces the non-empty `text` by its sentinel-free BWT; returns the rows
-/// of every `r`-th text position.
-pub fn bwt_in_place(text: &mut [u8], r: usize) -> Result<Vec<i32>, Error> {
+/// The BWT of the non-empty `text`, its rows counted from 1 (row 0 is the
+/// sentinel's), and `row << 32 | position` for each position set in
+/// `sampled`, in no particular order.
+pub fn bwt_and_rows(text: Vec<u8>, sampled: &[u64]) -> Result<(Vec<u8>, Vec<u64>), Error> {
     let n = text.len();
-    let rate = AuxIndicesSamplingRate::from(r as i32);
-    let (_, aux, _) = BwtConstruction::replace_text(text)
-        .with_owned_temporary_array_buffer32()
-        .single_threaded()
-        .with_aux_indices(rate)
-        .run()
-        .map_err(|e| Error::Construction(format!("libsais failed on {n} bytes: {e}")))?
-        .into_parts();
-    Ok(aux)
+    let (bwt, mut rows) = msbwt::bwt_sampled(text, sampled)
+        .map_err(|e| Error::Construction(format!("msbwt failed on {n} bytes: {e}")))?;
+    each(rows.chunks_mut(SUPER), |chunk| {
+        for x in chunk {
+            *x += 1 << 32;
+        }
+    });
+    Ok((bwt, rows))
 }

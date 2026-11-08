@@ -21,7 +21,7 @@ cargo install fmgrep
 ```
 
 or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
-1.98 or later and a C compiler (for the bundled libsais), nothing else.
+1.98 or later, nothing else.
 
 ## Usage
 
