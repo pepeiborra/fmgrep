@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 3): what each
+The on-disk layout `fmgrep index` writes (manifest format 4): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -32,7 +32,7 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `3` |
+| `format` | u32 | `4` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | usize | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
@@ -50,7 +50,7 @@ tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 3, naming the remedy: re-run `fmgrep index`. Old
+- a `format` other than 4, naming the remedy: re-run `fmgrep index`. Old
   indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
@@ -133,28 +133,28 @@ before construction.
 ## blobs.shard
 
 The blobs, in shard order, with no separators; `blob_lens` slices them.
-Each blob's length is a multiple of 16 KiB, so every blob, and every
-occurrence block inside one, starts page-aligned. The file is mapped at
-load and used in place, never decoded.
+Each blob's length is a multiple of 16 KiB, so every blob starts
+page-aligned. The file is mapped at load and used in place, never decoded.
 
-Blob version 7, little-endian. The code-side contract is the table in
-`crates/docfm/src/layout.rs`, with `occ.rs` and `marks.rs` beside it.
+Blob version 8, little-endian. The code-side contract is the table in
+`crates/docfm/src/layout.rs`, with `wavelet.rs`, `digits.rs` and `marks.rs`
+beside it.
 
 | section | holds |
 |---|---|
-| header, 2176 bytes | magic `DOCFM\0\x07\0`; text bytes `n`; sentinel row; sampling gaps `min` 8, `max` 16, `ws` 64 and walk bound 63; alphabet bitmap and size; `c` (first row per byte code); `num_docs`, `num_samples` |
-| supers | per 65536 BWT positions: u32 counts per code, padded to 64 bytes |
-| occurrence blocks | from the next 16 KiB boundary; per 4096 positions: u16 counts at the block midpoint, then the code bits of each 64 positions as bit planes |
-| marks | a u32 count per 4096 rows, then a u16 in-bucket offset per sampled row |
-| samples | u32 document id per sampled row, in row order |
+| header, 2368 bytes | magic `DOCFM\0\x08\0`; text bytes `n`; sentinel row; sampling gaps `min` 4, `max` 8, `ws` 32 and walk bound 31; alphabet bitmap and size; digits per block (256); `c` (first row per byte code); where each code starts below the last level; `num_docs`, `num_samples`; digit starts and payload bytes per level; bits per digit (4) |
+| levels | one per 4-bit digit of the codes (2 for more than 16 distinct bytes), each 64-byte aligned: per 16384 digits a u32 payload offset and a u32 count per digit; per 256-digit block a u16 kind and payload offset and a u16 count per digit from its super; then the payloads: none for a block of one digit, plain digits, or runs (a digit and an Elias-gamma length each) |
+| marks | the sampled rows as Elias-Fano: their low bits packed, their high bits in unary, a u32 position per 64th zero |
+| samples | document id per sampled row, in row order, packed in `ceil(log2 num_docs)` bits (at least 1) |
 
 A row is sampled iff its text position starts a document, or starts a
-word, subword or line at least 8 bytes past the previous sample, or is 16
-bytes past it (64 on whitespace). A locate walks LF to the nearest sampled
-row, in at most 63 steps, without leaving its document. The load checks
-the header, each code's total against the last block, the marks total and
-the sentinel row's sample. A blob that passes these checks but is corrupt
-elsewhere can miscount or panic, but never reads out of bounds.
+word, subword or line at least 4 bytes past the previous sample, or is 8
+bytes past it (32 on whitespace). A locate walks LF to the nearest sampled
+row, in at most 31 steps, without leaving its document. The load checks
+the header, each level's zeros against its ones, each code's total, the
+marks total and the sentinel row's sample. A blob that passes these checks
+but is corrupt elsewhere can miscount or panic, but never reads out of
+bounds.
 
 ## docs.stamps
 
