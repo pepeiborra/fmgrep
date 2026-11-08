@@ -15,6 +15,7 @@ rayon = "1"
 rustc-hash = "2"
 safe_arch = "0.7"
 thiserror = "2"
+typed-index-collections = "3.5"
 
 [dev-dependencies]
 dicetest = "0.3"
