@@ -440,6 +440,7 @@ dependencies = [
  "rustc-hash",
  "safe_arch",
  "thiserror",
+ "typed-index-collections",
 ]
 
 [[package]]
