@@ -65,16 +65,16 @@ msbwt's working arrays.
 
 The blob (`src/layout.rs`) is the query structure:
 `FmIndex::view` works over any `AsRef<[u8]>`, a mapped file slice included,
-copying nothing. The BWT is a wavelet matrix (`src/wt.rs`) over `d`-bit
+copying nothing. The BWT is a wavelet matrix (`../docfm-bits/src/wavelet.rs`) over `d`-bit
 digits of the codes (`d` = 4 by default; 1 and 2 also read): one level per
 digit, most significant first, each holding the digits of the codes in the
 order the level above left them, stably sorted by digit. Each level
-(`src/digits.rs`) is cut into blocks of 256 digits: a head per block (its
+(`../docfm-bits/src/wavelet/digits.rs`) is cut into blocks of 256 digits: a head per block (its
 kind, its payload's offset, a u16 count per digit from its super) and a
 u32 offset and counts per super, then the payloads: none for a block of one
 digit, plain digits, or runs (a digit and an Elias-gamma length each),
 whichever is smallest.
-The sample marks are Elias-Fano (`src/marks.rs`), the doc ids packed in
+The sample marks are Elias-Fano (`../docfm-bits/src/marks.rs`), the doc ids packed in
 `ceil(log2 num_docs)` bits each. The blob length is a multiple of
 16 KiB. `view` checks the header, each level's digit counts against its
 digit starts, each code's total, and the marks total; a blob consistent

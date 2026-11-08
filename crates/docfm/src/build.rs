@@ -1,6 +1,7 @@
 use rayon::slice::ParallelSliceMut;
 
 use crate::layout::{Config, Gaps, HEADER_BYTES, Header, Levels};
+use crate::wt::Params;
 use crate::{DOC_END, Error, MAX_TEXT_BYTES, marks, wt};
 
 /// Bytes per parallel unit of work.
@@ -54,9 +55,10 @@ pub fn encode_bwt(
     config: Config,
 ) -> (Vec<u8>, Header) {
     let Config { gaps, d, lb } = config;
+    let params = Params::new(d, lb).expect("a valid config");
     let n = bwt.len();
     let sigma = text.alphabet.iter().map(|w| w.count_ones() as usize).sum();
-    let (levels, digit_starts, bottom) = wt::encode(bwt, sigma, d, lb);
+    let levels = wt::encode(bwt, sigma, params);
     let header = Header::new(
         n,
         text.sentinel_row,
@@ -65,15 +67,14 @@ pub fn encode_bwt(
         text.c,
         (text.num_docs, num_samples),
         &Levels {
-            lb,
-            d,
-            starts: digit_starts,
-            payload: wt::payloads(&levels, n, d, lb),
-            bottom,
+            params,
+            starts: *levels.starts(),
+            payload: levels.payloads(),
+            bottom: *levels.bottom(),
         },
     );
     let mut out = vec![0u8; header.blob_len];
-    wt::write(&levels, &header.wt, &mut out);
+    levels.write(&header.wt, &mut out);
     (out, header)
 }
 
@@ -90,10 +91,9 @@ pub fn encode_samples(out: &mut [u8], header: &Header, samples: &[u64]) {
     }
     let marked = marks::write(&mut out[header.marks_at..header.samples_at], rows, &bits);
     debug_assert_eq!(marked, header.num_samples);
-    marks::pack(
+    header.ids.write(
         &mut out[header.samples_at..],
         samples.iter().map(|&x| u64::from(x as u32)),
-        header.sample_bits,
     );
     header.write(&mut out[..HEADER_BYTES]);
 }

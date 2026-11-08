@@ -1,12 +1,14 @@
 //! A balanced `k`-ary wavelet matrix over the sentinel-free BWT codes,
 //! `k = 1 << d` for `d` in 1, 2, 4: `depth` levels of `n` digits
-//! (`digits.rs`), the most significant digit of each code first. Each level
+//! (`wavelet/digits.rs`), the most significant digit of each code first. Each level
 //! holds the digits of the codes in the order the level above left them,
 //! stably sorted by that level's digit. A rank or an access reads one block
 //! per level: 8 levels for a byte alphabet at `d = 1`, 4 at 2, 2 at 4.
 
-use crate::build::each;
-use crate::digits::{self, Digits};
+mod digits;
+
+use self::digits::Digits;
+use crate::par::each;
 
 /// Most levels: codes are bytes.
 pub const MAX_DEPTH: usize = 8;
@@ -14,38 +16,79 @@ pub const MAX_DEPTH: usize = 8;
 /// Most `depth * k` entries of the per-level digit starts.
 pub const MAX_STARTS: usize = 32;
 
-/// The levels' places in a blob and what a rank needs besides.
+/// A digit width and block size the format allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Params {
+    d: u32,
+    lb: u32,
+}
+
+impl Params {
+    /// `d` bits per digit, 1, 2 or 4, in blocks of `1 << lb` digits, `lb` in
+    /// 8..=12; `None` for any other.
+    #[inline]
+    pub fn new(d: u32, lb: u32) -> Option<Self> {
+        (matches!(d, 1 | 2 | 4) && (8..=12).contains(&lb)).then_some(Self { d, lb })
+    }
+
+    /// Bits per digit.
+    #[inline]
+    pub fn d(self) -> u32 {
+        self.d
+    }
+
+    /// log2 of the digits per block.
+    #[inline]
+    pub fn lb(self) -> u32 {
+        self.lb
+    }
+}
+
+/// The levels' places in a blob and what a rank needs besides. Its fields
+/// are private so that a [`Wt`] only ever reads a shape [`Shape::new`] made:
+/// valid [`Params`] and at most [`MAX_DEPTH`] levels. The starts and bottoms
+/// may hold anything: reads clamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
-    pub n: usize,
-    pub depth: usize,
+    n: usize,
+    depth: usize,
     /// Bits per digit.
-    pub d: u32,
+    d: u32,
     /// log2 of the digits per block.
-    pub lb: u32,
-    pub levels: [Digits; MAX_DEPTH],
+    lb: u32,
+    levels: [Digits; MAX_DEPTH],
     /// Entry `l * k + x`: positions of level `l` holding a digit below `x`.
-    pub starts: [u32; MAX_STARTS],
+    starts: [u32; MAX_STARTS],
     /// Where each code's positions start below the last level.
-    pub bottom: [u32; 256],
+    bottom: [u32; 256],
 }
 
 impl Shape {
-    /// Levels from `at` with the given payload bytes (padding included),
-    /// each 64-byte aligned; also returns where the last ends.
+    /// The levels of `n` digits for `sigma <= 256` codes from `at` with the
+    /// given digit starts, bottoms and payload bytes (padding included),
+    /// each level 64-byte aligned; also returns where the last ends.
+    ///
+    /// # Panics
+    ///
+    /// If `sigma` is over 256.
+    #[inline]
     pub fn new(
         n: usize,
-        depth: usize,
-        d: u32,
-        lb: u32,
+        sigma: usize,
+        params: Params,
+        starts: [u32; MAX_STARTS],
+        bottom: [u32; 256],
         payload: &[u32; MAX_DEPTH],
         at: usize,
     ) -> (Self, usize) {
+        assert!(sigma <= 256, "{sigma} codes");
+        let Params { d, lb } = params;
+        let depth = depth_for(sigma, params);
         let mut levels = [Digits::default(); MAX_DEPTH];
         let mut end = at;
         for (level, &p) in levels.iter_mut().zip(payload).take(depth) {
             *level = Digits::at(end, n, d, lb);
-            end = (level.payload + p as usize).next_multiple_of(64);
+            end = (level.payload_at() + p as usize).next_multiple_of(64);
         }
         let shape = Self {
             n,
@@ -53,23 +96,76 @@ impl Shape {
             d,
             lb,
             levels,
-            starts: [0; MAX_STARTS],
-            bottom: [0; 256],
+            starts,
+            bottom,
         };
         (shape, end)
     }
+
+    /// Levels.
+    #[inline]
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// The digit width and block size.
+    #[inline]
+    pub fn params(&self) -> Params {
+        Params {
+            d: self.d,
+            lb: self.lb,
+        }
+    }
+
+    /// Entry `l * k + x`: positions of level `l` holding a digit below `x`.
+    #[inline]
+    pub fn starts(&self) -> &[u32; MAX_STARTS] {
+        &self.starts
+    }
+
+    /// Where each code's positions start below the last level.
+    #[inline]
+    pub fn bottom(&self) -> &[u32; 256] {
+        &self.bottom
+    }
+
+    /// The byte level `l` starts at.
+    ///
+    /// # Panics
+    ///
+    /// If `l` is not below the depth.
+    #[inline]
+    pub fn level_at(&self, l: usize) -> usize {
+        self.levels[..self.depth][l].start()
+    }
 }
 
-/// Levels of `d`-bit digits for `sigma` codes; one code needs none.
-pub fn depth_for(sigma: usize, d: u32) -> usize {
-    bits_for(sigma).div_ceil(d as usize)
+/// Levels of digits of `params` for `sigma` codes; one code needs none.
+#[inline]
+pub fn depth_for(sigma: usize, params: Params) -> usize {
+    bits_for(sigma).div_ceil(params.d as usize)
 }
 
 /// Bits for `sigma` codes.
-pub fn bits_for(sigma: usize) -> usize {
+#[inline]
+fn bits_for(sigma: usize) -> usize {
     (usize::BITS - sigma.saturating_sub(1).leading_zeros()) as usize
 }
 
+/// Most payload bytes of a level of `n` digits, padding included.
+#[inline]
+pub fn max_level_payload(n: usize, params: Params) -> usize {
+    digits::max_payload(n, params.d, params.lb)
+}
+
+/// Most bytes of a level of `n` digits, before its 64-byte alignment.
+#[inline]
+pub fn max_level_bytes(n: usize, params: Params) -> usize {
+    let (s, h) = digits::index_bytes(n, params.d, params.lb);
+    s + h + digits::max_payload(n, params.d, params.lb)
+}
+
+/// Reads the levels a [`Shape`] places in `bytes`, in place.
 #[derive(Clone, Copy)]
 pub struct Wt<'a> {
     bytes: &'a [u8],
@@ -77,14 +173,20 @@ pub struct Wt<'a> {
 }
 
 impl<'a> Wt<'a> {
+    /// The levels of `shape` in `bytes`.
+    #[inline]
     pub fn new(bytes: &'a [u8], shape: &'a Shape) -> Self {
         Self { bytes, shape }
     }
 
-    /// Occurrences of digit `x` in `0..i` of level `l`, unclamped.
+    /// Occurrences of digit `x` in `0..i` of level `l`, unclamped; zero
+    /// past the last level.
+    #[inline]
     pub fn level_rank(&self, l: usize, x: usize, i: usize) -> usize {
         let s = self.shape;
-        let level = s.levels[l];
+        let Some(&level) = s.levels[..s.depth].get(l) else {
+            return 0;
+        };
         match s.d {
             1 => level.rank::<1>(self.bytes, s.lb, i, x),
             2 => level.rank::<2>(self.bytes, s.lb, i, x),
@@ -219,18 +321,62 @@ fn digit_counts(seq: &[u8], digit: impl Fn(u8) -> usize + Sync) -> Vec<[usize; 1
     counts
 }
 
-/// The encoded levels of `codes` (all below `sigma`) in `d`-bit digits and
-/// blocks of `1 << lb`, each its supers, heads and payload; the digit starts
-/// of each; and where each code starts below the last. Each level's passes
-/// run in chunks on the current rayon pool; the levels below the first take
-/// one scratch copy of the codes, two past four levels.
-pub fn encode(
-    codes: &[u8],
-    sigma: usize,
-    d: u32,
-    lb: u32,
-) -> (Vec<Vec<u8>>, [u32; MAX_STARTS], [u32; 256]) {
-    let depth = depth_for(sigma, d);
+/// Levels as [`encode`] left them, each its supers, heads and payload, and
+/// the tables a [`Shape`] needs for them.
+pub struct Encoded {
+    levels: Vec<Vec<u8>>,
+    n: usize,
+    params: Params,
+    starts: [u32; MAX_STARTS],
+    bottom: [u32; 256],
+}
+
+impl Encoded {
+    /// The digit starts of each level.
+    pub fn starts(&self) -> &[u32; MAX_STARTS] {
+        &self.starts
+    }
+
+    /// Where each code starts below the last level.
+    pub fn bottom(&self) -> &[u32; 256] {
+        &self.bottom
+    }
+
+    /// Payload bytes of each level.
+    pub fn payloads(&self) -> [u32; MAX_DEPTH] {
+        let (d, lb) = (self.params.d, self.params.lb);
+        let (s, h) = digits::index_bytes(self.n, d, lb);
+        std::array::from_fn(|l| self.levels.get(l).map_or(0, |v| (v.len() - s - h) as u32))
+    }
+
+    /// Copies the levels where `shape` places them in the zeroed `out`.
+    ///
+    /// # Panics
+    ///
+    /// If `shape` was not made for these levels.
+    pub fn write(&self, shape: &Shape, out: &mut [u8]) {
+        assert!(
+            shape.n == self.n && shape.params() == self.params && shape.depth == self.levels.len(),
+            "a shape for other levels"
+        );
+        for (level, at) in self.levels.iter().zip(&shape.levels) {
+            out[at.start()..at.start() + level.len()].copy_from_slice(level);
+        }
+    }
+}
+
+/// The encoded levels of `codes`, all below `sigma <= 256`, with `params`,
+/// the most significant digit first. Each level's passes run in chunks on
+/// the current rayon pool; the levels below the first take one scratch copy
+/// of the codes, two past four levels.
+///
+/// # Panics
+///
+/// If `sigma` is over 256 or a code is not below it.
+pub fn encode(codes: &[u8], sigma: usize, params: Params) -> Encoded {
+    assert!(sigma <= 256, "{sigma} codes");
+    let Params { d, lb } = params;
+    let depth = depth_for(sigma, params);
     let (n, k) = (codes.len(), 1usize << d);
     let chunk_codes = histograms(codes);
     let mut counts = [0usize; 256];
@@ -239,6 +385,10 @@ pub fn encode(
             *c += p as usize;
         }
     }
+    assert!(
+        counts[sigma..].iter().all(|&c| c == 0),
+        "a code at or past {sigma}"
+    );
     let shift = |l: usize| ((depth - 1 - l) * d as usize) as u32;
     let digit = |c: u8, l: usize| usize::from(c) >> shift(l) & (k - 1);
     let mut levels = Vec::with_capacity(depth);
@@ -292,18 +442,14 @@ pub fn encode(
         bottom[c] = at as u32;
         at += counts[c];
     }
-    (levels, starts, bottom)
-}
-
-/// Payload bytes of each encoded level of `n` digits.
-pub fn payloads(levels: &[Vec<u8>], n: usize, d: u32, lb: u32) -> [u32; MAX_DEPTH] {
-    let (s, h) = digits::index_bytes(n, d, lb);
-    std::array::from_fn(|l| levels.get(l).map_or(0, |v| (v.len() - s - h) as u32))
-}
-
-/// Copies the encoded `levels` where `shape` places them in the zeroed `out`.
-pub fn write(levels: &[Vec<u8>], shape: &Shape, out: &mut [u8]) {
-    for (level, at) in levels.iter().zip(&shape.levels) {
-        out[at.supers..at.supers + level.len()].copy_from_slice(level);
+    Encoded {
+        levels,
+        n,
+        params,
+        starts,
+        bottom,
     }
 }
+
+#[cfg(test)]
+mod tests;

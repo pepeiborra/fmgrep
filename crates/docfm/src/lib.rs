@@ -26,13 +26,12 @@
 #![warn(missing_docs)]
 
 mod build;
-mod digits;
 mod forward;
 mod layout;
-mod marks;
 #[cfg(test)]
 mod tests;
-mod wt;
+
+use docfm_bits::{marks, packed, wavelet as wt};
 
 use crate::layout::{Config, Header};
 use crate::wt::Wt;
