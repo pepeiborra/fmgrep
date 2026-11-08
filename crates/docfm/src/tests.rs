@@ -493,8 +493,10 @@ fn bwt_matches_naive_rotation_sort() {
         let view = index.cursor().view;
         let got: Vec<Option<u8>> = (0..=text.len())
             .map(|row| {
-                (row != index.header.sentinel_row)
-                    .then(|| byte_of[usize::from(view.bwt().access_rank(view.bwt_index(row)).0)])
+                (row != index.header.sentinel_row).then(|| {
+                    let at = view.bwt_pos(Row::new(row)).get();
+                    byte_of[usize::from(view.bwt().access_rank(at).0)]
+                })
             })
             .collect();
         assert_eq!(got, want, "text {text:?}");
@@ -793,12 +795,13 @@ fn interleaved_locate_equals_rowwise() {
             let index = build_with(text.clone(), sampling).unwrap();
             for pattern in patterns(&text) {
                 let cursor = index.cursor().extend_front(&pattern);
-                let mut rowwise: Vec<usize> =
-                    (cursor.lo..cursor.hi).map(|r| cursor.view.doc(r)).collect();
+                let mut rowwise: Vec<usize> = Row::range(cursor.lo, cursor.hi)
+                    .map(|r| cursor.view.doc(r))
+                    .collect();
                 let mut got = Vec::new();
                 cursor
                     .view
-                    .docs::<false>(cursor.lo..cursor.hi, &mut |d| got.push(d));
+                    .docs::<false>(Row::range(cursor.lo, cursor.hi), &mut |d| got.push(d));
                 rowwise.sort_unstable();
                 got.sort_unstable();
                 assert_eq!(got, rowwise, "{sampling:?} pattern {pattern:?}");
@@ -827,8 +830,9 @@ fn rows_locates_a_slice_of_the_rows() {
                 let want_count = within.end.min(n).saturating_sub(within.start.min(n));
                 assert_eq!(slice.count(), want_count);
                 assert_eq!(slice.lo, cursor.lo + within.start.min(n) as usize);
-                let mut want: Vec<usize> =
-                    (slice.lo..slice.hi).map(|r| cursor.view.doc(r)).collect();
+                let mut want: Vec<usize> = Row::range(slice.lo, slice.hi)
+                    .map(|r| cursor.view.doc(r))
+                    .collect();
                 let mut got = Vec::new();
                 slice.locate(&mut |d| got.push(d));
                 want.sort_unstable();
@@ -893,7 +897,8 @@ fn text_walks_stay_within_bound() {
                 {
                     let mut want: Vec<usize> =
                         rows[run.clone()].iter().map(|&(p, _)| docs[p]).collect();
-                    let mut have: Vec<usize> = run.clone().map(|r| view.doc(r + 1)).collect();
+                    let mut have: Vec<usize> =
+                        run.clone().map(|r| view.doc(Row::new(r + 1))).collect();
                     want.sort_unstable();
                     have.sort_unstable();
                     assert_eq!(have, want, "{sampling:?} rows from {}", i + 1);
@@ -1151,7 +1156,7 @@ fn a_corrupt_mark_offset_stays_inside_the_interval() {
         viewed.push(s);
         for len in [1, 258, 300, 600] {
             let cursor = index.cursor().extend_front(&vec![b'a'; len]);
-            let (lo, hi) = (cursor.lo, cursor.hi);
+            let (lo, hi) = (cursor.lo.get(), cursor.hi.get());
             let marks = index.header.marks(&b);
             for (row, _) in marks.range(lo, hi) {
                 assert!(
@@ -1179,7 +1184,7 @@ fn decreasing_mark_ranks_panic_as_corrupt() {
     let index = FmIndex::view(blob.as_slice()).unwrap();
     let (lo, hi) = {
         let cursor = index.cursor().extend_front(&[b'a'; 5000]);
-        (cursor.lo, cursor.hi)
+        (cursor.lo.get(), cursor.hi.get())
     };
     let (s_lo, s_hi) = (((lo >> low) - 1) / 64, ((hi >> low) - 1) / 64);
     assert!(s_lo < s_hi && hi <= h.n, "{lo}..{hi}");

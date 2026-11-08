@@ -3,6 +3,8 @@
 use std::io::Write;
 use std::ops::Range;
 
+use typed_index_collections::TiVec;
+
 use crate::Document;
 
 use crate::automaton::{DeferredPlan, RegexPlan, automaton_locate};
@@ -37,13 +39,36 @@ fn may_contain(structure: &Structure, term: &[u8]) -> bool {
     term.iter().all(|&b| structure.contains_symbol(b))
 }
 
+/// A shard-local document ordinal: its place among the shard's non-empty
+/// documents, what docfm's locate reports.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShardDoc(usize);
+
+impl From<usize> for ShardDoc {
+    fn from(sub: usize) -> Self {
+        Self(sub)
+    }
+}
+
+impl From<ShardDoc> for usize {
+    fn from(sub: ShardDoc) -> Self {
+        sub.0
+    }
+}
+
+/// A document's id across the index, empty documents included.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GlobalDoc(usize);
+
 /// A shard's doc-id bookkeeping. Doc ranges partition `0..num_docs`
 /// contiguously.
 pub struct ShardMeta {
     /// Global doc ids this shard answers for, empties included.
     pub docs: Range<usize>,
     /// Shard-local document ordinal -> global doc id, ascending.
-    pub kept: Vec<usize>,
+    pub kept: TiVec<ShardDoc, GlobalDoc>,
     /// Shard text bytes: every non-empty document plus its separator.
     pub text_len: usize,
 }
@@ -53,11 +78,11 @@ impl ShardMeta {
     /// range.
     pub fn new(docs: Range<usize>, lens: &[u64]) -> Self {
         assert_eq!(docs.len(), lens.len(), "shard lengths must match its range");
-        let kept: Vec<usize> = docs
+        let kept = docs
             .clone()
             .zip(lens)
             .filter(|&(_, &l)| l > 0)
-            .map(|(i, _)| i)
+            .map(|(i, _)| GlobalDoc(i))
             .collect();
         let text_len = lens
             .iter()
@@ -72,8 +97,8 @@ impl ShardMeta {
     }
 
     /// The shard-local ordinal of a located `hit`, if it names a document.
-    fn sub_of(&self, hit: usize) -> Option<usize> {
-        (hit < self.kept.len()).then_some(hit)
+    fn sub_of(&self, hit: usize) -> Option<ShardDoc> {
+        (hit < self.kept.len()).then_some(ShardDoc(hit))
     }
 
     /// `structure` if it indexes this shard's non-empty document count.
@@ -119,25 +144,25 @@ impl ShardMeta {
 
     /// Ascending `(global doc id, occurrences)` of located shard ordinals:
     /// sorted when sparse, so the cost does not grow with the shard's docs.
-    fn tally(&self, mut subs: Vec<usize>) -> Vec<(usize, u64)> {
+    fn tally(&self, mut subs: Vec<ShardDoc>) -> Vec<(usize, u64)> {
         if subs.len() >= self.kept.len() / DENSE_TALLY {
-            let mut counts = vec![0u64; self.kept.len()];
+            let mut counts: TiVec<ShardDoc, u64> = vec![0; self.kept.len()].into();
             for sub in subs {
                 counts[sub] += 1;
             }
             return counts
-                .into_iter()
-                .enumerate()
+                .into_iter_enumerated()
                 .filter(|&(_, c)| c > 0)
-                .map(|(sub, c)| (self.kept[sub], c))
+                .map(|(sub, c)| (self.kept[sub].0, c))
                 .collect();
         }
         subs.sort_unstable();
         let mut out: Vec<(usize, u64)> = Vec::new();
         for sub in subs {
+            let global = self.kept[sub].0;
             match out.last_mut() {
-                Some((doc, c)) if *doc == self.kept[sub] => *c += 1,
-                _ => out.push((self.kept[sub], 1)),
+                Some((doc, c)) if *doc == global => *c += 1,
+                _ => out.push((global, 1)),
             }
         }
         out
