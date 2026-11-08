@@ -2,6 +2,8 @@
 //! over one corpus.
 
 mod elgrep;
+#[cfg(test)]
+mod fake_bin;
 mod report;
 mod rows;
 mod tgrep;
