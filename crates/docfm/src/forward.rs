@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use crate::build::word_start;
+use crate::row::Row;
 use crate::{Cursor, DOC_END, LocateStats, RING, View};
 
 /// A tail is used while it holds at most `RATIO * count / d` marks, `d` the
@@ -37,7 +38,7 @@ impl Cursor<'_> {
         let header = self.view.header;
         let limit = self.depth_cap().min(header.depth_limit());
         let marks = header.marks(self.view.bytes);
-        let own = marks.get_rank(self.hi).1 - marks.get_rank(self.lo).1;
+        let own = marks.get_rank(self.hi.get()).1 - marks.get_rank(self.lo.get()).1;
         let count = self.count() - own as u64;
         if count == 0 {
             return 0;
@@ -48,7 +49,7 @@ impl Cursor<'_> {
             .filter(|&i| self.probed(i))
             .take_while(|&i| {
                 let (from, to) = self.tail(i);
-                let inside = marks.get_rank(to).1 - marks.get_rank(from).1;
+                let inside = marks.get_rank(to.get()).1 - marks.get_rank(from.get()).1;
                 inside as u128 * u128::from(num) <= budget
             })
             .last()
@@ -77,8 +78,9 @@ impl Cursor<'_> {
         }
         let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
         let mut own = 0;
-        for (row, rank) in view.header.marks(view.bytes).range(lo, hi) {
-            resolved[(row - lo) / 64] |= 1 << ((row - lo) % 64);
+        for (row, rank) in view.header.marks(view.bytes).range(lo.get(), hi.get()) {
+            let at = Row::new(row) - lo;
+            resolved[at / 64] |= 1 << (at % 64);
             visit(view.sampled(rank));
             own += 1;
         }
@@ -92,10 +94,10 @@ impl Cursor<'_> {
         let (steps, longest) = if own == hi - lo {
             (0, 0)
         } else if !tails && own == 0 {
-            view.docs::<STATS>(lo..hi, visit)
+            view.docs::<STATS>(Row::range(lo, hi), visit)
         } else {
             view.docs::<STATS>(
-                (lo..hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
+                Row::range(lo, hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
                 visit,
             )
         };
@@ -143,11 +145,11 @@ impl Cursor<'_> {
         let marks = view.header.marks(view.bytes);
         for i in (1..=depth).filter(|&i| self.probed(i)) {
             let (from, to) = self.tail(i);
-            for (row, rank) in marks.range(from, to) {
+            for (row, rank) in marks.range(from.get(), to.get()) {
                 if STATS {
                     *probes += 1;
                 }
-                let Some(at) = view.back(row, &codes[..i]) else {
+                let Some(at) = view.back(Row::new(row), &codes[..i]) else {
                     continue;
                 };
                 assert!(
@@ -165,9 +167,9 @@ impl Cursor<'_> {
     }
 
     /// The rows of `path[i..]`, `1 <= i < min(len, RING)`.
-    fn tail(&self, i: usize) -> (usize, usize) {
+    fn tail(&self, i: usize) -> (Row, Row) {
         let (from, to) = self.tails[(self.len as usize).wrapping_sub(i) % RING];
-        (from as usize, to as usize)
+        (Row::new(from as usize), Row::new(to as usize))
     }
 
     /// `path[j]`, `j < min(len, RING)`.
@@ -179,17 +181,18 @@ impl Cursor<'_> {
 impl View<'_> {
     /// The row `codes.len()` LF steps before `row` if each step reads the
     /// next of `codes` from the back, else `None`.
-    fn back(&self, mut row: usize, codes: &[u8]) -> Option<usize> {
+    #[inline]
+    fn back(&self, mut row: Row, codes: &[u8]) -> Option<Row> {
         let bwt = self.bwt();
         for &want in codes.iter().rev() {
-            if row == self.header.sentinel_row {
+            if row == Row::new(self.header.sentinel_row) {
                 return None;
             }
-            let (code, rank) = bwt.access_rank(self.bwt_index(row));
+            let (code, rank) = bwt.access_rank(self.bwt_pos(row).get());
             if code != want {
                 return None;
             }
-            row = (self.header.c[usize::from(want)] as usize + rank).min(self.header.n);
+            row = self.lf_to(want, rank);
         }
         Some(row)
     }

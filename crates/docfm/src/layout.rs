@@ -1,5 +1,6 @@
 //! Blob v8, all little-endian. The blob length is a multiple of 16 KiB, so
-//! blobs laid end to end from a page-aligned offset stay page-aligned.
+//! blobs laid end to end from a page-aligned offset stay page-aligned. The
+//! struct `OnDisk` is the first 2368 bytes of this table, field for field.
 //!
 //! | offset | field |
 //! |---|---|
@@ -29,19 +30,11 @@ use crate::marks::{Marks, section_bytes};
 use crate::packed::Packed;
 use crate::wavelet::{self, MAX_DEPTH, MAX_STARTS, Params, Shape, WaveletMatrix, depth_for};
 use crate::{DOC_END, Error, MAX_TEXT_BYTES};
+use zerocopy::little_endian::{U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 const MAGIC: [u8; 8] = *b"DOCFM\0\x08\0";
 const SCHEME: u32 = 1;
-const BLOCK_AT: usize = 64;
-const SCHEME_AT: usize = 68;
-const RESERVED_END: usize = 96;
-const C_AT: usize = 96;
-const BOTTOM_AT: usize = 1124;
-const DOCS_AT: usize = 2148;
-const STARTS_AT: usize = 2176;
-const PAYLOAD_AT: usize = 2304;
-const DIGIT_AT: usize = 2336;
-const LEVELS_RESERVED: usize = 2340;
 pub const HEADER_BYTES: usize = 2368;
 pub const PAGE: usize = 16384;
 /// log2 of the digits per wavelet block a build writes.
@@ -130,39 +123,57 @@ fn corrupt(why: String) -> Error {
     Error::Corrupt(why)
 }
 
-fn u32_at(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(*b[at..].first_chunk().expect("in bounds"))
+/// The header as it lies on disk; the table above gives each field's meaning.
+#[derive(FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+struct OnDisk {
+    magic: [u8; 8],
+    n: U64,
+    sentinel_row: U64,
+    max_gap: U32,
+    sigma: U32,
+    alphabet: [U64; 4],
+    block: U32,
+    scheme: U32,
+    gap_min: U32,
+    gap_max: U32,
+    gap_ws: U32,
+    walk_bound: U32,
+    reserved_gaps: [u8; 8],
+    c: [U32; 257],
+    bottom: [U32; 256],
+    num_docs: U32,
+    num_samples: U32,
+    reserved_docs: [u8; 20],
+    starts: [U32; MAX_STARTS],
+    payload: [U32; MAX_DEPTH],
+    digit_bits: U32,
+    reserved_levels: [u8; 28],
 }
 
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(*b[at..].first_chunk().expect("in bounds"))
-}
-
-fn put_u32s(out: &mut [u8], at: usize, values: &[u32]) {
-    for (dst, v) in out[at..].as_chunks_mut::<4>().0.iter_mut().zip(values) {
-        dst.copy_from_slice(&v.to_le_bytes());
-    }
-}
+const _: () = assert!(size_of::<OnDisk>() == HEADER_BYTES);
 
 /// The gaps of a header with this version's magic.
-fn gaps_at(b: &[u8]) -> Result<Gaps, Error> {
-    let field = |k: usize| u32_at(b, SCHEME_AT + 4 * k);
-    let gaps = Gaps {
-        min: field(1),
-        max: field(2),
-        ws: field(3),
-    };
-    let tail_zero = b[SCHEME_AT + 20..RESERVED_END].iter().all(|&x| x == 0);
-    let max = u32_at(b, 24);
-    if field(0) != SCHEME
+fn gaps_of(raw: &OnDisk) -> Result<Gaps, Error> {
+    let fields = [
+        raw.scheme,
+        raw.gap_min,
+        raw.gap_max,
+        raw.gap_ws,
+        raw.walk_bound,
+    ]
+    .map(U32::get);
+    let [scheme, min, max, ws, walk_bound] = fields;
+    let gaps = Gaps { min, max, ws };
+    let max_gap = raw.max_gap.get();
+    if scheme != SCHEME
         || !gaps.check()
-        || gaps.max != max
-        || field(4) != gaps.walk_bound()
-        || !tail_zero
+        || gaps.max != max_gap
+        || walk_bound != gaps.walk_bound()
+        || raw.reserved_gaps != [0; 8]
     {
         return Err(corrupt(format!(
-            "v8 sampling fields {:?} with max gap {max}",
-            [0, 1, 2, 3, 4].map(field)
+            "v8 sampling fields {fields:?} with max gap {max_gap}"
         )));
     }
     Ok(gaps)
@@ -252,89 +263,84 @@ impl Header {
     }
 
     pub fn write(&self, out: &mut [u8]) {
-        out[..8].copy_from_slice(&MAGIC);
         let Gaps { min, max, ws } = self.sampling;
-        put_u32s(
-            out,
-            SCHEME_AT,
-            &[SCHEME, min, max, ws, self.sampling.walk_bound()],
-        );
-        out[8..16].copy_from_slice(&(self.n as u64).to_le_bytes());
-        out[16..24].copy_from_slice(&(self.sentinel_row as u64).to_le_bytes());
-        put_u32s(out, 24, &[self.sampling.max, self.sigma as u32]);
-        for (dst, w) in out[32..64]
-            .as_chunks_mut::<8>()
-            .0
-            .iter_mut()
-            .zip(self.alphabet)
-        {
-            dst.copy_from_slice(&w.to_le_bytes());
-        }
-        put_u32s(out, BLOCK_AT, &[1 << self.wavelet.params().lb()]);
-        put_u32s(out, C_AT, &self.c);
-        put_u32s(out, BOTTOM_AT, self.wavelet.bottom());
-        put_u32s(
-            out,
-            DOCS_AT,
-            &[self.num_docs as u32, self.num_samples as u32],
-        );
-        put_u32s(out, STARTS_AT, self.wavelet.starts());
-        put_u32s(out, PAYLOAD_AT, &self.payload);
-        put_u32s(out, DIGIT_AT, &[self.wavelet.params().d()]);
+        let params = self.wavelet.params();
+        let raw = OnDisk {
+            magic: MAGIC,
+            n: U64::new(self.n as u64),
+            sentinel_row: U64::new(self.sentinel_row as u64),
+            max_gap: U32::new(max),
+            sigma: U32::new(self.sigma as u32),
+            alphabet: self.alphabet.map(U64::new),
+            block: U32::new(1 << params.lb()),
+            scheme: U32::new(SCHEME),
+            gap_min: U32::new(min),
+            gap_max: U32::new(max),
+            gap_ws: U32::new(ws),
+            walk_bound: U32::new(self.sampling.walk_bound()),
+            reserved_gaps: [0; 8],
+            c: self.c.map(U32::new),
+            bottom: self.wavelet.bottom().map(U32::new),
+            num_docs: U32::new(self.num_docs as u32),
+            num_samples: U32::new(self.num_samples as u32),
+            reserved_docs: [0; 20],
+            starts: self.wavelet.starts().map(U32::new),
+            payload: self.payload.map(U32::new),
+            digit_bits: U32::new(params.d()),
+            reserved_levels: [0; 28],
+        };
+        out[..HEADER_BYTES].copy_from_slice(raw.as_bytes());
     }
 
     pub fn parse(b: &[u8]) -> Result<Self, Error> {
-        if b.len() < MAGIC.len() {
+        let Some(magic) = b.get(..MAGIC.len()) else {
             return Err(corrupt("truncated".into()));
+        };
+        if magic != MAGIC {
+            return Err(corrupt(format!("magic/version {magic:?}, want {MAGIC:?}")));
         }
-        if b[..8] != MAGIC {
-            return Err(corrupt(format!(
-                "magic/version {:?}, want {MAGIC:?}",
-                &b[..8]
-            )));
-        }
-        if b.len() < HEADER_BYTES {
+        let Ok((raw, _)) = OnDisk::read_from_prefix(b) else {
             return Err(corrupt("truncated".into()));
-        }
-        let block = u32_at(b, BLOCK_AT);
+        };
+        let block = raw.block.get();
         if !block.is_power_of_two() || !(256..=4096).contains(&block) {
             return Err(corrupt(format!(
                 "{block} digits per block, want a power of two in 256..=4096"
             )));
         }
-        let d = u32_at(b, DIGIT_AT);
+        let d = raw.digit_bits.get();
         if ![1, 2, 4].contains(&d) {
             return Err(corrupt(format!("{d} bits per digit, want 1, 2 or 4")));
         }
         let params = Params::new(d, block.ilog2()).expect("checked above");
-        let n = u64_at(b, 8);
+        let n = raw.n.get();
         if n > MAX_TEXT_BYTES {
             return Err(corrupt(format!("text length {n} over the bound")));
         }
         let n = n as usize;
-        let sentinel_row = u64_at(b, 16);
+        let sentinel_row = raw.sentinel_row.get();
         if sentinel_row > n as u64 {
             return Err(corrupt(format!("sentinel row {sentinel_row} past {n}")));
         }
-        let sampling = gaps_at(b)?;
-        let alphabet = std::array::from_fn(|k| u64_at(b, 32 + 8 * k));
-        let c = std::array::from_fn(|k| u32_at(b, C_AT + 4 * k));
-        let num_docs = u32_at(b, DOCS_AT) as usize;
-        let num_samples = u32_at(b, DOCS_AT + 4) as usize;
+        let sampling = gaps_of(&raw)?;
+        let alphabet = raw.alphabet.map(U64::get);
+        let c = raw.c.map(U32::get);
+        let num_docs = raw.num_docs.get() as usize;
+        let num_samples = raw.num_samples.get() as usize;
         // At most one sample per row, of which there are n + 1.
         if (num_docs == 0) != (n == 0) || num_docs > num_samples || num_samples > n + 1 {
             return Err(corrupt(format!(
                 "{num_docs} docs and {num_samples} samples over {n} bytes"
             )));
         }
-        let sigma = u32_at(b, 28) as usize;
+        let sigma = raw.sigma.get() as usize;
         let depth = depth_for(sigma.min(256), params);
         let k = 1usize << d;
         let levels = Levels {
             params,
-            starts: std::array::from_fn(|x| u32_at(b, STARTS_AT + 4 * x)),
-            payload: std::array::from_fn(|l| u32_at(b, PAYLOAD_AT + 4 * l)),
-            bottom: std::array::from_fn(|k| u32_at(b, BOTTOM_AT + 4 * k)),
+            starts: raw.starts.map(U32::get),
+            payload: raw.payload.map(U32::get),
+            bottom: raw.bottom.map(U32::get),
         };
         let max_payload = wavelet::max_level_payload(n, params);
         for l in 0..MAX_DEPTH {
@@ -359,8 +365,8 @@ impl Header {
                 if k < sigma { at as usize > n } else { at != 0 }
             },
         ) || levels.starts[depth * k..].iter().any(|&s| s != 0)
-            || b[DOCS_AT + 8..STARTS_AT].iter().any(|&x| x != 0)
-            || b[LEVELS_RESERVED..HEADER_BYTES].iter().any(|&x| x != 0)
+            || raw.reserved_docs != [0; 20]
+            || raw.reserved_levels != [0; 28]
         {
             return Err(corrupt("code starts or reserved bytes".into()));
         }
@@ -409,7 +415,7 @@ impl Header {
                 let start = h.wavelet.starts()[l * k + x] as usize;
                 let end = h.wavelet.starts().get(l * k + x + 1).filter(|_| x + 1 < k);
                 let want = end.map_or(n, |&e| e as usize) - start;
-                let got = bwt.level_rank(l, x, n);
+                let got = bwt.level_rank(l, n, params.digit(x).expect("below k"));
                 if got != want {
                     return Err(corrupt(format!(
                         "level {l}: {got} digits {x}, the starts say {want}"
