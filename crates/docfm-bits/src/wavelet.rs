@@ -31,6 +31,12 @@ impl Params {
         (matches!(d, 1 | 2 | 4) && (8..=12).contains(&lb)).then_some(Self { d, lb })
     }
 
+    /// `x` as a digit of this width; `None` from `1 << d`.
+    #[inline]
+    pub fn digit(self, x: usize) -> Option<Digit> {
+        (x < 1 << self.d).then_some(Digit(x))
+    }
+
     /// Bits per digit.
     #[inline]
     pub fn d(self) -> u32 {
@@ -43,6 +49,12 @@ impl Params {
         self.lb
     }
 }
+
+/// A digit value, below `1 << d` of the [`Params`] that made it, so a rank's
+/// digit cannot be passed for its position.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Digit(usize);
 
 /// The levels' places in a blob and what a rank needs besides. Its fields
 /// are private so that a [`WaveletMatrix`] only ever reads a shape [`Shape::new`] made:
@@ -179,14 +191,16 @@ impl<'a> WaveletMatrix<'a> {
         Self { bytes, shape }
     }
 
-    /// Occurrences of digit `x` in `0..i` of level `l`, unclamped; zero
-    /// past the last level.
+    /// Occurrences in `0..i` of level `l` of digit `x`, unclamped; zero
+    /// past the last level. A digit of wider [`Params`] than the shape's
+    /// miscounts.
     #[inline]
-    pub fn level_rank(&self, l: usize, x: usize, i: usize) -> usize {
+    pub fn level_rank(&self, l: usize, i: usize, x: Digit) -> usize {
         let s = self.shape;
         let Some(&level) = s.levels[..s.depth].get(l) else {
             return 0;
         };
+        let x = x.0;
         match s.d {
             1 => level.rank::<1>(self.bytes, s.lb, i, x),
             2 => level.rank::<2>(self.bytes, s.lb, i, x),
