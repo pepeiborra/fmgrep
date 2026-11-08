@@ -28,12 +28,15 @@
 mod build;
 mod forward;
 mod layout;
+mod row;
+mod samples;
 #[cfg(test)]
 mod tests;
 
 use docfm_bits::{marks, packed, wavelet};
 
 use crate::layout::{Config, Header};
+use crate::row::{BwtPos, Row};
 use crate::wavelet::WaveletMatrix;
 
 /// Longest text [`FmIndex::build`] accepts, the bound libsais once set; the
@@ -71,38 +74,24 @@ pub struct LocateStats {
 }
 
 /// Why a build, a write or a view failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The text, of this many bytes, is over [`MAX_TEXT_BYTES`].
+    #[error("text of {0} bytes exceeds the {max}-byte docfm bound", max = MAX_TEXT_BYTES)]
     TextTooLong(usize),
     /// The text does not end in [`DOC_END`].
+    #[error("docfm text must end in DOC_END (0x00)")]
     Unterminated,
     /// The BWT construction refused the text.
-    Construction(String),
+    #[error("docfm construction failed: {0}")]
+    Construction(#[source] msbwt::Error),
     /// Writing the blob failed.
-    Io(std::io::Error),
+    #[error("docfm blob I/O failed: {0}")]
+    Io(#[source] std::io::Error),
     /// The blob is not a docfm blob of this version, or fails its checks.
+    #[error("corrupt docfm blob: {0}")]
     Corrupt(String),
 }
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TextTooLong(n) => {
-                write!(
-                    f,
-                    "text of {n} bytes exceeds the {MAX_TEXT_BYTES}-byte docfm bound"
-                )
-            }
-            Self::Unterminated => write!(f, "docfm text must end in DOC_END (0x00)"),
-            Self::Construction(e) => write!(f, "docfm construction failed: {e}"),
-            Self::Io(e) => write!(f, "docfm blob I/O failed: {e}"),
-            Self::Corrupt(why) => write!(f, "corrupt docfm blob: {why}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl FmIndex<Vec<u8>> {
     /// `text` is documents, each followed by one [`DOC_END`]. Samples the doc
@@ -145,8 +134,8 @@ impl<D: AsRef<[u8]>> FmIndex<D> {
                 bytes: self.bytes.as_ref(),
                 header: &self.header,
             },
-            lo: 0,
-            hi: self.header.n + 1,
+            lo: Row::new(0),
+            hi: Row::new(self.header.n + 1),
             root: true,
             tails: [(0, 0); RING],
             front: [0; RING],
@@ -177,36 +166,47 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    #[inline]
     fn bwt(&self) -> WaveletMatrix<'_> {
         self.header.bwt(self.bytes)
     }
 
     /// Rows before `row` in the sentinel-free BWT.
-    fn bwt_index(&self, row: usize) -> usize {
-        row - usize::from(self.header.sentinel_row < row)
+    #[inline]
+    fn bwt_pos(&self, row: Row) -> BwtPos {
+        row.bwt_pos(Row::new(self.header.sentinel_row))
     }
 
     /// `c[code]` + occurrences of `code` in BWT rows `0..row`, at most `n + 1`.
-    fn step(&self, code: u8, row: usize) -> usize {
-        (self.header.c[usize::from(code)] as usize + self.bwt().rank(code, self.bwt_index(row)))
-            .min(self.header.n + 1)
+    #[inline]
+    fn step(&self, code: u8, row: Row) -> Row {
+        let rank = self.bwt().rank(code, self.bwt_pos(row).get());
+        Row::new((self.header.c[usize::from(code)] as usize + rank).min(self.header.n + 1))
+    }
+
+    /// The row one LF step reaches from a BWT byte `code` with `rank` of
+    /// its kind before it.
+    #[inline]
+    fn lf_to(&self, code: u8, rank: usize) -> Row {
+        Row::new((self.header.c[usize::from(code)] as usize + rank).min(self.header.n))
     }
 
     /// The row of the suffix one position earlier. `row` is not the
     /// sentinel's row.
-    fn lf(&self, row: usize) -> usize {
-        let (code, rank) = self.bwt().access_rank(self.bwt_index(row));
-        (self.header.c[usize::from(code)] as usize + rank).min(self.header.n)
+    #[inline]
+    fn lf(&self, row: Row) -> Row {
+        let (code, rank) = self.bwt().access_rank(self.bwt_pos(row).get());
+        self.lf_to(code, rank)
     }
 
     /// The doc id of the suffix at `row`, a non-empty suffix, one walk at a
     /// time.
     #[cfg(test)]
-    fn doc(&self, mut row: usize) -> usize {
+    fn doc(&self, mut row: Row) -> usize {
         let marks = self.header.marks(self.bytes);
         let mut steps = 0;
         loop {
-            let (marked, rank) = marks.get_rank(row);
+            let (marked, rank) = marks.get_rank(row.get());
             if marked {
                 return self.sampled(rank);
             }
@@ -236,14 +236,14 @@ impl View<'_> {
     #[inline(never)]
     fn docs<const STATS: bool>(
         &self,
-        mut rows: impl Iterator<Item = usize>,
+        mut rows: impl Iterator<Item = Row>,
         visit: &mut dyn FnMut(usize),
     ) -> (u64, usize) {
         let marks = self.header.marks(self.bytes);
         let bound = self.header.walk_bound();
         let (mut total, mut longest) = (0u64, 0usize);
         // (row, LF steps taken)
-        let mut lanes = [(0usize, 0usize); LANES];
+        let mut lanes = [(Row::new(0), 0usize); LANES];
         let mut live = 0;
         for (lane, row) in lanes.iter_mut().zip(rows.by_ref()) {
             *lane = (row, 0);
@@ -253,7 +253,7 @@ impl View<'_> {
             let mut i = 0;
             while i < live {
                 let (row, steps) = lanes[i];
-                let (marked, rank) = marks.get_rank(row);
+                let (marked, rank) = marks.get_rank(row.get());
                 if !marked {
                     assert!(
                         steps < bound,
@@ -297,8 +297,8 @@ const _: () = assert!(MAX_TEXT_BYTES < u32::MAX as u64);
 #[derive(Clone, Copy)]
 pub struct Cursor<'a> {
     view: View<'a>,
-    lo: usize,
-    hi: usize,
+    lo: Row,
+    hi: Row,
     root: bool,
     /// Slot `(len - i) % RING`: the rows of `path[i..]`, `path` the bytes
     /// prepended since the root or [`Cursor::rows`].
@@ -319,7 +319,7 @@ impl Cursor<'_> {
             }
             next.root = false;
             let slot = next.len as usize % RING;
-            next.tails[slot] = (next.lo as u32, next.hi as u32);
+            next.tails[slot] = (next.lo.get() as u32, next.hi.get() as u32);
             next.front[slot] = byte;
             next.len = next.len.wrapping_add(1);
             let Some(code) = self.view.header.code_of[usize::from(byte)] else {
