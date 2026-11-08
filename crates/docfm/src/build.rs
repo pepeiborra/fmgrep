@@ -1,8 +1,8 @@
 use rayon::slice::ParallelSliceMut;
 
 use crate::layout::{Config, Gaps, HEADER_BYTES, Header, Levels};
-use crate::wt::Params;
-use crate::{DOC_END, Error, MAX_TEXT_BYTES, marks, wt};
+use crate::wavelet::Params;
+use crate::{DOC_END, Error, MAX_TEXT_BYTES, marks, wavelet};
 
 /// Bytes per parallel unit of work.
 const SUPER: usize = 65536;
@@ -58,7 +58,7 @@ pub fn encode_bwt(
     let params = Params::new(d, lb).expect("a valid config");
     let n = bwt.len();
     let sigma = text.alphabet.iter().map(|w| w.count_ones() as usize).sum();
-    let levels = wt::encode(bwt, sigma, params);
+    let levels = wavelet::encode(bwt, sigma, params);
     let header = Header::new(
         n,
         text.sentinel_row,
@@ -74,7 +74,7 @@ pub fn encode_bwt(
         },
     );
     let mut out = vec![0u8; header.blob_len];
-    levels.write(&header.wt, &mut out);
+    levels.write(&header.wavelet, &mut out);
     (out, header)
 }
 

@@ -627,9 +627,9 @@ fn foreign_or_truncated_blob_is_refused() {
         refuse(&patched(2336, &d.to_le_bytes()), "bits per digit");
     }
     refuse(&patched(2340, &[1]), "reserved");
-    let depth = h.wt.depth();
+    let depth = h.wavelet.depth();
     // Level 0's start of digit 1 moves.
-    let start = h.wt.starts()[1];
+    let start = h.wavelet.starts()[1];
     refuse(&patched(2176 + 4, &(start + 1).to_le_bytes()), "digits");
     refuse(&patched(2176, &1u32.to_le_bytes()), "level 0");
     refuse(
@@ -643,10 +643,10 @@ fn foreign_or_truncated_blob_is_refused() {
     refuse(&patched(2304, &(1u32 << 30).to_le_bytes()), "level 0");
     // Level 0's first super counts one more digit 1 before it.
     refuse(
-        &patched(h.wt.level_at(0) + 4, &1u32.to_le_bytes()),
+        &patched(h.wavelet.level_at(0) + 4, &1u32.to_le_bytes()),
         "digits",
     );
-    let bottom = |k: usize| h.wt.bottom()[k];
+    let bottom = |k: usize| h.wavelet.bottom()[k];
     refuse(
         &patched(1124 + 4, &(bottom(1) + 1).to_le_bytes()),
         "code 1: ",
@@ -739,8 +739,8 @@ fn blob_is_page_aligned() {
         let index = Built::build(text).unwrap();
         let h = &index.header;
         assert_eq!(h.blob_len % layout::PAGE, 0);
-        let lines: Vec<usize> = (0..h.wt.depth())
-            .map(|l| h.wt.level_at(l))
+        let lines: Vec<usize> = (0..h.wavelet.depth())
+            .map(|l| h.wavelet.level_at(l))
             .chain([layout::HEADER_BYTES, h.marks_at, h.samples_at])
             .collect();
         assert!(lines.iter().all(|at| at % 64 == 0), "{lines:?}");
@@ -756,10 +756,10 @@ fn rank_overhead_is_bounded() {
         let n = text.len();
         let index = Built::build(text).unwrap();
         let h = &index.header;
-        let level = wt::max_level_bytes(n, h.wt.params()) + 64;
+        let level = wavelet::max_level_bytes(n, h.wavelet.params()) + 64;
         let levels = h.marks_at - layout::HEADER_BYTES;
         assert!(
-            levels <= h.wt.depth() * level,
+            levels <= h.wavelet.depth() * level,
             "{levels} vs {level} per level"
         );
         let n = n as f64;
@@ -1103,5 +1103,5 @@ fn locate_stats_count_the_probes() {
 #[path = "forward_tests.rs"]
 mod forward_tests;
 
-#[path = "wt_tests.rs"]
-mod wt_tests;
+#[path = "wavelet_tests.rs"]
+mod wavelet_tests;

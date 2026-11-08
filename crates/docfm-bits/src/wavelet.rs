@@ -45,7 +45,7 @@ impl Params {
 }
 
 /// The levels' places in a blob and what a rank needs besides. Its fields
-/// are private so that a [`Wt`] only ever reads a shape [`Shape::new`] made:
+/// are private so that a [`WaveletMatrix`] only ever reads a shape [`Shape::new`] made:
 /// valid [`Params`] and at most [`MAX_DEPTH`] levels. The starts and bottoms
 /// may hold anything: reads clamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,12 +167,12 @@ pub fn max_level_bytes(n: usize, params: Params) -> usize {
 
 /// Reads the levels a [`Shape`] places in `bytes`, in place.
 #[derive(Clone, Copy)]
-pub struct Wt<'a> {
+pub struct WaveletMatrix<'a> {
     bytes: &'a [u8],
     shape: &'a Shape,
 }
 
-impl<'a> Wt<'a> {
+impl<'a> WaveletMatrix<'a> {
     /// The levels of `shape` in `bytes`.
     #[inline]
     pub fn new(bytes: &'a [u8], shape: &'a Shape) -> Self {

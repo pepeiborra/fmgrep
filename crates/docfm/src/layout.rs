@@ -17,7 +17,7 @@
 //! | 2176 | digit starts `[u32; 32]`: entry `l * k + x`, the positions of level `l` holding a digit below `x`, zero from `depth * k` |
 //! | 2304 | payload bytes `[u32; 8]` of each level, padding included, zero from the depth |
 //! | 2336 | bits per digit `d` u32: 1, 2 or 4 (`k = 1 << d`); 2340..2368 reserved zero |
-//! | 2368 | levels (`wt`): each its supers, heads and payload (`digits`), 64-byte aligned |
+//! | 2368 | levels (`wavelet`): each its supers, heads and payload (`digits`), 64-byte aligned |
 //! | | marks (`marks`) over `n + 1` rows |
 //! | | samples: doc id per marked row, in row order, `ceil(log2 num_docs)` bits each (at least 1), packed |
 //!
@@ -27,7 +27,7 @@
 
 use crate::marks::{Marks, section_bytes};
 use crate::packed::Packed;
-use crate::wt::{self, MAX_DEPTH, MAX_STARTS, Params, Shape, Wt, depth_for};
+use crate::wavelet::{self, MAX_DEPTH, MAX_STARTS, Params, Shape, WaveletMatrix, depth_for};
 use crate::{DOC_END, Error, MAX_TEXT_BYTES};
 
 const MAGIC: [u8; 8] = *b"DOCFM\0\x08\0";
@@ -116,7 +116,7 @@ pub struct Header {
     pub sigma: usize,
     pub c: [u32; 257],
     pub payload: [u32; MAX_DEPTH],
-    pub wt: Shape,
+    pub wavelet: Shape,
     pub marks_at: usize,
     pub samples_at: usize,
     /// The packed doc ids.
@@ -186,7 +186,7 @@ impl Header {
                 sigma += 1;
             }
         }
-        let (wt, marks_at) = Shape::new(
+        let (wavelet, marks_at) = Shape::new(
             n,
             sigma,
             levels.params,
@@ -206,7 +206,7 @@ impl Header {
             sigma,
             c,
             payload: levels.payload,
-            wt,
+            wavelet,
             marks_at,
             samples_at,
             ids,
@@ -217,8 +217,8 @@ impl Header {
     }
 
     /// The BWT's wavelet levels in `bytes`.
-    pub fn bwt<'a>(&'a self, bytes: &'a [u8]) -> Wt<'a> {
-        Wt::new(bytes, &self.wt)
+    pub fn bwt<'a>(&'a self, bytes: &'a [u8]) -> WaveletMatrix<'a> {
+        WaveletMatrix::new(bytes, &self.wavelet)
     }
 
     /// Most LF steps from a row to a marked one.
@@ -270,17 +270,17 @@ impl Header {
         {
             dst.copy_from_slice(&w.to_le_bytes());
         }
-        put_u32s(out, BLOCK_AT, &[1 << self.wt.params().lb()]);
+        put_u32s(out, BLOCK_AT, &[1 << self.wavelet.params().lb()]);
         put_u32s(out, C_AT, &self.c);
-        put_u32s(out, BOTTOM_AT, self.wt.bottom());
+        put_u32s(out, BOTTOM_AT, self.wavelet.bottom());
         put_u32s(
             out,
             DOCS_AT,
             &[self.num_docs as u32, self.num_samples as u32],
         );
-        put_u32s(out, STARTS_AT, self.wt.starts());
+        put_u32s(out, STARTS_AT, self.wavelet.starts());
         put_u32s(out, PAYLOAD_AT, &self.payload);
-        put_u32s(out, DIGIT_AT, &[self.wt.params().d()]);
+        put_u32s(out, DIGIT_AT, &[self.wavelet.params().d()]);
     }
 
     pub fn parse(b: &[u8]) -> Result<Self, Error> {
@@ -336,7 +336,7 @@ impl Header {
             payload: std::array::from_fn(|l| u32_at(b, PAYLOAD_AT + 4 * l)),
             bottom: std::array::from_fn(|k| u32_at(b, BOTTOM_AT + 4 * k)),
         };
-        let max_payload = wt::max_level_payload(n, params);
+        let max_payload = wavelet::max_level_payload(n, params);
         for l in 0..MAX_DEPTH {
             let payload = levels.payload[l] as usize;
             let starts = levels.starts.get(l * k..(l + 1) * k).unwrap_or(&[]);
@@ -406,8 +406,8 @@ impl Header {
         let bwt = h.bwt(b);
         for l in 0..depth {
             for x in 0..k {
-                let start = h.wt.starts()[l * k + x] as usize;
-                let end = h.wt.starts().get(l * k + x + 1).filter(|_| x + 1 < k);
+                let start = h.wavelet.starts()[l * k + x] as usize;
+                let end = h.wavelet.starts().get(l * k + x + 1).filter(|_| x + 1 < k);
                 let want = end.map_or(n, |&e| e as usize) - start;
                 let got = bwt.level_rank(l, x, n);
                 if got != want {

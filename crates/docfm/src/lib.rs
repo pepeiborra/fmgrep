@@ -31,10 +31,10 @@ mod layout;
 #[cfg(test)]
 mod tests;
 
-use docfm_bits::{marks, packed, wavelet as wt};
+use docfm_bits::{marks, packed, wavelet};
 
 use crate::layout::{Config, Header};
-use crate::wt::Wt;
+use crate::wavelet::WaveletMatrix;
 
 /// Longest text [`FmIndex::build`] accepts, the bound libsais once set; the
 /// format's `u32` rows would allow up to twice it.
@@ -177,7 +177,7 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    fn bwt(&self) -> Wt<'_> {
+    fn bwt(&self) -> WaveletMatrix<'_> {
         self.header.bwt(self.bytes)
     }
 

@@ -54,7 +54,7 @@ fn run_codes(n: usize, sigma: usize, fate: &mut Fate) -> Vec<u8> {
 
 /// Every rank and access-rank at `positions`, ascending past the end too,
 /// against a running count.
-fn check_tree(tree: &Wt<'_>, codes: &[u8], sigma: usize, positions: &[usize]) {
+fn check_tree(tree: &WaveletMatrix<'_>, codes: &[u8], sigma: usize, positions: &[usize]) {
     let n = codes.len();
     let mut before = vec![0usize; sigma];
     let mut at = 0;
@@ -84,7 +84,7 @@ fn check_tree(tree: &Wt<'_>, codes: &[u8], sigma: usize, positions: &[usize]) {
 /// Every length and alphabet below at once: the sizes around a level's
 /// blocks and supers, up to several supers, that small dice do not reach.
 #[test]
-fn wt_rank_matches_naive() {
+fn wavelet_rank_matches_naive() {
     Dicetest::repeatedly().passes(1).run(|mut fate| {
         for n in [0, 1, 63, 64, 1023, 1024, 1025, 65536, 65537, 200_000] {
             for sigma in [1usize, 2, 3, 5, 17, 100, 200, 256] {
@@ -101,7 +101,7 @@ fn wt_rank_matches_naive() {
                         let p = params(d, lb);
                         let (bytes, shape) = in_pool(3, || tree_of(codes, sigma, p));
                         assert_eq!(shape.depth(), depth_for(sigma, p));
-                        let tree = Wt::new(&bytes, &shape);
+                        let tree = WaveletMatrix::new(&bytes, &shape);
                         let positions: Vec<usize> =
                             edges(n.max(1), digits::super_len(d), lb, &mut fate)
                                 .into_iter()
@@ -138,7 +138,7 @@ fn wavelet_matches_naive(sigma: usize) {
         hint!("sigma {sigma} d {d} lb {lb} n {n}");
         let codes = rolled_codes(&mut fate, n, sigma);
         let (bytes, shape) = tree_of(&codes, sigma, params(d, lb));
-        let tree = Wt::new(&bytes, &shape);
+        let tree = WaveletMatrix::new(&bytes, &shape);
         let positions: Vec<usize> = edges(n, digits::super_len(d), lb, &mut fate)
             .into_iter()
             .chain([n + 1, usize::MAX])
@@ -222,7 +222,7 @@ fn levels_refuse_another_shape() {
 #[test]
 fn level_rank_past_the_last_level_is_zero() {
     let (bytes, shape) = tree_of(&[0, 1, 1, 0], 2, params(1, 8));
-    let tree = Wt::new(&bytes, &shape);
+    let tree = WaveletMatrix::new(&bytes, &shape);
     assert_eq!(tree.level_rank(0, 1, 4), 2);
     assert_eq!(tree.level_rank(shape.depth(), 1, 4), 0);
     assert_eq!(tree.level_rank(usize::MAX, 1, 4), 0);

@@ -11,7 +11,7 @@ fn every_shape_builds_the_same_index() {
                 ..layout::Config::DEFAULT
             };
             let index = FmIndex::view(build::build(text.clone(), config).unwrap()).unwrap();
-            assert_eq!(index.header.wt.params().d(), d);
+            assert_eq!(index.header.wavelet.params().d(), d);
             let blob = encode(&index);
             let back = FmIndex::view(blob.as_slice()).unwrap();
             for pattern in patterns(&text) {
