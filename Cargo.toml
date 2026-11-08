@@ -1,6 +1,6 @@
 [workspace]
 default-members = ["crates/fmgrep"]
-members = ["crates/docfm", "crates/fmgrep", "crates/bench", "crates/msbwt"]
+members = ["crates/docfm", "crates/docfm-bits", "crates/fmgrep", "crates/bench", "crates/msbwt"]
 resolver = "3"
 
 [workspace.package]
@@ -13,4 +13,7 @@ authors = ["Pepe Iborra"]
 
 # docfm's tests build large indexes; unoptimized they take minutes.
 [profile.dev.package.docfm]
+opt-level = 3
+
+[profile.dev.package.docfm-bits]
 opt-level = 3

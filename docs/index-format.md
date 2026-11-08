@@ -137,8 +137,8 @@ Each blob's length is a multiple of 16 KiB, so every blob starts
 page-aligned. The file is mapped at load and used in place, never decoded.
 
 Blob version 8, little-endian. The code-side contract is the table in
-`crates/docfm/src/layout.rs`, with `wavelet.rs`, `digits.rs` and `marks.rs`
-beside it.
+`crates/docfm/src/layout.rs`, with `src/wavelet.rs`, `src/wavelet/digits.rs`
+and `src/marks.rs` of `crates/docfm-bits` for the structures it holds.
 
 | section | holds |
 |---|---|
