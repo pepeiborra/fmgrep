@@ -34,6 +34,7 @@ use atomic::Atomic;
 use bytemuck::NoUninit;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use typed_index_collections::{TiSlice, TiVec};
 
 #[cfg(test)]
 mod tests;
@@ -489,7 +490,15 @@ fn recurse<T: Sym, U: Sym>(
         }
         _ => (None, Vec::new()),
     };
-    down(up, &above, len, at.as_deref(), &alone, want, mode)
+    down(
+        up,
+        TiSlice::from_ref(&above),
+        len,
+        at.as_deref().map(TiSlice::from_ref),
+        &alone,
+        want,
+        mode,
+    )
 }
 
 /// The rows of `seq`, cyclic documents whose symbols below `num_term` are
@@ -511,7 +520,7 @@ fn solve_sa<T: Sym>(seq: &[T], num_sym: usize, num_term: usize, mode: Mode) -> V
         2 => sa_above::<u16>(next, &up, mode),
         _ => sa_above::<u8>(next, &up, mode),
     };
-    induce(seq, num_term, &up.counts, &above)
+    induce(seq, num_term, &up.counts.raw, &above)
 }
 
 fn sa_above<U: Sym>(next: Vec<u32>, up: &Up<impl Sym>, mode: Mode) -> Vec<u32> {
@@ -723,19 +732,76 @@ impl Flags {
     }
 }
 
+/// Defines the descent's index kinds, each a `u32` as the arrays hold it:
+/// indexes only their own arrays, and move by plain counts. No conversion
+/// from `usize`: it would truncate, and only [`TiSlice`]'s enumerating
+/// methods would want it.
+macro_rules! keys {
+    ($($(#[$doc:meta])* $key:ident;)+) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        struct $key(u32);
+
+        impl From<$key> for usize {
+            #[inline(always)]
+            fn from(key: $key) -> usize {
+                key.0 as usize
+            }
+        }
+
+        impl std::ops::Add<usize> for $key {
+            type Output = $key;
+            #[inline(always)]
+            fn add(self, n: usize) -> $key {
+                $key(self.0 + n as u32)
+            }
+        }
+
+        impl std::ops::Sub<usize> for $key {
+            type Output = $key;
+            #[inline(always)]
+            fn sub(self, n: usize) -> $key {
+                $key(self.0 - n as u32)
+            }
+        }
+
+        impl std::ops::AddAssign<usize> for $key {
+            #[inline(always)]
+            fn add_assign(&mut self, n: usize) {
+                self.0 += n as u32;
+            }
+        }
+    )+};
+}
+
+keys! {
+    /// A name of the level above: its count, offsets, LF row, last symbol.
+    Name;
+    /// A place in `alphabet`, and that place's group.
+    Offset;
+    /// A group of offsets, whose rows are filled together.
+    Group;
+    /// A row of this level.
+    Row;
+    /// A row of the level above.
+    RowAbove;
+    /// A symbol of this level: its count, loopers and queues.
+    Symbol;
+}
+
 /// What a level keeps from going up for coming down.
 struct Up<T> {
     num_sym: usize,
     num_term: usize,
     /// The distinct S* substrings in name order, each followed by its final
     /// symbol (the next S* symbol, or its own terminator at a document end).
-    alphabet: Vec<T>,
+    alphabet: TiVec<Offset, T>,
     /// Where each name starts in `alphabet`, then its length.
-    offsets: Vec<u32>,
+    offsets: TiVec<Name, Offset>,
     /// Per terminator, the documents that are that terminator alone.
-    loopers: Vec<u32>,
+    loopers: TiVec<Symbol, u32>,
     /// Per symbol, its occurrences.
-    counts: Vec<u32>,
+    counts: TiVec<Symbol, u32>,
     names: usize,
     /// Names starting with a terminator, all below the others.
     term_names: usize,
@@ -773,10 +839,10 @@ fn up<T: Sym>(seq: &[T], num_sym: usize, num_term: usize, mode: Mode) -> (Up<T>,
         num_sym,
         num_term,
         names: named.offsets.len() - 1,
-        alphabet: named.alphabet,
-        offsets: named.offsets,
-        loopers: named.loopers,
-        counts,
+        alphabet: named.alphabet.into(),
+        offsets: named.offsets.into_iter().map(Offset).collect(),
+        loopers: named.loopers.into(),
+        counts: counts.into(),
         term_names: named.term_names,
     };
     (up, named.next)
@@ -1456,10 +1522,32 @@ fn add_into(sum: &mut [u32], parts: &[Vec<u32>]) {
 }
 
 /// A queue entry: every occurrence of a name, at an offset into `alphabet`.
-/// [`GROUP`] in the name starts a group.
-type Entry = (u32, u32);
+type Entry = (Flagged, Offset);
 
+/// The bit of a [`Flagged`] that starts a group.
 const GROUP: u32 = 1 << 31;
+
+/// A [`Name`] and whether its entry starts a group, in one word. Nothing
+/// else reads the flag, so a stale one cannot pass for a name.
+#[derive(Clone, Copy)]
+struct Flagged(u32);
+
+impl Flagged {
+    #[inline(always)]
+    fn new(name: Name, starts_group: bool) -> Flagged {
+        Flagged(name.0 | (GROUP * u32::from(starts_group)))
+    }
+
+    #[inline(always)]
+    fn name(self) -> Name {
+        Name(self.0 & !GROUP)
+    }
+
+    #[inline(always)]
+    fn starts_group(self) -> bool {
+        self.0 & GROUP != 0
+    }
+}
 
 /// A hint to bring `slice[i]`'s cache line in; nothing past the end.
 /// `safe_arch` holds the intrinsic's `unsafe`.
@@ -1473,49 +1561,66 @@ fn prefetch<T>(slice: &[T], i: usize) {
     }
 }
 
+/// [`prefetch`] of a keyed array, by its own kind of key.
+#[inline(always)]
+fn prefetch_at<K: Into<usize>, V>(slice: &TiSlice<K, V>, key: K) {
+    prefetch(&slice.raw, key.into());
+}
+
+/// A symbol of the level above as what it is there, a name.
+#[inline(always)]
+fn name_of<U: Sym>(symbol: U) -> Name {
+    Name(symbol.idx() as u32)
+}
+
 /// Per-symbol queues in one array, each sized from the alphabet up front.
 struct Queues {
     entries: Vec<Entry>,
-    start: Vec<u32>,
-    end: Vec<u32>,
+    start: TiVec<Symbol, u32>,
+    end: TiVec<Symbol, u32>,
     /// The source group that last pushed to each queue.
-    last: Vec<u32>,
+    last: TiVec<Symbol, u32>,
 }
 
 impl Queues {
-    fn new(sizes: &[u32]) -> Queues {
-        let mut start = Vec::with_capacity(sizes.len());
+    fn new(sizes: &TiSlice<Symbol, u32>) -> Queues {
+        let mut start = TiVec::with_capacity(sizes.len());
         let mut acc = 0;
         for &s in sizes {
             start.push(acc);
             acc += s;
         }
         Queues {
-            entries: vec![(0, 0); acc as usize],
+            // Built from plain zeros, which `vec!` leaves to the allocator,
+            // in the same buffer: pushes first touch each page.
+            entries: vec![(0u32, 0u32); acc as usize]
+                .into_iter()
+                .map(|(name, ind)| (Flagged(name), Offset(ind)))
+                .collect(),
             end: start.clone(),
             start,
-            last: vec![u32::MAX; sizes.len()],
+            last: vec![u32::MAX; sizes.len()].into(),
         }
     }
 
     /// Appends to queue `q` from source group `src`; a new source starts a
     /// group.
-    fn push(&mut self, q: usize, src: u32, (name, ind): Entry) {
+    fn push(&mut self, q: Symbol, src: u32, (name, ind): (Name, Offset)) {
         // Branchless: whether the source changed is data, not control.
-        let flag = GROUP * u32::from(self.last[q] != src);
+        let starts_group = self.last[q] != src;
         self.last[q] = src;
-        self.entries[self.end[q] as usize] = (name | flag, ind);
+        self.entries[self.end[q] as usize] = (Flagged::new(name, starts_group), ind);
         self.end[q] += 1;
     }
 
     /// Prefetches queue `q`'s tail bookkeeping, for a push soon.
-    fn warm_tail(&self, q: usize) {
-        prefetch(&self.end, q);
-        prefetch(&self.last, q);
+    fn warm_tail(&self, q: Symbol) {
+        prefetch_at(&self.end, q);
+        prefetch_at(&self.last, q);
     }
 
     /// Prefetches the slot queue `q`'s next push writes; its tail warmed.
-    fn warm_slot(&self, q: usize) {
+    fn warm_slot(&self, q: Symbol) {
         prefetch(&self.entries, self.end[q] as usize);
     }
 }
@@ -1526,9 +1631,9 @@ impl Queues {
 /// rows' positions are found as `want` asks.
 fn down<T: Sym, U: Sym>(
     up: &Up<T>,
-    above: &[U],
+    above: &TiSlice<RowAbove, U>,
     len: usize,
-    at: Option<&[u32]>,
+    at: Option<&TiSlice<RowAbove, u32>>,
     alone: &[(u32, u32)],
     want: Want<'_>,
     mode: Mode,
@@ -1544,21 +1649,22 @@ fn down<T: Sym, U: Sym>(
         ..
     } = up;
     let (num_sym, num_term) = (*num_sym, *num_term);
-    let sym = |i: usize| alphabet[i].idx();
+    let sym = |i: Offset| Symbol(alphabet[i].idx() as u32);
     // Occurrences per name.
-    let per_name = tally_all(above, *names, mode);
+    let per_name: TiVec<Name, u32> = tally_all(&above.raw, *names, mode).into();
 
     // Each alphabet offset enters exactly one queue once: an L-type the L
     // queue of its symbol (and the LS queue when an S-type precedes it), an
     // S-type the S queue; each name's final symbol seeds the S* queue.
     let sizes = |names: Range<usize>| {
         let [mut l_size, mut ls_size, mut s_size, mut ss_size] =
-            [(); 4].map(|_| vec![0u32; num_sym]);
+            [(); 4].map(|_| TiVec::<Symbol, u32>::from(vec![0u32; num_sym]));
         for name in names {
-            let (a, b) = (offsets[name] as usize, offsets[name + 1] as usize);
+            let name = Name(name as u32);
+            let (a, b) = (offsets[name], offsets[name + 1]);
             ss_size[sym(b - 1)] += 1;
             let mut s_type = true;
-            for i in (a..b - 1).rev() {
+            for i in (a.0..b.0 - 1).rev().map(Offset) {
                 s_type =
                     alphabet[i] < alphabet[i + 1] || (alphabet[i] == alphabet[i + 1] && s_type);
                 if s_type {
@@ -1577,9 +1683,11 @@ fn down<T: Sym, U: Sym>(
     } else {
         // Pieces of names of about as many offsets each.
         let cuts: Vec<usize> = (0..=k)
-            .map(|j| offsets[..*names].partition_point(|&o| (o as usize) < alphabet.len() * j / k))
+            .map(|j| {
+                offsets.raw[..*names].partition_point(|&o| usize::from(o) < alphabet.len() * j / k)
+            })
             .collect();
-        let mut parts: Vec<[Vec<u32>; 4]> = (0..k)
+        let mut parts: Vec<[TiVec<Symbol, u32>; 4]> = (0..k)
             .into_par_iter()
             .map(|j| sizes(cuts[j]..cuts[j + 1]))
             .collect();
@@ -1587,15 +1695,15 @@ fn down<T: Sym, U: Sym>(
         let mut sum = parts.pop().unwrap();
         for part in rest {
             for (s, p) in sum.iter_mut().zip(part) {
-                add_into(s, &[p]);
+                add_into(&mut s.raw, &[p.raw]);
             }
         }
         sum
     };
     let mut ss = Queues::new(&ss_size);
-    for name in 0..*names {
+    for name in (0..*names as u32).map(Name) {
         let last = offsets[name + 1] - 1;
-        ss.push(sym(last as usize), 0, (name as u32, last));
+        ss.push(sym(last), 0, (name, last));
     }
     let mut l = Queues::new(&l_size);
     let mut ls = Queues::new(&ls_size);
@@ -1603,10 +1711,11 @@ fn down<T: Sym, U: Sym>(
     drop((l_size, ls_size, s_size, ss_size));
 
     // The first row of each group, then the next row to fill.
-    let mut starts: Vec<u32> = Vec::new();
+    let mut starts: TiVec<Group, Row> = TiVec::new();
     // Cells, so the prefetch below can read it while the passes write it.
-    let group_cells: Vec<Cell<u32>> = (0..alphabet.len()).map(|_| Cell::new(0)).collect();
-    let group_of = &group_cells[..];
+    let group_cells: TiVec<Offset, Cell<Group>> =
+        (0..alphabet.len()).map(|_| Cell::new(Group(0))).collect();
+    let group_of = group_cells.as_slice();
     let mut src = 0u32;
 
     // Each entry reads its name's count, its symbol before and its group
@@ -1615,16 +1724,16 @@ fn down<T: Sym, U: Sym>(
     // entry's own lines, then its target queue's tail, then the slot.
     let distance = PREFETCH;
     let warm = |(flagged, ind): Entry| {
-        let ind = ind as usize;
-        prefetch(&per_name, (flagged & !GROUP) as usize);
-        prefetch(alphabet, ind.wrapping_sub(1));
-        prefetch(group_of, ind);
+        prefetch_at(&per_name, flagged.name());
+        prefetch_at(alphabet, Offset(ind.0.wrapping_sub(1)));
+        prefetch_at(group_of, ind);
     };
-    let before = |(_, ind): Entry| (ind as usize).checked_sub(1).map(sym);
+    let before = |(_, ind): Entry| ind.0.checked_sub(1).map(|i| sym(Offset(i)));
 
     // L-types, left to right.
     let mut bucket_start = 0usize;
     for (x, &count) in counts.iter().enumerate() {
+        let x = Symbol(x as u32);
         let mut row = bucket_start;
         bucket_start += count as usize;
         let mut y = l.start[x] as usize;
@@ -1649,14 +1758,14 @@ fn down<T: Sym, U: Sym>(
             }
             let (flagged, ind) = l.entries[y];
             y += 1;
-            if flagged & GROUP != 0 {
-                starts.push(row as u32);
+            if flagged.starts_group() {
+                starts.push(Row(row as u32));
                 src += 1;
             }
-            let name = flagged & !GROUP;
-            row += per_name[name as usize] as usize;
-            group_of[ind as usize].set((starts.len() - 1) as u32);
-            let t = sym(ind as usize - 1);
+            let name = flagged.name();
+            row += per_name[name] as usize;
+            group_of[ind].set(Group((starts.len() - 1) as u32));
+            let t = sym(ind - 1);
             if t < x {
                 ls.push(x, src, (name, ind));
             } else {
@@ -1667,19 +1776,20 @@ fn down<T: Sym, U: Sym>(
             src += 1;
             for y in ss.start[x]..ss.end[x] {
                 let (flagged, ind) = ss.entries[y as usize];
-                let t = sym(ind as usize - 1);
-                l.push(t, src, (flagged & !GROUP, ind - 1));
+                let t = sym(ind - 1);
+                l.push(t, src, (flagged.name(), ind - 1));
             }
         }
     }
     drop((l, ss));
 
     // S-types, right to left. A group's first row is known when it closes.
-    let mut out = vec![T::default(); len];
+    let mut out: TiVec<Row, T> = vec![T::default(); len].into();
     // Every row's position, or a batch of the sampled rows for the sink.
-    let mut every = matches!(want, Want::Every).then(|| vec![0u32; len]);
+    let mut every: Option<TiVec<Row, u32>> =
+        matches!(want, Want::Every).then(|| vec![0u32; len].into());
     let mut batch: Vec<u64> = Vec::new();
-    for i in (0..num_sym).rev() {
+    for i in (0..num_sym as u32).rev().map(Symbol) {
         let mut row = bucket_start;
         bucket_start -= counts[i] as usize;
         let mut y = s.start[i] as usize;
@@ -1700,23 +1810,23 @@ fn down<T: Sym, U: Sym>(
             }
             let (flagged, ind) = s.entries[y];
             y += 1;
-            if flagged & GROUP != 0 {
+            if flagged.starts_group() {
                 if open {
-                    starts.push(row as u32);
+                    starts.push(Row(row as u32));
                 }
                 open = true;
                 src += 1;
             }
-            let name = flagged & !GROUP;
-            row -= per_name[name as usize] as usize;
-            group_of[ind as usize].set(starts.len() as u32);
-            if offsets[name as usize] != ind {
-                let t = sym(ind as usize - 1);
+            let name = flagged.name();
+            row -= per_name[name] as usize;
+            group_of[ind].set(Group(starts.len() as u32));
+            if offsets[name] != ind {
+                let t = sym(ind - 1);
                 s.push(t, src, (name, ind - 1));
             }
         }
         if open {
-            starts.push(row as u32);
+            starts.push(Row(row as u32));
         }
         // LS entries right to left: a flag ends a group.
         let mut fresh = true;
@@ -1742,18 +1852,18 @@ fn down<T: Sym, U: Sym>(
             if fresh {
                 src += 1;
             }
-            let t = sym(ind as usize - 1);
-            s.push(t, src, (flagged & !GROUP, ind - 1));
-            fresh = flagged & GROUP != 0;
+            let t = sym(ind - 1);
+            s.push(t, src, (flagged.name(), ind - 1));
+            fresh = flagged.starts_group();
         }
-        if i < num_term {
-            let mine = alone.partition_point(|&(t, _)| (t as usize) < i);
+        if usize::from(i) < num_term {
+            let mine = alone.partition_point(|&(t, _)| t < i.0);
             for k in 0..loopers[i] as usize {
                 row -= 1;
-                out[row] = T::of(i);
+                out[Row(row as u32)] = T::of(usize::from(i));
                 if let Some(&(_, q)) = alone.get(mine + k).filter(|_| at.is_some()) {
                     match want {
-                        Want::Every => every.as_mut().unwrap()[row] = q,
+                        Want::Every => every.as_mut().unwrap()[Row(row as u32)] = q,
                         Want::Sampled(samples) => samples.note(row, q as usize, &mut batch),
                         Want::Nothing => {}
                     }
@@ -1764,26 +1874,26 @@ fn down<T: Sym, U: Sym>(
     drop((s, ls));
 
     // Plain again for the fill, which shares it across threads.
-    let group_of: Vec<u32> = group_cells.into_iter().map(Cell::into_inner).collect();
+    let group_of: TiVec<Offset, Group> = group_cells.into_iter().map(Cell::into_inner).collect();
 
     // Rows of each name in the level above, as its LF walks them.
-    let mut lf = Vec::with_capacity(*names);
+    let mut lf: TiVec<Name, RowAbove> = TiVec::with_capacity(*names);
     let mut acc = 0u32;
     for &c in &per_name {
-        lf.push(acc);
+        lf.push(RowAbove(acc));
         acc += c;
     }
     drop(per_name);
     // Each name's last symbol before its final one: what precedes the start
     // of the substring after it, one load instead of two dependent ones.
-    let last_of: Vec<T> = (0..*names)
-        .map(|name| alphabet[offsets[name + 1] as usize - 2])
+    let last_of: TiVec<Name, T> = (0..*names as u32)
+        .map(|name| alphabet[offsets[Name(name) + 1] - 2])
         .collect();
 
     // Pieces write apart rows of one `out` at once: relaxed atomic stores,
     // plain stores in the machine code, and safe whatever the pieces do.
-    let out: Vec<Atomic<T>> = out.into_iter().map(Atomic::new).collect();
-    let every: Option<Vec<AtomicU32>> =
+    let out: TiVec<Row, Atomic<T>> = out.into_iter().map(Atomic::new).collect();
+    let every: Option<TiVec<Row, AtomicU32>> =
         every.map(|rows| rows.into_iter().map(AtomicU32::new).collect());
     let fill = Fill {
         alphabet,
@@ -1804,7 +1914,7 @@ fn down<T: Sym, U: Sym>(
         samples.sink().put(&mut batch);
     }
     // The level's BWT, and its positions as asked.
-    let done = |out: Vec<Atomic<T>>, every: Option<Vec<AtomicU32>>| {
+    let done = |out: TiVec<Row, Atomic<T>>, every: Option<TiVec<Row, AtomicU32>>| {
         let found = match (want, every) {
             (Want::Every, Some(rows)) => {
                 Found::Every(rows.into_iter().map(AtomicU32::into_inner).collect())
@@ -1821,18 +1931,24 @@ fn down<T: Sym, U: Sym>(
     let budget = len * size_of::<T>();
     let k = mode.pieces(above.len(), above.len() / (1 + budget / per_piece));
     if k == 1 {
-        fill.run(0..above.len(), &mut starts, &mut lf);
+        fill.run(
+            RowAbove(0)..RowAbove(above.len() as u32),
+            &mut starts,
+            &mut lf,
+        );
         return done(out, every);
     }
     let size = above.len().div_ceil(k);
-    let bounds: Vec<usize> = (0..above.len())
+    let bounds: Vec<RowAbove> = (0..above.len())
         .step_by(size)
         .chain([above.len()])
+        .map(|y| RowAbove(y as u32))
         .collect();
     let k = bounds.len() - 1;
     // Per piece after the first, its names' LF rows: the counts of the
     // pieces before it, summed over pieces per name.
     let mut lfs: Vec<Vec<u32>> = above[..bounds[k - 1]]
+        .raw
         .par_chunks(size)
         .map(|part| tally(part, *names))
         .collect();
@@ -1845,39 +1961,48 @@ fn down<T: Sym, U: Sym>(
     }
     cols.into_par_iter().enumerate().for_each(|(c, mut col)| {
         for i in 0..col[0].len() {
-            let mut acc = lf[c * span + i];
+            let mut acc = lf[Name((c * span + i) as u32)].0;
             for part in &mut col {
                 acc += part[i];
                 part[i] = acc;
             }
         }
     });
+    // Summed, in the same buffers.
+    let mut lfs: Vec<TiVec<Name, RowAbove>> = lfs
+        .into_par_iter()
+        .map(|rows| rows.into_iter().map(RowAbove).collect())
+        .collect();
     // Its groups' next rows: each name's rows before it, in every group of
     // the name's offsets.
-    let mut nexts: Vec<Vec<u32>> = lfs
+    let mut nexts: Vec<TiVec<Group, Row>> = lfs
         .par_iter()
         .map(|piece_lf| {
             let mut next = starts.clone();
-            for name in 0..*names {
-                let before = piece_lf[name] - lf[name];
+            for name in (0..*names as u32).map(Name) {
+                let before = piece_lf[name].0 - lf[name].0;
                 if before > 0 {
-                    let (a, b) = (offsets[name] as usize, offsets[name + 1] as usize);
+                    let (a, b) = (offsets[name], offsets[name + 1]);
                     for &g in &group_of[a..b - 1] {
-                        next[g as usize] += before;
+                        next[g] += before as usize;
                     }
                 }
             }
             next
         })
         .collect();
-    let first = (bounds[0]..bounds[1], &mut starts[..], &mut lf[..]);
+    let first = (
+        bounds[0]..bounds[1],
+        starts.as_mut_slice(),
+        lf.as_mut_slice(),
+    );
     let rest = nexts.iter_mut().zip(&mut lfs).enumerate();
-    let jobs: Vec<(Range<usize>, &mut [u32], &mut [u32])> = std::iter::once(first)
+    let jobs: Vec<_> = std::iter::once(first)
         .chain(rest.map(|(j, (next, piece_lf))| {
             (
                 bounds[j + 1]..bounds[j + 2],
-                &mut next[..],
-                &mut piece_lf[..],
+                next.as_mut_slice(),
+                piece_lf.as_mut_slice(),
             )
         }))
         .collect();
@@ -1890,43 +2015,43 @@ fn down<T: Sym, U: Sym>(
 
 /// What filling the level's rows from the level above reads.
 struct Fill<'a, T: Sym, U> {
-    alphabet: &'a [T],
-    offsets: &'a [u32],
+    alphabet: &'a TiSlice<Offset, T>,
+    offsets: &'a TiSlice<Name, Offset>,
     /// Each alphabet offset's group.
-    group_of: &'a [u32],
+    group_of: &'a TiSlice<Offset, Group>,
     /// Each name's last symbol before its final one.
-    last_of: &'a [T],
-    above: &'a [U],
+    last_of: &'a TiSlice<Name, T>,
+    above: &'a TiSlice<RowAbove, U>,
     distance: usize,
     /// The level's rows, written by several pieces at once.
-    rows: &'a [Atomic<T>],
+    rows: &'a TiSlice<Row, Atomic<T>>,
     /// Where each row above's preceding substring starts here, when the
     /// rows' positions are wanted.
-    at: Option<&'a [u32]>,
+    at: Option<&'a TiSlice<RowAbove, u32>>,
     track: Track<'a>,
 }
 
 /// Where a fill puts its rows' positions.
 enum Track<'a> {
     Nothing,
-    Every(&'a [AtomicU32]),
+    Every(&'a TiSlice<Row, AtomicU32>),
     Sampled(&'a Samples<'a>),
 }
 
 impl Track<'_> {
-    /// Rows `o..` hold the positions `starts`, each `offset` on: every one
-    /// stored, or the sampled ones batched for the sink.
-    fn note(&self, o: usize, starts: &[u32], offset: u32, batch: &mut Vec<u64>) {
+    /// Rows `o..` hold the `positions`, each `offset` on: every one stored,
+    /// or the sampled ones batched for the sink.
+    fn note(&self, o: Row, positions: &TiSlice<RowAbove, u32>, offset: u32, batch: &mut Vec<u64>) {
         match self {
             Track::Nothing => {}
             Track::Every(rows) => {
-                for (row, &s) in rows[o..o + starts.len()].iter().zip(starts) {
+                for (row, &s) in rows[o..o + positions.len()].iter().zip(positions) {
                     row.store(s + offset, Relaxed);
                 }
             }
             Track::Sampled(samples) => {
-                for (z, &s) in starts.iter().enumerate() {
-                    samples.note(o + z, (s + offset) as usize, batch);
+                for (z, &s) in positions.iter().enumerate() {
+                    samples.note(usize::from(o) + z, (s + offset) as usize, batch);
                 }
             }
         }
@@ -1937,7 +2062,12 @@ impl<T: Sym, U: Sym> Fill<'_, T, U> {
     /// Fills the rows of `above[range]`'s names, from each group's next row
     /// `starts` and each name's next LF row `lf`, advancing both, and their
     /// positions as tracked.
-    fn run(&self, range: Range<usize>, starts: &mut [u32], lf: &mut [u32]) {
+    fn run(
+        &self,
+        range: Range<RowAbove>,
+        starts: &mut TiSlice<Group, Row>,
+        lf: &mut TiSlice<Name, RowAbove>,
+    ) {
         let mut found = Vec::new();
         let Fill {
             alphabet,
@@ -1954,39 +2084,39 @@ impl<T: Sym, U: Sym> Fill<'_, T, U> {
         // (the name's offsets, its groups, their next rows, the store), so
         // the names ahead are prefetched in stages, each stage reading what
         // the one before brought in, as libsais does.
-        let ahead = |y: usize| above.get(y).map(|c| c.idx());
+        let ahead = |y: RowAbove| above.get(y).map(|&c| name_of(c));
         let mut y = range.start;
-        while y < above.len() {
+        while usize::from(y) < above.len() {
             if let Some(name) = ahead(y + 4 * distance) {
-                prefetch(offsets, name);
-                prefetch(lf, name);
+                prefetch_at(offsets, name);
+                prefetch_at(lf, name);
             }
             if let Some(name) = ahead(y + 2 * distance) {
-                let (a, b) = (offsets[name] as usize, offsets[name + 1] as usize);
-                prefetch(group_of, a);
-                prefetch(group_of, b - 2);
-                prefetch(all, lf[name] as usize);
+                let (a, b) = (offsets[name], offsets[name + 1]);
+                prefetch_at(group_of, a);
+                prefetch_at(group_of, b - 2);
+                prefetch_at(all, lf[name]);
             }
             if let Some(name) = ahead(y + distance) {
-                let (a, b) = (offsets[name] as usize, offsets[name + 1] as usize);
+                let (a, b) = (offsets[name], offsets[name + 1]);
                 for &g in &group_of[a..b - 1] {
-                    prefetch(starts, g as usize);
+                    prefetch_at(starts, g);
                 }
-                if let Some(&pred) = all.get(lf[name] as usize) {
-                    prefetch(last_of, pred.idx());
+                if let Some(&pred) = all.get(lf[name]) {
+                    prefetch_at(last_of, name_of(pred));
                 }
             }
-            let name = above[y].idx();
+            let name = name_of(above[y]);
             let run_start = y;
             y += 1;
-            while y < above.len() && above[y].idx() == name {
+            while usize::from(y) < above.len() && name_of(above[y]) == name {
                 y += 1;
             }
-            let run = y - run_start;
-            let (a, b) = (offsets[name] as usize, offsets[name + 1] as usize);
-            for i in (a + 1..b - 1).rev() {
-                let g = group_of[i] as usize;
-                let o = starts[g] as usize;
+            let run = (y.0 - run_start.0) as usize;
+            let (a, b) = (offsets[name], offsets[name + 1]);
+            for i in (a.0 + 1..b.0 - 1).rev().map(Offset) {
+                let g = group_of[i];
+                let o = starts[g];
                 if run == 1 {
                     out[o].store(alphabet[i - 1], Relaxed);
                 } else {
@@ -1995,23 +2125,23 @@ impl<T: Sym, U: Sym> Fill<'_, T, U> {
                     }
                 }
                 if let Some(at) = self.at {
-                    let offset = (i - a) as u32;
+                    let offset = i.0 - a.0;
                     self.track.note(o, &at[run_start..y], offset, &mut found);
                 }
-                starts[g] += run as u32;
+                starts[g] += run;
             }
             // The substring's start: before it, the end of the name before.
-            let g = group_of[a] as usize;
-            let o = starts[g] as usize;
-            let from = lf[name] as usize;
+            let g = group_of[a];
+            let o = starts[g];
+            let from = lf[name];
             for (row, &pred) in out[o..o + run].iter().zip(&all[from..from + run]) {
-                row.store(last_of[pred.idx()], Relaxed);
+                row.store(last_of[name_of(pred)], Relaxed);
             }
             if let Some(at) = self.at {
                 self.track.note(o, &at[run_start..y], 0, &mut found);
             }
-            lf[name] += run as u32;
-            starts[g] += run as u32;
+            lf[name] += run;
+            starts[g] += run;
         }
         if let Track::Sampled(samples) = self.track {
             samples.sink().put(&mut found);
