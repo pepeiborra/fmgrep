@@ -190,58 +190,6 @@ fn forward_resolves_occurrences() {
     assert!(deepest > 0 && gate > 0, "{deepest} {gate}");
 }
 
-#[test]
-fn marks_range_matches_get_rank() {
-    let mut rng = Rng(31);
-    for len in [0usize, 1, 4095, 4096, 4097, 70_001] {
-        for fill in 0..7 {
-            let bits: Vec<bool> = (0..len)
-                .map(|i| match fill {
-                    0 => rng.below(2) == 1,
-                    1 => true,
-                    2 => false,
-                    3 => i % 32 == 0,
-                    // Sparse: low bits and empty buckets.
-                    4 => rng.below(13) == 0,
-                    5 => rng.below(1000) == 0,
-                    // Clustered: long gaps between dense runs.
-                    _ => i % 20_000 < 300 && rng.below(3) == 0,
-                })
-                .collect();
-            let mut words = vec![0u64; len.div_ceil(64) + 1];
-            for (i, _) in bits.iter().enumerate().filter(|&(_, &b)| b) {
-                words[i / 64] |= 1 << (i % 64);
-            }
-            let ones = bits.iter().filter(|&&b| b).count();
-            let mut out = vec![0u8; marks::section_bytes(len, ones)];
-            marks::write(&mut out, len, &words);
-            let marks = marks::Marks::new(&out, len, ones);
-            let mut ranges = vec![
-                (0, 0),
-                (0, 1),
-                (0, len),
-                (4095, 4097),
-                (100, 8000),
-                (len.saturating_sub(1), len + 5000),
-                (len + 10, len + 20),
-                (7, 3),
-            ];
-            ranges.extend((0..20).map(|_| {
-                let lo = rng.below(len as u64 + 1) as usize;
-                (lo, lo + rng.below(9000) as usize)
-            }));
-            for (lo, hi) in ranges {
-                let want: Vec<(usize, usize)> = (lo..hi.min(len))
-                    .filter(|&r| marks.get_rank(r).0)
-                    .map(|r| (r, marks.get_rank(r).1))
-                    .collect();
-                let got: Vec<(usize, usize)> = marks.range(lo, hi).collect();
-                assert_eq!(got, want, "len {len} fill {fill} {lo}..{hi}");
-            }
-        }
-    }
-}
-
 /// `pattern` prepended one byte at a time, or in random chunks if `rng`.
 fn chained<'a>(index: &'a Built, pattern: &[u8], rng: Option<&mut Rng>) -> Cursor<'a> {
     let mut cursor = index.cursor();

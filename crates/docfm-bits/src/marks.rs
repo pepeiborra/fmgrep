@@ -11,6 +11,8 @@
 //! Reads clamp, so no section content can index past it or loop past its
 //! bits.
 
+use crate::word::{bits_at, pack, select_in_word, u64_at};
+
 /// Zeros per select sample.
 const SAMPLE: usize = 64;
 
@@ -25,6 +27,7 @@ struct Shape {
 }
 
 impl Shape {
+    #[inline]
     fn new(rows: usize, count: usize) -> Self {
         let low = rows
             .checked_div(count)
@@ -44,70 +47,14 @@ impl Shape {
     }
 }
 
+/// Bytes of the section of `count` marks over `rows` rows.
+#[inline]
 pub fn section_bytes(rows: usize, count: usize) -> usize {
     Shape::new(rows, count).len
 }
 
-#[inline]
-fn u64_at(b: &[u8], at: usize) -> u64 {
-    match b.get(at..at.wrapping_add(8)) {
-        Some(w) => u64::from_le_bytes(w.try_into().expect("8 bytes")),
-        None => {
-            let mut w = [0u8; 8];
-            let tail = b.get(at..).unwrap_or(&[]);
-            w[..tail.len()].copy_from_slice(tail);
-            u64::from_le_bytes(w)
-        }
-    }
-}
-
-/// `width <= 57` bits of `b` from bit `at`.
-#[inline]
-pub fn bits_at(b: &[u8], at: usize, width: u32) -> u64 {
-    (u64_at(b, at / 8) >> (at % 8)) & ((1u64 << width) - 1)
-}
-
-/// Entry `byte * 8 + r`: the position of set bit `r` of `byte`, 8 if none.
-const SELECT_IN_BYTE: [u8; 2048] = {
-    let mut t = [8u8; 2048];
-    let mut byte = 0;
-    while byte < 256 {
-        let (mut bit, mut r) = (0, 0);
-        while bit < 8 {
-            if byte >> bit & 1 == 1 {
-                t[byte * 8 + r] = bit as u8;
-                r += 1;
-            }
-            bit += 1;
-        }
-        byte += 1;
-    }
-    t
-};
-
-/// Position of set bit `r < popcount(w)` of `w`: the byte holding it from
-/// byte-wise prefix popcounts, then a table.
-#[inline]
-pub fn select_in_word(w: u64, r: usize) -> usize {
-    const L8: u64 = 0x0101_0101_0101_0101;
-    let mut s = w - (w >> 1 & 0x5555_5555_5555_5555);
-    s = (s & 0x3333_3333_3333_3333) + (s >> 2 & 0x3333_3333_3333_3333);
-    s = (s + (s >> 4)) & 0x0f0f_0f0f_0f0f_0f0f;
-    // Byte `b` of `prefix`: set bits in bytes `0..=b`.
-    let prefix = s.wrapping_mul(L8);
-    // Bytes whose prefix is at most `r`: the target byte is the next one.
-    let r8 = (r as u64) * L8;
-    let le = ((r8 | 0x8080_8080_8080_8080) - prefix) & 0x8080_8080_8080_8080;
-    let byte = (le.count_ones() as usize).min(7);
-    let before = if byte == 0 {
-        0
-    } else {
-        (prefix >> (8 * byte - 8) & 0xff) as usize
-    };
-    let in_byte = (w >> (8 * byte)) as usize & 0xff;
-    8 * byte + usize::from(SELECT_IN_BYTE[in_byte * 8 + (r - before).min(7)])
-}
-
+/// Reads a section of marks, in place. Reads clamp to the bytes given, so
+/// any bytes are safe; only [`write`]'s answer correctly.
 #[derive(Clone, Copy)]
 pub struct Marks<'a> {
     bytes: &'a [u8],
@@ -118,6 +65,7 @@ pub struct Marks<'a> {
 
 impl<'a> Marks<'a> {
     /// `bytes` holds exactly `section_bytes(rows, count)`.
+    #[inline]
     pub fn new(bytes: &'a [u8], rows: usize, count: usize) -> Self {
         debug_assert_eq!(bytes.len(), section_bytes(rows, count));
         Self {
@@ -191,6 +139,7 @@ impl<'a> Marks<'a> {
     }
 
     /// The marks the high bits hold, for checking against the header.
+    #[inline]
     pub fn total(&self) -> usize {
         (0..self.shape.high_bits.div_ceil(64))
             .map(|w| {
@@ -219,6 +168,7 @@ impl<'a> Marks<'a> {
 
     /// `(row, marks before it)` of each marked row in `lo..hi`, ascending;
     /// both clamp to `rows`.
+    #[inline]
     pub fn range(&self, lo: usize, hi: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
         let marks = *self;
         let hi = hi.min(self.rows);
@@ -245,7 +195,11 @@ impl<'a> Marks<'a> {
 }
 
 /// Fills `out` with the rows set in `bits` (bits from `rows` on ignored);
-/// returns their count. `out` must be `section_bytes(rows, count)` bytes.
+/// returns their count.
+///
+/// # Panics
+///
+/// If `out` is not `section_bytes(rows, count)` bytes.
 pub fn write(out: &mut [u8], rows: usize, bits: &[u64]) -> usize {
     let word = |w: usize| {
         let x = bits.get(w).copied().unwrap_or(0);
@@ -256,7 +210,7 @@ pub fn write(out: &mut [u8], rows: usize, bits: &[u64]) -> usize {
         .map(|w| word(w).count_ones() as usize)
         .sum();
     let s = Shape::new(rows, count);
-    debug_assert_eq!(out.len(), s.len);
+    assert_eq!(out.len(), s.len);
     let mask = (1u64 << s.low) - 1;
     let mut marked = (0..rows.div_ceil(64)).flat_map(|w| {
         let mut x = word(w);
@@ -303,38 +257,5 @@ pub fn write(out: &mut [u8], rows: usize, bits: &[u64]) -> usize {
     count
 }
 
-/// Writes `values`, each below `1 << width` (`width <= 32`), into `out` as
-/// consecutive `width`-bit fields from bit 0, little-endian.
-pub fn pack(out: &mut [u8], values: impl Iterator<Item = u64>, width: u32) {
-    if width == 0 {
-        return;
-    }
-    let (mut acc, mut held, mut at) = (0u64, 0u32, 0usize);
-    for v in values {
-        acc |= v << held;
-        held += width;
-        while held >= 8 {
-            out[at] = acc as u8;
-            (acc, held, at) = (acc >> 8, held - 8, at + 1);
-        }
-    }
-    if held > 0 {
-        out[at] = acc as u8;
-    }
-}
-
-/// The low bits per mark and where the high bits start, for tests that
-/// tamper with them.
 #[cfg(test)]
-pub fn layout_of(rows: usize, count: usize) -> (u32, usize) {
-    let s = Shape::new(rows, count);
-    (s.low, s.highs_at)
-}
-
-/// Where the select samples start and how many, for tests that tamper with
-/// them.
-#[cfg(test)]
-pub fn samples_of(rows: usize, count: usize) -> (usize, usize) {
-    let s = Shape::new(rows, count);
-    (s.samples_at, ((rows >> s.low) + 1) / SAMPLE + 1)
-}
+mod tests;
