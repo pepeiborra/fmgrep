@@ -28,6 +28,58 @@ by default `target/bench/<corpus>`; the harness exits 2 when it is missing.
 `--fixture` searches one file of the query set's literals instead, as a smoke
 test.
 
+## EC2
+
+`scripts/ec2-bench.sh` runs `scripts/bench.sh` on a short-lived EC2
+instance in your AWS account and copies the results back:
+
+```sh
+scripts/ec2-bench.sh --dry-run     # print every command, run none
+scripts/ec2-bench.sh               # linux on an i4i.4xlarge spot instance
+CORPORA="linux chromium" scripts/ec2-bench.sh
+scripts/ec2-bench.sh down          # delete what an interrupted run left
+```
+
+It looks up the Ubuntu 24.04 image, creates a key pair and a security group
+that admits SSH from your address only, and launches one instance that shuts
+down, and so terminates, after `TTL` hours whatever happens. It copies the
+committed `HEAD` there, formats the instance's NVMe storage, installs Rust,
+ripgrep, tgrep and elgrep at the versions in
+[BENCHMARKS.md](../BENCHMARKS.md), runs `scripts/bench.sh` with every row
+for each corpus and copies `results-<corpus>.md`,
+`trace-<corpus>.jsonl` and `box.txt` (the commit and the machine) to
+`target/ec2-bench/<run>/`. On any exit it terminates the instance and
+deletes the key pair and security group, found by their `Run` tag, and exits
+with the first failing `scripts/bench.sh` status. The run is one SSH
+session: if it drops, the instance still terminates after `TTL` hours, and
+`down` deletes the rest.
+
+| Variable | Default | |
+|---|---|---|
+| `INSTANCE_TYPE` | `i4i.4xlarge` | must have NVMe instance storage; a Graviton type gets the arm64 image |
+| `CORPORA` | `linux` | any of `linux chromium ghc` |
+| `TTL` | `3` | hours until the instance terminates itself |
+| `SPOT` | `1` | `0` launches on demand, when spot capacity is short |
+
+`AWS_PROFILE` and `AWS_REGION` pick the account and region, as for any
+`aws` command. It needs the AWS CLI v2, `ssh`, `git`, `curl` and a default
+VPC in the region. The caller needs `ec2:DescribeInstances`,
+`ec2:DescribeInstanceTypeOfferings`, `ec2:DescribeSecurityGroups`,
+`ec2:DescribeKeyPairs`, `ec2:RunInstances`, `ec2:ImportKeyPair`,
+`ec2:CreateSecurityGroup`, `ec2:CreateTags`,
+`ec2:AuthorizeSecurityGroupIngress`, `ec2:TerminateInstances`,
+`ec2:DeleteSecurityGroup`, `ec2:DeleteKeyPair` and `ssm:GetParameter` on
+`arn:aws:ssm:*::parameter/aws/service/canonical/*`; the creating actions can
+be limited with `aws:RequestTag/Project` on the instance, volume, key-pair
+and security-group resources, and the others with
+`aws:ResourceTag/Project`, both `fmgrep-bench`. A first spot launch in an
+account may also need `iam:CreateServiceLinkedRole` for the EC2 Spot role.
+On an i4i.4xlarge, linux and chromium together took under 0.6
+instance-hours, tool builds and the sync included: about
+$1 or less at on-demand prices, less on spot. `down` deletes every instance,
+security group and key pair tagged `Project=fmgrep-bench` in the region,
+another run's included.
+
 ## tgrep (optional)
 
 The tgrep row runs Microsoft's indexed-search

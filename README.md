@@ -104,6 +104,8 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 | regex p50 | 14.8 / 133 ms | 39.7 / 567 ms |
 
 AWS i4i.4xlarge, Linux; method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
+[scripts/ec2-bench.sh](scripts/ec2-bench.sh) runs the benchmark on such an
+instance ([docs/benchmark.md](docs/benchmark.md#ec2)).
 
 ## How it works
 
