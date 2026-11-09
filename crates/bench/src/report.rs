@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::corpus::QuerySet;
 use crate::deviations::Deviation;
 use crate::verify::{Paths, Unsearched};
-use crate::{Kind, Row, RowKind};
+use crate::{Kind, Row, RowKind, RowName};
 
 pub struct Run {
     pub corpus: &'static str,
@@ -152,11 +152,11 @@ fn opt<T>(v: Option<T>, f: impl Fn(T) -> String) -> String {
     v.map_or_else(|| "-".to_string(), f)
 }
 
-fn label(name: RowKind) -> &'static str {
-    match name {
+fn label(name: RowName) -> &'static str {
+    match name.kind {
         RowKind::FmgrepStoreDocs => "fmgrep `--store-docs`",
         RowKind::FmgrepDirect => "fmgrep, no server",
-        RowKind::Rg | RowKind::Fmgrep | RowKind::Tgrep | RowKind::Elgrep => name.into(),
+        _ => name.as_str(),
     }
 }
 
@@ -224,7 +224,19 @@ pub fn markdown(run: &Run, rows: &[Row], found: &Found) -> String {
     if !notes.is_empty() {
         md += &format!("\n{notes}");
     }
-    let tgrep = if rows.iter().any(|r| r.name == RowKind::Tgrep) {
+    let ran = |kinds: &[RowKind]| rows.iter().any(|r| kinds.contains(&r.name.kind));
+    let served = if ran(&[RowKind::Fmgrep, RowKind::FmgrepStoreDocs]) {
+        ", or `fmgrep --server` against one `fmgrep serve`"
+    } else {
+        ""
+    };
+    let [servers, clients] = [
+        ", or `fmgrep --server` against the `fmgrep serve` already running at \
+         each `fmgrep@` row's address",
+        " An `fmgrep@` row's server is not measured.",
+    ]
+    .map(|s| if ran(&[RowKind::FmgrepServer]) { s } else { "" });
+    let tgrep = if ran(&[RowKind::Tgrep]) {
         ", or a `tgrep` client against one `tgrep serve`"
     } else {
         ""
@@ -234,21 +246,20 @@ pub fn markdown(run: &Run, rows: &[Row], found: &Found) -> String {
     } else {
         ", or several `tgrep` clients"
     };
-    let direct = if rows.iter().any(|r| r.name == RowKind::FmgrepDirect) {
+    let direct = if ran(&[RowKind::FmgrepDirect]) {
         ", or one `fmgrep --index` process with no server"
     } else {
         ""
     };
-    let has_eg = rows.iter().any(|r| r.name == RowKind::Elgrep);
+    let has_eg = ran(&[RowKind::Elgrep]);
     let eg = [", or `eg` beside one `eg-indexd`", ", or an `eg` pipe"];
     let [elgrep, elgrep_and] = eg.map(|s| if has_eg { s } else { "" });
     md += &format!(
         "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
-         `rg` over the checkout, or `fmgrep --server` against one \
-         `fmgrep serve`{direct}{tgrep}{elgrep}. \
+         `rg` over the checkout{served}{servers}{direct}{tgrep}{elgrep}. \
          An intersection is an `rg` pipe{tgrep_and}{elgrep_and}. \
          Footprint is the peak anonymous memory while querying; RSS also counts \
-         file-backed pages such as the mapped index. load1 is the 1-minute load average \
+         file-backed pages such as the mapped index.{clients} load1 is the 1-minute load average \
          at the row's start and end; `!` marks 4 or more, where timings are likely inflated.\n\n"
     );
     md += &match diffs.len() {
@@ -341,7 +352,7 @@ fn unsearched(n: usize, found: &Found) -> String {
 
 pub fn trace(run: &Run, rows: &[Row], found: &Found) -> String {
     let us = |d: Option<Duration>| d.map(|d| d.as_micros() as u64);
-    let not_searched = |row: RowKind, term: &str| {
+    let not_searched = |row: RowName, term: &str| {
         let own = found
             .unsearched
             .iter()
@@ -582,9 +593,9 @@ mod tests {
     fn markdown_lists_searched_counts_and_differences() {
         let (run, rows) = run_of(false, PIN);
         let paths = paths();
-        let missing = |term: &str, row, class, files: &[u32]| Unsearched {
+        let missing = |term: &str, row: RowKind, class, files: &[u32]| Unsearched {
             term: term.to_string(),
-            row,
+            row: row.into(),
             class,
             files: files.to_vec(),
         };
@@ -621,6 +632,70 @@ mod tests {
         ];
         for want in want {
             assert!(trace.contains(want), "{want} not in\n{trace}");
+        }
+    }
+
+    #[test]
+    fn server_rows_print_dashes_speedups_and_one_latency_clause() {
+        let (run, mut rows) = run_of(false, PIN);
+        rows.truncate(1);
+        for label in ["a", "b"] {
+            let mut row = Row::new(RowName::server(label));
+            row.searched = vec![0];
+            for q in &rows[0].queries {
+                let hits = Hits {
+                    per_file: q.hits.per_file.clone(),
+                    binary: Vec::new(),
+                };
+                row.queries
+                    .push(Query::new(&q.term, Duration::from_millis(1), hits));
+            }
+            rows.push(row);
+        }
+        let paths = paths();
+        let missing = |row: &str| Unsearched {
+            term: "a".to_string(),
+            row: RowName::server(row),
+            class: Class::Binary,
+            files: vec![1],
+        };
+        let unsearched = [missing("a"), missing("b")];
+        let found = Found {
+            diffs: &[],
+            unsearched: &unsearched,
+            deviations: &[],
+            paths: &paths,
+        };
+        let md = markdown(&run, &rows, &found);
+        assert_has(
+            &md,
+            &[
+                "\n| fmgrep@a | - | - | - |",
+                "| 1.00 ms | 1.00 ms | - | - | - | - |\n| fmgrep@b |",
+                "| speedup fmgrep@a | speedup fmgrep@b |",
+                "\n- files searched: rg 2, fmgrep@a 1, fmgrep@b 1 (non-empty)\n",
+                "`rg` over the checkout, or `fmgrep --server` against the `fmgrep serve` \
+                 already running at each `fmgrep@` row's address. ",
+                " An `fmgrep@` row's server is not measured. ",
+                "- `a`: fmgrep@a did not search binary 1 (`.w`); \
+                 fmgrep@b did not search binary 1 (`.w`)\n",
+            ],
+        );
+        assert_eq!(md.matches("already running").count(), 1, "{md}");
+        assert!(!md.contains("against one `fmgrep serve`"), "{md}");
+        let (_, served) = run_of(false, PIN);
+        let mut fmgrep = served.into_iter().nth(1).unwrap();
+        fmgrep.name = RowKind::Fmgrep.into();
+        rows.push(fmgrep);
+        let md = markdown(&run, &rows, &found);
+        assert_has(
+            &md,
+            &["against one `fmgrep serve`, or `fmgrep --server` against the"],
+        );
+        let trace = trace(&run, &rows, &found);
+        for name in ["fmgrep@a", "fmgrep@b"] {
+            let want = format!(r#""index_name":"{name}""#);
+            assert_eq!(trace.matches(&want).count(), 4, "{trace}");
         }
     }
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use fmgrep::regex_pattern;
 
 use crate::verify::{Paths, rg as rg_cmd};
-use crate::{Query, Row, RowKind, leaves};
+use crate::{Query, Row, RowKind, Server, leaves};
 
 pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let mut row = Row::new(RowKind::Rg);
@@ -91,9 +91,74 @@ pub fn and_pipe(
 /// Printed by every row: `path:N:text`, one line per matching line.
 pub const LINES: [&str; 4] = ["-n", "--no-heading", "--color", "never"];
 
-/// The `fmgrep` rows: `fmgrep-store-docs` indexes with `--store-docs`;
-/// `fmgrep-direct` runs each query as a fresh process over the index, with
-/// no server.
+/// The non-empty files of the walk, sorted: what an index of it searches.
+fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
+    let searched = docs.iter().filter(|d| d.len > 0);
+    let mut searched: Vec<u32> = searched.filter_map(|d| paths.id(&d.path)).collect();
+    searched.sort_unstable();
+    searched
+}
+
+/// Each query through `fmgrep --server addr`.
+fn clients(
+    bin: &Path,
+    addr: &str,
+    paths: &Paths,
+    terms: &[String],
+    row: &mut Row,
+) -> Result<(), String> {
+    for term in terms {
+        let mut cmd = Command::new(bin);
+        let leaves = leaves(term);
+        cmd.args(["--server", addr]).args(LINES);
+        cmd.args((leaves.len() > 1).then_some("--and"));
+        cmd.arg("--").args(leaves);
+        let (out, latency, _) = timed(&mut cmd, None)?;
+        let hits = paths.hits(&format!("fmgrep --server {term:?}"), &out)?;
+        row.queries.push(Query::new(term, latency, hits));
+    }
+    Ok(())
+}
+
+/// Refuses a server that does not serve the walk's `files` files of `root`.
+pub fn check_server(bin: &Path, addr: &str, root: &Path, files: usize) -> Result<(), String> {
+    let (out, _, _) = timed(Command::new(bin).args(["--server", addr, "--status"]), None)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(stderr.trim().trim_start_matches("error: ").to_string());
+    }
+    let status: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("--status: {e}"))?;
+    let (served, at) = (status["files"].as_u64(), status["root"].as_str());
+    let (Some(served), Some(at)) = (served, at) else {
+        return Err(format!("--status: no files or root in {status}"));
+    };
+    if status["store_docs"] != true && Path::new(at) != root {
+        return Err(format!("serves {at}, not {}", root.display()));
+    }
+    if served != files as u64 {
+        return Err(format!("serves {served} files, the checkout has {files}"));
+    }
+    Ok(())
+}
+
+/// A `--server` row: the queries against a server it neither starts nor
+/// stops, and so does not measure.
+pub fn server(
+    bin: &Path,
+    paths: &Paths,
+    docs: &[fmgrep::DocMeta],
+    server: &Server,
+    terms: &[String],
+) -> Result<Row, String> {
+    let mut row = Row::new(server.name);
+    row.searched = searched(paths, docs);
+    clients(bin, &server.addr, paths, terms, &mut row)?;
+    Ok(row)
+}
+
+/// The `fmgrep` and `fmgrep-store-docs` rows, served; `fmgrep-direct`, a
+/// process per query.
 pub fn fmgrep(
     bin: &Path,
     (paths, root, docs): (&Paths, &Path, &[fmgrep::DocMeta]),
@@ -121,12 +186,7 @@ pub fn fmgrep(
         ));
     }
     let mut row = Row::new(name);
-    let searched = docs
-        .iter()
-        .filter(|d| d.len > 0)
-        .filter_map(|d| paths.id(&d.path));
-    row.searched = searched.collect();
-    row.searched.sort_unstable();
+    row.searched = searched(paths, docs);
     row.index_time = Some(Duration::from_micros(field("build_time_us")?));
     row.index_bytes = Some(field("index_size_bytes")?);
     row.index_peak_rss = peak;
@@ -155,16 +215,7 @@ pub fn fmgrep(
     row.ready = Some(start.elapsed());
     std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
 
-    for term in terms {
-        let mut cmd = Command::new(bin);
-        let leaves = leaves(term);
-        cmd.args(["--server", &addr]).args(LINES);
-        cmd.args((leaves.len() > 1).then_some("--and"));
-        cmd.arg("--").args(leaves);
-        let (out, latency, _) = timed(&mut cmd, None)?;
-        let hits = paths.hits(&format!("fmgrep --server {term:?}"), &out)?;
-        row.queries.push(Query::new(term, latency, hits));
-    }
+    clients(bin, &addr, paths, terms, &mut row)?;
     let mut shutdown = Command::new(bin);
     let (out, _, _) = timed(shutdown.args(["--server", &addr, "--shutdown"]), None)?;
     if !out.status.success() {
@@ -192,7 +243,7 @@ fn direct(
     let bin = bin
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
-    let mut largest: Option<Peak> = None;
+    let mut largest = None;
     for term in terms {
         let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
@@ -202,13 +253,7 @@ fn direct(
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let hits = paths.hits(&format!("fmgrep --index {term:?}"), &out)?;
         row.queries.push(Query::new(term, latency, hits));
-        if let Some(p) = peak {
-            let l = largest.get_or_insert(Peak {
-                footprint: 0,
-                rss: 0,
-            });
-            (l.footprint, l.rss) = (l.footprint.max(p.footprint), l.rss.max(p.rss));
-        }
+        largest = Peak::max(largest, peak);
     }
     (row.footprint, row.query_rss) = (largest.map(|p| p.footprint), largest.map(|p| p.rss));
     Ok(())
@@ -304,6 +349,18 @@ pub struct Peak {
     pub rss: u64,
 }
 
+impl Peak {
+    fn max(a: Option<Peak>, b: Option<Peak>) -> Option<Peak> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(Peak {
+                footprint: a.footprint.max(b.footprint),
+                rss: a.rss.max(b.rss),
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// Samples a process's memory every `tick` and keeps each field's peak.
 pub struct Sampler(Arc<AtomicBool>, JoinHandle<Option<Peak>>);
 
@@ -317,13 +374,7 @@ impl Sampler {
                 if flag.load(Ordering::Relaxed) {
                     return peak;
                 }
-                peak = match (peak, memory(pid)) {
-                    (Some(a), Some(b)) => Some(Peak {
-                        footprint: a.footprint.max(b.footprint),
-                        rss: a.rss.max(b.rss),
-                    }),
-                    (a, b) => a.or(b),
-                };
+                peak = Peak::max(peak, memory(pid));
             }
         });
         Self(stop, handle)

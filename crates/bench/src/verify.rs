@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 
 use crate::deviations::Deviation;
 use crate::rows::failure;
-use crate::{Row, RowKind, THIRD_PARTY};
+use crate::{Row, RowName, THIRD_PARTY};
 
 pub struct Paths {
     root: Vec<u8>,
@@ -78,7 +78,7 @@ impl Hits {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Unsearched {
     pub term: String,
-    pub row: RowKind,
+    pub row: RowName,
     pub class: Class,
     pub files: Vec<u32>,
 }
@@ -303,7 +303,7 @@ pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> Verdict {
             let b = reference.unwrap_or(0);
             let key = |r: usize| hits[r].get(file).map_or((0, 0), |h| (h.lines, h.digest));
             for (r, row) in rows.iter().enumerate() {
-                let third = THIRD_PARTY.contains(&row.name);
+                let third = THIRD_PARTY.contains(&row.name.kind);
                 let got = hits[r].get(file);
                 if got.is_some() && !listed(r) && !third {
                     let path = paths.name(file);
@@ -364,7 +364,7 @@ pub fn verify(paths: &Paths, root: &Path, rows: &[Row]) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Query;
+    use crate::{Query, RowKind};
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
     use std::time::Duration;
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(listed.unwrap(), [2, 4]);
     }
 
-    fn row(name: RowKind, searched: &[u32], hits: &[&[(u32, u32, u64)]]) -> Row {
+    fn row(name: impl Into<RowName>, searched: &[u32], hits: &[&[(u32, u32, u64)]]) -> Row {
         let mut row = Row::new(name);
         row.searched = searched.to_vec();
         for (i, files) in hits.iter().enumerate() {
@@ -463,9 +463,9 @@ mod tests {
             fatal, unsearched, ..
         } = verify(&p, root, &[rg(), fm]);
         assert_eq!(fatal, Vec::<String>::new());
-        let missing = |term: &str, row, class, files: &[u32]| Unsearched {
+        let missing = |term: &str, row: RowKind, class, files: &[u32]| Unsearched {
             term: term.to_string(),
-            row,
+            row: row.into(),
             class,
             files: files.to_vec(),
         };
@@ -490,7 +490,7 @@ mod tests {
         assert_eq!(fatal, want);
 
         let mut partial = rg();
-        partial.name = RowKind::Tgrep;
+        partial.name = RowKind::Tgrep.into();
         partial.queries.remove(1);
         let fatal = verify(&p, root, &[rg(), partial]).fatal;
         assert_eq!(fatal, ["queries: rg and tgrep differ"]);
@@ -507,10 +507,10 @@ mod tests {
         );
         let v = verify(&p, root, &[ours(RowKind::Rg), ours(RowKind::Fmgrep), eg]);
         assert_eq!(v.fatal, Vec::<String>::new());
-        let dev = |against, file, want, got, other| Deviation {
+        let dev = |against: RowKind, file, want, got, other| Deviation {
             term: "t0".to_string(),
-            row: RowKind::Elgrep,
-            against,
+            row: RowKind::Elgrep.into(),
+            against: against.into(),
             file,
             want,
             got,
@@ -522,7 +522,7 @@ mod tests {
             dev(RowKind::Rg, 2, 1, 1, true),
         ];
         assert_eq!(v.deviations, want);
-        let unsearched = v.unsearched.iter().map(|u| (u.row, &u.files[..]));
+        let unsearched = v.unsearched.iter().map(|u| (u.row.kind, &u.files[..]));
         let unsearched: Vec<_> = unsearched.collect();
         assert_eq!(
             unsearched,
@@ -547,7 +547,7 @@ mod tests {
         let v = verify(&p, root, &[row(RowKind::Rg, &[0], &[&[(0, 2, 7)]]), fm, tg]);
         assert_eq!(v.fatal, Vec::<String>::new());
         let mut want = dev(RowKind::Fmgrep, 4, 1, 2, false);
-        want.row = RowKind::Tgrep;
+        want.row = RowKind::Tgrep.into();
         assert_eq!(v.deviations, [want]);
     }
 
@@ -591,5 +591,16 @@ mod tests {
         assert_eq!(lossy.len(), 2);
         assert_eq!(lossy.class(&root, 0), Class::Name);
         assert_eq!(lossy.class(&root, 1), Class::Name);
+    }
+
+    #[test]
+    fn server_rows_fail_like_fmgrep_rows() {
+        let (p, root) = (table(), Path::new("/nonexistent"));
+        let rg = row(RowKind::Rg, &[0, 1, 2], &[&[(0, 2, 7)]]);
+        let a = row(RowName::server("a"), &[0, 1, 2], &[&[(0, 2, 7)]]);
+        let b = row(RowName::server("b"), &[0, 1, 2], &[&[(0, 1, 7)]]);
+        let v = verify(&p, root, &[rg, a, b]);
+        assert_eq!(v.fatal, ["\"t0\": a/c:1:d.txt: rg 2 lines, fmgrep@b 1"]);
+        assert_eq!(v.deviations, []);
     }
 }

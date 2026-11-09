@@ -139,3 +139,23 @@ Each corpus's queries and pinned commit are in
 `crates/bench/queries/<corpus>.json`; `/.../` entries are regexes and
 `A AND B` entries intersections. To add a corpus, add a query file and name
 it in `crates/bench/src/corpus.rs`.
+
+## Comparing index configurations
+
+To compare index configurations, build and serve each index yourself and
+give the harness one `--server [LABEL=]HOST:PORT` per server. Each adds a
+row `fmgrep@LABEL` that runs the queries through `fmgrep --server` against
+that server and leaves it running; the harness first checks with
+`--status` that the server holds the checkout's files. Such a row prints
+`-` in the index and memory columns, and discard the first run after the
+servers start, which is cold:
+
+```sh
+cargo build --release -p fmgrep
+FMGREP_SHARD_BYTES=100MB target/release/fmgrep index ~/chromium --output /tmp/chromium100
+FMGREP_SHARD_BYTES=250MB target/release/fmgrep index ~/chromium --output /tmp/chromium250
+target/release/fmgrep serve /tmp/chromium100 --listen 127.0.0.1:7100 &
+target/release/fmgrep serve /tmp/chromium250 --listen 127.0.0.1:7250 &
+scripts/bench.sh --corpus chromium --repo-path ~/chromium -- --rows rg \
+    --server 100mb=127.0.0.1:7100 --server 250mb=127.0.0.1:7250
+```
