@@ -4,15 +4,15 @@
 use serde_json::{Value, json};
 
 use crate::report::Found;
-use crate::{Row, RowKind, THIRD_PARTY};
+use crate::{Row, RowKind, RowName, THIRD_PARTY};
 
 /// A third-party row's lines from one file, where they differ from the reference row's.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Deviation {
     pub term: String,
-    pub row: RowKind,
+    pub row: RowName,
     /// The first row that searched the file.
-    pub against: RowKind,
+    pub against: RowName,
     pub file: u32,
     pub want: u32,
     pub got: u32,
@@ -35,7 +35,7 @@ fn code(s: &str) -> String {
 
 /// The number of distinct (row, query) pairs.
 pub fn count(deviations: &[Deviation]) -> usize {
-    let pairs = deviations.iter().map(|d| (<&str>::from(d.row), &d.term));
+    let pairs = deviations.iter().map(|d| (d.row, &d.term));
     let mut pairs: Vec<_> = pairs.collect();
     pairs.sort_unstable();
     pairs.dedup();
@@ -53,8 +53,8 @@ pub fn ok_line(rows: &[Row], n: usize, deviations: &[Deviation]) -> String {
     if k == 0 {
         return format!("verify: OK, {} on {n} queries\n", agree(rows.len()));
     }
-    let ours = rows.iter().filter(|r| !THIRD_PARTY.contains(&r.name));
-    let ours: Vec<RowKind> = ours.map(|r| r.name).collect();
+    let ours = rows.iter().filter(|r| !THIRD_PARTY.contains(&r.name.kind));
+    let ours: Vec<RowKind> = ours.map(|r| r.name.kind).collect();
     let subject = match ours[..] {
         [RowKind::Rg, _, ..] => "fmgrep rows agree with rg".to_string(),
         _ => agree(ours.len()),
@@ -87,14 +87,14 @@ fn part(found: &Found, devs: &[&Deviation]) -> Option<String> {
 }
 
 /// One `(row, note)` per third-party row that deviates, in query order.
-pub fn notes(n: usize, found: &Found) -> Vec<(RowKind, String)> {
+pub fn notes(n: usize, found: &Found) -> Vec<(RowName, String)> {
     let mut out = Vec::new();
-    for row in THIRD_PARTY {
+    for row in THIRD_PARTY.map(RowName::from) {
         let own: Vec<&Deviation> = found.deviations.iter().filter(|d| d.row == row).collect();
         if own.is_empty() {
             continue;
         }
-        let mut against: Vec<RowKind> = Vec::new();
+        let mut against: Vec<RowName> = Vec::new();
         for d in &own {
             if !against.contains(&d.against) {
                 against.push(d.against);
@@ -117,7 +117,7 @@ pub fn notes(n: usize, found: &Found) -> Vec<(RowKind, String)> {
         }
         let k = queries.len();
         let verb = if k == 1 { "differs" } else { "differ" };
-        let against: Vec<String> = against.iter().map(RowKind::to_string).collect();
+        let against: Vec<String> = against.iter().map(RowName::to_string).collect();
         let against = against.join(" or ");
         let shown = shown.join("; ");
         out.push((
@@ -129,7 +129,7 @@ pub fn notes(n: usize, found: &Found) -> Vec<(RowKind, String)> {
 }
 
 /// The trace's `differs` for one row's query.
-pub fn trace(found: &Found, row: RowKind, term: &str) -> Value {
+pub fn trace(found: &Found, row: RowName, term: &str) -> Value {
     let own = found
         .deviations
         .iter()
@@ -159,8 +159,8 @@ mod tests {
     fn dev(term: &str, row: RowKind, file: u32, want: u32, got: u32) -> Deviation {
         Deviation {
             term: term.to_string(),
-            row,
-            against: RowKind::Rg,
+            row: row.into(),
+            against: RowKind::Rg.into(),
             file,
             want,
             got,
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(
             notes(46, &found(&paths, &one)),
             [(
-                RowKind::Elgrep,
+                RowKind::Elgrep.into(),
                 "1 of 46 queries differs from rg: `MCK_ AND C_Check`, 40 lines missed in 1 file (`a`)"
                     .to_string()
             )]
@@ -199,7 +199,7 @@ mod tests {
             many.push(dev(t, RowKind::Tgrep, 4, 1, 0));
         }
         let mut vs_fmgrep = dev("y", RowKind::Tgrep, 3, 1, 2);
-        vs_fmgrep.against = RowKind::Fmgrep;
+        vs_fmgrep.against = RowKind::Fmgrep.into();
         many.push(vs_fmgrep);
         let got = notes(46, &found(&paths, &many));
         let tgrep = "7 of 46 queries differ from rg or fmgrep: \
@@ -212,8 +212,8 @@ mod tests {
         assert_eq!(
             got,
             [
-                (RowKind::Tgrep, tgrep.to_string()),
-                (RowKind::Elgrep, elgrep.to_string())
+                (RowKind::Tgrep.into(), tgrep.to_string()),
+                (RowKind::Elgrep.into(), elgrep.to_string())
             ]
         );
         assert_eq!((count(&many), count(&one), count(&[])), (8, 1, 0));

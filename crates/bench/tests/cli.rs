@@ -287,3 +287,148 @@ fn third_party_row_dropping_a_file_is_a_footnote_not_a_failure() {
     let want = r#"[{"against":"rg","file":"ghc.txt","lines":0,"want":1}]"#;
     assert_eq!(differs, [(r#""elgrep""#.to_string(), want.to_string())]);
 }
+
+/// Kills the server when dropped.
+struct Served(std::process::Child, String);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A git tree `dir/name` of `a.txt` and a `%PDF-` `p.txt`, indexed into
+/// `dir/name.idx` and served on an ephemeral port.
+fn served_tree(fmgrep: &Path, dir: &Path, name: &str) -> (std::path::PathBuf, Served) {
+    use std::io::BufRead;
+    let root = dir.join(name);
+    std::fs::create_dir(&root).unwrap();
+    let git = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(&root)
+        .status();
+    assert!(git.unwrap().success());
+    let queries: serde_json::Value =
+        serde_json::from_str(include_str!("../queries/ghc.json")).unwrap();
+    let literals = queries["queries"].as_array().unwrap().iter();
+    let literals = literals
+        .filter_map(|q| q.as_str())
+        .filter(|q| !q.starts_with('/'));
+    let lines: String = literals
+        .flat_map(|q| q.split(" AND "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(root.join("a.txt"), &lines).unwrap();
+    std::fs::write(root.join("p.txt"), format!("%PDF-\n{lines}")).unwrap();
+    let index = dir.join(format!("{name}.idx"));
+    let fmgrep = |args: &[&std::ffi::OsStr]| {
+        let mut cmd = Command::new(fmgrep);
+        cmd.args(args).env("FMGREP_JOURNAL", "off");
+        cmd
+    };
+    let mut built = fmgrep(&[
+        "index".as_ref(),
+        root.as_ref(),
+        "--output".as_ref(),
+        index.as_ref(),
+    ]);
+    assert!(built.output().unwrap().status.success());
+    let mut serve = fmgrep(&["serve".as_ref(), index.as_ref()]);
+    serve.stdin(std::process::Stdio::null());
+    let mut child = serve.stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut addr = String::new();
+    out.read_line(&mut addr).unwrap();
+    std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+    (root, Served(child, addr.trim().to_string()))
+}
+
+fn needs_fmgrep_rg_and_git() -> Option<std::path::PathBuf> {
+    let fmgrep = Path::new(env!("CARGO_BIN_EXE_bench")).with_file_name("fmgrep");
+    let tools = ["rg", "git"].map(|t| Command::new(t).arg("--version").output().is_ok());
+    if !fmgrep.is_file() || tools.contains(&false) {
+        eprintln!("skipped: needs fmgrep, rg and git");
+        return None;
+    }
+    Some(fmgrep)
+}
+
+#[test]
+fn server_rows_query_running_servers_and_leave_them_up() {
+    let Some(fmgrep) = needs_fmgrep_rg_and_git() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (root, server) = served_tree(&fmgrep, dir.path(), "tree");
+    let before = snapshot(&root);
+    let (labelled, addr) = (format!("a={}", server.1), server.1.as_str());
+    let out = bench(
+        dir.path(),
+        &[("FMGREP_CORPUS_GHC", &root)],
+        &[
+            "--rows", "rg", "--server", &labelled, "--server", addr, "--trace", "t.jsonl",
+        ],
+    );
+    let md = text(&out.stdout);
+    assert!(out.status.success(), "{md}\n{}", text(&out.stderr));
+    assert_eq!(snapshot(&root), before);
+    let wants = [
+        "\n| fmgrep@a | - | - | - |".to_string(),
+        format!("\n| fmgrep@{addr} | - | - | - |"),
+        format!("\n- files searched: rg 2, fmgrep@a 1, fmgrep@{addr} 1 (non-empty)\n"),
+        "verify: OK, 3 rows agree on 40 queries\n".to_string(),
+        "fmgrep@a did not search binary 1 (`p.txt`)".to_string(),
+    ];
+    for want in &wants {
+        assert!(md.contains(want), "{want:?} not in\n{md}");
+    }
+    let trace = std::fs::read_to_string(dir.path().join("t.jsonl")).unwrap();
+    let names: std::collections::BTreeSet<String> = trace
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .map(|v| v["index_name"].as_str().unwrap().to_string())
+        .collect();
+    let want = [
+        "fmgrep@a".to_string(),
+        format!("fmgrep@{addr}"),
+        "rg".into(),
+    ];
+    assert_eq!(names, want.into());
+    let status = Command::new(&fmgrep)
+        .args(["--server", addr, "--status"])
+        .output();
+    assert!(status.unwrap().status.success());
+}
+
+#[test]
+fn server_flags_that_cannot_run_exit_2() {
+    let Some(fmgrep) = needs_fmgrep_rg_and_git() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (other, served) = served_tree(&fmgrep, dir.path(), "other");
+    let root = dir.path().join("tree");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    let env = [("FMGREP_CORPUS_GHC", root.as_path())];
+    let run = |args: &[&str]| bench(dir.path(), &env, args);
+    let refused = run(&["--rows", "rg", "--server", "a=127.0.0.1:1"]);
+    assert_refused(&refused, &["error: --server a=127.0.0.1:1: "]);
+    let wrong = format!("b={}", served.1);
+    let (other, root) = (other.canonicalize().unwrap(), root.canonicalize().unwrap());
+    let fragment = format!(
+        "--server {wrong}: serves {}, not {}",
+        other.display(),
+        root.display()
+    );
+    assert_refused(&run(&["--server", &wrong]), &[fragment]);
+    let twice = run(&["--server", "a=h:1", "--server", "a=h:2"]);
+    assert_refused(&twice, &["error: --server: two rows named fmgrep@a"]);
+    let fixture = run(&["--fixture", "--server", "a=h:1"]);
+    assert_refused(
+        &fixture,
+        &["error: --server needs the corpus, not --fixture"],
+    );
+}

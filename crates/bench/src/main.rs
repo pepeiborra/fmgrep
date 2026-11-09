@@ -21,6 +21,7 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
 const USAGE: &str = "\
 usage: bench [--corpus ghc|linux|chromium|aosp] [--rows ROWS] [--fixture] [--trace FILE]
+             [--server [LABEL=]HOST:PORT]...
 
 Runs every row over the checkout in place, checks each row's lines from
 every file against rg's, lists the files only some rows searched, and
@@ -34,14 +35,28 @@ prints the results as markdown; tgrep and elgrep differences are notes.
                  elgrep when it is on PATH on Linux, where its index answers
   --fixture      search one file of the query set's literals instead
   --trace FILE   write one JSON line per query and per row
+  --server [LABEL=]HOST:PORT
+                 also query the fmgrep serve already running there, as
+                 row fmgrep@LABEL (default fmgrep@HOST:PORT); repeatable
 
 Exits 1 when a row fails or an fmgrep row differs from rg, 2 on a usage or
 corpus error.";
 
-/// A row, named in kebab-case by `--rows`, the results and the trace; rows
-/// run and print in this order.
+/// A row's kind, named in kebab-case by `--rows`; rows run and print in
+/// this order, `--server` rows in place of `fmgrep-server`.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Display, EnumIter, EnumString, IntoStaticStr,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Display,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
 )]
 #[strum(serialize_all = "kebab-case")]
 pub enum RowKind {
@@ -50,8 +65,50 @@ pub enum RowKind {
     Fmgrep,
     FmgrepStoreDocs,
     FmgrepDirect,
+    FmgrepServer,
     Tgrep,
     Elgrep,
+}
+
+/// A row's name in the results and the trace: its kind's, or `fmgrep@LABEL`
+/// for a `--server` row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RowName {
+    pub kind: RowKind,
+    server: Option<&'static str>,
+}
+
+impl RowName {
+    pub fn server(label: &str) -> Self {
+        let name = format!("fmgrep@{label}").leak();
+        RowName {
+            kind: RowKind::FmgrepServer,
+            server: Some(name),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.server.unwrap_or(self.kind.into())
+    }
+}
+
+impl From<RowKind> for RowName {
+    fn from(kind: RowKind) -> Self {
+        RowName { kind, server: None }
+    }
+}
+
+impl std::fmt::Display for RowName {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `--server` row: the fmgrep serve it queries.
+#[derive(Debug)]
+pub struct Server {
+    pub name: RowName,
+    pub addr: String,
 }
 
 /// Rows whose differences from the reference are noted, not failures.
@@ -65,7 +122,7 @@ pub struct Query {
 
 #[derive(Default)]
 pub struct Row {
-    pub name: RowKind,
+    pub name: RowName,
     /// The non-empty files it searched, sorted.
     pub searched: Vec<u32>,
     pub queries: Vec<Query>,
@@ -91,9 +148,9 @@ impl Query {
 }
 
 impl Row {
-    fn new(name: RowKind) -> Self {
+    fn new(name: impl Into<RowName>) -> Self {
         Row {
-            name,
+            name: name.into(),
             ..Row::default()
         }
     }
@@ -142,21 +199,54 @@ fn failed(e: impl std::fmt::Display) -> Fail {
     (1, format!("error: {e}"))
 }
 
+/// The `--server [LABEL=]HOST:PORT` flags, in order.
+fn servers(specs: &[String]) -> Result<Vec<Server>, String> {
+    let mut servers: Vec<Server> = Vec::new();
+    for spec in specs {
+        let bad = |why: &str| format!("--server {spec:?}: {why}");
+        let (label, addr) = match spec.split_once('=') {
+            Some((label, addr)) => (Some(label), addr),
+            None => (None, spec.as_str()),
+        };
+        let port = addr.rsplit_once(':').and_then(|(host, port)| {
+            let port = port.parse::<u16>().ok().filter(|&p| p > 0);
+            port.filter(|_| !host.is_empty())
+        });
+        if port.is_none() {
+            return Err(bad("not [LABEL=]HOST:PORT"));
+        }
+        let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if label.is_some_and(|l| l.is_empty() || !l.chars().all(ok)) {
+            return Err(bad("a label is letters, digits, '.', '_' or '-'"));
+        }
+        let name = RowName::server(label.unwrap_or(addr));
+        if servers.iter().any(|s| s.name == name) {
+            return Err(format!("--server: two rows named {name}"));
+        }
+        let addr = addr.to_string();
+        servers.push(Server { name, addr });
+    }
+    Ok(servers)
+}
+
 fn select_rows(
     spec: Option<&str>,
+    servers: &[Server],
     tgrep: &Result<tgrep::Tgrep, String>,
     elgrep: &Result<elgrep::Elgrep, String>,
-) -> Result<Vec<RowKind>, String> {
+) -> Result<Vec<RowName>, String> {
     let by_default = |r: &RowKind| match r {
         RowKind::Rg | RowKind::Fmgrep => true,
-        RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect => false,
+        RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect | RowKind::FmgrepServer => false,
         RowKind::Tgrep => tgrep.is_ok(),
         RowKind::Elgrep => elgrep.is_ok() && cfg!(target_os = "linux"),
     };
+    let named = || RowKind::iter().filter(|&r| r != RowKind::FmgrepServer);
     let parse = |w: &str| {
-        let names: Vec<&str> = RowKind::iter().map(<&str>::from).collect();
+        let names: Vec<&str> = named().map(<&str>::from).collect();
         let bad = format!("--rows: {w:?} is not one of {}", names.join(", "));
-        w.parse::<RowKind>().map_err(|_| bad)
+        let kind = w.parse::<RowKind>().ok();
+        kind.filter(|&k| k != RowKind::FmgrepServer).ok_or(bad)
     };
     let wanted: Vec<RowKind> = match spec {
         Some(spec) => spec
@@ -172,7 +262,12 @@ fn select_rows(
     if let (true, Err(note)) = (wanted.contains(&RowKind::Elgrep), elgrep) {
         return Err(format!("--rows names elgrep, but {note}"));
     }
-    Ok(RowKind::iter().filter(|r| wanted.contains(r)).collect())
+    let rows = RowKind::iter().flat_map(|r| match r {
+        RowKind::FmgrepServer => servers.iter().map(|s| s.name).collect(),
+        r if wanted.contains(&r) => vec![r.into()],
+        _ => vec![],
+    });
+    Ok(rows.collect())
 }
 
 /// `fmgrep` next to this executable, else on `PATH`.
@@ -198,6 +293,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Fail> {
     let (mut corpus, mut rows, mut fixture, mut trace) = ("ghc", None, false, None);
+    let mut specs = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(usage(format!("{arg} needs a value")));
@@ -213,20 +309,21 @@ fn run() -> Result<(), Fail> {
             }
             "--rows" => rows = Some(value()?),
             "--trace" => trace = Some(PathBuf::from(value()?)),
+            "--server" => specs.push(value()?),
             "--fixture" => fixture = true,
             _ => return Err(usage(format!("unknown argument {arg:?}\n{USAGE}"))),
         }
     }
+    let servers = servers(&specs).map_err(usage)?;
+    if fixture && !servers.is_empty() {
+        return Err(usage("--server needs the corpus, not --fixture"));
+    }
     let (tgrep, elgrep) = (tgrep::detect(), elgrep::detect());
     let eg_dropped = rows.is_none() && elgrep.is_ok() && !cfg!(target_os = "linux");
-    let rows = select_rows(rows.as_deref(), &tgrep, &elgrep).map_err(usage)?;
+    let rows = select_rows(rows.as_deref(), &servers, &tgrep, &elgrep).map_err(usage)?;
     let fmgrep = fmgrep_bin();
-    let fmgrep_row = |r: &RowKind| {
-        matches!(
-            r,
-            RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect
-        )
-    };
+    let fmgrep_row =
+        |r: &RowName| !matches!(r.kind, RowKind::Rg | RowKind::Tgrep | RowKind::Elgrep);
     if fmgrep.is_none() && rows.iter().any(fmgrep_row) {
         return Err(usage("no fmgrep next to bench or on PATH"));
     }
@@ -247,6 +344,11 @@ fn run() -> Result<(), Fail> {
         std::fs::canonicalize(&root).map_err(|e| usage(format!("{}: {e}", root.display())))?;
     let docs = fmgrep::discover_index_meta(&root);
     let docs = docs.map_err(|e| usage(e.trim_start_matches("error: ")))?;
+    for (spec, s) in specs.iter().zip(&servers) {
+        let bin = fmgrep.as_deref().expect("server rows need fmgrep");
+        let checked = rows::check_server(bin, &s.addr, &root, docs.len());
+        checked.map_err(|e| usage(format!("--server {spec}: {e}")))?;
+    }
     let start = Instant::now();
     let paths = verify::Paths::new(&root, &docs).map_err(failed)?;
     let secs = start.elapsed().as_secs_f64();
@@ -257,13 +359,22 @@ fn run() -> Result<(), Fail> {
     for &name in &rows {
         eprintln!("running {name}");
         let before = rows::load1();
-        let row = match (name, &fmgrep, &tgrep, &elgrep) {
+        let row = match (name.kind, &fmgrep, &tgrep, &elgrep) {
             (RowKind::Rg, ..) => rows::rg(&paths, &root, terms),
             (RowKind::Tgrep, _, Ok(t), _) => tgrep::row(&t.bin, &paths, &root, terms),
             (RowKind::Elgrep, _, _, Ok(e)) => elgrep::row(e, &paths, &root, terms),
-            (RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect, Some(bin), ..) => {
+            (RowKind::FmgrepServer, Some(bin), ..) => {
+                let server = servers.iter().find(|s| s.name == name);
+                let server = server.expect("server rows come from --server");
+                rows::server(bin, &paths, &docs, server, terms)
+            }
+            (
+                kind @ (RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect),
+                Some(bin),
+                ..,
+            ) => {
                 let tree = (&paths, root.as_path(), docs.as_slice());
-                rows::fmgrep(bin, tree, name, terms)
+                rows::fmgrep(bin, tree, kind, terms)
             }
             _ => unreachable!("rows are checked above"),
         };
@@ -330,6 +441,10 @@ mod tests {
         assert_eq!(names, ["literal", "regex", "intersection"]);
     }
 
+    fn kinds(rows: Result<Vec<RowName>, String>) -> Vec<RowKind> {
+        rows.unwrap().iter().map(|r| r.kind).collect()
+    }
+
     #[test]
     fn select_rows_defaults_follow_detection() {
         let bin = PathBuf::from("x");
@@ -338,9 +453,6 @@ mod tests {
             bin: bin.clone(),
             version: version.clone(),
         });
-        fn absent<T>() -> Result<T, String> {
-            Err("absent".to_string())
-        }
         let daemon = bin.clone();
         let e = Ok(elgrep::Elgrep {
             bin,
@@ -353,18 +465,84 @@ mod tests {
             vec![]
         };
         assert_eq!(
-            select_rows(None, &absent(), &absent()).unwrap(),
+            kinds(select_rows(None, &[], &absent(), &absent())),
             [RowKind::Rg, RowKind::Fmgrep]
         );
-        let all = select_rows(None, &t, &e).unwrap();
+        let all = kinds(select_rows(None, &[], &t, &e));
         let found = [RowKind::Rg, RowKind::Fmgrep, RowKind::Tgrep];
         assert_eq!(all, [&found[..], &elgrep].concat());
-        let picked = select_rows(Some("elgrep,rg"), &absent(), &e).unwrap();
+        let picked = kinds(select_rows(Some("elgrep,rg"), &[], &absent(), &e));
         assert_eq!(picked, [RowKind::Rg, RowKind::Elgrep]);
-        let err = select_rows(Some("rg,elgrep"), &t, &absent()).unwrap_err();
+        let err = select_rows(Some("rg,elgrep"), &[], &t, &absent()).unwrap_err();
         assert_eq!(err, "--rows names elgrep, but absent");
-        let err = select_rows(Some("rg,x"), &t, &e).unwrap_err();
-        let names = "rg, fmgrep, fmgrep-store-docs, fmgrep-direct, tgrep, elgrep";
-        assert_eq!(err, format!("--rows: \"x\" is not one of {names}"));
+        let err = select_rows(Some("rg,x"), &[], &t, &e).unwrap_err();
+        assert_eq!(err, format!("--rows: \"x\" is not one of {NAMES}"));
+    }
+
+    const NAMES: &str = "rg, fmgrep, fmgrep-store-docs, fmgrep-direct, tgrep, elgrep";
+
+    fn absent<T>() -> Result<T, String> {
+        Err("absent".to_string())
+    }
+
+    fn specs(specs: &[&str]) -> Result<Vec<Server>, String> {
+        servers(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn server_flags_name_rows_and_refuse_bad_addresses_labels_and_collisions() {
+        let got = specs(&[
+            "a=127.0.0.1:7001",
+            "127.0.0.1:7001",
+            "localhost:1",
+            "[::1]:1",
+        ]);
+        let got: Vec<_> = got
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.name.as_str(), s.addr))
+            .collect();
+        let want = [
+            ("fmgrep@a", "127.0.0.1:7001"),
+            ("fmgrep@127.0.0.1:7001", "127.0.0.1:7001"),
+            ("fmgrep@localhost:1", "localhost:1"),
+            ("fmgrep@[::1]:1", "[::1]:1"),
+        ];
+        assert_eq!(got, want.map(|(n, a)| (n, a.to_string())));
+        assert_eq!(RowName::server("a").to_string(), "fmgrep@a");
+        for bad in ["127.0.0.1", "h:", "h:0", "h:99999", "h:x", ":7100", "a=h"] {
+            let want = format!("--server {bad:?}: not [LABEL=]HOST:PORT");
+            assert_eq!(specs(&[bad]).unwrap_err(), want);
+        }
+        for bad in ["=h:1", "a b=h:1", "a|b=h:1", "a@b=h:1"] {
+            let want = format!("--server {bad:?}: a label is letters, digits, '.', '_' or '-'");
+            assert_eq!(specs(&[bad]).unwrap_err(), want);
+        }
+        let two = "--server: two rows named fmgrep@a";
+        assert_eq!(specs(&["a=h:1", "a=h:2"]).unwrap_err(), two);
+        assert_eq!(specs(&["a=h:1", "b=h:1", "A.b_-9=h:1"]).unwrap().len(), 3);
+        let same = specs(&["h:1", "h:1"]).unwrap_err();
+        assert_eq!(same, "--server: two rows named fmgrep@h:1");
+    }
+
+    #[test]
+    fn server_rows_run_after_the_fmgrep_rows_in_flag_order() {
+        let servers = specs(&["b=h:1", "a=h:2"]).unwrap();
+        let t = Ok(tgrep::Tgrep {
+            bin: PathBuf::from("x"),
+            version: String::new(),
+        });
+        let rows = select_rows(Some("tgrep,fmgrep-direct,rg"), &servers, &t, &absent());
+        let names: Vec<_> = rows.unwrap().iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            names,
+            ["rg", "fmgrep-direct", "fmgrep@b", "fmgrep@a", "tgrep"]
+        );
+        let rows = select_rows(None, &servers, &absent(), &absent()).unwrap();
+        let names: Vec<_> = rows.iter().map(|r| r.as_str()).collect();
+        assert_eq!(names, ["rg", "fmgrep", "fmgrep@b", "fmgrep@a"]);
+        let err = select_rows(Some("rg,fmgrep-server"), &servers, &t, &absent());
+        let want = format!("--rows: \"fmgrep-server\" is not one of {NAMES}");
+        assert_eq!(err.unwrap_err(), want);
     }
 }
