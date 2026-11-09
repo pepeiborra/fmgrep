@@ -6,17 +6,17 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rayon::prelude::*;
 
 use crate::Stamp;
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 mod added;
 mod journal;
 mod recorded;
+mod watcher;
 
 pub use journal::{Journal, Knob, marks};
 pub use recorded::{Recorded, write_walk};
@@ -86,8 +86,6 @@ const WARNED: u8 = 4;
 /// Docs above this are statted on several threads.
 const PARALLEL_STAT_MIN: usize = 64;
 const STAT_THREADS: usize = 16;
-/// How long the watcher waits for a burst of events to end.
-const WATCH_SETTLE: Duration = Duration::from_millis(20);
 /// How often an idle watcher checks its stop flag.
 const WATCH_TICK: Duration = Duration::from_millis(50);
 
@@ -440,19 +438,11 @@ impl Files {
         let failed =
             |e: &dyn std::fmt::Display| format!("cannot watch {}: {e}", self.known.root.display());
         let root = self.known.root.canonicalize().map_err(|e| failed(&e))?;
-        let (tx, events) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = tx.send(event);
-        })
-        .map_err(|e| failed(&e))?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .map_err(|e| failed(&e))?;
+        let feed = watcher::Feed::new(&root).map_err(|e| failed(&e))?;
         Ok(Watch {
             known: Arc::clone(&self.known),
             root,
-            events,
-            _watcher: watcher,
+            feed,
         })
     }
 }
@@ -462,38 +452,26 @@ pub struct Watch {
     known: Arc<Known>,
     /// Canonical, as events name paths.
     root: PathBuf,
-    events: mpsc::Receiver<notify::Result<Event>>,
-    _watcher: RecommendedWatcher,
+    feed: watcher::Feed,
 }
 
 impl Watch {
-    /// Re-stat and re-check for added files what each burst names, until
-    /// `stop`; an error, overflow or root event redoes all.
-    pub fn run(self, files: &[String], lens: &[u64], stop: &AtomicBool) {
+    /// Re-check what each burst names until `stop`; lost events or a root event redo all.
+    pub fn run(mut self, files: &[String], lens: &[u64], stop: &AtomicBool) {
         let mut by_path: Vec<usize> = (0..files.len()).collect();
         by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
         while !stop.load(Ordering::Relaxed) {
-            let first = match self.events.recv_timeout(WATCH_TICK) {
-                Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            let burst = match self.feed.next(WATCH_TICK) {
+                watcher::Next::Idle => continue,
+                watcher::Next::Closed => return,
+                watcher::Next::Burst(burst) => burst,
             };
-            std::thread::sleep(WATCH_SETTLE);
-            let mut all = false;
+            let mut all = burst.rescan;
             let mut ids = Vec::new();
             let mut named = Vec::new();
-            for event in std::iter::once(first).chain(self.events.try_iter()) {
-                match event {
-                    Ok(e) if e.need_rescan() => all = true,
-                    Ok(e) if matches!(e.kind, EventKind::Access(_)) => {}
-                    Ok(e) => {
-                        for path in e.paths {
-                            all |= docs_at(&self.root, &path, files, &by_path, &mut ids);
-                            named.push(path);
-                        }
-                    }
-                    Err(_) => all = true,
-                }
+            for path in burst.paths {
+                all |= docs_at(&self.root, &path, files, &by_path, &mut ids);
+                named.push(path);
             }
             if all {
                 self.known.stat_all(files, lens);

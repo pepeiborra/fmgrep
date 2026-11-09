@@ -215,7 +215,7 @@ enum Entry {
 /// `.`-prefixed names are pruned, a symlink is taken only to a file (never
 /// descended), and `exclude` (canonical) is never entered.
 fn classify(entry: &std::fs::DirEntry, exclude: Option<&Path>) -> Entry {
-    if entry.file_name().as_encoded_bytes().starts_with(b".") {
+    if pruned(&entry.file_name()) {
         return Entry::Skip;
     }
     let Ok(file_type) = entry.file_type() else {
@@ -239,6 +239,17 @@ fn classify(entry: &std::fs::DirEntry, exclude: Option<&Path>) -> Entry {
     } else {
         Entry::Skip
     }
+}
+
+/// Whether the walk prunes an entry by its name alone.
+pub fn pruned(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().starts_with(b".")
+}
+
+/// Whether the walk descends into `entry`, the index dir aside.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn descends(entry: &std::fs::DirEntry) -> bool {
+    matches!(classify(entry, None), Entry::Dir)
 }
 
 /// Paths relative to `root`, sorted, of every file under `under` the index
