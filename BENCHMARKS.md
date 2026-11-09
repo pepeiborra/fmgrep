@@ -5,10 +5,11 @@ Linux server.
 ## Method
 
 Every run is `scripts/bench.sh` ([docs/benchmark.md](docs/benchmark.md)).
-Every row searches the same staged copy of the corpus, one query at a time,
-and prints each matching line as `path:line:text`; a run fails unless all
-rows print the same lines, by file and line number, for every query they
-answer.
+Every row searches the checkout itself, one query at a time, and prints
+each matching line as `path:line:text`; a run fails unless the rows that
+searched a file print the same lines from it, by line number.
+Files only some rows searched (hidden, symlinked, gitignored, binary) are
+listed under the run's results, not failures.
 
 - **rg**: one `rg -n --no-heading` process per query.
 - **fmgrep**: an index (`index build`, `index size`), one `fmgrep serve`
@@ -41,8 +42,8 @@ answer.
   `--debug`, which names any query eg scanned without the index; a note
   under the table counts them. The index answers only on Linux (it needs
   inotify); elsewhere every query is a scan. eg searches a file holding a
-  NUL byte up to the NUL where rg skips the file; the harness stages no
-  such file, so the rows still agree. This is elgrep 1.0.0, from
+  NUL byte up to the NUL where rg skips the file; such a file is listed as
+  one rg did not search. This is elgrep 1.0.0, from
   [github.com/eliosai/sngram](https://github.com/eliosai/sngram)
   (`cargo install --locked elgrep --version 1.0.0`). See
   [docs/benchmark.md](docs/benchmark.md#elgrep-optional).
@@ -75,8 +76,9 @@ hold both.
   xargs -0 -r rg -n --no-heading -e A -e B`: a pass over the whole tree for
   the first side, then one over the files left per further side.
 - **tgrep**: one `tgrep -l` per side, then `tgrep -n --no-heading -e A -e B
-  --type-add and:FILE ... -t and` over the files on every list (`-g` and
-  path arguments would bypass its index).
+  --type-add and:NAME ... -t and` over the base names of the files on every
+  list (`-g` and path arguments would bypass its index), keeping the lines
+  of those files.
 - **elgrep**: rg's pipe with `eg`, `eg -l --null A | xargs -0 -r eg -l
   --null B | xargs -0 -r eg -n --no-heading -e A -e B`. eg answers file
   arguments from the same index, restricted to those files, and has no AND

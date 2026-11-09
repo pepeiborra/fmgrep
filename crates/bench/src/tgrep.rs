@@ -1,6 +1,6 @@
 //! The optional tgrep row: `tgrep index`, one `tgrep serve --no-watch`, then
 //! one `tgrep -n` client per query; an intersection is one `tgrep -l` per side
-//! and one more over the files they share.
+//! and one more over the base names of the files they share.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use fmgrep::regex_pattern;
 use serde_json::Value;
 
-use crate::rows::{Guard, LINES, Sampler, failure, hits, run_measured, timed};
+use crate::rows::{Guard, LINES, Sampler, failure, run_measured, timed};
+use crate::verify::Paths;
 use crate::{Query, Row, RowKind, leaves};
 
 pub struct Tgrep {
@@ -85,17 +86,19 @@ fn check(bin: PathBuf, what: &str) -> Result<Tgrep, String> {
     })
 }
 
-pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
+pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let index = dir.path().join("tgrep-index");
     let tgrep = |args: &[&str]| {
         let mut cmd = Command::new(bin);
-        cmd.args(args).arg("--index-path").arg(&index).arg(staged);
+        // tgrep skips files over 64 MiB by default; rg and fmgrep have no cap.
+        cmd.args(args).arg("--no-max-filesize");
+        cmd.arg("--index-path").arg(&index).arg(root);
         cmd
     };
     let start = Instant::now();
     let (status, _, peak) = run_measured(&mut tgrep(&["index"]))?;
-    let mut row = Row::new(RowKind::Tgrep, n);
+    let mut row = Row::new(RowKind::Tgrep);
     row.index_time = Some(start.elapsed());
     if !status.success() {
         return Err(format!("tgrep index: {status}"));
@@ -121,13 +124,15 @@ pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
             return Err(format!("tgrep serve: not ready after 300 s: {last}"));
         }
         match server_status(&index, pid) {
-            Ok(s) if status_ready(&s, n)? => break,
+            Ok(s) if status_ready(&s)? => break,
             Ok(s) => last = s.to_string(),
             Err(e) => last = e,
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     row.ready = Some(start.elapsed());
+    let out = search(&mut tgrep(&["-l", "-e="]), "tgrep -l ''")?;
+    row.searched = paths.listed("tgrep -l ''", &out)?;
 
     for term in terms {
         let what = format!("tgrep {term:?}");
@@ -138,11 +143,11 @@ pub fn row(bin: &Path, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
                 let args: Vec<&str> = LINES.into_iter().chain(fixed).chain([&*e]).collect();
                 search(&mut tgrep(&args), &what)?
             }
-            all => and(&tgrep, all, &what)?,
+            all => and(&tgrep, paths, all, &what)?,
         };
         let latency = start.elapsed();
-        row.queries
-            .push(Query::new(term, latency, hits(&what, &out)?));
+        let hits = paths.hits(&what, &out)?;
+        row.queries.push(Query::new(term, latency, hits));
     }
     drop(server);
     let peak = sampler.stop();
@@ -169,25 +174,23 @@ fn search(cmd: &mut Command, what: &str) -> Result<Output, String> {
     Ok(out)
 }
 
-/// One `tgrep -l` per leaf, then the lines matching any leaf in the files every
-/// leaf listed, restricted by `--type-add`/`-t` (`-g` and paths bypass the index).
-fn and(tgrep: &impl Fn(&[&str]) -> Command, leaves: &[&str], what: &str) -> Result<Output, String> {
-    let mut shared: Option<BTreeSet<String>> = None;
+/// `tgrep -l` per leaf, then `-n` over the shared files' base names, keeping only shared paths.
+fn and(
+    tgrep: &impl Fn(&[&str]) -> Command,
+    paths: &Paths,
+    leaves: &[&str],
+    what: &str,
+) -> Result<Output, String> {
+    let mut shared: Option<BTreeSet<u32>> = None;
     for leaf in leaves {
         let (fixed, e) = pattern(leaf);
         let args: Vec<&str> = ["-l"].into_iter().chain(fixed).chain([&*e]).collect();
         let out = search(&mut tgrep(&args), what)?;
-        if !matches!(out.status.code(), Some(0 | 1)) {
-            return Err(failure(what, &out));
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let names = stdout.lines().filter_map(|l| l.rsplit('/').next());
-        let mut names: BTreeSet<String> =
-            names.filter(|n| !n.is_empty()).map(String::from).collect();
+        let mut files: BTreeSet<u32> = paths.listed(what, &out)?.into_iter().collect();
         if let Some(shared) = &shared {
-            names.retain(|n| shared.contains(n));
+            files.retain(|f| shared.contains(f));
         }
-        if names.is_empty() {
+        if files.is_empty() {
             let status = ExitStatus::from_raw(1 << 8);
             let (stdout, stderr) = (Vec::new(), Vec::new());
             return Ok(Output {
@@ -196,19 +199,38 @@ fn and(tgrep: &impl Fn(&[&str]) -> Command, leaves: &[&str], what: &str) -> Resu
                 stderr,
             });
         }
-        shared = Some(names);
+        shared = Some(files);
     }
+    let shared = shared.unwrap_or_default();
     let any = leaves
         .iter()
         .map(|l| format!("-e={}", regex_pattern(l).unwrap_or(l)));
-    let files = shared
-        .into_iter()
-        .flatten()
-        .map(|n| format!("--type-add=and:{n}"));
-    let args: Vec<String> = any.chain(files).collect();
+    let names: BTreeSet<String> = shared
+        .iter()
+        .map(|&f| type_glob(paths.name(f).rsplit('/').next().unwrap_or_default()))
+        .collect();
+    let names = names.into_iter().map(|n| format!("--type-add=and:{n}"));
+    let args: Vec<String> = any.chain(names).collect();
     let args = args.iter().map(String::as_str).chain(["-t", "and"]);
     let args: Vec<&str> = LINES.into_iter().chain(args).collect();
-    search(&mut tgrep(&args), what)
+    let mut out = search(&mut tgrep(&args), what)?;
+    let keep = |l: &&[u8]| paths.file_of(l).is_none_or(|f| shared.contains(&f));
+    let lines = out.stdout.split_inclusive(|&b| b == b'\n').filter(keep);
+    out.stdout = lines.flatten().copied().collect();
+    Ok(out)
+}
+
+/// A glob for the base name `name`; `:` (it ends a type name) becomes `?`.
+fn type_glob(name: &str) -> String {
+    let mut glob = String::new();
+    for c in name.chars() {
+        match c {
+            '*' | '?' | '[' | ']' | '{' | '}' | '\\' => glob.extend(['\\', c]),
+            ':' => glob.push('?'),
+            c => glob.push(c),
+        }
+    }
+    glob
 }
 
 pub fn dir_size(dir: &Path) -> u64 {
@@ -242,9 +264,8 @@ fn server_status(index: &Path, pid: u32) -> Result<Value, String> {
     Ok(reply["result"].clone())
 }
 
-/// Ready once the startup reconcile finished with exactly `n` files; `Err`
-/// when it never can be.
-fn status_ready(s: &Value, n: usize) -> Result<bool, String> {
+/// Ready once the startup reconcile finished; `Err` when it never can be.
+fn status_ready(s: &Value) -> Result<bool, String> {
     let flag = |k: &str| {
         s[k].as_bool()
             .ok_or(format!("tgrep status lacks {k:?}: {s}"))
@@ -257,21 +278,11 @@ fn status_ready(s: &Value, n: usize) -> Result<bool, String> {
         flag("hidden_complete")?,
         flag("reconcile_running")?,
     );
-    if indexing || !hidden || running || s["last_reconcile_at"].is_null() {
-        return Ok(false);
-    }
-    if s["num_files"].as_u64() == Some(n as u64) {
-        Ok(true)
-    } else {
-        Err(format!(
-            "tgrep serve holds {} files, {n} staged",
-            s["num_files"]
-        ))
-    }
+    Ok(!(indexing || !hidden || running || s["last_reconcile_at"].is_null()))
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A `tgrep` script in a fresh directory, printing `help` for any `--help`.
@@ -300,6 +311,34 @@ mod tests {
         assert_eq!((tgrep.bin, tgrep.version.as_str()), (bin, "tgrep 9.9"));
     }
 
+    /// Repeated base names, one copy holding both leaves, and a glob metacharacter.
+    pub fn tree() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let docs = [
+            ("a/x.c", "alpha\n"),
+            ("b/x.c", "beta\nalpha\n"),
+            ("c/x.c", "beta\n"),
+            ("y.c", "alpha\nx\nbeta\n"),
+            ("d/[x].c", "alpha beta\n"),
+            ("e/x.c", "alpha beta zzz\n"),
+        ];
+        for (name, text) in docs {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        (dir, root)
+    }
+
+    pub const TERMS: [&str; 5] = [
+        "alpha AND beta",
+        "/al+pha/ AND beta",
+        "zzz AND alpha",
+        "qqq AND alpha",
+        "beta",
+    ];
+
     #[test]
     fn row_answers_intersections_as_rg_does() {
         let Ok(tgrep) = detect() else {
@@ -310,30 +349,28 @@ mod tests {
             eprintln!("skipped: rg is not on PATH");
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let docs = ["alpha\n", "beta\n", "alpha\nx\nbeta\n", "alpha beta\n"];
-        for (id, text) in docs.iter().enumerate() {
-            std::fs::write(dir.path().join(format!("{id:08}.c")), text).unwrap();
-        }
-        let terms = [
-            "alpha AND beta",
-            "/al+pha/ AND beta",
-            "alpha AND zzz",
-            "zzz AND alpha",
-            "beta",
-        ]
-        .map(String::from);
-        let row = row(&tgrep.bin, dir.path(), docs.len(), &terms).unwrap();
-        let rg = crate::rows::rg(dir.path(), docs.len(), &terms).unwrap();
+        let (_dir, root) = tree();
+        let paths = Paths::new(&root, &[]).unwrap();
+        let terms = TERMS.map(String::from);
+        let row = row(&tgrep.bin, &paths, &root, &terms).unwrap();
+        let rg = crate::rows::rg(&paths, &root, &terms).unwrap();
         let got: Vec<_> = row
             .queries
             .iter()
-            .map(|q| (q.hits.lines, q.hits.files))
+            .map(|q| (q.hits.lines(), q.hits.files()))
             .collect();
-        assert_eq!(got, [(3, 2), (3, 2), (0, 0), (0, 0), (3, 3)]);
+        assert_eq!(got, [(6, 4), (6, 4), (1, 1), (0, 0), (5, 5)]);
+        assert_eq!(row.searched, rg.searched);
         for (t, r) in row.queries.iter().zip(&rg.queries) {
-            assert_eq!(t.hits.digest, r.hits.digest, "{}", t.term);
+            assert_eq!(t.hits.per_file, r.hits.per_file, "{}", t.term);
         }
+    }
+
+    #[test]
+    fn type_globs_escape_metacharacters() {
+        assert_eq!(type_glob("x.c"), "x.c");
+        assert_eq!(type_glob("[x]*?.{c}"), "\\[x\\]\\*\\?.\\{c\\}");
+        assert_eq!(type_glob("a:1:b\\c"), "a?1?b\\\\c");
     }
 
     #[test]
@@ -345,15 +382,14 @@ mod tests {
         let with = |k: &str, v: Value| {
             let mut s = ready.clone();
             s[k] = v;
-            status_ready(&s, 2)
+            status_ready(&s)
         };
-        assert_eq!(status_ready(&ready, 2), Ok(true));
+        assert_eq!(status_ready(&ready), Ok(true));
         assert_eq!(with("indexing", true.into()), Ok(false));
         assert_eq!(with("hidden_complete", false.into()), Ok(false));
         assert_eq!(with("reconcile_running", true.into()), Ok(false));
         assert_eq!(with("last_reconcile_at", Value::Null), Ok(false));
         assert!(with("last_reconcile_error", "boom".into()).is_err());
         assert!(with("indexing", Value::Null).is_err());
-        assert!(status_ready(&ready, 3).is_err());
     }
 }

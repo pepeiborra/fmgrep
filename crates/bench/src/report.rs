@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::corpus::QuerySet;
+use crate::verify::{Paths, Unsearched};
 use crate::{Kind, Row, RowKind};
 
 pub struct Run {
@@ -17,6 +18,13 @@ pub struct Run {
     pub files: usize,
     pub bytes: u64,
     pub stamps: Stamps,
+}
+
+/// What verify found.
+pub struct Found<'a> {
+    pub diffs: &'a [String],
+    pub unsearched: &'a [Unsearched],
+    pub paths: &'a Paths,
 }
 
 pub struct Stamps {
@@ -150,7 +158,8 @@ fn label(name: RowKind) -> &'static str {
     }
 }
 
-pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
+pub fn markdown(run: &Run, rows: &[Row], found: &Found) -> String {
+    let diffs = found.diffs;
     let (url, pin) = (&run.set.repo_url, &run.set.commit);
     let revision = match &run.revision {
         Some(rev) if rev == pin => format!("{url} @ {rev} (pinned)"),
@@ -164,8 +173,13 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     });
     let stamps = &run.stamps;
     let note: String = stamps.notes.iter().map(|n| format!("- {n}\n")).collect();
+    let searched = rows
+        .iter()
+        .map(|r| format!("{} {}", label(r.name), r.searched.len()));
+    let searched = searched.collect::<Vec<_>>().join(", ");
     let mut md = format!(
-        "## fmgrep benchmark: {}{}\n\n- corpus: {} files, {}\n- revision: {revision}\n\
+        "## fmgrep benchmark: {}{}\n\n- corpus: {} files, {}\n\
+         - files searched: {searched} (non-empty)\n- revision: {revision}\n\
          - queries: {n} ({})\n- machine: {}\n- versions: {}\n{note}\
          - date: {}\n\n{SUMMARY}\n",
         run.corpus,
@@ -228,7 +242,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     let [elgrep, elgrep_and] = eg.map(|s| if has_eg { s } else { "" });
     md += &format!(
         "\nLatency is per query, spawn to exit, of the processes printing the matching lines: \
-         `rg` over a staged copy of the corpus, or `fmgrep --server` against one \
+         `rg` over the checkout, or `fmgrep --server` against one \
          `fmgrep serve`{direct}{tgrep}{elgrep}. \
          An intersection is an `rg` pipe{tgrep_and}{elgrep_and}. \
          Footprint is the peak anonymous memory while querying; RSS also counts \
@@ -248,6 +262,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
             diffs.join("\n")
         ),
     };
+    md += &unsearched(n, found);
 
     let Some((base, others)) = rows.split_first() else {
         return md;
@@ -277,7 +292,7 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
         for q in queries {
             let ticks = if q.term.contains('`') { "``" } else { "`" };
             let term = format!("{ticks}{}{ticks}", q.term.replace('|', "\\|"));
-            let mut cells = vec![term, q.hits.lines.to_string(), q.hits.files.to_string()];
+            let mut cells = vec![term, q.hits.lines().to_string(), q.hits.files().to_string()];
             let latency = |r: &Row| Some(r.queries.iter().find(|o| o.term == q.term)?.latency);
             cells.extend(rows.iter().map(|r| opt(latency(r), ms)));
             cells.extend(others.iter().map(|r| {
@@ -297,8 +312,50 @@ pub fn markdown(run: &Run, rows: &[Row], diffs: &[String]) -> String {
     md
 }
 
-pub fn trace(run: &Run, rows: &[Row]) -> String {
+/// One bullet per query printing lines from files some rows did not search.
+fn unsearched(n: usize, found: &Found) -> String {
+    let class = |u: &Unsearched| {
+        let (k, shown) = (u.files.len(), u.files.iter().take(3));
+        let shown = shown.map(|&f| format!("`{}`", found.paths.name(f)));
+        let more = if k > 3 { ", …" } else { "" };
+        let shown = shown.collect::<Vec<_>>().join(", ");
+        format!("{} {k} ({shown}{more})", u.class.name())
+    };
+    let row = |us: &[Unsearched]| {
+        let classes = us.iter().map(class).collect::<Vec<_>>().join(", ");
+        format!("{} did not search {classes}", label(us[0].row))
+    };
+    let terms: Vec<_> = found.unsearched.chunk_by(|a, b| a.term == b.term).collect();
+    if terms.is_empty() {
+        return String::new();
+    }
+    let mut md = format!(
+        "\n{} of {n} queries print lines from files some rows did not search \
+         (not failures):\n\n",
+        terms.len()
+    );
+    for us in terms {
+        let (term, rows) = (&us[0].term, us.chunk_by(|a, b| a.row == b.row));
+        let ticks = if term.contains('`') { "``" } else { "`" };
+        let rows = rows.map(row).collect::<Vec<_>>().join("; ");
+        md += &format!("- {ticks}{term}{ticks}: {rows}\n");
+    }
+    md
+}
+
+pub fn trace(run: &Run, rows: &[Row], found: &Found) -> String {
     let us = |d: Option<Duration>| d.map(|d| d.as_micros() as u64);
+    let not_searched = |row: RowKind, term: &str| {
+        let own = found
+            .unsearched
+            .iter()
+            .filter(|u| u.row == row && u.term == term);
+        let own = own.map(|u| {
+            let files: Vec<_> = u.files.iter().map(|&f| found.paths.name(f)).collect();
+            json!({"class": u.class.name(), "files": files})
+        });
+        own.collect::<Vec<_>>()
+    };
     let mut lines = Vec::new();
     for r in rows {
         for q in &r.queries {
@@ -311,8 +368,9 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
                 "term": q.term,
                 "term_kind": Kind::of(&q.term).name(),
                 "latency_us": q.latency.as_micros() as u64,
-                "lines": q.hits.lines,
-                "files": q.hits.files,
+                "lines": q.hits.lines(),
+                "files": q.hits.files(),
+                "not_searched": not_searched(r.name, &q.term),
             }));
         }
         lines.push(json!({
@@ -321,7 +379,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
             "corpus": run.corpus,
             "corpus_revision": run.revision,
             "fixture": run.fixture,
-            "num_files_indexed": r.files,
+            "num_files_searched": r.searched.len(),
             "index_time_us": us(r.index_time),
             "index_size_bytes": r.index_bytes,
             "ready_us": us(r.ready),
@@ -340,6 +398,7 @@ pub fn trace(run: &Run, rows: &[Row]) -> String {
 mod tests {
     use super::*;
     use crate::Query;
+    use crate::verify::{Class, FileHits, Hits};
 
     const PIN: &str = "4cf7628aa66f56000c29aef93924b6b8515db8f7";
 
@@ -365,10 +424,8 @@ mod tests {
             bytes: 9,
             stamps,
         };
-        let (mut rg, mut docs) = (
-            Row::new(RowKind::Rg, 1),
-            Row::new(RowKind::FmgrepStoreDocs, 1),
-        );
+        let (mut rg, mut docs) = (Row::new(RowKind::Rg), Row::new(RowKind::FmgrepStoreDocs));
+        (rg.searched, docs.searched) = (vec![0, 1], vec![0]);
         for term in TERMS {
             let rows = if term.contains(" AND ") {
                 vec![&mut rg]
@@ -376,10 +433,14 @@ mod tests {
                 vec![&mut rg, &mut docs]
             };
             for row in rows {
-                let hits = crate::rows::Hits {
+                let file = FileHits {
+                    file: 0,
                     lines: 1,
-                    files: 1,
                     digest: 0,
+                };
+                let hits = Hits {
+                    per_file: vec![file],
+                    binary: Vec::new(),
                 };
                 row.queries
                     .push(Query::new(term, Duration::from_millis(2), hits));
@@ -391,9 +452,21 @@ mod tests {
         (run, vec![rg, docs])
     }
 
+    fn paths() -> Paths {
+        let walk = b"/r/a\n/r/.w\n/r/b\n/r/c\n/r/d\n/r/e\n";
+        Paths::from_lists(Path::new("/r"), walk, b"", &[])
+    }
+
     fn markdown_of(fixture: bool, revision: &str, diffs: &[String]) -> String {
         let (run, rows) = run_of(fixture, revision);
-        markdown(&run, &rows, diffs)
+        let paths = paths();
+        let unsearched = [];
+        let found = Found {
+            diffs,
+            unsearched: &unsearched,
+            paths: &paths,
+        };
+        markdown(&run, &rows, &found)
     }
 
     fn assert_has(md: &str, wants: &[&str]) {
@@ -481,11 +554,17 @@ mod tests {
         assert!(and > blocks[2], "{md}");
 
         let (run, rows) = run_of(false, PIN);
-        let md = markdown(&run, &rows[1..], &[]);
+        let paths = paths();
+        let found = Found {
+            diffs: &[],
+            unsearched: &[],
+            paths: &paths,
+        };
+        let md = markdown(&run, &rows[1..], &found);
         assert_has(&md, &["regex queries (1)"]);
         assert!(!md.contains("intersection queries"), "{md}");
 
-        let trace = trace(&run, &rows);
+        let trace = trace(&run, &rows, &found);
         for (term, kind) in [
             ("a AND b", "intersection"),
             ("/b/", "regex"),
@@ -497,6 +576,51 @@ mod tests {
         for rss in ["2097152", "null"] {
             let want = format!(r#""query_peak_rss_bytes":{rss}"#);
             assert!(trace.contains(&want), "{want} not in\n{trace}");
+        }
+    }
+
+    #[test]
+    fn markdown_lists_searched_counts_and_differences() {
+        let (run, rows) = run_of(false, PIN);
+        let paths = paths();
+        let missing = |term: &str, row, class, files: &[u32]| Unsearched {
+            term: term.to_string(),
+            row,
+            class,
+            files: files.to_vec(),
+        };
+        let unsearched = [
+            missing("a", RowKind::Rg, Class::Symlink, &[0]),
+            missing("a", RowKind::FmgrepStoreDocs, Class::Hidden, &[1]),
+            missing("a", RowKind::FmgrepStoreDocs, Class::Binary, &[2, 3, 4, 5]),
+            missing("/b/", RowKind::Rg, Class::Ignored, &[2]),
+        ];
+        let found = Found {
+            diffs: &[],
+            unsearched: &unsearched,
+            paths: &paths,
+        };
+        let md = markdown(&run, &rows, &found);
+        assert_has(
+            &md,
+            &[
+                "\n- files searched: rg 2, fmgrep `--store-docs` 1 (non-empty)\n",
+                "verify: OK, 2 rows agree on 3 queries\n\n\
+                 2 of 3 queries print lines from files some rows did not search (not failures):\n\n\
+                 - `a`: rg did not search symlink 1 (`a`); fmgrep `--store-docs` did not search \
+                 hidden 1 (`.w`), binary 4 (`b`, `c`, `d`, …)\n\
+                 - `/b/`: rg did not search ignored 1 (`b`)\n",
+            ],
+        );
+        let trace = trace(&run, &rows, &found);
+        let want = [
+            r#""index_name":"rg","latency_us":2000,"lines":1,"not_searched":[{"class":"symlink","files":["a"]}],"term":"a","#,
+            r#""not_searched":[{"class":"hidden","files":[".w"]},{"class":"binary","files":["b","c","d","e"]}],"term":"a","#,
+            r#""not_searched":[],"term":"a AND b","#,
+            r#""num_files_searched":2"#,
+        ];
+        for want in want {
+            assert!(trace.contains(want), "{want} not in\n{trace}");
         }
     }
 }
