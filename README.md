@@ -99,9 +99,9 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 | fmgrep / rg | linux | chromium | aosp |
 |---|--:|--:|--:|
 | index size | 1.11 GB / - | 2.23 GB / - | 12.13 GB / - |
-| files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 | 1241 / all 1264964 |
-| literal p50 | 4.64 / 127 ms | 36.0 / 550 ms | 14.3 / 2380 ms |
-| regex p50 | 11.6 / 128 ms | 39.2 / 548 ms | 16.5 / 2360 ms |
+| files read per literal (mean) | 798 / all 95553 | 14219 / all 461027 | 1241 / all 1264964 |
+| literal p50 | 3.89 / 121 ms | 24.4 / 569 ms | 10.6 / 2380 ms |
+| regex p50 | 9.79 / 123 ms | 32.1 / 560 ms | 12.1 / 2360 ms |
 
 aosp is Android's platform source: 17.6 GB of text in 1.26 M files from
 about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
