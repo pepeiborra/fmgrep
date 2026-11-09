@@ -1,6 +1,6 @@
 # Benchmarks
 
-fmgrep against ripgrep, tgrep and elgrep on two pinned source trees, on a
+fmgrep against ripgrep, tgrep and elgrep on three pinned source trees, on a
 Linux server.
 ## Method
 
@@ -64,6 +64,12 @@ bytes.
 |---|---|--:|--:|--:|
 | linux | `5878583` | 95553 | 1.53 GB | 113 (92 / 13 / 8) |
 | chromium | `e2c5a77` | 460957 | 2.84 GB | 46 (30 / 8 / 8) |
+| aosp | `android-17.0.0_r1` | 1264964 | 17.57 GB | 46 (30 / 8 / 8) |
+
+aosp is the Android Open Source Project's platform source at release tag
+`android-17.0.0_r1`, assembled by the repo tool from the platform
+manifest, with the projects of prebuilt binaries left out. `scripts/bench.sh`
+never clones it; see [docs/benchmark.md](docs/benchmark.md#aosp).
 
 
 ## Intersections
@@ -91,7 +97,10 @@ hold both.
 AWS i4i.4xlarge spot instance (16 vCPUs, Intel Xeon Platinum 8375C at 2.90
 GHz, 123 GiB, local NVMe formatted ext4), Ubuntu 24.04, kernel 7.0. fmgrep
 0.1.0 (release build), ripgrep 15.2.0, tgrep 1.0.8, elgrep 1.0.0. One run per corpus,
-measured 2026-11-09 (UTC).
+measured 2026-11-09 (UTC). aosp was measured searching the checkout in place,
+its fmgrep rows in a second run on the same instance (rg, tgrep and elgrep
+do not use fmgrep's index); linux and chromium were measured with the
+earlier harness, which searched a staged copy of the checkout.
 
 ### Results
 
@@ -120,3 +129,24 @@ elgrep answered 4 of the 113 queries by scanning: its index refuses a pattern th
 | elgrep | 55.58 s | 3.45 GB | 55.58 s | 44.1 ms | 78.7 ms | 51.6 ms | 122 ms | 146 ms | 991 ms | 50.5 ms | 245 ms | 61.34 MB | 628.96 MB | 15.51 GB | 4.47->8.64! |
 
 elgrep answered every query from its index.
+
+### aosp
+
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| rg | - | - | - | 2.38 s | 2.38 s | 2.36 s | 2.40 s | 2.31 s | 2.31 s | 2.36 s | 2.37 s | 368.68 MB | 372.44 MB | - | 4.01->8.04! |
+| fmgrep | 212.87 s | 12.13 GB | 3.82 s | 14.3 ms | 38.2 ms | 16.5 ms | 139 ms | 15.6 ms | 20.4 ms | 15.5 ms | 52.7 ms | 1.00 GB | 10.75 GB | 10.17 GB | 8.74->8.74! |
+| fmgrep `--store-docs` | 198.56 s | 29.71 GB | 540 ms | 13.3 ms | 33.1 ms | 13.7 ms | 133 ms | 15.1 ms | 19.8 ms | 14.3 ms | 48.1 ms | 1.02 GB | 10.81 GB | 9.75 GB | 8.74->13.19! |
+| fmgrep, no server | 207.91 s | 12.13 GB | - | 1.64 s | 1.67 s | 1.69 s | 1.75 s | 1.65 s | 1.66 s | 1.66 s | 1.68 s | 870.21 MB | 8.41 GB | 11.59 GB | 13.19->13.97! |
+| tgrep | 159.16 s | 9.87 GB | 34.59 s | 137 ms | 249 ms | 488 ms | 822 ms | 566 ms | 673 ms | 187 ms | 423 ms | 28.12 GB | 28.18 GB | 2.63 GB | 11.01->2.73! |
+| elgrep | 294.54 s | 12.23 GB | 294.55 s | 52.6 ms | 1.07 s | 47.4 ms | 65.8 ms | 162 ms | 307 ms | 59.9 ms | 761 ms | 310.67 MB | 1020.09 MB | 59.55 GB | 2.73->8.71! |
+
+elgrep answered 12 of the 46 queries by scanning, before its daemon
+vouched that the tree had not changed since the index was published.
+
+elgrep differed from rg on 2 queries: `ndk::ScopedAStatus AND
+android::base::unique_fd` (227 lines missed in 3 files) and `MCK_ AND
+C_Check` (40 lines missed in 1 file). The second file is indexed; eg 1.0.0
+anchors the index at the common parent of its search paths under
+`--index-dir` (here `external/`) and drops every candidate, while a scan
+finds it, so the miss is intermittent.
