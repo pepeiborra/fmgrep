@@ -9,9 +9,8 @@ fn create(path: &Path, script: &str) {
     fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
 }
 
-/// Creates `path`, returning once nothing has it open for writing: another
-/// test's `Command::spawn` can inherit the handle between its fork and exec,
-/// and until that child execs, running the script fails with `ETXTBSY`.
+/// Creates `path` and waits for its last `CLOSE_WRITE` event. That event is
+/// not an execution-readiness barrier, so callers retry transient `ETXTBSY`.
 #[cfg(target_os = "linux")]
 pub fn write(path: &Path, script: &str) {
     use inotify::{Inotify, WatchMask};
@@ -51,4 +50,29 @@ pub fn write(path: &Path, script: &str) {
 #[cfg(not(target_os = "linux"))]
 pub fn write(path: &Path, script: &str) {
     create(path, script);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn output_retries_until_the_executable_write_handle_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake");
+        write(&script, "#!/bin/sh\nexit 0\n");
+        let handle = OpenOptions::new().write(true).open(&script).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            drop(handle);
+        });
+
+        let output = crate::rows::output_retry_etxtbsy(&mut Command::new(&script)).unwrap();
+        release.join().unwrap();
+        assert!(output.status.success());
+    }
 }
