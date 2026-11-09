@@ -200,9 +200,12 @@ fn direct(
     terms: &[String],
     row: &mut Row,
 ) -> Result<(), String> {
+    let bin = bin
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
     let mut largest: Option<Peak> = None;
     for term in terms {
-        let mut cmd = Command::new(bin);
+        let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
         cmd.current_dir(staged)
             .arg("--index")
