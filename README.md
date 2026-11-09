@@ -96,14 +96,16 @@ A search reads every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
 files are read in full; after many edits, remove `.fmgrep` and re-index.
 
-| fmgrep / rg | linux | chromium |
-|---|--:|--:|
-| index size | 1.11 GB / - | 2.23 GB / - |
-| files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 |
-| literal p50 | 4.64 / 127 ms | 36.0 / 550 ms |
-| regex p50 | 11.6 / 128 ms | 39.2 / 548 ms |
+| fmgrep / rg | linux | chromium | aosp |
+|---|--:|--:|--:|
+| index size | 1.11 GB / - | 2.23 GB / - | 12.13 GB / - |
+| files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 | 1241 / all 1264964 |
+| literal p50 | 4.64 / 127 ms | 36.0 / 550 ms | 14.3 / 2380 ms |
+| regex p50 | 11.6 / 128 ms | 39.2 / 548 ms | 16.5 / 2360 ms |
 
-AWS i4i.4xlarge, Linux; method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
+aosp is Android's platform source: 17.6 GB of text in 1.26 M files from
+about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
+tables in [BENCHMARKS.md](BENCHMARKS.md).
 [scripts/ec2-bench.sh](scripts/ec2-bench.sh) runs the benchmark on such an
 instance ([docs/benchmark.md](docs/benchmark.md#ec2)).
 
