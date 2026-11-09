@@ -8,6 +8,7 @@ mod fake_bin;
 mod report;
 mod rows;
 mod tgrep;
+mod verify;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,8 +21,9 @@ use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 const USAGE: &str = "\
 usage: bench [--corpus ghc|linux|chromium|aosp] [--rows ROWS] [--fixture] [--trace FILE]
 
-Stages the corpus, runs every row over its queries, checks that every row
-prints the same lines as the first, and prints the results as markdown.
+Runs every row over the checkout in place, checks that the rows print the
+same lines for every file they both searched, lists the files only some
+rows searched, and prints the results as markdown.
 
   --corpus ID    ghc (default), linux, chromium or aosp; the checkout is
                  $FMGREP_CORPUS_<ID>, by default target/bench/<ID>
@@ -53,13 +55,14 @@ pub enum RowKind {
 pub struct Query {
     pub term: String,
     pub latency: Duration,
-    pub hits: rows::Hits,
+    pub hits: verify::Hits,
 }
 
 #[derive(Default)]
 pub struct Row {
     pub name: RowKind,
-    pub files: usize,
+    /// The non-empty files it searched, sorted.
+    pub searched: Vec<u32>,
     pub queries: Vec<Query>,
     pub index_time: Option<Duration>,
     pub index_bytes: Option<u64>,
@@ -73,7 +76,7 @@ pub struct Row {
 }
 
 impl Query {
-    fn new(term: &str, latency: Duration, hits: rows::Hits) -> Self {
+    fn new(term: &str, latency: Duration, hits: verify::Hits) -> Self {
         Query {
             term: term.to_string(),
             latency,
@@ -83,10 +86,9 @@ impl Query {
 }
 
 impl Row {
-    fn new(name: RowKind, files: usize) -> Self {
+    fn new(name: RowKind) -> Self {
         Row {
             name,
-            files,
             ..Row::default()
         }
     }
@@ -179,37 +181,6 @@ fn fmgrep_bin() -> Option<PathBuf> {
     bins.find(|p| p.is_file())
 }
 
-/// Every row must answer the first row's queries with the same lines.
-fn verify(rows: &[Row]) -> Vec<String> {
-    let Some((base, others)) = rows.split_first() else {
-        return Vec::new();
-    };
-    let terms = |r: &Row| r.queries.iter().map(|q| q.term.clone()).collect::<Vec<_>>();
-    let mut diffs = Vec::new();
-    for row in others {
-        if row.files != base.files {
-            let (bn, bf, rn, rf) = (base.name, base.files, row.name, row.files);
-            diffs.push(format!("files: {bn} {bf}, {rn} {rf}"));
-        }
-        if terms(row) != terms(base) {
-            diffs.push(format!("queries: {} and {} differ", base.name, row.name));
-            continue;
-        }
-        for (b, q) in base.queries.iter().zip(&row.queries) {
-            let (bn, qn, bh, qh) = (base.name, row.name, &b.hits, &q.hits);
-            if (bh.lines, bh.files) != (qh.lines, qh.files) {
-                diffs.push(format!(
-                    "{:?}: {bn} {} lines in {} files, {qn} {} in {}",
-                    b.term, bh.lines, bh.files, qh.lines, qh.files
-                ));
-            } else if bh.digest != qh.digest {
-                diffs.push(format!("{:?}: {bn} and {qn} print different lines", b.term));
-            }
-        }
-    }
-    diffs
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -267,24 +238,27 @@ fn run() -> Result<(), Fail> {
         }
         None => corpus_root(corpus).map_err(usage)?,
     };
+    let root =
+        std::fs::canonicalize(&root).map_err(|e| usage(format!("{}: {e}", root.display())))?;
     let docs = fmgrep::discover_index_meta(&root);
     let docs = docs.map_err(|e| usage(e.trim_start_matches("error: ")))?;
     let start = Instant::now();
-    let staged = stage(&root, &docs).map_err(failed)?;
+    let paths = verify::Paths::new(&root, &docs).map_err(failed)?;
     let secs = start.elapsed().as_secs_f64();
-    eprintln!("staged {} files in {secs:.1} s", docs.len());
+    eprintln!("listed {} files in {secs:.1} s", paths.len());
 
-    let (n, staged, terms) = (docs.len(), staged.path(), &set.queries);
+    let terms = &set.queries;
     let mut results = Vec::new();
     for &name in &rows {
         eprintln!("running {name}");
         let before = rows::load1();
         let row = match (name, &fmgrep, &tgrep, &elgrep) {
-            (RowKind::Rg, ..) => rows::rg(staged, n, terms),
-            (RowKind::Tgrep, _, Ok(t), _) => tgrep::row(&t.bin, staged, n, terms),
-            (RowKind::Elgrep, _, _, Ok(e)) => elgrep::row(e, staged, n, terms),
+            (RowKind::Rg, ..) => rows::rg(&paths, &root, terms),
+            (RowKind::Tgrep, _, Ok(t), _) => tgrep::row(&t.bin, &paths, &root, terms),
+            (RowKind::Elgrep, _, _, Ok(e)) => elgrep::row(e, &paths, &root, terms),
             (RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect, Some(bin), ..) => {
-                rows::fmgrep(bin, staged, name, terms)
+                let tree = (&paths, root.as_path(), docs.as_slice());
+                rows::fmgrep(bin, tree, name, terms)
             }
             _ => unreachable!("rows are checked above"),
         };
@@ -293,12 +267,12 @@ fn run() -> Result<(), Fail> {
         results.push(row);
     }
 
-    let diffs = verify(&results);
+    let (diffs, unsearched) = verify::verify(&paths, &root, &results);
     let mut run = report::Run {
         corpus,
         fixture,
         revision: (!fixture).then(|| corpus::revision(&root)).flatten(),
-        files: n,
+        files: docs.len(),
         bytes: docs.iter().map(|d| d.len).sum(),
         stamps: report::stamps(fmgrep.as_deref(), &tgrep, &elgrep),
         set,
@@ -307,9 +281,14 @@ fn run() -> Result<(), Fail> {
         let note = "elgrep: not run by default, its index answers only on Linux";
         run.stamps.notes.push(note.to_owned());
     }
-    print!("{}", report::markdown(&run, &results, &diffs));
+    let found = report::Found {
+        diffs: &diffs,
+        unsearched: &unsearched,
+        paths: &paths,
+    };
+    print!("{}", report::markdown(&run, &results, &found));
     if let Some(path) = &trace {
-        let written = std::fs::write(path, report::trace(&run, &results));
+        let written = std::fs::write(path, report::trace(&run, &results, &found));
         written.map_err(|e| failed(format!("{}: {e}", path.display())))?;
     }
     if !diffs.is_empty() {
@@ -317,17 +296,6 @@ fn run() -> Result<(), Fail> {
     }
     eprintln!("verify: OK");
     Ok(())
-}
-
-/// Copies every document to `{id:08}.c` in a fresh directory; tgrep skips `.bin`.
-fn stage(root: &Path, docs: &[fmgrep::DocMeta]) -> Result<tempfile::TempDir, String> {
-    let dir = tempfile::tempdir().map_err(|e| format!("cannot create the staging: {e}"))?;
-    for (id, doc) in docs.iter().enumerate() {
-        let dst = dir.path().join(format!("{id:08}.c"));
-        std::fs::copy(root.join(&doc.path), &dst)
-            .map_err(|e| format!("cannot stage {}: {e}", doc.path))?;
-    }
-    Ok(dir)
 }
 
 #[cfg(test)]
@@ -385,33 +353,5 @@ mod tests {
         let err = select_rows(Some("rg,x"), &t, &e).unwrap_err();
         let names = "rg, fmgrep, fmgrep-store-docs, fmgrep-direct, tgrep, elgrep";
         assert_eq!(err, format!("--rows: \"x\" is not one of {names}"));
-    }
-
-    #[test]
-    fn verify_names_the_term_and_row_of_a_mismatch() {
-        let row = |name, files, hits: &[(u64, usize, u64)]| {
-            let mut row = Row::new(name, files);
-            for (i, &(lines, files, digest)) in hits.iter().enumerate() {
-                let hits = rows::Hits {
-                    lines,
-                    files,
-                    digest,
-                };
-                row.queries
-                    .push(Query::new(&format!("t{i}"), Duration::ZERO, hits));
-            }
-            row
-        };
-        let rg = || row(RowKind::Rg, 5, &[(3, 2, 7), (0, 0, 0), (2, 1, 8)]);
-        assert!(verify(&[rg(), rg()]).is_empty());
-        let mut partial = rg();
-        partial.name = RowKind::Tgrep;
-        partial.queries.remove(1);
-        assert_eq!(verify(&[rg(), partial]), ["queries: rg and tgrep differ"]);
-        let other = row(RowKind::Fmgrep, 4, &[(3, 2, 7), (1, 1, 1), (2, 1, 9)]);
-        let diffs = verify(&[rg(), other]);
-        let t1 = "\"t1\": rg 0 lines in 0 files, fmgrep 1 in 1";
-        let t2 = "\"t2\": rg and fmgrep print different lines";
-        assert_eq!(diffs, ["files: rg 5, fmgrep 4", t1, t2]);
     }
 }

@@ -16,8 +16,9 @@ use fmgrep::regex_pattern;
 use serde_json::Value;
 
 use crate::report::bytes;
-use crate::rows::{LINES, Peak, Sampler, and_pipe, failure, hits, memory, timed};
+use crate::rows::{LINES, Peak, Sampler, and_pipe, failure, memory, timed};
 use crate::tgrep::dir_size;
+use crate::verify::Paths;
 use crate::{Query, Row, RowKind, leaves};
 
 pub struct Elgrep {
@@ -26,7 +27,7 @@ pub struct Elgrep {
     pub version: String,
 }
 
-/// A literal no staged file holds: the probe only waits out the cold build.
+/// A literal no file holds: the probe only waits out the cold build.
 const PROBE: &str = "elgrep-bench-probe-7f3a9c0e";
 const SCAN: &str = "scanning directly because of ";
 /// eg's plain notice beside the `--debug` scan line, when the index refuses a pattern.
@@ -99,33 +100,25 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-pub fn row(e: &Elgrep, staged: &Path, n: usize, terms: &[String]) -> Result<Row, String> {
+pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let (index, runtime) = (dir.path().join("index"), dir.path().join("runtime"));
     // One walk for every eg: the daemon builds the index with the first one's.
-    let flags = [
-        format!("--index-dir={}", index.display()),
-        "--no-ignore".to_string(),
-        "--no-require-git".to_string(),
-    ];
+    let flags = [format!("--index-dir={}", index.display())];
     let eg = |args: &[&str]| {
         let mut cmd = Command::new(&e.bin);
         env(&mut cmd, &runtime).args(&flags).args(args);
         cmd
     };
-    let (out, _, _) = timed(eg(&["--files", "--"]).arg(staged), None)?;
-    let listed = out.stdout.split(|&b| b == b'\n').filter(|l| !l.is_empty());
-    let listed = listed.count();
-    if !out.status.success() || listed != n {
-        return Err(format!("eg --files lists {listed} of the {n} staged files"));
-    }
-    let mut row = Row::new(RowKind::Elgrep, n);
+    let (out, _, _) = timed(eg(&["-l", "-e", "", "--"]).arg(root), None)?;
+    let mut row = Row::new(RowKind::Elgrep);
+    row.searched = paths.listed("eg -l ''", &out)?;
 
     let daemon = if cfg!(target_os = "linux") {
         let start = Instant::now();
         let daemon = Daemon::start(e, &runtime)?;
-        let (out, _, _) = timed(eg(&["--bench", "-F", "-e", PROBE, "--"]).arg(staged), None)?;
-        let build = probe(&out, n)?;
+        let (out, _, _) = timed(eg(&["--bench", "-F", "-e", PROBE, "--"]).arg(root), None)?;
+        let build = probe(&out)?;
         row.ready = Some(start.elapsed());
         row.index_time = Some(Duration::from_secs_f64(build / 1000.0));
         row.index_bytes = Some(dir_size(&index.join("index")));
@@ -145,11 +138,11 @@ pub fn row(e: &Elgrep, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
                     regex_pattern(term).map_or((term.as_str(), Some("-F")), |p| (p, None));
                 let mut cmd = eg(&["--debug", "--with-filename"]);
                 cmd.args(LINES).args(fixed).args(["-e", pattern, "--"]);
-                cmd.arg(staged);
+                cmd.arg(root);
                 cmd
             }
             all => {
-                let mut cmd = and_pipe(&prog, &quoted, staged, all);
+                let mut cmd = and_pipe(&prog, &quoted, root, all);
                 env(&mut cmd, &runtime);
                 cmd
             }
@@ -161,8 +154,8 @@ pub fn row(e: &Elgrep, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
             .map_err(|l| failure(&what, &out) + &l)?;
         row.footprint = row.footprint.max(peak.map(|p| p.footprint));
         row.query_rss = row.query_rss.max(peak.map(|p| p.rss));
-        row.queries
-            .push(Query::new(term, latency, hits(&what, &out)?));
+        let hits = paths.hits(&what, &out)?;
+        row.queries.push(Query::new(term, latency, hits));
     }
     match daemon.map(Daemon::stop) {
         Some((peak, index_peak)) => {
@@ -182,22 +175,14 @@ pub fn row(e: &Elgrep, staged: &Path, n: usize, terms: &[String]) -> Result<Row,
     Ok(row)
 }
 
-/// The probe's cold-build wait in ms; `Err` unless the index answered it
-/// over exactly the `n` staged files, none skipped as binary.
-fn probe(out: &Output, n: usize) -> Result<f64, String> {
+/// The probe's cold-build wait in ms.
+fn probe(out: &Output) -> Result<f64, String> {
     let v: Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| failure(&format!("eg --bench: {e}"), out))?;
     if v["ok"] != true || !matches!(out.status.code(), Some(0 | 1)) {
         return Err(failure(
             &format!("eg --bench: {}", v["unsupported_reason"]),
             out,
-        ));
-    }
-    let count = |k: &str| v["counts"][k].as_u64().unwrap_or(u64::MAX);
-    let (files, binary) = (count("total_manifest_files"), count("binary_skipped_files"));
-    if (files, binary) != (n as u64, 0) {
-        return Err(format!(
-            "eg's index holds {files} files, {binary} skipped as binary; {n} staged"
         ));
     }
     let build = v["timings_ms"]["cold_build_total"].as_f64();
@@ -453,29 +438,20 @@ mod tests {
             eprintln!("skipped: rg is not on PATH");
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let docs = ["alpha\n", "beta\n", "alpha\nx\nbeta\n", "alpha beta\n"];
-        for (id, text) in docs.iter().enumerate() {
-            std::fs::write(dir.path().join(format!("{id:08}.c")), text).unwrap();
-        }
-        let terms = [
-            "alpha AND beta",
-            "/al+pha/ AND beta",
-            "alpha AND zzz",
-            "zzz AND alpha",
-            "beta",
-        ]
-        .map(String::from);
-        let row = row(&e, dir.path(), docs.len(), &terms).unwrap();
-        let rg = crate::rows::rg(dir.path(), docs.len(), &terms).unwrap();
+        let (_dir, root) = crate::tgrep::tests::tree();
+        let paths = Paths::new(&root, &[]).unwrap();
+        let terms = crate::tgrep::tests::TERMS.map(String::from);
+        let row = row(&e, &paths, &root, &terms).unwrap();
+        let rg = crate::rows::rg(&paths, &root, &terms).unwrap();
         let got: Vec<_> = row
             .queries
             .iter()
-            .map(|q| (q.hits.lines, q.hits.files))
+            .map(|q| (q.hits.lines(), q.hits.files()))
             .collect();
-        assert_eq!(got, [(3, 2), (3, 2), (0, 0), (0, 0), (3, 3)]);
+        assert_eq!(got, [(6, 4), (6, 4), (1, 1), (0, 0), (5, 5)]);
+        assert_eq!(row.searched, rg.searched);
         for (t, r) in row.queries.iter().zip(&rg.queries) {
-            assert_eq!(t.hits.digest, r.hits.digest, "{}", t.term);
+            assert_eq!(t.hits.per_file, r.hits.per_file, "{}", t.term);
         }
         let scans = row.notes.last().unwrap();
         assert!(

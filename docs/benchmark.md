@@ -12,6 +12,7 @@ scripts/bench.sh                          # GHC, cloned into target/bench/ghc
 scripts/bench.sh --corpus linux --repo-path ~/src/linux
 scripts/bench.sh --corpus aosp --repo-path ~/aosp   # synced first, see AOSP
 scripts/bench.sh --results bench.md -- --rows rg,fmgrep,fmgrep-store-docs
+scripts/bench.sh -- --rows rg,fmgrep,fmgrep-direct  # a process per query, no server
 ```
 
 `scripts/bench.sh` needs `git`, `rg` and `cargo`. Without `--repo-path` it
@@ -21,8 +22,11 @@ that its numbers are not comparable. It builds release binaries, runs the
 harness and prints its markdown, by default
 `target/bench/results-<corpus>.md`, with a JSON line per query, stamped
 with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
-row prints each query's matching lines, and the harness exits 1 unless all
-rows print the same lines. Arguments after `--` go to the harness;
+row searches the checkout in place, and nothing is written under it:
+indexes and tool state go to temporary directories. Every row prints each
+query's matching lines, and the harness exits 1 unless the rows that
+searched a file print the same lines from it; files only some rows searched
+are listed in the results. Arguments after `--` go to the harness;
 `target/release/bench --help` lists them. The corpus checkout is
 `FMGREP_CORPUS_GHC`, `FMGREP_CORPUS_LINUX`, `FMGREP_CORPUS_CHROMIUM` or
 `FMGREP_CORPUS_AOSP`, by default `target/bench/<corpus>`; the harness exits
@@ -101,8 +105,7 @@ repo list -a -p | grep -Ev "$EXCLUDE" | xargs repo sync -c --no-tags -j8
 
 The synced tree takes about 48 GB of disk: 1.3 million files, of which
 fmgrep indexes 19 GB of text, 79% of it under `external/`. A run needs
-about 30 GB more for the largest row index (rows run one at a time), plus
-19 GB for the staged copy where the filesystem cannot clone files.
+about 30 GB more for the largest row index (rows run one at a time).
 
 ## tgrep (optional)
 

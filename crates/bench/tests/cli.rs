@@ -1,4 +1,5 @@
-//! The bench binary end to end: corpus refusals and a fixture run.
+//! The bench binary end to end: corpus refusals, a fixture run and a run in
+//! place.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -110,6 +111,10 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         md.contains(&format!("verify: OK, {agree} on 40 queries")),
         "{md}"
     );
+    let searched = rows.split(',').map(|r| format!("{r} 1"));
+    let searched = searched.collect::<Vec<_>>().join(", ");
+    let searched = format!("\n- files searched: {searched} (non-empty)\n");
+    assert!(md.contains(&searched), "{md}");
     let trace = std::fs::read_to_string(dir.path().join("t.jsonl")).unwrap();
     let lines: Vec<serde_json::Value> = trace
         .lines()
@@ -138,4 +143,76 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         ("regex", 5 * n),
     ];
     assert_eq!(kinds, per_kind.into(), "{trace}");
+}
+
+/// Every file under `root` but `.git`, with its modification time.
+fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
+    let mut all = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() && !path.ends_with(".git") {
+                stack.push(path.clone());
+            }
+            all.push((path, meta.modified().unwrap()));
+        }
+    }
+    all.sort();
+    all
+}
+
+#[test]
+fn in_place_run_lists_files_only_some_rows_searched() {
+    let fmgrep = Path::new(env!("CARGO_BIN_EXE_bench")).with_file_name("fmgrep");
+    let tools = ["rg", "git"].map(|t| Command::new(t).arg("--version").output().is_ok());
+    if !fmgrep.is_file() || tools.contains(&false) {
+        eprintln!("skipped: needs fmgrep, rg and git");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("tree");
+    std::fs::create_dir(&root).unwrap();
+    let git = Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .arg(&root)
+        .status();
+    assert!(git.unwrap().success());
+    let queries: serde_json::Value =
+        serde_json::from_str(include_str!("../queries/ghc.json")).unwrap();
+    let literals = queries["queries"].as_array().unwrap().iter();
+    let literals = literals
+        .filter_map(|q| q.as_str())
+        .filter(|q| !q.starts_with('/'));
+    let lines: String = literals
+        .flat_map(|q| q.split(" AND "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    for name in ["a.txt", "ign.txt", ".w.txt"] {
+        std::fs::write(root.join(name), &lines).unwrap();
+    }
+    std::fs::write(root.join(".gitignore"), "ign.txt\n!.w.txt\n").unwrap();
+    std::os::unix::fs::symlink("a.txt", root.join("link.txt")).unwrap();
+    let before = snapshot(&root);
+
+    let out = bench(
+        dir.path(),
+        &[("FMGREP_CORPUS_GHC", &root)],
+        &["--rows", "rg,fmgrep", "--trace", "t.jsonl"],
+    );
+    let md = text(&out.stdout);
+    assert!(out.status.success(), "{md}\n{}", text(&out.stderr));
+    assert_eq!(snapshot(&root), before);
+    let wants = [
+        "\n- files searched: rg 2, fmgrep 3 (non-empty)\n",
+        "verify: OK, 2 rows agree on 40 queries\n",
+        "queries print lines from files some rows did not search (not failures):",
+        ": rg did not search symlink 1 (`link.txt`), ignored 1 (`ign.txt`); \
+         fmgrep did not search hidden 1 (`.w.txt`)\n",
+    ];
+    for want in wants {
+        assert!(md.contains(want), "{want:?} not in\n{md}");
+    }
 }
