@@ -24,13 +24,18 @@ docfm = { path = "../docfm", version = "0.1.0" }
 globset = { version = "0.4", default-features = false }
 memchr = "2"
 memmap2 = "0.9"
-notify = "7.0.0"
 rayon = "1"
 regex = "1"
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "unicode", "nfa-thompson", "dfa-build", "dfa-search"] }
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { version = "0.10.2", default-features = false }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+notify = "7.0.0"
 
 [dev-dependencies]
 tempfile = "3"
