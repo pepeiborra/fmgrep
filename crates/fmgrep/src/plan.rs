@@ -10,7 +10,7 @@ use std::ops::Range;
 pub type ShardPlan = Vec<Range<usize>>;
 
 const SHARD_BYTES_VAR: &str = "FMGREP_SHARD_BYTES";
-const DEFAULT_SHARD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_SHARD_BYTES: u64 = 250 << 20;
 
 /// Shard cap for `index`, from `FMGREP_SHARD_BYTES`.
 pub fn shard_bytes() -> Result<u64, String> {
@@ -225,18 +225,13 @@ mod tests {
         assert_eq!(plan[0], 0..lens.len());
     }
 
-    /// The default is 100 MiB, and it keeps the GHC corpus (26787 docs,
-    /// 88781005 text bytes, 88.8 MB with separators) in a single shard.
     #[test]
     fn default_cap_keeps_the_ghc_corpus_in_one_shard() {
-        assert_eq!(DEFAULT_SHARD_BYTES, 100 * 1024 * 1024);
         let (docs, text) = (26_787usize, 88_781_005u64);
         let mut lens = vec![text / docs as u64; docs];
         lens[0] += text % docs as u64;
         assert_eq!(lens.iter().sum::<u64>(), text);
         assert_eq!(plan_shards(&lens, DEFAULT_SHARD_BYTES), vec![0..docs]);
-        // And it is the last power-of-two step that does: 50 MiB cuts it.
-        assert!(plan_shards(&lens, DEFAULT_SHARD_BYTES / 2).len() > 1);
     }
 
     #[test]

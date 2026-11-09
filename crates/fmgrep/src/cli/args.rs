@@ -20,7 +20,7 @@ tree, all of it.";
 
 const ENV: &str = "\
 Environment:
-  FMGREP_SHARD_BYTES    index shard size (default 100MiB)
+  FMGREP_SHARD_BYTES    index shard size (default 250MiB)
   FMGREP_VERBOSE=1      as -v";
 
 /// The mode flags: the last one given wins.

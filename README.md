@@ -98,10 +98,10 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 
 | fmgrep / rg | linux | chromium |
 |---|--:|--:|
-| index size | 1.11 GB / - | 2.23 GB / - |
+| index size | 1.16 GB / - | 2.29 GB / - |
 | files read per literal (mean) | 798 / all 95553 | 14219 / all 460957 |
-| literal p50 | 4.64 / 127 ms | 36.0 / 550 ms |
-| regex p50 | 11.6 / 128 ms | 39.2 / 548 ms |
+| literal p50 | 4.23 / 127 ms | 35.5 / 550 ms |
+| regex p50 | 12.7 / 128 ms | 37.5 / 548 ms |
 
 AWS i4i.4xlarge, Linux; method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
 [scripts/ec2-bench.sh](scripts/ec2-bench.sh) runs the benchmark on such an

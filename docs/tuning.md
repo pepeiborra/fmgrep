@@ -14,14 +14,14 @@ empty is the default, and any other value that does not parse is an error.
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_SHARD_BYTES` | `100MB` | Text per shard. A term probes every shard its PATHs, globs and cwd leave, so small shards add per-term work; large ones build slower in more memory. 100 MiB keeps a 90 MB tree in one shard. |
+| `FMGREP_SHARD_BYTES` | `250MB` | Text per shard. A term probes every shard its PATHs, globs and cwd leave, so small shards add per-term work; large ones build slower in more memory. A 240 MB tree is one shard. |
 | `FMGREP_VERBOSE` | `0`; a count | `1`, as `index -v`: lists each skipped binary file, and `serve` prints the read and locate costs it measured. `2`: a search also prints its plan on stderr (each leaf's probe, what decided it and the costs; a served search on the server's). |
 
 ## Index (developer)
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_BUILD_BYTES` | half of physical memory, else `8GB` | The build's memory budget. Shards built at once are this over `8 x FMGREP_SHARD_BYTES` (a shard needs about 8 bytes per text byte while it builds), at most the build pool size: build wall against peak memory. |
+| `FMGREP_BUILD_BYTES` | half of physical memory, else `8GB` | The build's memory budget. Shards built at once are this over `8 x FMGREP_SHARD_BYTES` (a shard needs about 8 bytes per text byte while it builds), at most the build pool size: build wall against peak memory. At the defaults a 16 GB machine builds 4 shards at once, an 8 GB one 2. |
 | `RAYON_NUM_THREADS` | machine parallelism | Threads for the build, and for a search's shard probes and directory walk. |
 
 ## Search (developer)

@@ -96,9 +96,9 @@ measured 2026-11-09 (UTC).
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | rg | - | - | - | 127 ms | 127 ms | 128 ms | 129 ms | 133 ms | 208 ms | 127 ms | 133 ms | 41.84 MB | 45.59 MB | - | 1.11->2.95 |
-| fmgrep | 19.37 s | 1.11 GB | 197 ms | 4.64 ms | 5.72 ms | 11.6 ms | 20.1 ms | 16.5 ms | 18.1 ms | 5.38 ms | 8.25 ms | 204.93 MB | 1.28 GB | 6.26 GB | 2.95->5.41! |
-| fmgrep `--store-docs` | 22.40 s | 2.64 GB | 39.3 ms | 3.53 ms | 4.33 ms | 8.53 ms | 13.4 ms | 16.1 ms | 22.4 ms | 4.06 ms | 6.64 ms | 207.40 MB | 1.29 GB | 6.55 GB | 5.41->7.85! |
-| fmgrep, no server | 17.85 s | 1.11 GB | - | 70.6 ms | 71.7 ms | 78.1 ms | 87.8 ms | 79.1 ms | 81.4 ms | 71.6 ms | 74.2 ms | 195.39 MB | 930.86 MB | 7.08 GB | 7.85->11.56! |
+| fmgrep | 25.10 s | 1.16 GB | 196 ms | 4.23 ms | 5.35 ms | 12.7 ms | 28.1 ms | 16.9 ms | 18.7 ms | 4.85 ms | 8.92 ms | 253.43 MB | 1.36 GB | 6.94 GB | 3.60->6.91! |
+| fmgrep `--store-docs` | 25.61 s | 2.68 GB | 38.9 ms | 3.57 ms | 4.34 ms | 8.54 ms | 18.8 ms | 16.1 ms | 27.0 ms | 3.97 ms | 7.61 ms | 260.02 MB | 1.37 GB | 7.15 GB | 6.91->8.92! |
+| fmgrep, no server | 25.21 s | 1.16 GB | - | 68.9 ms | 69.5 ms | 75.5 ms | 91.8 ms | 75.4 ms | 80.6 ms | 69.1 ms | 72.9 ms | 251.32 MB | 1.05 GB | 6.83 GB | 8.92->8.92! |
 | tgrep | 16.57 s | 1.02 GB | 1.98 s | 20.3 ms | 31.6 ms | 46.7 ms | 66.5 ms | 113 ms | 522 ms | 22.7 ms | 70.3 ms | 2.07 GB | 2.22 GB | 190.61 MB | 11.56->8.32! |
 | elgrep | 27.96 s | 1.47 GB | 27.97 s | 9.91 ms | 11.1 ms | 25.0 ms | 23.5 ms | 42.1 ms | 1.19 s | 11.0 ms | 95.9 ms | 10.34 MB | 404.20 MB | 7.29 GB | 8.32->8.77! |
 
@@ -109,9 +109,9 @@ elgrep answered 4 of the 113 queries by scanning: its index refuses a pattern th
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | rg | - | - | - | 550 ms | 561 ms | 548 ms | 555 ms | 545 ms | 550 ms | 550 ms | 558 ms | 199.71 MB | 203.22 MB | - | 7.05->6.95! |
-| fmgrep | 35.52 s | 2.23 GB | 920 ms | 36.0 ms | 74.1 ms | 39.2 ms | 84.0 ms | 4.61 ms | 5.07 ms | 23.8 ms | 63.8 ms | 223.32 MB | 2.38 GB | 9.05 GB | 6.95->14.57! |
-| fmgrep `--store-docs` | 41.07 s | 5.06 GB | 99.1 ms | 26.5 ms | 56.3 ms | 29.1 ms | 55.9 ms | 5.58 ms | 5.92 ms | 20.1 ms | 47.5 ms | 295.14 MB | 2.45 GB | 8.28 GB | 14.57->14.04! |
-| fmgrep, no server | 37.86 s | 2.23 GB | - | 316 ms | 343 ms | 321 ms | 360 ms | 295 ms | 299 ms | 310 ms | 338 ms | 142.85 MB | 2.19 GB | 8.70 GB | 14.04->12.69! |
+| fmgrep | 38.54 s | 2.29 GB | 936 ms | 35.5 ms | 74.4 ms | 37.5 ms | 94.8 ms | 4.11 ms | 4.72 ms | 23.3 ms | 65.8 ms | 224.17 MB | 2.45 GB | 14.60 GB | 6.32->10.83! |
+| fmgrep `--store-docs` | 39.29 s | 5.12 GB | 97.3 ms | 26.8 ms | 56.3 ms | 26.7 ms | 65.3 ms | 5.05 ms | 5.43 ms | 19.7 ms | 49.0 ms | 286.61 MB | 2.52 GB | 14.42 GB | 10.83->11.59! |
+| fmgrep, no server | 38.62 s | 2.29 GB | - | 319 ms | 341 ms | 326 ms | 373 ms | 299 ms | 301 ms | 314 ms | 340 ms | 149.85 MB | 2.23 GB | 14.61 GB | 11.59->14.26! |
 | tgrep | 39.62 s | 2.70 GB | 11.65 s | 179 ms | 444 ms | 477 ms | 854 ms | 174 ms | 367 ms | 185 ms | 502 ms | 5.02 GB | 5.16 GB | 871.89 MB | 12.69->4.47! |
 | elgrep | 55.58 s | 3.45 GB | 55.58 s | 44.1 ms | 78.7 ms | 51.6 ms | 122 ms | 146 ms | 991 ms | 50.5 ms | 245 ms | 61.34 MB | 628.96 MB | 15.51 GB | 4.47->8.64! |
 

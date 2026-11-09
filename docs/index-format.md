@@ -123,7 +123,7 @@ no tree: a PATH is refused and the cwd does not narrow the search.
 Documents are cut into shards greedily, whole documents only, in id order.
 Each non-empty document costs its length plus one NUL separator. A shard
 closes when the next document would take it past `FMGREP_SHARD_BYTES`
-(default 100 MiB), and a document over the cap forms its own shard. Empty
+(default 250 MiB), and a document over the cap forms its own shard. Empty
 documents index nothing and belong to whichever shard spans them. Labels
 are `shard-%08d-%08d.bin`, over the id range `start..end`. A search
 re-derives the plan from the labels and `doc_lens`, never from the
