@@ -199,6 +199,25 @@ pub fn failure(what: &str, out: &Output) -> String {
     format!("{what}: {}: {}", out.status, stderr.trim())
 }
 
+/// Retries transient `ETXTBSY` errors while another process closes an
+/// inherited write handle to an executable.
+pub fn output_retry_etxtbsy(cmd: &mut Command) -> std::io::Result<Output> {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match cmd.output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                result => return result,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    cmd.output()
+}
+
 pub struct Guard(pub Child);
 
 impl Drop for Guard {

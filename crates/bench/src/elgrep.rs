@@ -65,7 +65,7 @@ fn executable(p: &Path) -> bool {
 fn check(bin: PathBuf, what: &str) -> Result<Elgrep, String> {
     let mut cmd = Command::new(&bin);
     cmd.arg("--version").env_remove("RIPGREP_CONFIG_PATH");
-    let out = cmd.stdin(Stdio::null()).output();
+    let out = crate::rows::output_retry_etxtbsy(cmd.stdin(Stdio::null()));
     let out = out.map_err(|e| format!("elgrep: {what} does not run ({e})"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let version = stdout.lines().next().unwrap_or_default().trim();

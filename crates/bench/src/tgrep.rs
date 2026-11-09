@@ -54,7 +54,9 @@ fn on_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
 /// `--index-path` surface the row drives.
 fn check(bin: PathBuf, what: &str) -> Result<Tgrep, String> {
     let probe = |args: &[&str]| {
-        let out = Command::new(&bin).args(args).stdin(Stdio::null()).output();
+        let mut cmd = Command::new(&bin);
+        cmd.args(args).stdin(Stdio::null());
+        let out = crate::rows::output_retry_etxtbsy(&mut cmd);
         match out {
             Ok(out) if out.status.success() => {
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
