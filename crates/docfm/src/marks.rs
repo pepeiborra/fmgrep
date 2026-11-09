@@ -230,7 +230,8 @@ impl<'a> Marks<'a> {
                     continue;
                 }
                 let row = ((p - k) << marks.shape.low) | marks.low(k) as usize;
-                if row >= hi {
+                // Below `lo` only in a corrupt blob: stop there too, a miscount.
+                if row >= hi || row < lo {
                     k = marks.count;
                     return None;
                 }
@@ -328,4 +329,12 @@ pub fn pack(out: &mut [u8], values: impl Iterator<Item = u64>, width: u32) {
 pub fn layout_of(rows: usize, count: usize) -> (u32, usize) {
     let s = Shape::new(rows, count);
     (s.low, s.highs_at)
+}
+
+/// Where the select samples start and how many, for tests that tamper with
+/// them.
+#[cfg(test)]
+pub fn samples_of(rows: usize, count: usize) -> (usize, usize) {
+    let s = Shape::new(rows, count);
+    (s.samples_at, ((rows >> s.low) + 1) / SAMPLE + 1)
 }

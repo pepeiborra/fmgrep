@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use crate::build::word_start;
+use crate::marks::Marks;
 use crate::{Cursor, DOC_END, LocateStats, RING, View};
 
 /// A tail is used while it holds at most `RATIO * count / d` marks, `d` the
@@ -13,6 +14,18 @@ const RATIO: u64 = 32;
 
 /// Deepest tail used.
 pub const MAX_DEPTH: usize = 15;
+
+/// Marks in `from..to`; decreasing ranks or more marks than rows mean a corrupt blob.
+fn marks_in(marks: &Marks<'_>, from: usize, to: usize) -> usize {
+    let inside = (marks.get_rank(to).1)
+        .checked_sub(marks.get_rank(from).1)
+        .expect("corrupt docfm index: mark ranks decrease");
+    assert!(
+        inside <= to - from,
+        "corrupt docfm index: more marks than rows"
+    );
+    inside
+}
 
 impl Cursor<'_> {
     /// The deepest tail whose marks lie in the occurrence's document.
@@ -37,7 +50,7 @@ impl Cursor<'_> {
         let header = self.view.header;
         let limit = self.depth_cap().min(header.depth_limit());
         let marks = header.marks(self.view.bytes);
-        let own = marks.get_rank(self.hi).1 - marks.get_rank(self.lo).1;
+        let own = marks_in(&marks, self.lo, self.hi);
         let count = self.count() - own as u64;
         if count == 0 {
             return 0;
@@ -48,7 +61,7 @@ impl Cursor<'_> {
             .filter(|&i| self.probed(i))
             .take_while(|&i| {
                 let (from, to) = self.tail(i);
-                let inside = marks.get_rank(to).1 - marks.get_rank(from).1;
+                let inside = marks_in(&marks, from, to);
                 inside as u128 * u128::from(num) <= budget
             })
             .last()

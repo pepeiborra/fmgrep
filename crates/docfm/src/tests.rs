@@ -1064,6 +1064,111 @@ fn locate_stats_count_the_probes() {
     assert!(probes > 0);
 }
 
+/// The message of a caught panic.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// Runs a locate of `cursor`; a panic must be our own.
+fn locate_or_corrupt(cursor: &Cursor<'_>, what: &str) {
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.locate(&mut |_| {});
+    }));
+    if let Err(panic) = run {
+        let msg = panic_message(&*panic);
+        assert!(msg.contains("corrupt docfm index"), "{what}: {msg}");
+    }
+}
+
+/// Where the select samples of `h`'s marks start in the blob, and how many.
+fn select_samples(h: &Header) -> (usize, usize) {
+    let (at, len) = marks::samples_of(h.n + 1, h.num_samples);
+    (h.marks_at + at, len)
+}
+
+#[test]
+fn a_corrupt_mark_offset_stays_inside_the_interval() {
+    let mut text = vec![DOC_END];
+    text.extend([b'a'; 1024]);
+    text.push(DOC_END);
+    let blob = encode(&Built::build(text).unwrap());
+    let h = Header::parse(&blob).unwrap();
+    let (samples, num) = select_samples(&h);
+    let mut viewed = Vec::new();
+    for s in 0..num {
+        let b = patched(&blob, samples + 4 * s, &0u32.to_le_bytes());
+        let Ok(index) = FmIndex::view(b.as_slice()) else {
+            continue;
+        };
+        viewed.push(s);
+        for len in [1, 258, 300, 600] {
+            let cursor = index.cursor().extend_front(&vec![b'a'; len]);
+            let (lo, hi) = (cursor.lo, cursor.hi);
+            let marks = index.header.marks(&b);
+            for (row, _) in marks.range(lo, hi) {
+                assert!(
+                    (lo..hi).contains(&row),
+                    "sample {s}, a^{len}: row {row} outside {lo}..{hi}"
+                );
+            }
+            locate_or_corrupt(&cursor, &format!("sample {s}, a^{len}"));
+        }
+    }
+    assert!(viewed.contains(&1), "viewed {viewed:?} of {num}");
+}
+
+#[test]
+fn decreasing_mark_ranks_panic_as_corrupt() {
+    let mut text = vec![DOC_END];
+    text.extend([b'a'; 10_000]);
+    text.push(DOC_END);
+    text.extend([b'b'; 3000]);
+    text.push(DOC_END);
+    let blob = encode(&Built::build(text).unwrap());
+    let h = Header::parse(&blob).unwrap();
+    let (samples, _) = select_samples(&h);
+    let (low, _) = marks::layout_of(h.n + 1, h.num_samples);
+    let index = FmIndex::view(blob.as_slice()).unwrap();
+    let (lo, hi) = {
+        let cursor = index.cursor().extend_front(&[b'a'; 5000]);
+        (cursor.lo, cursor.hi)
+    };
+    let (s_lo, s_hi) = (((lo >> low) - 1) / 64, ((hi >> low) - 1) / 64);
+    assert!(s_lo < s_hi && hi <= h.n, "{lo}..{hi}");
+    // The sample before `lo` points past the high bits: `lo` ranks as all.
+    let b = patched(&blob, samples + 4 * s_lo, &u32::MAX.to_le_bytes());
+    let index = FmIndex::view(b.as_slice()).unwrap();
+    let cursor = index.cursor().extend_front(&[b'a'; 5000]);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.locate(&mut |_| {});
+    }));
+    let msg = panic_message(&*run.expect_err("decreasing ranks must panic"));
+    assert!(msg.contains("corrupt docfm index"), "{msg}");
+}
+
+#[test]
+fn more_marks_than_rows_panic_as_corrupt() {
+    let mut text = vec![DOC_END];
+    text.extend([b'a'; 1024]);
+    text.push(DOC_END);
+    let blob = encode(&Built::build(text).unwrap());
+    let h = Header::parse(&blob).unwrap();
+    let (samples, _) = select_samples(&h);
+    // Sample 1 points past the high bits: one row ranks as 96 marks.
+    let b = patched(&blob, samples + 4, &u32::MAX.to_le_bytes());
+    let index = FmIndex::view(b.as_slice()).unwrap();
+    let cursor = index.cursor().extend_front(b"a").rows(256..257);
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cursor.locate(&mut |_| {});
+    }));
+    let msg = panic_message(&*run.expect_err("more marks than rows must panic"));
+    assert!(msg.contains("corrupt docfm index"), "{msg}");
+}
+
 #[path = "forward_tests.rs"]
 mod forward_tests;
 
