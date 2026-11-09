@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 5): what each
+The on-disk layout `fmgrep index` writes (manifest format 6): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -33,7 +33,7 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `5` |
+| `format` | u32 | `6` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | usize | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
@@ -51,7 +51,7 @@ tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 5, naming the remedy: re-run `fmgrep index`. Old
+- a `format` other than 6, naming the remedy: re-run `fmgrep index`. Old
   indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
