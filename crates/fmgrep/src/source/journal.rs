@@ -1,16 +1,12 @@
 //! Change sources: which corpus paths changed since a mark taken before the
 //! index walk or at a search's checkpoint, so a load re-checks only those.
-//! `docs.journal` holds the marks, the symlinked docs (`recheck`), the dirs
-//! holding a dangling symlink (`relist`) and what differed at the marks
-//! (`named`).
+//! `docs.journal` holds the marks and what differed at them (`named`).
 
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::walk::WalkNotes;
 
 #[cfg(unix)]
 mod watchman;
@@ -137,8 +133,6 @@ pub struct Journal {
     v: u32,
     root: String,
     tokens: Vec<Token>,
-    recheck: Vec<String>,
-    relist: Vec<String>,
     named: Vec<String>,
     #[serde(skip)]
     knob: Knob,
@@ -149,34 +143,18 @@ pub struct Replay {
     pub kind: &'static str,
     /// Ascending, deduped.
     pub paths: Vec<String>,
-    pub relist: Vec<String>,
 }
 
 impl Journal {
-    /// The journal of `walk` from canonical `root`; nothing without marks.
-    pub fn write_new(
-        output: &Path,
-        root: &str,
-        tokens: Vec<Token>,
-        walk: &WalkNotes,
-    ) -> Result<(), String> {
+    /// The journal of an index of canonical `root`; nothing without marks.
+    pub fn write_new(output: &Path, root: &str, tokens: Vec<Token>) -> Result<(), String> {
         if tokens.is_empty() {
             return Ok(());
         }
-        let mut recheck = walk.links.clone();
-        recheck.sort();
-        let relist = walk
-            .dirs
-            .iter()
-            .filter(|(_, s)| s.is_none())
-            .map(|(rel, _)| rel.clone())
-            .collect();
         let journal = Self {
             v: VERSION,
             root: root.to_owned(),
             tokens,
-            recheck,
-            relist,
             named: Vec::new(),
             knob: Knob::Off,
         };
@@ -225,7 +203,7 @@ impl Journal {
     }
 
     /// Fresh marks for the next checkpoint, and the first vouching source's
-    /// replay with `recheck` and `named`; no marks when no source pays off
+    /// replay with `named`; no marks when no source pays off
     /// for `docs` docs.
     pub fn ask(&self, root: &Path, docs: usize) -> (Vec<Token>, Option<Replay>) {
         if Path::new(&self.root) != root {
@@ -261,14 +239,12 @@ impl Journal {
                     ));
                 }
                 Since::Paths(mut paths) => {
-                    paths.extend(self.recheck.iter().chain(&self.named).cloned());
+                    paths.extend(self.named.iter().cloned());
                     paths.sort_unstable();
                     paths.dedup();
-                    let relist = self.relist.clone();
                     let replay = Replay {
                         kind: s.kind(),
                         paths,
-                        relist,
                     };
                     return (marks, Some(replay));
                 }

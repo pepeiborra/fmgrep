@@ -92,6 +92,12 @@ They pick files; fmgrep then prints the lines of every TERM in those files.
 fmgrep index .              # index the current folder
 ```
 
+`index` takes the files `rg --files` lists (`.gitignore`, `.ignore` and
+`.rgignore` apply; hidden files and symlinks are skipped), minus binary
+files. A search never reads a file the index skips: where rg searches a
+hidden or ignored file named as a PATH or matched by a `-g` glob, fmgrep
+finds nothing.
+
 A search reads every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
 files are read in full; after many edits, remove `.fmgrep` and re-index.

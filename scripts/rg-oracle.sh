@@ -8,11 +8,12 @@
 # Sibling names are chosen so rg's per-directory DFS (`--sort path`) and our
 # sorted relative paths agree (`a.txt` vs `a/b.txt` would not).
 #
-# Without --store-docs every case runs twice: on the indexed tree, backdated
-# so discovery prunes by directory stamp, then on a stale one (files edited,
-# deleted, renamed and added after index), where each search must print
-# exactly three warnings: the deleted file, the one moved with its directory,
-# and the one turned binary.
+# The tree is a git repository with ignore files, so rg's default rules and
+# ours must agree. Without --store-docs every case runs twice: on the indexed
+# tree, backdated so discovery prunes by directory stamp, then on a stale one
+# (files edited, deleted, renamed and added after index, .gitignore edited in
+# place), where each search must print exactly three warnings: the deleted
+# file, the one moved with its directory, and the one turned binary.
 #
 # --serve repeats every case through `--server` (lines `srv`): same stdout and
 # exit status, empty stderr.
@@ -92,7 +93,7 @@ spawn_serve() {
     [[ -n "${!4}" ]] || { echo "$2 did not become ready"; cat "$WORK/serve.err"; exit 2; }
 }
 
-RG_COMMON=(--no-ignore --no-require-git -a --sort path)
+RG_COMMON=(-a --sort path)
 # --iglob: rg adds them after every -g, so a case's own globs cannot undo them.
 RG_SKIP=(--iglob '!k.dat')
 TERM=alpha
@@ -418,7 +419,7 @@ rg_list() {
     local list="$1"
     shift
     [[ -s "$list" ]] || return 0
-    ( cd "$CORPUS" && xargs -0 rg --no-ignore --no-require-git -a -H "$@" -- < "$list" 2> "$WORK/rgerr" ) || true
+    ( cd "$CORPUS" && xargs -0 rg -a -H "$@" -- < "$list" 2> "$WORK/rgerr" ) || true
     [[ ! -s "$WORK/rgerr" ]] || { cat "$WORK/rgerr" >&2; exit 2; }
 }
 
@@ -481,7 +482,7 @@ globbed() {
     "$BIN" --server "$ADDR" -l "${args[@]}" --regex '^' > "$WORK/raw" 2> /dev/null || src=$?
     LC_ALL=C sort "$WORK/raw" > "$WORK/srv-g"
     # No PATH: rg exits 2 only then when the globs exclude every file.
-    ( cd "$CORPUS" && rg --no-ignore --no-require-git -a -l "${args[@]}" '^' < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
+    ( cd "$CORPUS" && rg -a -l "${args[@]}" '^' < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
     sed 's|^\./||' "$WORK/raw" | LC_ALL=C sort | LC_ALL=C comm -12 - "$WORK/files" > "$WORK/rg-g"
     [[ "$rc" == "$rgrc" ]] || fail+=" exit=$rc/$rgrc"
     [[ "$src" == "$rc" ]] || fail+=" served-exit=$src"
@@ -489,7 +490,7 @@ globbed() {
     cmp -s "$WORK/ours-g" "$WORK/srv-g" || fail+=" served"
     "$BIN" --index "$IDX" -l "${args[@]}" import > "$WORK/raw" 2> /dev/null || true
     LC_ALL=C sort "$WORK/raw" > "$WORK/ours-l"
-    ( cd "$CORPUS" && rg --no-ignore --no-require-git -a -l "${args[@]}" -F import < /dev/null ) > "$WORK/raw" 2> /dev/null || true
+    ( cd "$CORPUS" && rg -a -l "${args[@]}" -F import < /dev/null ) > "$WORK/raw" 2> /dev/null || true
     sed 's|^\./||' "$WORK/raw" | LC_ALL=C sort | LC_ALL=C comm -12 - "$WORK/files" > "$WORK/rg-l"
     cmp -s "$WORK/ours-l" "$WORK/rg-l" || fail+=" literal"
     if [[ -z "$fail" ]]; then
@@ -528,7 +529,7 @@ pathset() {
     LC_ALL=C sort "$WORK/raw" > "$WORK/ours-p"
     ( cd "$here" && "$BIN" --server "$ADDR" -l "${args[@]}" ) > "$WORK/raw" 2> /dev/null || src=$?
     LC_ALL=C sort "$WORK/raw" > "$WORK/srv-p"
-    ( cd "$here" && rg --no-ignore --no-require-git -a -l "${rg_args[@]}" < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
+    ( cd "$here" && rg -a -l "${rg_args[@]}" < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
     LC_ALL=C sort "$WORK/raw" | LC_ALL=C comm -12 - "$WORK/spelled" > "$WORK/rg-p"
     [[ "$rc" == "$rgrc" ]] || fail+=" exit=$rc/$rgrc"
     [[ "$src" == "$rc" ]] || fail+=" served-exit=$src"
@@ -536,7 +537,7 @@ pathset() {
     cmp -s "$WORK/ours-p" "$WORK/srv-p" || fail+=" served"
     if [[ $# == 1 && -f "$here/$1" ]]; then
         local count
-        count="$( cd "$here" && rg --no-ignore --no-require-git -a -c "${rg_args[@]}")"
+        count="$( cd "$here" && rg -a -c "${rg_args[@]}")"
         [[ "$( cd "$here" && "$BIN" --index "$IDX" -c "${args[@]}")" == "$count" ]] || fail+=" -c"
         [[ "$( cd "$here" && "$BIN" --server "$ADDR" -c "${args[@]}")" == "$count" ]] || fail+=" served-c"
     fi
@@ -691,6 +692,17 @@ printf 'alpha moved\nbeta\n' > "$CORPUS/mw/m.txt"
 printf 'alpha text\n' > "$CORPUS/tb.txt"
 printf 'alpha deep tree\n' > "$WORK/tree/t/deep/x.txt"
 printf 'beta\nalpha y\n' > "$WORK/tree/t/y.txt"
+# Ignore files, and files only they tell apart. rg's -g globs override
+# ignore rules, so no case's glob matches an ignored file.
+mkdir -p "$CORPUS/.git" "$CORPUS/ig" "$CORPUS/ns"
+printf 'ig/\n*.gen\n' > "$CORPUS/.gitignore"
+printf '!.wl.txt\n' > "$CORPUS/.ignore"
+printf 'g.log\n' > "$CORPUS/ns/.gitignore"
+printf 'alpha ignored dir\n' > "$CORPUS/ig/x.txt"
+printf 'alpha generated\n' > "$CORPUS/s.gen"
+printf 'alpha whitelisted\n' > "$CORPUS/.wl.txt"
+printf 'alpha nested ignore\n' > "$CORPUS/ns/g.log"
+printf 'alpha soon ignored\n' > "$CORPUS/n.md"
 find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
 
 ( cd "$CORPUS" && "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} ) >&2
@@ -918,6 +930,9 @@ if [[ "$STORE_DOCS" == false ]]; then
     { printf '\xfe\xff'; printf 'alpha be\nbeta\n' | iconv -f UTF-8 -t UTF-16BE; } > "$CORPUS/u.txt"
     { printf '\xff\xfe'; printf 'alpha added utf16\n' | iconv -f UTF-8 -t UTF-16LE; } > "$CORPUS/ub.txt"
     mv "$CORPUS/mw" "$CORPUS/mv2"
+    # Edited in place: s.gen comes back, n.md goes without a warning.
+    printf 'ig/\nn.md\n' > "$CORPUS/.gitignore"
+    printf 'alpha never seen\n' > "$CORPUS/ig/new.txt"
     RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
     await_watch
     rm -f "$CORPUS/gone.txt"

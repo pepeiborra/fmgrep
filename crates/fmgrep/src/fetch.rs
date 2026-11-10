@@ -211,7 +211,7 @@ impl DocStore {
     /// not list; nothing for stored docs.
     pub fn discover(&self, files: &[String]) {
         if let Source::Files(f) = &self.source {
-            f.discover(files);
+            f.discover(files, &self.lens);
         }
     }
 

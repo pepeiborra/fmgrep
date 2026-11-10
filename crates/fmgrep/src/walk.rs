@@ -2,7 +2,7 @@
 //! the bench harness.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
@@ -81,22 +81,85 @@ pub struct DocMeta {
     pub len: u64,
 }
 
-/// What the walk saw besides documents; every list ascending, root-relative.
+/// What the walk saw besides documents; every list ascending.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalkNotes {
-    /// Every listed directory, `""` the root, stamped before listing; `None`
-    /// when unstattable or holding a symlink to no file.
+    /// Every listed directory, root-relative, `""` the root, stamped before
+    /// listing; `None` when unstattable.
     pub dirs: Vec<(String, Option<Stamp>)>,
-    /// Kept documents that are symlinks.
-    pub links: Vec<String>,
+    /// Every ignore file below the root, root-relative, stamped before it is
+    /// read; then, `None` when absent, those of the root and its ancestors
+    /// (`../`-prefixed) and the global excludes file (absolute).
+    pub ignores: Vec<(String, Option<Stamp>)>,
 }
 
-/// The definition of "indexable": every file under `root`, sorted by relative
-/// path, positional ids. Symlinked dirs are never descended, symlinked files
-/// are included, `.`-prefixed names are pruned. A file [`text`] refuses is
-/// skipped: a binary one in one [`skip_summary`] line by default, a
+/// The ignore files a directory may hold, besides [`GIT_EXCLUDE`].
+const IGNORE_FILES: [&str; 3] = [".gitignore", ".ignore", ".rgignore"];
+const GIT_EXCLUDE: &str = ".git/info/exclude";
+
+/// rg's default walk: ignore files honoured, hidden names and symlinks skipped.
+fn builder(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.add_custom_ignore_filename(".rgignore");
+    builder
+}
+
+/// The walk's rule for one root-relative path at a time.
+pub fn rules(root: &Path) -> ignore::IncrementalIgnore {
+    builder(root).build_matchers().remove(0)
+}
+
+/// The directory whose rules ignore file `rel` changes, if it is one.
+pub fn ignore_file_dir(rel: &str) -> Option<&str> {
+    if let Some(dir) = rel.strip_suffix(GIT_EXCLUDE) {
+        return (dir.is_empty() || dir.ends_with('/')).then(|| dir.trim_end_matches('/'));
+    }
+    let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    IGNORE_FILES.contains(&name).then_some(dir)
+}
+
+/// `path`'s stamp, symlinks followed; `None` when absent.
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    std::fs::metadata(path).ok().map(|m| Stamp::of(&m))
+}
+
+/// `dir`'s ignore files, each stamped.
+pub fn ignore_files(dir: &Path) -> impl Iterator<Item = (&'static str, Option<Stamp>)> + '_ {
+    IGNORE_FILES
+        .into_iter()
+        .chain([GIT_EXCLUDE])
+        .map(|name| (name, stamp(&dir.join(name))))
+}
+
+/// `rel/name`, `name` alone at the root.
+pub fn join_rel(rel: &str, name: &str) -> String {
+    if rel.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{rel}/{name}")
+    }
+}
+
+/// The ignore inputs from above the root: those of the root and its
+/// ancestors, then the global excludes file.
+fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
+    let mut rows = Vec::new();
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for (up, dir) in canonical.ancestors().enumerate() {
+        let prefix = "../".repeat(up);
+        rows.extend(ignore_files(dir).map(|(name, s)| (format!("{prefix}{name}"), s)));
+    }
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+        rows.push((global.to_string_lossy().into_owned(), stamp(&global)));
+    }
+    rows
+}
+
+/// The definition of "indexable": every file `rg --files` lists under
+/// `root`, sorted by relative path, positional ids. A file [`text`] refuses
+/// is skipped: a binary one in one [`skip_summary`] line by default, a
 /// `warning:` each under [`verbose`]; a too-large one with a `warning:`
-/// always. An unreadable root or an all-skipped tree is `Err`. `f` takes
+/// always. An unlistable directory or an all-skipped tree is `Err`. `f` takes
 /// `(rel path, text, stamp, bytes read)`, the stamp being the read handle's
 /// fstat before the read; its `Err` stops the walk at once and is returned
 /// verbatim.
@@ -111,48 +174,10 @@ pub fn for_each_index_doc(
     exclude: Option<&Path>,
     mut f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
 ) -> Result<WalkNotes, String> {
-    let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
-    let mut stack = vec![root.to_path_buf()];
-    // Length per document, for the batch byte bound alone.
-    let mut rels: Vec<(String, u64)> = Vec::new();
-    let mut dirs = Vec::new();
-    let mut symlinks = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let meta = if dir == root {
-            std::fs::metadata(&dir)
-        } else {
-            std::fs::symlink_metadata(&dir)
-        };
-        let mut stamp = meta.ok().map(|m| Stamp::of(&m));
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("error: cannot list folder {}: {e}", dir.display()))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|e| format!("error: cannot list folder {}: {e}", dir.display()))?;
-            match classify(&entry, exclude.as_deref()) {
-                Entry::Link(len) => {
-                    let rel = relative_path(root, &entry.path());
-                    symlinks.push(rel.clone());
-                    rels.push((rel, len));
-                }
-                Entry::File => {
-                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    rels.push((relative_path(root, &entry.path()), len));
-                }
-                Entry::Dir => stack.push(entry.path()),
-                Entry::Unresolved => stamp = None,
-                Entry::Skip => {}
-            }
-        }
-        dirs.push((relative_path(root, &dir), stamp));
-    }
-    rels.sort();
-    dirs.sort_by(|a, b| a.0.cmp(&b.0));
-    symlinks.sort();
-    let mut links = Vec::new();
+    let (rels, notes) = list(root, exclude)?;
     if rels.is_empty() {
         return Err(format!(
-            "error: no indexable files in {} (want regular non-hidden files)",
+            "error: no indexable files in {} (every file is ignored, hidden or a symlink)",
             root.display()
         ));
     }
@@ -183,9 +208,6 @@ pub fn for_each_index_doc(
                 }
             };
             f(rel, text, stamp, got)?;
-            if symlinks.binary_search(rel).is_ok() {
-                links.push(rel.clone());
-            }
             kept += 1;
         }
         at = end;
@@ -199,125 +221,171 @@ pub fn for_each_index_doc(
     if skipped > 0 {
         eprintln!("{}", skip_summary(skipped));
     }
-    Ok(WalkNotes { dirs, links })
+    Ok(notes)
 }
 
-/// What the walk makes of one directory entry.
-enum Entry {
-    File,
-    /// A symlink to a file, with the target's length.
-    Link(u64),
-    Dir,
-    /// A symlink to no file: skipped, but a new target can make it one.
-    Unresolved,
-    Skip,
+/// Whether `path` is the canonical `exclude`.
+fn is_excluded(path: &Path, exclude: Option<&Path>) -> bool {
+    exclude.is_some_and(|x| {
+        x.file_name() == path.file_name() && std::fs::canonicalize(path).is_ok_and(|p| p == x)
+    })
 }
 
-/// `.`-prefixed names are pruned, a symlink is taken only to a file (never
-/// descended), and `exclude` (canonical) is never entered.
-fn classify(entry: &std::fs::DirEntry, exclude: Option<&Path>) -> Entry {
-    if pruned(&entry.file_name()) {
-        return Entry::Skip;
-    }
-    let Ok(file_type) = entry.file_type() else {
-        return Entry::Skip;
-    };
-    if file_type.is_symlink() {
-        return match std::fs::metadata(entry.path()) {
-            Ok(meta) if meta.is_file() => Entry::Link(meta.len()),
-            _ => Entry::Unresolved,
-        };
-    }
-    if file_type.is_dir() {
-        let excluded = exclude.is_some_and(|x| {
-            x.file_name() == Some(entry.file_name().as_os_str())
-                && std::fs::canonicalize(entry.path()).is_ok_and(|p| p == x)
-        });
-        return if excluded { Entry::Skip } else { Entry::Dir };
-    }
-    if file_type.is_file() {
-        Entry::File
-    } else {
-        Entry::Skip
-    }
+fn is_dir(entry: &ignore::DirEntry) -> bool {
+    entry.file_type().is_some_and(|t| t.is_dir())
 }
 
-/// Whether the walk prunes an entry by its name alone.
-pub fn pruned(name: &std::ffi::OsStr) -> bool {
-    name.as_encoded_bytes().starts_with(b".")
+/// The walk's files, sorted, each with its length, and what it saw besides.
+fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, WalkNotes), String> {
+    let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
+    let mut ignores = outer_ignores(root);
+    let notes = Arc::new(Mutex::new(WalkNotes {
+        dirs: vec![(String::new(), stamp(root))],
+        ignores: Vec::new(),
+    }));
+    let mut walk = builder(root);
+    let (seen, base) = (Arc::clone(&notes), root.to_path_buf());
+    walk.filter_entry(move |entry| {
+        if !is_dir(entry) {
+            return true;
+        }
+        if is_excluded(entry.path(), exclude.as_deref()) {
+            return false;
+        }
+        let dir = entry.metadata().ok().map(|m| Stamp::of(&m));
+        let rel = relative_path(&base, entry.path());
+        let found: Vec<_> = ignore_files(entry.path())
+            .filter_map(|(name, s)| Some((join_rel(&rel, name), Some(s?))))
+            .collect();
+        let mut seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.dirs.push((rel, dir));
+        seen.ignores.extend(found);
+        true
+    });
+    let files = Mutex::new(Vec::new());
+    let failed = Mutex::new(None);
+    walk.build_parallel().run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                // Only a listing error has a depth; an ignore file's is skipped, as rg does.
+                Err(e) if e.depth().is_some() => {
+                    let mut failed = failed.lock().unwrap_or_else(PoisonError::into_inner);
+                    failed.get_or_insert(format!("error: cannot list folder {e}"));
+                    return ignore::WalkState::Quit;
+                }
+                Err(e) => {
+                    if verbose() {
+                        eprintln!("warning: {e}");
+                    }
+                    return ignore::WalkState::Continue;
+                }
+            };
+            if let Some(e) = entry.error()
+                && verbose()
+            {
+                eprintln!("warning: {e}");
+            }
+            if entry.file_type().is_some_and(|t| t.is_file()) {
+                let len = entry.metadata().map_or(0, |m| m.len());
+                files
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((relative_path(root, entry.path()), len));
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    if let Some(e) = failed.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        return Err(e);
+    }
+    let mut rels = files.into_inner().unwrap_or_else(PoisonError::into_inner);
+    rels.sort();
+    let mut notes = std::mem::take(&mut *notes.lock().unwrap_or_else(PoisonError::into_inner));
+    notes.dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    ignores.append(&mut notes.ignores);
+    ignores.sort_by(|a, b| a.0.cmp(&b.0));
+    notes.ignores = ignores;
+    Ok((rels, notes))
 }
 
-/// Whether the walk descends into `entry`, the index dir aside.
+/// Every dir at or under `top` that the index walk of `root` enters, plus each `.git/info` beside one.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn descends(entry: &std::fs::DirEntry) -> bool {
-    matches!(classify(entry, None), Entry::Dir)
+pub fn walk_dirs(root: &Path, top: &Path) -> Vec<PathBuf> {
+    let rel = relative_path(root, top);
+    if !rel.is_empty() && rules(root).matched(&rel, true).is_ignore() {
+        return Vec::new();
+    }
+    let found = Mutex::new(Vec::new());
+    builder(top).build_parallel().run(|| {
+        Box::new(|entry| {
+            if let Ok(entry) = entry
+                && is_dir(&entry)
+            {
+                let info = entry.path().join(".git/info");
+                let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
+                if info.is_dir() {
+                    found.push(info);
+                }
+                found.push(entry.into_path());
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    found.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Paths relative to `root`, sorted, of every file under `under` the index
 /// walk lists before its text check. An unreadable directory is skipped.
 pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Vec<String> {
-    walk_changed(root, vec![under.to_path_buf()], exclude, &|_| false)
+    walk_changed(root, vec![under.to_path_buf()], exclude, |_| false)
 }
 
 /// [`walk_paths`] under each of `dirs`, never descending into a directory
-/// whose relative path `recorded` holds.
+/// whose relative path `prune` holds.
 pub fn walk_changed(
     root: &Path,
     dirs: Vec<PathBuf>,
     exclude: Option<&Path>,
-    recorded: &(dyn Fn(&str) -> bool + Sync),
+    prune: impl Fn(&str) -> bool + Send + Sync + 'static,
 ) -> Vec<String> {
-    if dirs.is_empty() {
+    // The walker never filters its roots.
+    let mut matcher = rules(root);
+    let mut seeds = dirs.into_iter().filter(|dir| {
+        let rel = relative_path(root, dir);
+        rel.is_empty() || !matcher.matched(&rel, true).is_ignore()
+    });
+    let Some(first) = seeds.next() else {
         return Vec::new();
+    };
+    let mut walk = builder(&first);
+    for seed in seeds {
+        walk.add(seed);
     }
     let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
-    let walk = Walk {
-        root,
-        exclude: exclude.as_deref(),
-        recorded,
-        found: Mutex::new(Vec::new()),
-    };
-    rayon::scope(|scope| {
-        for dir in dirs {
-            let walk = &walk;
-            scope.spawn(move |scope| walk.list(scope, dir));
-        }
+    let base = root.to_path_buf();
+    walk.filter_entry(move |entry| {
+        !is_dir(entry)
+            || !is_excluded(entry.path(), exclude.as_deref())
+                && !prune(&relative_path(&base, entry.path()))
     });
-    let mut found = walk
-        .found
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner);
+    let found = Mutex::new(Vec::new());
+    walk.build_parallel().run(|| {
+        Box::new(|entry| {
+            if let Ok(entry) = entry
+                && entry.file_type().is_some_and(|t| t.is_file())
+            {
+                found
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(relative_path(root, entry.path()));
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
     found.sort_unstable();
     found
-}
-
-struct Walk<'a> {
-    root: &'a Path,
-    exclude: Option<&'a Path>,
-    recorded: &'a (dyn Fn(&str) -> bool + Sync),
-    found: Mutex<Vec<String>>,
-}
-
-impl<'a> Walk<'a> {
-    fn list(&'a self, scope: &rayon::Scope<'a>, dir: PathBuf) {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            match classify(&entry, self.exclude) {
-                Entry::File | Entry::Link(_) => files.push(relative_path(self.root, &entry.path())),
-                Entry::Dir => {
-                    let path = entry.path();
-                    if !(self.recorded)(&relative_path(self.root, &path)) {
-                        scope.spawn(move |scope| self.list(scope, path));
-                    }
-                }
-                Entry::Unresolved | Entry::Skip => {}
-            }
-        }
-        self.found
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(files);
-    }
 }
 
 /// The walk's one default-verbosity line: what the per-file `warning:` lines
@@ -593,7 +661,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn discover_never_descends_symlink_dirs_but_follows_symlink_files() {
+    fn discover_skips_symlinks_like_rg() {
         use std::os::unix::fs::symlink;
         let dir = scratch_dir("symlink");
         std::fs::create_dir_all(dir.join("real")).unwrap();
@@ -602,11 +670,107 @@ mod tests {
         symlink(dir.join("real"), dir.join("linkdir")).unwrap();
         symlink(dir.join("real").join("a.c"), dir.join("alias.c")).unwrap();
         let docs = discover_index_docs(&dir).unwrap();
-        let mut paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
-        paths.sort();
-        // The symlinked dir contributes nothing (never descended); the
-        // symlinked file counts (harness p.is_file() follows links).
-        assert_eq!(paths, vec!["alias.c", "real/a.c", "real/b.c"]);
+        let paths: Vec<&str> = docs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["real/a.c", "real/b.c"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether a directory above the scratch dirs holds `.git`, which makes
+    /// every scratch tree part of a repository.
+    fn scratch_in_a_repo() -> bool {
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        tmp.ancestors().any(|d| d.join(".git").exists())
+    }
+
+    fn put(dir: &Path, files: &[(&str, &str)]) {
+        for (rel, text) in files {
+            std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(rel), text).unwrap();
+        }
+    }
+
+    fn indexed(dir: &Path) -> Vec<String> {
+        discover_index_meta(dir)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect()
+    }
+
+    #[test]
+    fn discover_follows_ignore_files_like_rg() {
+        let dir = scratch_dir("ignores");
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        put(
+            &dir,
+            &[
+                (".gitignore", "ig/\n*.log\n!keep.log\np.c\n"),
+                (".ignore", "!p.c\n!.wl.c\n"),
+                (".rgignore", "rg.c\n"),
+                (".git/info/exclude", "ex.c\n"),
+                ("a.c", "keep"),
+                ("ig/x.c", "ignored dir"),
+                ("x.log", "ignored"),
+                ("keep.log", "whitelisted"),
+                ("p.c", ".ignore over .gitignore"),
+                ("rg.c", "ignored"),
+                ("ex.c", "ignored"),
+                (".wl.c", "whitelisted hidden file"),
+                (".hidden.c", "hidden"),
+                ("sub/.gitignore", "n.c\n"),
+                ("sub/n.c", "ignored"),
+                ("sub/m.c", "keep"),
+            ],
+        );
+        assert_eq!(
+            indexed(&dir),
+            [".wl.c", "a.c", "keep.log", "p.c", "sub/m.c"]
+        );
+        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(())).unwrap();
+        let dirs: Vec<&str> = notes.dirs.iter().map(|(rel, _)| rel.as_str()).collect();
+        assert_eq!(dirs, ["", "sub"], "ignored dirs are never listed");
+        assert_eq!(walk_paths(&dir, &dir, None), indexed(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_reads_ignore_files_above_the_root() {
+        let dir = scratch_dir("parent-ignores");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        put(
+            &dir,
+            &[
+                (".gitignore", "*.gen\n/sub/top.c\n"),
+                (".ignore", "*.tmp\n"),
+                ("sub/a.c", "keep"),
+                ("sub/b.gen", "ignored"),
+                ("sub/c.tmp", "ignored"),
+                ("sub/top.c", "ignored"),
+            ],
+        );
+        assert_eq!(indexed(&dir.join("sub")), ["a.c"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_applies_gitignore_only_in_a_repo() {
+        if scratch_in_a_repo() {
+            return;
+        }
+        let dir = scratch_dir("no-repo");
+        put(
+            &dir,
+            &[
+                (".gitignore", "*.gen\n"),
+                (".ignore", "*.tmp\n"),
+                ("a.c", "keep"),
+                ("b.gen", "kept"),
+                ("c.tmp", "ignored"),
+            ],
+        );
+        assert_eq!(indexed(&dir), ["a.c", "b.gen"]);
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        assert_eq!(indexed(&dir), ["a.c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -750,6 +914,8 @@ mod tests {
         std::fs::write(dir.join("sub").join("nested").join("d.c"), b"deep").unwrap();
         std::fs::create_dir_all(dir.join("idx")).unwrap();
         std::fs::write(dir.join("idx").join("manifest.json"), b"{}").unwrap();
+        std::fs::write(dir.join(".ignore"), b"*.skip\n").unwrap();
+        std::fs::write(dir.join("sub").join("x.skip"), b"ignored").unwrap();
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(dir.join("sub"), dir.join("linkdir")).unwrap();
@@ -762,20 +928,18 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        for threads in [1, 4] {
-            let (walked, sub) = pool(threads).install(|| {
-                let sub = walk_paths(&dir, &dir.join("sub"), None);
-                (walk_paths(&dir, &dir, Some(&exclude)), sub)
-            });
-            let text: Vec<String> = walked
-                .iter()
-                .filter(|p| !p.ends_with(".bin"))
-                .cloned()
-                .collect();
-            assert_eq!(text, indexed, "threads={threads}");
-            assert!(walked.contains(&"nul.bin".to_string()), "threads={threads}");
-            assert_eq!(sub, ["sub/b.c", "sub/nested/d.c"], "threads={threads}");
-        }
+        let walked = walk_paths(&dir, &dir, Some(&exclude));
+        let text: Vec<String> = walked
+            .iter()
+            .filter(|p| !p.ends_with(".bin"))
+            .cloned()
+            .collect();
+        assert_eq!(text, indexed);
+        assert!(walked.contains(&"nul.bin".to_string()));
+        assert_eq!(
+            walk_paths(&dir, &dir.join("sub"), None),
+            ["sub/b.c", "sub/nested/d.c"]
+        );
         assert!(walk_paths(&dir, &dir.join("missing"), None).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -816,7 +980,7 @@ mod tests {
         };
         let want = [
             ("", stamp("")),
-            ("links", None),
+            ("links", stamp("links")),
             ("sub", stamp("sub")),
             ("sub/deep", stamp("sub/deep")),
         ];
@@ -825,27 +989,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn walk_notes_record_links() {
-        use std::os::unix::fs::symlink;
-        let dir = scratch_dir("walk-links");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::create_dir_all(dir.join("vendor/mod")).unwrap();
-        std::fs::write(dir.join("a.c"), b"keep").unwrap();
-        std::fs::write(dir.join("sub/b.c"), b"keep").unwrap();
-        std::fs::write(dir.join("vendor/mod/c.c"), b"keep").unwrap();
-        std::fs::write(dir.join("bin.o"), b"\x00binary").unwrap();
-        symlink(dir.join("a.c"), dir.join("alias.c")).unwrap();
-        symlink(dir.join("bin.o"), dir.join("bin-alias.o")).unwrap();
-        let mut paths = Vec::new();
-        let notes = for_each_index_doc(&dir, None, |path, _, _, _| {
-            paths.push(path.to_owned());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(notes.links, ["alias.c"]);
-        assert_eq!(paths, ["a.c", "alias.c", "sub/b.c", "vendor/mod/c.c"]);
+    fn walk_notes_record_ignore_files() {
+        let dir = scratch_dir("walk-ignores");
+        put(
+            &dir,
+            &[
+                ("a.c", "keep"),
+                ("sub/.rgignore", "*.gen\n"),
+                ("sub/b.c", "keep"),
+                ("skip/.gitignore", "x\n"),
+                ("skip/c.c", "keep"),
+            ],
+        );
+        std::fs::write(dir.join(".ignore"), b"*.tmp\nskip/\n").unwrap();
+        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(())).unwrap();
+        let stamp = |rel: &str| Some(Stamp::of(&std::fs::metadata(dir.join(rel)).unwrap()));
+        let rows: Vec<&(String, Option<Stamp>)> = notes
+            .ignores
+            .iter()
+            .filter(|(rel, _)| !rel.starts_with("../") && !rel.starts_with('/'))
+            .collect();
+        let want = [
+            (".git/info/exclude", None),
+            (".gitignore", None),
+            (".ignore", stamp(".ignore")),
+            (".rgignore", None),
+            ("sub/.rgignore", stamp("sub/.rgignore")),
+        ]
+        .map(|(rel, s)| (rel.to_string(), s));
+        assert_eq!(rows, want.iter().collect::<Vec<_>>());
+        let depth = std::fs::canonicalize(&dir).unwrap().ancestors().count();
+        let above = notes
+            .ignores
+            .iter()
+            .filter(|(rel, _)| rel.starts_with("../"))
+            .count();
+        assert_eq!(above, 4 * (depth - 1), "each ancestor's, present or not");
+        assert!(notes.ignores.is_sorted_by(|a, b| a.0 < b.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_changed_lists_nothing_under_an_ignored_seed() {
+        let dir = scratch_dir("ignored-seed");
+        put(
+            &dir,
+            &[
+                (".ignore", "ig/\n"),
+                ("ig/deep/a.c", "ignored"),
+                (".hdir/b.c", "hidden"),
+                ("ok/c.c", "keep"),
+            ],
+        );
+        let seeds = vec![
+            dir.join("ig"),
+            dir.join("ig/deep"),
+            dir.join(".hdir"),
+            dir.join("ok"),
+        ];
+        assert_eq!(walk_changed(&dir, seeds, None, |_| false), ["ok/c.c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -865,27 +1068,18 @@ mod tests {
         }
         let old = |rel: &str| rel == "sub/old";
         let exclude = dir.join("sub/idx");
-        for threads in [1, 4] {
-            pool(threads).install(|| {
-                let got = walk_changed(&dir, vec![dir.join("sub")], Some(&exclude), &old);
-                assert_eq!(
-                    got,
-                    ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c"],
-                    "threads={threads}"
-                );
-                let seeds = vec![dir.join("sub/old"), dir.join("sub")];
-                let got = walk_changed(&dir, seeds, Some(&exclude), &old);
-                assert_eq!(
-                    got,
-                    ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c", "sub/old/o.c"],
-                    "threads={threads}"
-                );
-                let all = walk_changed(&dir, vec![dir.clone()], None, &|_| false);
-                assert_eq!(all, walk_paths(&dir, &dir, None), "threads={threads}");
-                assert_eq!(all.len(), 6, "threads={threads}");
-            });
-        }
-        assert!(walk_changed(&dir, Vec::new(), None, &|_| false).is_empty());
+        let got = walk_changed(&dir, vec![dir.join("sub")], Some(&exclude), old);
+        assert_eq!(got, ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c"]);
+        let seeds = vec![dir.join("sub/old"), dir.join("sub")];
+        let got = walk_changed(&dir, seeds, Some(&exclude), old);
+        assert_eq!(
+            got,
+            ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c", "sub/old/o.c"]
+        );
+        let all = walk_changed(&dir, vec![dir.clone()], None, |_| false);
+        assert_eq!(all, walk_paths(&dir, &dir, None));
+        assert_eq!(all.len(), 6);
+        assert!(walk_changed(&dir, Vec::new(), None, |_| false).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

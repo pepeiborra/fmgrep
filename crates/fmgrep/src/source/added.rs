@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 
-use super::{Known, Recorded, parallel};
+use super::{IGNORED, Known, Recorded, parallel};
 use crate::binary::sniff_text;
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
@@ -70,12 +70,14 @@ impl Added {
 
 impl super::Files {
     /// Register every text file under the root that ascending `files` does
-    /// not list; with a record, only changed and new directories are listed.
-    pub fn discover(&self, files: &[String]) {
+    /// not list, and mark the indexed ones an ignore rule now skips; with a
+    /// record, only changed and new directories are listed, and the dirs a
+    /// changed ignore input affects.
+    pub fn discover(&self, files: &[String], lens: &[u64]) {
         let known = &*self.known;
         match &known.recorded {
-            Some(recorded) => known.discover_recorded(recorded, files),
-            None => known.discover(&known.root, &known.root, files),
+            Some(recorded) => known.discover_recorded(recorded, files, lens),
+            None => known.discover(&known.root, &known.root, files, lens),
         }
         known.complete.store(true, Ordering::Release);
         let n = known.added().live().count();
@@ -94,6 +96,19 @@ fn seek(files: &[String], from: usize, rel: &str) -> usize {
     }
     let hi = (lo + step).min(files.len());
     lo + files[lo..hi].partition_point(|f| f.as_str() < rel)
+}
+
+/// Ids of ascending `files` at or under `rel`, `""` the root.
+fn docs_under<'a>(files: &'a [String], rel: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let exact = files.binary_search_by(|f| f.as_str().cmp(rel)).ok();
+    let dir = format!("{rel}/");
+    let lo = match rel {
+        "" => 0,
+        _ => files.partition_point(|f| f.as_str() < dir.as_str()),
+    };
+    let tree =
+        (lo..files.len()).take_while(move |&id| rel.is_empty() || files[id].starts_with(&dir));
+    exact.into_iter().chain(tree)
 }
 
 /// Ascending `walked` minus ascending `files`.
@@ -139,26 +154,55 @@ impl Known {
             .collect()
     }
 
-    /// Walk `under` (at or below `root`) and reconcile what it holds.
-    pub fn discover(&self, root: &Path, under: &Path, files: &[String]) {
+    /// Walk `under` (at or below `root`) and reconcile what it holds: an
+    /// indexed doc the rule skips, or no longer a regular file, is ignored;
+    /// one the walk missed or lists again is statted.
+    pub fn discover(&self, root: &Path, under: &Path, files: &[String], lens: &[u64]) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
-        let found = self.text_only(root, unlisted(walked, files));
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
         };
+        let (mut skipped, mut back, mut at) = (Vec::new(), Vec::new(), 0);
+        for id in docs_under(files, rel) {
+            at = seek(&walked, at, &files[id]);
+            match (walked.get(at) == Some(&files[id]), self.kind(id) == IGNORED) {
+                (false, false) => skipped.push(id),
+                (true, true) => back.push(id),
+                _ => {}
+            }
+        }
+        parallel(&skipped, |&id| {
+            let path = root.join(&files[id]);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if !m.is_file() || self.ignored(&files[id], false) => self.set(id, IGNORED),
+                Ok(_) => {
+                    if let Some(why) = self.stat(id, files, lens, true) {
+                        self.exclude(id, &path, &why);
+                    }
+                }
+                Err(_) => {}
+            }
+        });
+        parallel(&back, |&id| self.stat(id, files, lens, true));
+        let found = self.text_only(root, unlisted(walked, files));
         self.reconcile(rel, &found);
     }
 
     /// [`Self::discover`] of the root, listing only the recorded dirs whose
-    /// stamp moved and the new ones below them.
-    fn discover_recorded(&self, recorded: &Recorded, files: &[String]) {
+    /// stamp moved and the new ones below them, then walking the dirs a
+    /// changed ignore input affects.
+    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: &[String], lens: &[u64]) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
-        let walked = crate::walk::walk_changed(root, changed, self.exclude.as_deref(), &|rel| {
-            recorded.is_dir(rel)
-        });
+        let scopes = recorded.ignore_scopes(root, &changed);
+        let prune = Arc::clone(recorded);
+        let walked =
+            crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {
+                prune.is_dir(rel)
+            });
         let found = self.text_only(root, unlisted(walked, files));
         self.reconcile("", &found);
+        self.discover_scopes(scopes, files, lens);
     }
 
     /// Whether `rel` is at or under the index dir.
@@ -170,44 +214,32 @@ impl Known {
     }
 
     /// Reconcile what is at `path` now: a text file not in ascending `files`
-    /// is added, a directory is walked, anything else is dropped.
-    pub fn reconcile_path(&self, root: &Path, path: &Path, files: &[String]) {
+    /// is added, a directory is walked, anything else is dropped; what the
+    /// walk's rule skips is left alone.
+    pub fn reconcile_path(&self, root: &Path, path: &Path, files: &[String], lens: &[u64]) {
         let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
         };
-        if rel.is_empty() || self.excluded(root, rel) || rel.split('/').any(|c| c.starts_with('.'))
+        if rel.is_empty() || self.excluded(root, rel) {
+            return;
+        }
+        let meta = std::fs::symlink_metadata(path).ok();
+        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+        if !is_dir && files.binary_search_by(|f| f.as_str().cmp(rel)).is_ok()
+            || self.ignored(rel, is_dir)
         {
             return;
         }
-        let text = match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() => return self.discover(root, path, files),
-            _ if files.binary_search_by(|f| f.as_str().cmp(rel)).is_ok() => return,
-            Ok(meta) => {
-                let file = meta.is_file()
-                    || meta.is_symlink() && std::fs::metadata(path).is_ok_and(|m| m.is_file());
-                file && sniff_text(path)
-            }
-            Err(_) => false,
-        };
+        if is_dir {
+            return self.discover(root, path, files, lens);
+        }
+        let text = meta.is_some_and(|m| m.is_file()) && sniff_text(path);
         let found = if text {
             vec![rel.to_owned()]
         } else {
             Vec::new()
         };
         self.reconcile(rel, &found);
-    }
-
-    /// Reconcile each file directly in `rel` (a dir) that ascending `files`
-    /// does not list.
-    pub fn relist(&self, rel: &str, files: &[String]) {
-        let root = &self.root;
-        let walked =
-            crate::walk::walk_changed(root, vec![root.join(rel)], self.exclude.as_deref(), &|_| {
-                true
-            });
-        for rel in unlisted(walked, files) {
-            self.reconcile_path(root, &root.join(rel), files);
-        }
     }
 
     pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {

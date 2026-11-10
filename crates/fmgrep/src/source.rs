@@ -1,12 +1,13 @@
 //! What the files layout knows of each file since indexing: fresh, stale
-//! (scanned in full), gone (excluded) or added (not in the manifest; scanned
-//! in full). A change journal, when it vouches, names what to re-check
-//! instead of the stat pass and discovery.
+//! (scanned in full), gone (excluded), ignored (excluded silently: an ignore
+//! rule now skips it) or added (not in the manifest; scanned in full). A
+//! change journal, when it vouches, names what to re-check instead of the
+//! stat pass and discovery.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -19,6 +20,7 @@ mod recorded;
 mod watcher;
 
 pub use journal::{Journal, Knob, marks};
+use recorded::outermost;
 pub use recorded::{Recorded, write_walk};
 
 /// Per-doc mtimes and UTF-16 file lengths of a files-layout index, at the
@@ -113,6 +115,7 @@ impl Stamps {
 const FRESH: u8 = 0;
 const STALE: u8 = 1;
 const GONE: u8 = 2;
+const IGNORED: u8 = 3;
 const KIND: u8 = 3;
 const WARNED: u8 = 4;
 
@@ -134,7 +137,9 @@ struct Known {
     /// The index dir, canonical: never an added file.
     exclude: Option<PathBuf>,
     added: Mutex<added::Added>,
-    recorded: Option<Recorded>,
+    recorded: Option<Arc<Recorded>>,
+    /// The walk's rule, loaded on first use.
+    rules: Mutex<Option<ignore::IncrementalIgnore>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
 }
@@ -145,11 +150,20 @@ impl Known {
     }
 
     fn set(&self, id: usize, kind: u8) {
-        let old = self.state[id]
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
-                Some(s & WARNED | kind)
-            })
-            .expect("the update always applies");
+        self.update(id, kind, true);
+    }
+
+    /// [`Self::set`] unless `id` is [`IGNORED`]: whether it applied.
+    fn settle(&self, id: usize, kind: u8) -> bool {
+        self.update(id, kind, false)
+    }
+
+    fn update(&self, id: usize, kind: u8, force: bool) -> bool {
+        let Ok(old) = self.state[id].try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+            (force || s & KIND != IGNORED).then_some(s & WARNED | kind)
+        }) else {
+            return false;
+        };
         // `changed` moves before `epoch`: a reader that sees the new epoch
         // sees the new count.
         match (old & KIND == FRESH, kind == FRESH) {
@@ -164,38 +178,58 @@ impl Known {
         if old & KIND != kind {
             self.epoch.fetch_add(1, Ordering::AcqRel);
         }
+        true
     }
 
-    /// Mark `id` gone; the first exclusion of a doc per process warns.
+    /// Mark `id` gone unless ignored; the first exclusion of a doc per
+    /// process warns.
     fn exclude(&self, id: usize, path: &Path, why: &str) {
-        self.set(id, GONE);
-        if self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0 {
+        let first = self.settle(id, GONE)
+            && self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0;
+        if first {
             eprintln!("warning: excluding {}: {why}", path.display());
         }
     }
 
-    /// Stat `id` against its stamp: why it is gone, if it is.
-    fn stat(&self, id: usize, files: &[String], lens: &[u64]) -> Option<String> {
-        match std::fs::metadata(self.root.join(&files[id])) {
-            Ok(meta) => {
-                let fresh = self.stamps.holds(id, &meta, lens[id]);
-                self.set(id, if fresh { FRESH } else { STALE });
-                None
-            }
-            Err(e) => {
-                self.set(id, GONE);
+    /// Stat `id` against its stamp, an ignored doc only if `force`: why it
+    /// is gone, if it is.
+    fn stat(&self, id: usize, files: &[String], lens: &[u64], force: bool) -> Option<String> {
+        let (kind, why) = match std::fs::metadata(self.root.join(&files[id])) {
+            Ok(meta) if self.stamps.holds(id, &meta, lens[id]) => (FRESH, None),
+            Ok(_) => (STALE, None),
+            Err(e) => (
+                GONE,
                 Some(match e.kind() {
                     std::io::ErrorKind::NotFound => "is missing".to_string(),
                     _ => format!("cannot stat ({e})"),
-                })
-            }
+                }),
+            ),
+        };
+        if self.update(id, kind, force) {
+            why
+        } else {
+            None
         }
+    }
+
+    /// Whether the walk's rule skips root-relative `rel`.
+    fn ignored(&self, rel: &str, is_dir: bool) -> bool {
+        let mut rules = self.rules.lock().unwrap_or_else(PoisonError::into_inner);
+        rules
+            .get_or_insert_with(|| crate::walk::rules(&self.root))
+            .matched(rel, is_dir)
+            .is_ignore()
+    }
+
+    /// Reload the walk's rule at its next use.
+    fn reload_rules(&self) {
+        *self.rules.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Stat `ids` (ascending), then warn about the gone ones in order, or
     /// once when over half the docs are.
     fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64]) {
-        let gone = parallel(ids, |&id| self.stat(id, files, lens));
+        let gone = parallel(ids, |&id| self.stat(id, files, lens, false));
         let n = gone.iter().flatten().count();
         if n * 2 > self.state.len() {
             eprintln!(
@@ -221,9 +255,9 @@ impl Known {
     }
 
     /// Take ascending `paths` as all that changed in ascending `files`:
-    /// re-stat the docs at or under each and reconcile each; list each of
-    /// `relist` one level.
-    fn replay(&self, paths: &[String], relist: &[String], files: &[String], lens: &[u64]) {
+    /// re-stat the docs at or under each and reconcile each, then walk again
+    /// what a changed ignore input affects.
+    fn replay(&self, paths: &[String], files: &[String], lens: &[u64]) {
         let root = &self.root;
         let by_path: Vec<usize> = (0..files.len()).collect();
         let mut ids = Vec::new();
@@ -232,19 +266,35 @@ impl Known {
             .any(|rel| docs_at(root, &root.join(rel), files, &by_path, &mut ids))
         {
             self.stat_all(files, lens);
-            self.discover(root, root, files);
+            self.discover(root, root, files, lens);
         } else {
             ids.sort_unstable();
             ids.dedup();
             self.stat_ids(&ids, files, lens);
             parallel(paths, |rel| {
-                self.reconcile_path(root, &root.join(rel), files)
+                self.reconcile_path(root, &root.join(rel), files, lens)
             });
-            for dir in relist {
-                self.relist(dir, files);
-            }
+            let mut scopes = match &self.recorded {
+                Some(recorded) => recorded.ignore_scopes(root, &[]),
+                None => vec![String::new()],
+            };
+            scopes.extend(
+                paths
+                    .iter()
+                    .filter_map(|p| crate::walk::ignore_file_dir(p))
+                    .map(str::to_owned),
+            );
+            self.discover_scopes(scopes, files, lens);
         }
         self.complete.store(true, Ordering::Release);
+    }
+
+    /// [`Self::discover`] of the outermost of root-relative `scopes`.
+    fn discover_scopes(&self, scopes: Vec<String>, files: &[String], lens: &[u64]) {
+        let root = &self.root;
+        for scope in outermost(scopes) {
+            self.discover(root, &root.join(scope), files, lens);
+        }
     }
 }
 
@@ -299,6 +349,7 @@ impl Files {
                 exclude: None,
                 added: Mutex::default(),
                 recorded: None,
+                rules: Mutex::default(),
                 complete: AtomicBool::new(false),
             }),
             journal: None,
@@ -333,8 +384,7 @@ impl Files {
             return false;
         };
         let applied = std::time::Instant::now();
-        self.known
-            .replay(&replay.paths, &replay.relist, files, lens);
+        self.known.replay(&replay.paths, files, lens);
         if crate::verbose::verbose() {
             let (n, ask, apply) = (replay.paths.len(), applied - asked, applied.elapsed());
             let kind = replay.kind;
@@ -387,7 +437,7 @@ impl Files {
     /// Before any watch or discovery.
     pub fn record(&mut self, recorded: Recorded) {
         let known = Arc::get_mut(&mut self.known).expect("record precedes sharing");
-        known.recorded = Some(recorded);
+        known.recorded = Some(Arc::new(recorded));
     }
 
     /// Stat every doc; each newly gone one warns, in doc order.
@@ -412,7 +462,7 @@ impl Files {
             for id in 0..num_docs {
                 match self.known.kind(id) {
                     STALE => snap.stale.push(id),
-                    GONE => snap.gone.push(id),
+                    GONE | IGNORED => snap.gone.push(id),
                     _ => {}
                 }
             }
@@ -432,11 +482,14 @@ impl Files {
     /// Doc `doc`'s current text: `buf` (its recorded length) filled while
     /// the stamp holds and the doc is not UTF-16, else
     /// [`crate::binary::text`] of the whole file, and the doc turns stale
-    /// unless it is the indexed UTF-16 text. A file that cannot be read or is
-    /// no longer text is excluded: `None`.
+    /// unless it is the indexed UTF-16 text. A file that is ignored, cannot
+    /// be read or is no longer text is excluded: `None`.
     pub fn read(&self, doc: usize, rel: &str, mut buf: Vec<u8>) -> Option<Vec<u8>> {
         use std::io::Read as _;
         let known = &*self.known;
+        if known.kind(doc) == IGNORED {
+            return None;
+        }
         let path = known.root.join(rel);
         let failed = |e: std::io::Error| {
             known.exclude(doc, &path, &format!("cannot read ({e})"));
@@ -457,8 +510,8 @@ impl Files {
                 Err(e) => failed(e),
             };
         }
-        if !holds {
-            known.set(doc, STALE);
+        if !holds && !known.settle(doc, STALE) {
+            return None;
         }
         if meta.len() > crate::binary::MAX_DOC_BYTES {
             known.exclude(doc, &path, &crate::binary::Skip::TooLarge.to_string());
@@ -471,7 +524,7 @@ impl Files {
         match crate::binary::text(whole) {
             Ok(text) => {
                 if text.bytes.len() != buf.len() {
-                    known.set(doc, STALE);
+                    known.settle(doc, STALE);
                 }
                 Some(text.bytes)
             }
@@ -505,7 +558,9 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Re-check what each burst names until `stop`; lost events or a root event redo all.
+    /// Re-stat and re-check for added files what each burst names, and walk
+    /// again the dir of each ignore file it names, until `stop`; lost events
+    /// or a root event redo all.
     pub fn run(mut self, files: &[String], lens: &[u64], stop: &AtomicBool) {
         let mut by_path: Vec<usize> = (0..files.len()).collect();
         by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
@@ -522,18 +577,25 @@ impl Watch {
                 all |= docs_at(&self.root, &path, files, &by_path, &mut ids);
                 named.push(path);
             }
+            self.known.reload_rules();
             if all {
                 self.known.stat_all(files, lens);
-                self.known.discover(&self.root, &self.root, files);
+                self.known.discover(&self.root, &self.root, files, lens);
             } else {
                 ids.sort_unstable();
                 ids.dedup();
                 self.known.stat_ids(&ids, files, lens);
                 named.sort_unstable();
                 named.dedup();
+                let mut scopes = Vec::new();
                 for path in &named {
-                    self.known.reconcile_path(&self.root, path, files);
+                    let rel = path.strip_prefix(&self.root).ok().and_then(Path::to_str);
+                    match rel.and_then(crate::walk::ignore_file_dir) {
+                        Some(dir) => scopes.push(dir.to_owned()),
+                        None => self.known.reconcile_path(&self.root, path, files, lens),
+                    }
                 }
+                self.known.discover_scopes(scopes, files, lens);
             }
         }
     }
@@ -747,9 +809,27 @@ mod tests {
     }
 
     #[test]
+    fn an_ignored_doc_survives_the_stat_pass_and_is_never_warned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        let files = open_files(&fix);
+        files.known.set(1, IGNORED);
+        files.known.set(2, IGNORED);
+        std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
+        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+        files.stat_all(&fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [FRESH, IGNORED, IGNORED]);
+        assert_eq!(stale_gone(&files), (vec![], vec![1, 2]));
+        assert_eq!(files.read(1, &fix.files[1], vec![0; 2]), None);
+        assert!(!files.warned(1) && !files.warned(2));
+    }
+
+    #[test]
     fn replay_restats_named_docs_and_walks_named_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
+        write_walk(&fix.index, &walk, std::time::SystemTime::now()).unwrap();
         std::fs::write(fix.path.join(&fix.files[0]), b"printk changed").unwrap();
         std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
         std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
@@ -757,13 +837,12 @@ mod tests {
         std::fs::write(fix.path.join("sub/deep/n.c"), b"new").unwrap();
         std::fs::write(fix.path.join("sub/bin.dat"), b"a\0b").unwrap();
         std::fs::create_dir(fix.path.join("rl")).unwrap();
-        std::fs::write(fix.path.join("rl/r.c"), b"relisted").unwrap();
+        std::fs::write(fix.path.join("rl/r.c"), b"unnamed dir").unwrap();
         std::fs::write(fix.path.join("unnamed.c"), b"unseen").unwrap();
-        let files = open_files(&fix);
+        let mut files = open_files(&fix);
+        files.record(Recorded::open(&fix.index).unwrap().unwrap());
         let named = ["d0000.c", "d0002.c", "sub"].map(String::from);
-        files
-            .known
-            .replay(&named, &["rl".into()], &fix.files, &fix.lens);
+        files.known.replay(&named, &fix.files, &fix.lens);
         assert_eq!(files.kinds(), [STALE, FRESH, GONE], "only named docs");
         let snap = files.snapshot();
         let added: Vec<&str> = snap
@@ -771,10 +850,8 @@ mod tests {
             .iter()
             .map(|&d| snap.names[d - 3].as_str())
             .collect();
-        assert_eq!(added, ["sub/deep/n.c", "rl/r.c"]);
-        files
-            .known
-            .replay(&[String::new()], &[], &fix.files, &fix.lens);
+        assert_eq!(added, ["sub/deep/n.c"]);
+        files.known.replay(&[String::new()], &fix.files, &fix.lens);
         assert_eq!(
             files.kinds(),
             [STALE, STALE, GONE],

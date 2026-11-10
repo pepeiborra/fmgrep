@@ -16,6 +16,7 @@ directory.
 | `blobs.shard` | always | one docfm blob per shard, concatenated |
 | `docs.stamps` | default | one mtime per document, and the file length of each UTF-16 one |
 | `dirs.stamps` | default | every walked directory's `(size, mtime)` |
+| `ignores.stamps` | default | every ignore file's `(size, mtime)` |
 | `docs.journal` | default, when a change source marks | change-source tokens, rewritten by each search |
 | `docs.shard` | `--store-docs` | the documents, concatenated |
 
@@ -63,11 +64,12 @@ A load refuses, with exit 2:
 
 The walk under PATH defines the document set:
 
-- every regular file, sorted by relative path; ids are positions in that
-  order;
-- names starting with `.` are pruned, files and directories alike, so
-  `.git`, `.sl` and `.fmgrep` are never read;
-- symlinked directories are not descended; symlinked files are included;
+- every file `rg --files` lists, sorted by relative path; ids are positions
+  in that order. As in rg, `.gitignore` (inside a git repository),
+  `.ignore`, `.rgignore`, `.git/info/exclude` and the global git excludes
+  file apply, including those of the directories above PATH; hidden names
+  are skipped unless an ignore file whitelists them; symlinks are not
+  followed. `.fmgrep` is never read;
 - a file starting with a UTF-16LE or UTF-16BE BOM is read as the UTF-8
   that rg decodes it to; a document is that text, else the file's bytes;
 - binary files are skipped, with one summary line on stderr (`-v` lists
@@ -95,7 +97,13 @@ answer, a load stats every document against its `(size, mtime)` stamp:
 - a file the walk skipped as non-text is sniffed again whenever its
   directory is listed: one rewritten in place as text is found once its
   directory's stamp moves, or when a change source or `serve`'s watch
-  names it.
+  names it;
+- when an ignore file in `ignores.stamps` changes, or one appears in a
+  listed directory, the load walks the directory it governs in full (the
+  root for those above it): an indexed file the rules now skip is excluded
+  with no warning, and a file they now allow is added. This repeats at
+  every load until the next `index`. `serve`'s watch does the same when it
+  sees an ignore file change inside the tree.
 
 `serve` watches the tree, following new files and directories; with
 `--no-watch` it misses files added after it is ready. On a filesystem
@@ -107,10 +115,9 @@ Re-index after many edits.
 
 `index` also asks a running watchman daemon (never started; asked to watch
 the tree) for a token before the walk. The token goes to `docs.journal`
-(JSON), with the symlinked documents and the directories holding a
-dangling symlink. A load asks watchman what changed since its token,
-re-checks only those paths, the symlinked documents and those directories,
-and skips the stat pass and the directory check; a search then rewrites
+(JSON). A load asks watchman what changed since its token, re-checks only
+those paths and the ignore files, and skips the stat pass and the directory
+check; a search then rewrites
 the token with what differs now. Watchman is asked from 50,000 documents.
 A watchman that answers too slowly or names too many paths, and an index
 without `docs.journal`, fall back to the stat pass. An edit made while a
@@ -189,13 +196,24 @@ stamp. The stamp `len = u64::MAX, mtime_ns = i64::MIN` matches no stat, so
 its directory is listed at every load. It is written for a directory
 stamped within 2 s of the index start (a change in the same timestamp tick
 would not move it; writing `.fmgrep` makes the root of a default index
-one), one that could not be statted, one holding a symlink to no file, and
-a path that collides once decoded lossily, which is written once.
+one), one that could not be statted, and a path that collides once decoded
+lossily, which is written once.
 
 A file with another magic or version is ignored, as if absent. One with
 the right magic that is truncated, not ascending, not UTF-8 or not rooted
 is refused with exit 2, like a damaged `docs.stamps`. A `docs.skipped`
 left by an older `fmgrep` is ignored.
+
+## ignores.stamps
+
+Optional, with `dirs.stamps`: without it, every load walks the whole tree.
+Magic `fmigns\0\x01`, then records as in `dirs.stamps`, strictly
+ascending by path: every `.gitignore`, `.ignore`, `.rgignore` and
+`.git/info/exclude` in a walked directory, stamped before it is read; the
+same four of the root and of each directory above it, prefixed `../` once
+per level; and the global git excludes file, by absolute path. The stamp
+`len = u64::MAX, mtime_ns = i64::MAX` records an absent file; the other
+sentinel and the 2 s rule are those of `dirs.stamps`.
 
 ## docs.shard
 
@@ -204,7 +222,7 @@ them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
 
 ## Determinism
 
-The same tree and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and
-`docs.shard` bytes, whatever the thread counts. `docs.stamps` and
-`dirs.stamps` follow the mtimes. Only `build_time_us`
+The same tree, the same ignore files outside it (see Documents) and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and
+`docs.shard` bytes, whatever the thread counts. `docs.stamps`,
+`dirs.stamps` and `ignores.stamps` follow the mtimes. Only `build_time_us`
 differs in the manifest, besides `corpus_root` when the tree moves.
