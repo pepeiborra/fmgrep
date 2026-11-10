@@ -134,7 +134,11 @@ fn search(
     p.scope(tree.as_deref());
     let root = found.root.filter(|_| !manifest.store_docs);
     let req = p.request(&found.index_dir, &manifest, root.as_deref())?;
-    render(&p, s.json, out, |sink| run_query(&req, sink)).map(Outcome::Query)
+    let report = render(&p, s.json, out, |sink| run_query(&req, sink));
+    drop(req);
+    // Off the exit path: dropping a large tree's paths costs milliseconds.
+    std::thread::spawn(move || drop(manifest));
+    report.map(Outcome::Query)
 }
 
 /// `--server`: one `query`; PATHs resolve against the served tree.
