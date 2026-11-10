@@ -193,6 +193,7 @@ fn in_place_run_lists_files_only_some_rows_searched() {
     for name in ["a.txt", "ign.txt", ".w.txt"] {
         std::fs::write(root.join(name), &lines).unwrap();
     }
+    std::fs::write(root.join("p.txt"), format!("%PDF-\n{lines}")).unwrap();
     std::fs::write(root.join(".gitignore"), "ign.txt\n!.w.txt\n").unwrap();
     std::os::unix::fs::symlink("a.txt", root.join("link.txt")).unwrap();
     let before = snapshot(&root);
@@ -206,11 +207,10 @@ fn in_place_run_lists_files_only_some_rows_searched() {
     assert!(out.status.success(), "{md}\n{}", text(&out.stderr));
     assert_eq!(snapshot(&root), before);
     let wants = [
-        "\n- files searched: rg 2, fmgrep 3 (non-empty)\n",
+        "\n- files searched: rg 3, fmgrep 2 (non-empty)\n",
         "verify: OK, 2 rows agree on 40 queries\n",
         "queries print lines from files some rows did not search (not failures):",
-        ": rg did not search symlink 1 (`link.txt`), ignored 1 (`ign.txt`); \
-         fmgrep did not search hidden 1 (`.w.txt`)\n",
+        ": fmgrep did not search binary 1 (`p.txt`)\n",
     ];
     for want in wants {
         assert!(md.contains(want), "{want:?} not in\n{md}");

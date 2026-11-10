@@ -75,7 +75,7 @@ mod inotify_feed {
     }
 
     impl Feed {
-        /// Watch every directory under `root` the index walk descends.
+        /// Watch every directory under `root` the index walk enters.
         pub fn new(root: &Path) -> Result<Self, String> {
             let mut feed = Self {
                 inotify: Inotify::init().map_err(|e| e.to_string())?,
@@ -84,47 +84,50 @@ mod inotify_feed {
                 buf: vec![0; 64 << 10],
                 warned: false,
             };
-            feed.add_tree(root).map_err(|(p, e)| explain(&p, &e))?;
-            Ok(feed)
+            match feed.add_tree(root) {
+                Ok(true) => Ok(feed),
+                Ok(false) => Err("cannot list it".to_string()),
+                Err((p, e)) => Err(explain(&p, &e)),
+            }
         }
 
-        /// Watch `top` and the dirs under it; only a failure on `top` or running out of watches is an error.
-        fn add_tree(&mut self, top: &Path) -> Result<(), (PathBuf, std::io::Error)> {
-            let mut stack = vec![top.to_path_buf()];
-            while let Some(dir) = stack.pop() {
-                match self.inotify.watches().add(&dir, MASK) {
+        /// Watch the dirs at or under `top` the walk enters; only a failure on `top` or running out of watches is an error.
+        fn add_tree(&mut self, top: &Path) -> Result<bool, (PathBuf, std::io::Error)> {
+            let dirs = crate::walk::walk_dirs(&self.root, top);
+            for dir in &dirs {
+                match self.inotify.watches().add(dir, MASK) {
                     Ok(wd) => {
                         self.dirs.insert(wd, dir.clone());
                     }
                     Err(e) if dir == top || e.kind() == ErrorKind::StorageFull => {
-                        return Err((dir, e));
+                        return Err((dir.clone(), e));
                     }
-                    Err(_) => continue,
-                }
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    if crate::walk::descends(&entry) {
-                        stack.push(entry.path());
-                    }
+                    Err(_) => {}
                 }
             }
-            Ok(())
+            Ok(!dirs.is_empty())
         }
 
-        /// Watch `top` again; out of watches, warn once and ask for a rescan.
-        fn rewatch(&mut self, top: &Path, burst: &mut Burst) {
+        /// Watch `top` again, true when the walk enters it; out of watches, warn once and ask for a rescan.
+        fn rewatch(&mut self, top: &Path, burst: &mut Burst) -> bool {
             match self.add_tree(top) {
+                Ok(entered) => entered,
                 Err((path, e)) if e.kind() == ErrorKind::StorageFull => {
                     if !std::mem::replace(&mut self.warned, true) {
                         eprintln!("warning: {}; some changes go unseen", explain(&path, &e));
                     }
                     burst.rescan = true;
+                    true
                 }
                 // Gone or replaced already: its path is in the burst, which re-checks it.
-                _ => {}
+                Err(_) => false,
             }
+        }
+
+        /// The dir whose rules ignore file `path` changes, if it is one.
+        fn ignore_scope(&self, path: &Path) -> Option<PathBuf> {
+            let rel = path.strip_prefix(&self.root).ok()?.to_str()?;
+            crate::walk::ignore_file_dir(rel).map(|dir| self.root.join(dir))
         }
 
         /// The watches at or under `path`.
@@ -178,19 +181,18 @@ mod inotify_feed {
                         continue;
                     };
                     let path = name.as_ref().map_or_else(|| dir.clone(), |n| dir.join(n));
-                    let dir_name = name.as_deref().filter(|_| mask.contains(EventMask::ISDIR));
-                    if let Some(n) = dir_name {
-                        if mask.contains(EventMask::MOVED_FROM) {
-                            away.push((cookie, path.clone(), self.under(&path)));
-                        } else if mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
-                            && !crate::walk::pruned(n)
-                        {
-                            if mask.contains(EventMask::MOVED_TO) {
-                                away.retain(|(c, _, _)| *c != cookie);
-                            }
-                            // Re-adding a moved dir keeps its watches and refreshes their paths.
-                            self.rewatch(&path, burst);
+                    let named_dir = name.is_some() && mask.contains(EventMask::ISDIR);
+                    if named_dir && mask.contains(EventMask::MOVED_FROM) {
+                        away.push((cookie, path.clone(), self.under(&path)));
+                    } else if named_dir && mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
+                    {
+                        // Re-adding a moved dir keeps its watches and refreshes their paths.
+                        if self.rewatch(&path, burst) && mask.contains(EventMask::MOVED_TO) {
+                            away.retain(|(c, _, _)| *c != cookie);
                         }
+                    } else if let Some(dir) = self.ignore_scope(&path) {
+                        // An ignore file changed: the walk may now enter dirs under its own.
+                        self.rewatch(&dir, burst);
                     }
                     burst.paths.push(path);
                 }
@@ -295,10 +297,16 @@ mod tests {
     fn reads_queue_nothing_and_new_dirs_are_watched() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join(".hidden")).unwrap();
+        std::fs::create_dir(root.join("out")).unwrap();
+        std::fs::write(root.join(".ignore"), b"out/\n").unwrap();
         std::fs::write(root.join("a.c"), b"a").unwrap();
         let mut feed = Feed::new(&root).unwrap();
-        assert_eq!(feed.dirs.len(), 1, "dot dirs are not watched");
+        assert_eq!(
+            feed.dirs.len(),
+            1,
+            "hidden and ignored dirs are not watched"
+        );
         for _ in 0..20_000 {
             std::fs::read(root.join("a.c")).unwrap();
         }
@@ -322,7 +330,7 @@ mod tests {
         while burst(&mut feed).is_some() {}
         assert!(
             feed.dirs.values().all(|d| !d.starts_with(root.join(".x"))),
-            "a new dot dir stays unwatched: {:?}",
+            "a new hidden dir is not watched: {:?}",
             feed.dirs.values().collect::<Vec<_>>()
         );
     }

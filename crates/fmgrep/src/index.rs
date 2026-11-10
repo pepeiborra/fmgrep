@@ -59,7 +59,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         }
         let build_time_us = start.elapsed().as_micros() as u64;
         if let Some(root) = docs.root.as_deref().filter(|_| !req.store_docs) {
-            Journal::write_new(output, root, marks, &docs.walk)?;
+            Journal::write_new(output, root, marks)?;
         }
         let manifest = Manifest {
             format: MANIFEST_FORMAT,

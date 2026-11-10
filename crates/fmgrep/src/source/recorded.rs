@@ -1,10 +1,11 @@
 //! `dirs.stamps`: every directory the index walk listed, with its stamp, so
-//! discovery at load lists only what changed.
+//! discovery at load lists only what changed; `ignores.stamps`: every ignore
+//! input, so a load re-walks what an ignore file's change affects.
 //!
-//! An 8-byte magic (`fmdirs\0\x01`), then records to EOF, strictly ascending
-//! by path, the root `""` first: `u64 LE len | i64 LE mtime_ns | u32 LE n |
-//! n bytes of UTF-8 corpus-relative path`. A stamp no stat can vouch for is
-//! written [`UNKNOWN`].
+//! An 8-byte magic (`fmdirs\0\x01`, `fmigns\0\x01`), then records to EOF,
+//! strictly ascending by path: `u64 LE len | i64 LE mtime_ns | u32 LE n | n
+//! bytes of UTF-8 path`. `dirs.stamps` starts with the root `""`. A stamp no
+//! stat can vouch for is written [`UNKNOWN`], an absent file [`ABSENT`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,8 +16,10 @@ use crate::walk::WalkNotes;
 use super::parallel;
 
 const DIRS_STAMPS: &str = "dirs.stamps";
+const IGNORES_STAMPS: &str = "ignores.stamps";
 
 const DIRS_MAGIC: &[u8; 8] = b"fmdirs\0\x01";
+const IGNORES_MAGIC: &[u8; 8] = b"fmigns\0\x01";
 /// Bytes of a record's stamp.
 const STAMP: usize = 16;
 
@@ -25,11 +28,16 @@ const UNKNOWN: Stamp = Stamp {
     len: u64::MAX,
     mtime_ns: i64::MIN,
 };
+/// Equals a failed stat.
+const ABSENT: Stamp = Stamp {
+    len: u64::MAX,
+    mtime_ns: i64::MAX,
+};
 /// A stamp this close to the index start may hide a change in the same
 /// timestamp tick.
 const RACY: Duration = Duration::from_secs(2);
 
-/// Write `dirs.stamps` of `walk`, which began at `started`.
+/// Write `dirs.stamps` and `ignores.stamps` of `walk`, which began at `started`.
 pub fn write_walk(output: &Path, walk: &WalkNotes, started: SystemTime) -> Result<(), String> {
     let since = started
         .checked_sub(RACY)
@@ -40,15 +48,21 @@ pub fn write_walk(output: &Path, walk: &WalkNotes, started: SystemTime) -> Resul
     });
     let vouched = |s: Option<Stamp>| s.filter(|s| s.mtime_ns < racy).unwrap_or(UNKNOWN);
     let dirs = walk.dirs.iter().map(|(rel, s)| (rel.as_str(), vouched(*s)));
-    write_table(&output.join(DIRS_STAMPS), dirs)
+    write_table(&output.join(DIRS_STAMPS), DIRS_MAGIC, dirs)?;
+    let ignores = walk
+        .ignores
+        .iter()
+        .map(|(rel, s)| (rel.as_str(), s.map_or(ABSENT, |s| vouched(Some(s)))));
+    write_table(&output.join(IGNORES_STAMPS), IGNORES_MAGIC, ignores)
 }
 
 /// Ascending `rows`; paths that collide (lossy names) are written once, [`UNKNOWN`].
 fn write_table<'a>(
     path: &Path,
+    magic: &[u8; 8],
     rows: impl Iterator<Item = (&'a str, Stamp)>,
 ) -> Result<(), String> {
-    let mut out = DIRS_MAGIC.to_vec();
+    let mut out = magic.to_vec();
     let mut rows = rows.peekable();
     while let Some((rel, mut stamp)) = rows.next() {
         while rows.next_if(|&(next, _)| next == rel).is_some() {
@@ -92,7 +106,7 @@ impl Table {
 }
 
 /// `None` when absent or of another layout.
-fn read_table(path: &Path) -> Result<Option<Table>, String> {
+fn read_table(path: &Path, magic: &[u8; 8]) -> Result<Option<Table>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -100,8 +114,8 @@ fn read_table(path: &Path) -> Result<Option<Table>, String> {
     };
     let tampered =
         |why: &str| format!("error: {} {why}; refusing a tampered index", path.display());
-    let Some(body) = bytes.strip_prefix(&DIRS_MAGIC[..]) else {
-        return if bytes.len() < DIRS_MAGIC.len() {
+    let Some(body) = bytes.strip_prefix(&magic[..]) else {
+        return if bytes.len() < magic.len() {
             Err(tampered("is truncated"))
         } else {
             Ok(None)
@@ -137,16 +151,18 @@ fn read_table(path: &Path) -> Result<Option<Table>, String> {
     Ok(Some(table))
 }
 
-/// `dirs.stamps`, as `index` wrote it.
+/// `dirs.stamps` and `ignores.stamps`, as `index` wrote them.
 pub struct Recorded {
     dirs: Table,
+    ignores: Table,
 }
 
 impl Recorded {
-    /// `None` when absent or of another layout; a malformed one is refused.
+    /// `None` when either is absent or of another layout; a malformed one is
+    /// refused.
     pub fn open(index_dir: &Path) -> Result<Option<Self>, String> {
         let path = index_dir.join(DIRS_STAMPS);
-        let Some(dirs) = read_table(&path)? else {
+        let Some(dirs) = read_table(&path, DIRS_MAGIC)? else {
             return Ok(None);
         };
         if dirs.rows.is_empty() || !dirs.path(0).is_empty() {
@@ -155,7 +171,8 @@ impl Recorded {
                 path.display()
             ));
         }
-        Ok(Some(Self { dirs }))
+        let ignores = read_table(&index_dir.join(IGNORES_STAMPS), IGNORES_MAGIC)?;
+        Ok(ignores.map(|ignores| Self { dirs, ignores }))
     }
 
     pub fn is_dir(&self, rel: &str) -> bool {
@@ -193,6 +210,77 @@ impl Recorded {
         }
         changed
     }
+
+    /// The root-relative dirs to walk again since `index` because an ignore
+    /// input moved, or one appeared in one of the `changed` dirs; outermost
+    /// only, ascending.
+    pub fn ignore_scopes(&self, root: &Path, changed: &[PathBuf]) -> Vec<String> {
+        let rows: Vec<usize> = (0..self.ignores.rows.len()).collect();
+        let moved = parallel(&rows, |&i| {
+            let rel = self.ignores.path(i);
+            let now = crate::walk::stamp(&resolve(root, rel)).unwrap_or(ABSENT);
+            now != self.ignores.rows[i].1
+        });
+        let mut scopes: Vec<String> = rows
+            .into_iter()
+            .filter(|&i| moved[i])
+            .map(|i| {
+                let rel = self.ignores.path(i);
+                match crate::walk::ignore_file_dir(rel) {
+                    Some(dir) if !rel.starts_with("../") && !Path::new(rel).is_absolute() => {
+                        dir.to_owned()
+                    }
+                    _ => String::new(),
+                }
+            })
+            .collect();
+        for dir in changed {
+            let Some(rel) = dir.strip_prefix(root).ok().and_then(Path::to_str) else {
+                continue;
+            };
+            let new = crate::walk::ignore_files(dir).any(|(name, s)| {
+                s.is_some()
+                    && self
+                        .ignores
+                        .find(&crate::walk::join_rel(rel, name))
+                        .is_none()
+            });
+            if new {
+                scopes.push(rel.to_owned());
+            }
+        }
+        outermost(scopes)
+    }
+}
+
+/// `rel` of an ignores row against `root`: `../` climbs, an absolute path is itself.
+fn resolve(root: &Path, rel: &str) -> PathBuf {
+    let mut base = root;
+    let mut rest = rel;
+    while let Some(up) = rest.strip_prefix("../") {
+        base = base.parent().unwrap_or(base);
+        rest = up;
+    }
+    base.join(rest)
+}
+
+/// Ascending, deduped, without any dir under another.
+pub fn outermost(mut dirs: Vec<String>) -> Vec<String> {
+    dirs.sort_unstable();
+    dirs.dedup();
+    let mut kept: Vec<String> = Vec::new();
+    for dir in dirs {
+        let nested = kept.iter().any(|top| {
+            top.is_empty()
+                || dir
+                    .strip_prefix(top.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        });
+        if !nested {
+            kept.push(dir);
+        }
+    }
+    kept
 }
 
 #[cfg(test)]

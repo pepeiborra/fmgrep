@@ -112,6 +112,7 @@ fn files_index_writes_blobs_stamps_walk_and_manifest_only() {
             BLOBS_SHARD,
             "dirs.stamps",
             crate::source::DOCS_STAMPS,
+            "ignores.stamps",
             "manifest.json"
         ]
     );

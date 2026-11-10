@@ -32,7 +32,11 @@ fn walk_record_round_trips_and_racy_or_unstatted_dirs_never_match() {
             ("d".into(), Some(at(3000))),
             ("e".into(), Some(at(20_000))),
         ],
-        ..Default::default()
+        ignores: vec![
+            ("../.gitignore".into(), None),
+            (".gitignore".into(), Some(at(1000))),
+            ("a/.ignore".into(), Some(at(20_000))),
+        ],
     };
     write_walk(tmp.path(), &walk, UNIX_EPOCH + Duration::from_secs(10_000)).unwrap();
     let recorded = Recorded::open(tmp.path()).unwrap().expect("written");
@@ -45,6 +49,12 @@ fn walk_record_round_trips_and_racy_or_unstatted_dirs_never_match() {
         ("e", UNKNOWN),
     ];
     assert_eq!(rows(&recorded.dirs), owned(&dirs));
+    let ignores = [
+        ("../.gitignore", ABSENT),
+        (".gitignore", at(1000)),
+        ("a/.ignore", UNKNOWN),
+    ];
+    assert_eq!(rows(&recorded.ignores), owned(&ignores));
     assert!(recorded.is_dir("a/b") && recorded.is_dir("") && !recorded.is_dir("a/x.bin"));
 }
 
@@ -84,6 +94,30 @@ fn malformed_record_is_refused_and_absent_or_foreign_one_walks_the_root() {
         );
     }
     std::fs::write(dir.join(DIRS_STAMPS), &good).unwrap();
+    assert!(Recorded::open(dir).unwrap().is_none(), "no ignores.stamps");
+    let ignores = [&IGNORES_MAGIC[..], &record(ABSENT, b".gitignore")].concat();
+    for (why, bytes) in [
+        ("truncated", ignores[..ignores.len() - 1].to_vec()),
+        (
+            "not ascending",
+            [&ignores[..], &record(ABSENT, b"..")].concat(),
+        ),
+    ] {
+        std::fs::write(dir.join(IGNORES_STAMPS), bytes).unwrap();
+        let err = Recorded::open(dir).err().unwrap_or_else(|| panic!("{why}"));
+        assert!(
+            err.contains(IGNORES_STAMPS) && err.contains("tampered"),
+            "{why}: {err}"
+        );
+    }
+    let mut foreign = ignores.clone();
+    foreign[7] = 2;
+    std::fs::write(dir.join(IGNORES_STAMPS), foreign).unwrap();
+    assert!(
+        Recorded::open(dir).unwrap().is_none(),
+        "another ignores.stamps"
+    );
+    std::fs::write(dir.join(IGNORES_STAMPS), &ignores).unwrap();
     assert!(Recorded::open(dir).unwrap().is_some());
     let mut foreign = good.clone();
     foreign[7] = 2;
@@ -91,4 +125,55 @@ fn malformed_record_is_refused_and_absent_or_foreign_one_walks_the_root() {
     assert!(Recorded::open(dir).unwrap().is_none(), "another version");
     std::fs::remove_file(dir.join(DIRS_STAMPS)).unwrap();
     assert!(Recorded::open(dir).unwrap().is_none(), "no dirs.stamps");
+}
+
+/// `<tmp>/outer/root` holding `files`, backdated, recorded as `index` records it.
+#[cfg(unix)]
+fn recorded_tree(tmp: &Path, files: &[&str]) -> (PathBuf, Recorded) {
+    let root = tmp.join("outer/root");
+    for rel in files {
+        std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(root.join(rel), b"x\n").unwrap();
+    }
+    crate::tests::support::backdate(&tmp.join("outer"));
+    let walk = crate::for_each_index_doc(&root, None, |_, _, _, _| Ok(())).unwrap();
+    write_walk(tmp, &walk, std::time::SystemTime::now()).unwrap();
+    (root, Recorded::open(tmp).unwrap().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn ignore_scopes_name_the_dir_of_a_moved_row_and_the_root_above_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files = [
+        "a.c",
+        ".gitignore",
+        "sub/.ignore",
+        "a/b/.rgignore",
+        "a/b/c.c",
+    ];
+    let (root, recorded) = recorded_tree(tmp.path(), &files);
+    assert!(recorded.ignore_scopes(&root, &[]).is_empty());
+    std::fs::write(root.join("sub/.ignore"), b"x\ny\n").unwrap();
+    assert_eq!(recorded.ignore_scopes(&root, &[]), ["sub"]);
+    std::fs::remove_file(root.join("a/b/.rgignore")).unwrap();
+    assert_eq!(recorded.ignore_scopes(&root, &[]), ["a/b", "sub"]);
+    std::fs::write(root.join("../.ignore"), b"*.c\n").unwrap();
+    assert_eq!(recorded.ignore_scopes(&root, &[]), [""]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_ignore_file_in_a_changed_dir_is_a_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, recorded) = recorded_tree(tmp.path(), &["a.c", "c/d.c", "e/f.c"]);
+    std::fs::write(root.join("c/.gitignore"), b"d.c\n").unwrap();
+    std::fs::write(root.join("e/g.c"), b"x\n").unwrap();
+    let changed = recorded.changes(&root, &|_| false);
+    assert_eq!(changed, [root.join("c"), root.join("e")]);
+    assert_eq!(recorded.ignore_scopes(&root, &changed), ["c"]);
+    assert!(
+        recorded.ignore_scopes(&root, &[]).is_empty(),
+        "only a changed dir is checked"
+    );
 }

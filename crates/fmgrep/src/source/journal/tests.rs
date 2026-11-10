@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use super::*;
-use crate::Stamp;
 
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap()
@@ -21,30 +20,20 @@ fn dirs(tmp: &Path) -> (PathBuf, PathBuf) {
 fn journal_round_trips_and_malformed_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let (root, index) = dirs(tmp.path());
-    let stamp = Stamp {
-        len: 1,
-        mtime_ns: 1,
-    };
-    let walk = WalkNotes {
-        links: vec!["l.c".into()],
-        dirs: vec![(String::new(), Some(stamp)), ("d".into(), None)],
-    };
     let root_str = root.to_str().unwrap();
-    Journal::write_new(&index, root_str, Vec::new(), &walk).unwrap();
+    Journal::write_new(&index, root_str, Vec::new()).unwrap();
     assert_eq!(Journal::open(&index, Knob::On).unwrap(), None, "no marks");
     let tokens = vec![Token {
         kind: "elsewhere".into(),
         token: json!(1),
     }];
-    Journal::write_new(&index, root_str, tokens.clone(), &walk).unwrap();
+    Journal::write_new(&index, root_str, tokens.clone()).unwrap();
     assert_eq!(Journal::open(&index, Knob::Off).unwrap(), None, "off");
     let journal = Journal::open(&index, Knob::On).unwrap().expect("written");
     let want = Journal {
         v: 1,
         root: root_str.into(),
         tokens,
-        recheck: vec!["l.c".into()],
-        relist: vec!["d".into()],
         named: Vec::new(),
         knob: Knob::On,
     };
@@ -188,8 +177,6 @@ mod watchman_tests {
                 v: VERSION,
                 root: "/w/sub".into(),
                 tokens: tokens.clone(),
-                recheck: Vec::new(),
-                relist: Vec::new(),
                 named: Vec::new(),
                 knob,
             };

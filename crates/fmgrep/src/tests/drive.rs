@@ -638,6 +638,39 @@ fn pruned_added_tree_answers_like_a_fresh_index() {
 }
 
 #[test]
+fn search_follows_ignore_files_and_their_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("corpus/ig")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("corpus/sub")).unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[
+            (".ignore", b"*.gen\nig/\n"),
+            ("a.c", b"printk\n"),
+            ("b.c", b"printk soon ignored\n"),
+            ("s.gen", b"printk generated\n"),
+            ("ig/x.c", b"printk in an ignored dir\n"),
+            ("sub/.ignore", b"y.c\n"),
+            ("sub/y.c", b"printk\n"),
+            ("sub/z.c", b"printk\n"),
+        ],
+    );
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, false);
+    assert_eq!(
+        printed(&output, &["-l"], &["printk"]),
+        "a.c\nb.c\nsub/z.c\n"
+    );
+    std::fs::write(folder.join(".ignore"), b"b.c\nig/\n").unwrap();
+    std::fs::write(folder.join("sub/.ignore"), b"z.c\n").unwrap();
+    let want = "a.c\ns.gen\nsub/y.c\n";
+    assert_eq!(printed(&output, &["-l"], &["printk"]), want);
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    answers_like(&output, &fresh, &["printk", "generated"], &["printk"]);
+}
+
+#[test]
 fn walk_record_missing_falls_back_and_malformed_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let (folder, output) = files_index(tmp.path());
@@ -756,8 +789,11 @@ fn journal_answers_like_the_sweep() {
         std::fs::write(folder.join(rel), bytes).unwrap();
     };
     for (rel, bytes) in [
-        ("a.c", &b"printk one\n"[..]),
+        (".ignore", &b"ig.c\n"[..]),
+        ("a.c", b"printk one\n"),
+        ("a2.c", b"printk soon ignored\n"),
         ("d.c", b"printk gone\n"),
+        ("ig.c", b"printk soon searched\n"),
         ("kb/k.dat", b"printk\0binary"),
         ("mw/m.c", b"printk moved\n"),
         ("r.c", b"printk renamed\n"),
@@ -767,12 +803,9 @@ fn journal_answers_like_the_sweep() {
     }
     std::fs::create_dir_all(outside.join("t/deep")).unwrap();
     std::fs::write(outside.join("t/deep/x.c"), b"deep printk\n").unwrap();
-    std::fs::write(outside.join("target.c"), b"printk linked\n").unwrap();
-    std::os::unix::fs::symlink(outside.join("target.c"), folder.join("link.c")).unwrap();
-    std::os::unix::fs::symlink(outside.join("later.c"), folder.join("kb/dangling.c")).unwrap();
     let stale = tmp.path().join("idx");
     index_it(&folder, &stale, false);
-    assert_eq!(journal_json(&stale)["relist"], serde_json::json!(["kb"]));
+    put(".ignore", b"a2.c\n");
     put("a.c", b"printk one\nprintk printk\n");
     put("b.c", b"printk added\naa\n");
     put("new/deep/n.c", b"deep printk\n");
@@ -782,11 +815,8 @@ fn journal_answers_like_the_sweep() {
     std::fs::rename(folder.join("mw"), folder.join("mv2")).unwrap();
     std::fs::rename(folder.join("r.c"), folder.join("r2.c")).unwrap();
     std::fs::remove_file(folder.join("d.c")).unwrap();
-    std::fs::write(outside.join("target.c"), b"printk linked, edited printk\n").unwrap();
-    std::fs::write(outside.join("later.c"), b"printk resolved\n").unwrap();
     assert!(replays(&stale));
-    let want =
-        "a.c\nb.c\nkb/dangling.c\nkb/k.dat\nlink.c\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
+    let want = "a.c\nb.c\nig.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
     let got = printed(&stale, &["-l"], &["printk"]);
     assert_eq!(got, want, "kb/k.dat, named, is found");
     put("kb/k.dat", b"printk\0binary");
@@ -866,9 +896,7 @@ fn checkpoint_advances_the_token_and_keeps_changed_paths() {
     let after = journal_json(&output);
     assert_ne!(clock(&after), clock(&before), "{after}");
     assert_eq!(after["named"], serde_json::json!(["a.c", "n.c"]));
-    let kept =
-        |j: &serde_json::Value| (j["recheck"].clone(), j["relist"].clone(), j["root"].clone());
-    assert_eq!(kept(&after), kept(&before));
+    assert_eq!(after["root"], before["root"]);
     std::fs::remove_file(folder.join("n.c")).unwrap();
     assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:1\n");
     assert_eq!(journal_json(&output)["named"], serde_json::json!(["a.c"]));
