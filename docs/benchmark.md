@@ -44,6 +44,7 @@ instance in your AWS account and copies the results back:
 scripts/ec2-bench.sh --dry-run     # print every command, run none
 scripts/ec2-bench.sh               # linux on an i4i.4xlarge spot instance
 CORPORA="linux chromium" scripts/ec2-bench.sh
+CORPORA=aosp scripts/ec2-bench.sh  # syncs AOSP on the instance first
 scripts/ec2-bench.sh down          # delete what an interrupted run left
 ```
 
@@ -52,19 +53,20 @@ that admits SSH from your address only, and launches one instance that shuts
 down, and so terminates, after `TTL` hours whatever happens. It copies the
 committed `HEAD` there, formats the instance's NVMe storage, installs Rust,
 ripgrep, tgrep and elgrep at the versions in
-[BENCHMARKS.md](../BENCHMARKS.md), runs `scripts/bench.sh` with every row
-for each corpus and copies `results-<corpus>.md`,
-`trace-<corpus>.jsonl` and `box.txt` (the commit and the machine) to
-`target/ec2-bench/<run>/`. On any exit it terminates the instance and
-deletes the key pair and security group, found by their `Run` tag, and exits
-with the first failing `scripts/bench.sh` status. The run is one SSH
-session: if it drops, the instance still terminates after `TTL` hours, and
-`down` deletes the rest.
+[BENCHMARKS.md](../BENCHMARKS.md), for `aosp` syncs the tree as under
+[AOSP](#aosp) with the repo launcher at v2.72 (about 11 GB to download),
+runs `scripts/bench.sh` with every row for each corpus and copies
+`results-<corpus>.md`, `trace-<corpus>.jsonl` and `box.txt` (the commit and
+the machine) to `target/ec2-bench/<run>/`. On any exit it terminates the
+instance and deletes the key pair and security group, found by their `Run`
+tag, and exits with the first failing `scripts/bench.sh` status. The run is
+one SSH session: if it drops, the instance still terminates after `TTL`
+hours, and `down` deletes the rest.
 
 | Variable | Default | |
 |---|---|---|
-| `INSTANCE_TYPE` | `i4i.4xlarge` | must have NVMe instance storage; a Graviton type gets the arm64 image |
-| `CORPORA` | `linux` | any of `linux chromium ghc` |
+| `INSTANCE_TYPE` | `i4i.4xlarge` | must have NVMe instance storage, about 100 GB of it and the default's 128 GB of memory for `aosp` (the elgrep index build peaks near 60 GB); a Graviton type gets the arm64 image |
+| `CORPORA` | `linux` | any of `linux chromium ghc aosp` |
 | `TTL` | `3` | hours until the instance terminates itself |
 | `SPOT` | `1` | `0` launches on demand, when spot capacity is short |
 
@@ -86,6 +88,7 @@ instance-hours, tool builds and the sync included: about
 $1 or less at on-demand prices, less on spot. `down` deletes every instance,
 security group and key pair tagged `Project=fmgrep-bench` in the region,
 another run's included.
+
 ## AOSP
 
 The `aosp` corpus is the Android Open Source Project's platform source at
@@ -99,7 +102,7 @@ does not clone it; sync it once, then pass the tree with `--repo-path` or
 ```sh
 EXCLUDE='(^|/)prebuilts?(/|$)|[-_]prebuilts?$|Prebuilt$|-kernel$|^external/chromium-webview$|^device/google/cuttlefish_vmm$'
 mkdir ~/aosp && cd ~/aosp
-repo init --depth=1 --no-clone-bundle -b android-17.0.0_r1 \
+repo init --depth=1 --no-partial-clone --no-clone-bundle --repo-rev=v2.72 -b android-17.0.0_r1 \
     -u https://android.googlesource.com/platform/manifest.git
 repo list -a -p | grep -Ev "$EXCLUDE" | xargs repo sync -c --no-tags -j8
 ```
