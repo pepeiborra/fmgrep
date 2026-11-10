@@ -30,7 +30,7 @@ for a in "$@"; do
 done
 [[ $TTL =~ ^[1-9][0-9]*$ ]] || die "TTL takes whole hours"
 for c in $CORPORA; do
-    case $c in linux | chromium | ghc) ;; *) die "CORPORA: $c is not linux, chromium or ghc" ;; esac
+    case $c in linux | chromium | ghc | aosp) ;; *) die "CORPORA: $c is not linux, chromium, ghc or aosp" ;; esac
 done
 
 show() {
@@ -135,6 +135,17 @@ set -euxo pipefail
     tar xzf ~/src.tar.gz -C $W/fmgrep
     sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 update
     sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 install build-essential pkg-config
+    if [[ " $* " == *" aosp "* ]]; then
+        git -c advice.detachedHead=false clone -q --depth 1 --branch v2.72 https://gerrit.googlesource.com/git-repo $W/git-repo
+        [[ $(git -C $W/git-repo rev-parse HEAD) == 365629015667e04739f59070e745548a728549c8 ]]
+        export PATH=$W/git-repo:$PATH FMGREP_CORPUS_AOSP=$W/aosp
+        ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
+        EXCLUDE='(^|/)prebuilts?(/|$)|[-_]prebuilts?$|Prebuilt$|-kernel$|^external/chromium-webview$|^device/google/cuttlefish_vmm$'
+        mkdir $W/aosp && cd $W/aosp
+        repo init --depth=1 --no-partial-clone --no-clone-bundle --repo-rev=v2.72 -b android-17.0.0_r1 \
+            -u https://android.googlesource.com/platform/manifest.git
+        repo list -a -p | grep -Ev "$EXCLUDE" | xargs repo sync -c --no-tags --no-clone-bundle --retry-fetches=3 -j8
+    fi
     curl -fsS https://sh.rustup.rs | sh -s -- -y -q --no-modify-path --profile minimal
     cargo install -q --locked ripgrep --version 15.2.0
     cargo install -q --locked elgrep --version 1.0.0
