@@ -1,5 +1,5 @@
-//! A filtered literal answered by reading the files the filter keeps
-//! instead of locating its occurrences.
+//! A filtered literal, plain or case-folded, answered by reading the files
+//! the filter keeps instead of locating its occurrences.
 
 use std::fmt::Write;
 use std::ops::{Range, RangeInclusive};
@@ -41,26 +41,32 @@ struct Spread {
     fetched: bool,
 }
 
-/// Per literal, the answer that reads the ids `kept` yields, when that costs
+/// A term that may be read instead: its count probe, its text, and whether
+/// its located files are read too.
+pub struct Readable<'a> {
+    pub count: Query<'a>,
+    pub text: &'a [u8],
+    pub fetched: bool,
+}
+
+/// Per term, the answer that reads the ids `kept` yields, when that costs
 /// less than locating it in the shards overlapping `cover`; None to locate.
-/// `fetched` says whether a located literal's files are read too.
 pub fn read_instead(
     index: &DocfmIndex,
-    literals: &[Option<&[u8]>],
+    terms: &[Option<Readable<'_>>],
     cover: &[Range<usize>],
     kept: impl Iterator<Item = usize>,
     doc_lens: &[u64],
     costs: Costs,
-    fetched: impl Fn(&[u8]) -> bool,
 ) -> Vec<Option<Answer>> {
-    let none = || literals.iter().map(|_| None).collect();
-    let counts: Vec<Query<'_>> = literals.iter().flatten().map(|t| Query::Count(t)).collect();
+    let none = || terms.iter().map(|_| None).collect();
+    let counts: Vec<Query<'_>> = terms.iter().flatten().map(|t| t.count).collect();
     if counts.is_empty() {
         return none();
     }
     let counted = index.probe_all(&counts, Some(cover));
-    let spreads: Vec<Spread> = (counted.iter().zip(literals.iter().flatten()))
-        .map(|(a, l)| {
+    let spreads: Vec<Spread> = (counted.iter().zip(terms.iter().flatten()))
+        .map(|(a, t)| {
             let bytes: u64 = a
                 .counts
                 .iter()
@@ -70,7 +76,7 @@ pub fn read_instead(
             Spread {
                 busiest: a.counts.iter().map(|c| c.1).max().unwrap_or(0),
                 per_byte: total as f64 / bytes.max(1) as f64,
-                fetched: fetched(l),
+                fetched: t.fetched,
             }
         })
         .collect();
@@ -99,13 +105,13 @@ pub fn read_instead(
         }
     }
     if plans() {
-        eprint!("{}", note(literals, &spreads, ids.len(), bytes, costs));
+        eprint!("{}", note(terms, &spreads, ids.len(), bytes, costs));
     }
     let mut counted = counted.into_iter().zip(spreads);
-    literals
+    terms
         .iter()
-        .map(|l| {
-            l.as_ref()?;
+        .map(|t| {
+            t.as_ref()?;
             let (a, spread) = counted.next()?;
             reads(spread, ids.len(), bytes, costs).then(|| Answer {
                 exact: Vec::new(),
@@ -135,16 +141,16 @@ fn estimates(spread: Spread, files: usize, bytes: u64, costs: Costs) -> (f64, f6
     (read, locate)
 }
 
-/// The verbose plan: per literal, both costs and which one won.
+/// The verbose plan: per term, both costs and which one won.
 fn note(
-    literals: &[Option<&[u8]>],
+    terms: &[Option<Readable<'_>>],
     spreads: &[Spread],
     files: usize,
     bytes: u64,
     costs: Costs,
 ) -> String {
-    let terms: Vec<(usize, String)> = (literals.iter().enumerate())
-        .filter_map(|(k, l)| l.map(|l| (k, String::from_utf8_lossy(l).into_owned())))
+    let terms: Vec<(usize, String)> = (terms.iter().enumerate())
+        .filter_map(|(k, t)| Some((k, String::from_utf8_lossy(t.as_ref()?.text).into_owned())))
         .collect();
     let width = terms.iter().map(|t| t.1.chars().count()).max().unwrap_or(0);
     let mut out = String::from("plan:\n");

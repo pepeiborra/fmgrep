@@ -263,6 +263,11 @@ fn spelled(term: &str, regex: bool, ignore_case: bool) -> Option<Cow<'_, str>> {
     }
 }
 
+/// Whether `term` is a bare term `-i` turned into a pattern.
+fn folded(term: &Term<'_>, req: &QueryRequest<'_>) -> bool {
+    req.mode.ignore_case && !req.regex && regex_pattern(&term.name).is_none()
+}
+
 /// An invalid pattern is fatal, never a silent 0.
 fn prepare(pattern: Option<&str>, mode: MatchMode) -> Result<Option<PreparedPattern>, String> {
     pattern
@@ -352,11 +357,24 @@ fn answer_terms(
     };
     let reads = match (&req.filter, cover.as_deref()) {
         (Some(f), Some(c)) => {
-            let literals: Vec<Option<&[u8]>> = probes
+            let readable: Vec<Option<read::Readable<'_>>> = probes
                 .iter()
                 .zip(terms)
                 .map(|(q, t)| match *q {
-                    Query::Literal(l) if t.pattern.is_none() && boolean::demotable(l) => Some(l),
+                    Query::Literal(l) if t.pattern.is_none() && boolean::demotable(l) => {
+                        Some(read::Readable {
+                            count: Query::Count(l),
+                            text: l,
+                            fetched: reads_exact(req.output, l),
+                        })
+                    }
+                    Query::Regex(p) if folded(t, req) && boolean::demotable(t.literal) => {
+                        p.fold().map(|plan| read::Readable {
+                            count: Query::CountFold(plan),
+                            text: t.literal,
+                            fetched: true,
+                        })
+                    }
                     _ => None,
                 })
                 .collect();
@@ -373,16 +391,7 @@ fn answer_terms(
                 file_us,
                 locate_us: loaded.locate_us,
             };
-            let fetched = |l: &[u8]| reads_exact(req.output, l);
-            let reads = read::read_instead(
-                index,
-                &literals,
-                c,
-                kept,
-                &manifest.doc_lens,
-                costs,
-                fetched,
-            );
+            let reads = read::read_instead(index, &readable, c, kept, &manifest.doc_lens, costs);
             failed.map_or(Ok(reads), Err)?
         }
         _ => probes.iter().map(|_| None).collect(),
