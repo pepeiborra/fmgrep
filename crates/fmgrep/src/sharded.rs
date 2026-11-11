@@ -15,6 +15,7 @@ use crate::{Document, UNIFIED_SEPARATOR};
 
 use crate::blobs::{Blob, BlobSink, BlobSlots, labels_of, map_slots};
 use crate::docs::{Cut, Cuts};
+use crate::fold::fold_count;
 use crate::pattern::PreparedPattern;
 use crate::plan::{plan_from_labels, shard_label, shard_text_bytes};
 use crate::probe::{Answer, Query};
@@ -230,6 +231,20 @@ impl DocfmIndex {
             .collect()
     }
 
+    /// Each shard's nonzero `count`, for the shards overlapping `within`.
+    /// Sequential: a count is cheap next to a locate.
+    fn shard_counts(
+        &self,
+        within: Option<&[Range<usize>]>,
+        count: impl Fn(&Structure, &ShardMeta) -> u64,
+    ) -> Vec<(Range<usize>, u64)> {
+        let kept = |(_, m): &(&Structure, &ShardMeta)| within.is_none_or(|w| m.overlaps(w));
+        (self.shards.iter().zip(&self.metas).filter(kept))
+            .map(|(s, meta)| (meta.docs.clone(), count(s, meta)))
+            .filter(|&(_, n)| n > 0)
+            .collect()
+    }
+
     /// Literal term: ascending `(doc, count)`, zero counts omitted. Complete:
     /// the FM-index answers every document, no fetch. An empty term or one
     /// holding the separator counts 0 everywhere. Counts are document-wide
@@ -277,16 +292,13 @@ impl DocfmIndex {
                         (exact, Some(Vec::new()))
                     }
                     Query::Count(term) => {
-                        // Sequential: a count-only shard is one backward search.
-                        let kept = |(_, m): &(&Structure, &ShardMeta)| {
-                            within.is_none_or(|w| m.overlaps(w))
-                        };
-                        for (s, meta) in self.shards.iter().zip(&self.metas).filter(kept) {
-                            match literal_term(term).map_or(0, |term| meta.count(s, term)) {
-                                0 => {}
-                                n => counts.push((meta.docs.clone(), n)),
-                            }
-                        }
+                        counts = self.shard_counts(within, |s, meta| {
+                            literal_term(term).map_or(0, |term| meta.count(s, term))
+                        });
+                        (Vec::new(), Some(Vec::new()))
+                    }
+                    Query::CountFold(plan) => {
+                        counts = self.shard_counts(within, |s, _| fold_count(s.cursor(), plan));
                         (Vec::new(), Some(Vec::new()))
                     }
                     Query::Regex(pattern) => (Vec::new(), self.regex_candidates(pattern, within)),

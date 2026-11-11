@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use crate::fold::FoldPlan;
 use crate::pattern::PreparedPattern;
 
 /// [`Answer::candidates`] with `None` expanded against the corpus size.
@@ -15,6 +16,9 @@ pub enum Query<'a> {
     Literal(&'a [u8]),
     /// A literal's per-shard counts, no locate: [`Answer::counts`].
     Count(&'a [u8]),
+    /// [`Query::Count`] of a case-folded literal: every variant, an upper
+    /// bound where its walk gives up.
+    CountFold(&'a FoldPlan),
     /// [`Query::Literal`], exact on at least the docs of ascending disjoint
     /// `within`.
     LiteralWithin {
@@ -33,6 +37,6 @@ pub struct Answer {
     pub candidates: Option<Vec<usize>>,
     pub probe_us: u64,
     /// Ascending disjoint doc ranges with their nonzero counts; empty unless
-    /// [`Query::Count`].
+    /// a count query.
     pub counts: Vec<(Range<usize>, u64)>,
 }

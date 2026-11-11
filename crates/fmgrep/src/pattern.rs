@@ -226,6 +226,10 @@ impl PreparedPattern {
     pub fn count(&self, raw: &[u8]) -> u64 {
         self.re.find_iter(raw).count() as u64
     }
+
+    pub fn is_match(&self, raw: &[u8]) -> bool {
+        self.re.is_match(raw)
+    }
 }
 
 /// The literal `p` is, when its FM count per document equals
