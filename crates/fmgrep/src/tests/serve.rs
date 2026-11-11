@@ -521,6 +521,34 @@ fn serve_no_watch_finds_only_files_added_before_load() {
     server.join().unwrap().unwrap();
 }
 
+#[test]
+fn serve_refuses_a_watch_that_cannot_start_unless_no_watch() {
+    const CAUSE: &str = "/t/d: out of inotify watches (raise fs.inotify.max_user_watches)";
+    crate::tests::WATCH_FAILS.set(Some(CAUSE));
+    let status = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\"}\n";
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = staged(tmp.path(), store_docs);
+        for flags in [&[][..], &["--no-watch"]] {
+            let mut words = argv(&["serve", "--stdio", &index.display().to_string()]);
+            words.extend(argv(flags));
+            let mut out = Vec::new();
+            let got = dispatch_to(&words, &mut &status[..], &mut out, false);
+            let what = format!("store_docs={store_docs} {flags:?}");
+            if store_docs || !flags.is_empty() {
+                assert!(matches!(got, Ok(Outcome::Done)), "{what}");
+                assert_eq!(String::from_utf8(out).unwrap().lines().count(), 1, "{what}");
+                continue;
+            }
+            let e = got.err().unwrap();
+            assert!(e.starts_with("error: cannot watch "), "{e}");
+            assert!(e.contains(CAUSE) && e.contains("pass --no-watch"), "{e}");
+            assert!(out.is_empty(), "{what}: served nothing");
+        }
+    }
+    crate::tests::WATCH_FAILS.set(None);
+}
+
 const AND_EXPR: &str = r#"{"and":[{"term":"printk"},{"or":[{"regex":"a{3}"},{"term":"one"}]}]}"#;
 
 fn query_expr(index: &Path, flags: &[&str], expr: &str) -> OutputReport {

@@ -539,6 +539,10 @@ impl Files {
     pub fn watch(&self) -> Result<Watch, String> {
         let failed =
             |e: &dyn std::fmt::Display| format!("cannot watch {}: {e}", self.known.root.display());
+        #[cfg(test)]
+        if let Some(cause) = crate::tests::WATCH_FAILS.get() {
+            return Err(failed(&cause));
+        }
         let root = self.known.root.canonicalize().map_err(|e| failed(&e))?;
         let feed = watcher::Feed::new(&root).map_err(|e| failed(&e))?;
         Ok(Watch {
