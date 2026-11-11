@@ -31,4 +31,6 @@ thread_local! {
     pub static SHARD_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
     /// `FMGREP_JOURNAL` for indexes and loads on this thread, over the env.
     pub static JOURNAL: Cell<Option<&'static str>> = const { Cell::new(Some("off")) };
+    /// The cause a watch started on this thread fails with.
+    pub static WATCH_FAILS: Cell<Option<&'static str>> = const { Cell::new(None) };
 }

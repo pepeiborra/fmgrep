@@ -105,9 +105,12 @@ answer, a load stats every document against its `(size, mtime)` stamp:
   every load until the next `index`. `serve`'s watch does the same when it
   sees an ignore file change inside the tree.
 
-`serve` watches the tree, following new files and directories; with
-`--no-watch` it misses files added after it is ready. On a filesystem
-with 1-second mtimes, a same-size edit within that second goes unnoticed.
+`serve` watches the tree, following new files and directories, and exits
+2 when the watch cannot start (on Linux, out of inotify watches: raise
+`fs.inotify.max_user_watches`). With `--no-watch` it misses files added
+after it is ready, and sees a changed file only when a query reads it.
+On a filesystem with 1-second mtimes, a same-size edit within that second
+goes unnoticed.
 The directory check relies on the filesystem updating a directory's mtime
 when an entry is created, removed or renamed, as POSIX requires; on one
 that does not, delete `dirs.stamps` to make every load walk the tree.

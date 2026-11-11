@@ -102,7 +102,7 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout replays its journal, else stats every doc
 /// and discovers added files; under `watch` it watches the root from before
-/// both.
+/// both, and a watch that cannot start is an error.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
@@ -111,13 +111,13 @@ pub fn load(
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
     let docs = DocStore::open(index_dir, manifest, corpus_root)?;
-    let watch = match watch.then(|| docs.watch()).flatten() {
-        Some(Err(e)) => {
-            eprintln!("warning: {e}; a changed file is seen only when a query reads it");
-            None
-        }
-        w => w.and_then(Result::ok),
-    };
+    let watch = watch.then(|| docs.watch()).flatten().transpose();
+    let watch = watch.map_err(|e| {
+        format!(
+            "error: {e}; without a watch, answers would miss later changes \
+             (pass --no-watch to serve a tree that does not change)"
+        )
+    })?;
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
     let (files, docs_ref) = (&manifest.files, &docs);
     // Plain threads: fixed blocking passes that overlap the load.

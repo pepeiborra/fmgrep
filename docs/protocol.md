@@ -22,7 +22,9 @@ response line each, after any [frames](#streamed-output).
 - A load that fails (no index, an old format, a damaged index) exits 2
   before the readiness line, with the message a search would print.
 - `serve` watches the tree for changed and added files unless `--no-watch`
-  is given ([Staleness](index-format.md#staleness)).
+  is given ([Staleness](index-format.md#staleness)). A watch that cannot
+  start (on Linux, out of inotify watches) exits 2 before the readiness
+  line.
 - `serve` needs its documents: `docs.shard`, or the tree with
   `docs.stamps` and at most half the indexed files. Otherwise it exits 2
   before the readiness line.
