@@ -161,19 +161,28 @@ pub fn plan(
     within: Option<&[Range<usize>]>,
 ) -> Plan {
     let n = leaves.len();
-    let terms: Vec<Option<&[u8]>> = leaves
+    let terms: Vec<Option<Query<'_>>> = leaves
         .iter()
-        .map(|l| match &l.probe {
-            Probe::Literal(lit) => Some(lit.as_slice()),
-            Probe::Regex => l.prep.as_ref().and_then(crate::pattern::anchor),
-            Probe::Never => None,
+        .map(|l| match (&l.probe, &l.prep) {
+            (Probe::Literal(lit), _) => Some(Query::Count(lit)),
+            (Probe::Fold, Some(p)) => p.fold().map(Query::CountFold),
+            (Probe::Regex, Some(p)) => crate::pattern::anchor(p).map(Query::Count),
+            _ => None,
         })
         .collect();
     let demotable: Vec<bool> = leaves
         .iter()
-        .map(|l| matches!(&l.probe, Probe::Literal(lit) if demotable(lit)))
+        .map(|l| match &l.probe {
+            Probe::Literal(lit) => demotable(lit),
+            Probe::Fold => demotable(l.src.as_bytes()),
+            Probe::Never | Probe::Regex => false,
+        })
         .collect();
-    let literal: Vec<bool> = leaves
+    let exact: Vec<bool> = leaves
+        .iter()
+        .map(|l| matches!(l.probe, Probe::Literal(_) | Probe::Fold))
+        .collect();
+    let narrowed: Vec<bool> = leaves
         .iter()
         .map(|l| matches!(l.probe, Probe::Literal(_)))
         .collect();
@@ -183,7 +192,7 @@ pub fn plan(
     let queries: Vec<Query<'_>> = terms
         .iter()
         .zip(&counted)
-        .filter_map(|(t, &c)| t.filter(|_| c).map(Query::Count))
+        .filter_map(|(t, &c)| t.filter(|_| c))
         .collect();
     let mut counts = vec![Vec::new(); n];
     let mut probe_us = 0;
@@ -196,7 +205,7 @@ pub fn plan(
             counts[i] = a.counts;
         }
     }
-    let mut plan = arrange(&groups, counts, &counted, &demotable, &literal);
+    let mut plan = arrange(&groups, counts, &counted, &demotable, &exact, &narrowed);
     plan.probe_us = probe_us;
     plan
 }
@@ -206,14 +215,17 @@ fn ranges(counts: &[(Range<usize>, u64)]) -> Vec<Range<usize>> {
 }
 
 /// The plan from the `counted` leaves' `counts`. Per AND the first smallest
-/// is located; a regex smallest or an AND under an OR demotes now by
-/// [`FALLBACK_RATIO`], otherwise every other demotable leaf is a candidate.
+/// is located; a smallest that is not `exact` (its located answer lists a
+/// superset) or an AND under an OR demotes now by [`FALLBACK_RATIO`],
+/// otherwise every other demotable leaf is a candidate. Only `narrowed`
+/// leaves are probed within the AND's span.
 pub fn arrange(
     groups: &[AndGroup],
     counts: Vec<Vec<(Range<usize>, u64)>>,
     counted: &[bool],
     demotable: &[bool],
-    literal: &[bool],
+    exact: &[bool],
+    narrowed: &[bool],
 ) -> Plan {
     let n = counted.len();
     let mut plan = Plan {
@@ -239,7 +251,7 @@ pub fn arrange(
         let Some((m, min)) = totals.clone().min_by_key(|&(_, t)| t) else {
             continue;
         };
-        let ratio = (!literal[m] || *under_or).then_some(FALLBACK_RATIO);
+        let ratio = (!exact[m] || *under_or).then_some(FALLBACK_RATIO);
         plan.why[m] = Why::Reference;
         let mut candidates = Vec::new();
         for (i, t) in totals.filter(|&(i, _)| i != m && demotable[i]) {
@@ -266,10 +278,10 @@ pub fn arrange(
         else {
             continue;
         };
-        for &i in g.iter().filter(|&&i| literal[i]) {
+        for &i in g {
             if plan.demoted[i] {
                 plan.unsettled[i] = ranges(&counts[i]);
-            } else {
+            } else if narrowed[i] {
                 plan.unsettled[i] = difference(&ranges(&counts[i]), &within);
                 plan.within[i] = Some(within.clone());
             }
@@ -301,11 +313,9 @@ pub fn decide(
     let mut sampled = None;
     for g in std::mem::take(&mut plan.groups) {
         let a = stage1[g.reference].expect("a reference is probed before its candidates");
-        let docs: Vec<usize> = a
-            .exact
-            .iter()
-            .filter(|&&(d, c)| c > 0 && contains(&g.within, d))
-            .map(|&(d, _)| d)
+        let located = a.exact.iter().filter(|e| e.1 > 0).map(|e| e.0);
+        let docs: Vec<usize> = (located.chain(a.candidates.iter().flatten().copied()))
+            .filter(|&d| contains(&g.within, d))
             .collect();
         let occ_m = occurrences(&plan.counts[g.reference], &g.within);
         for &i in &g.candidates {

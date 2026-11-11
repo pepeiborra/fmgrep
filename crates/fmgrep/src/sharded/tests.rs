@@ -843,7 +843,9 @@ fn probe_all_matches_per_query_probes() {
                     Vec::new(),
                     candidate_docs(index.regex_candidates(p, None), docs.len()),
                 ),
-                Query::Count(_) | Query::LiteralWithin { .. } => unreachable!("not queried"),
+                Query::Count(_) | Query::CountFold(_) | Query::LiteralWithin { .. } => {
+                    unreachable!("not queried")
+                }
             })
             .collect();
         assert_eq!(answers_of(&index, &qs), want);

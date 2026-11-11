@@ -109,3 +109,45 @@ fn literal_within_skips_shards_outside_within() {
         assert!(within(&index, term, &ranges(&[(0, 6)])).is_empty());
     }
 }
+
+#[test]
+fn fold_count_equals_located_fold_hits_per_shard() {
+    let bytes: Vec<String> = (0..40)
+        .map(|i| match i % 5 {
+            0 => String::new(),
+            1 => format!("printk {i} PRINTK"),
+            2 => format!("Print\u{212A} {i}"),
+            3 => "prINTk printk".to_string(),
+            _ => format!("doc {i}"),
+        })
+        .collect();
+    let docs = docs_of(&bytes.iter().map(String::as_bytes).collect::<Vec<_>>());
+    let variants: [&[u8]; 4] = [b"printk", b"PRINTK", "Print\u{212A}".as_bytes(), b"prINTk"];
+    let pattern = PreparedPattern::prepare_with("printk", ci()).unwrap();
+    let plan = pattern.fold().expect("plan");
+    for cap in [1u64, 40, 1 << 20] {
+        let built = DocfmIndex::build_with_cap(&docs, cap);
+        let located: Vec<(Range<usize>, u64)> = (built.shards.iter().zip(&built.metas))
+            .map(|(s, m)| {
+                let hits = crate::fold::fold_locate(s.cursor(), plan).expect("under the cap");
+                (m.docs.clone(), hits.len() as u64)
+            })
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        let mut spelled: Vec<(Range<usize>, u64)> = Vec::new();
+        for (r, n) in counts(&built, &variants).into_iter().flatten() {
+            match spelled.iter_mut().find(|(s, _)| *s == r) {
+                Some((_, total)) => *total += n,
+                None => spelled.push((r, n)),
+            }
+        }
+        spelled.sort_by_key(|(r, _)| r.start);
+        assert_eq!(located, spelled, "cap={cap}");
+        let dir = tempfile::tempdir().unwrap();
+        for index in [round_trip(&built, dir.path(), &docs), built] {
+            let a = index.probe_all(&[Query::CountFold(plan)], None).remove(0);
+            assert!(a.exact.is_empty());
+            assert_eq!(a.counts, located, "cap={cap}");
+        }
+    }
+}

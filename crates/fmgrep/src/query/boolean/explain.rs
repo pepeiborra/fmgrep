@@ -34,6 +34,7 @@ impl fmt::Display for Explain<'_> {
                 Probe::Never => f.write_str("empty")?,
                 Probe::Literal(lit) if lit == l.src.as_bytes() => f.write_str("literal")?,
                 Probe::Literal(lit) => write!(f, "literal {:?}", String::from_utf8_lossy(lit))?,
+                Probe::Fold => f.write_str("folded literal")?,
                 Probe::Regex => match l.prep.as_ref().and_then(crate::pattern::anchor) {
                     Some(a) => write!(f, "regex anchor {:?}", String::from_utf8_lossy(a))?,
                     None => f.write_str("regex, no anchor")?,
@@ -58,7 +59,7 @@ impl fmt::Display for Explain<'_> {
                 counted: plan.counted[i],
                 regex_reference: match plan.why[i] {
                     Why::Ratio { reference, .. } => {
-                        !matches!(self.leaves[reference].probe, Probe::Literal(_))
+                        matches!(self.leaves[reference].probe, Probe::Regex)
                     }
                     _ => false,
                 },
@@ -86,7 +87,7 @@ impl fmt::Display for Explain<'_> {
             }
             let (exact, candidates) = &self.hits[i];
             match l.probe {
-                Probe::Regex => writeln!(
+                Probe::Fold | Probe::Regex => writeln!(
                     f,
                     ", {} candidate{}",
                     candidates.len(),

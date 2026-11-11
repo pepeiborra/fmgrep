@@ -34,6 +34,8 @@ enum Probe {
     Never,
     /// Exact per-document counts.
     Literal(Vec<u8>),
+    /// A case-folded term: counted by its fold walk, its candidates verified.
+    Fold,
     /// A candidate superset.
     Regex,
 }
@@ -66,9 +68,11 @@ fn leaves<'a>(expr: &'a Expr, req: &QueryRequest<'_>) -> Result<Vec<Leaf<'a>>, S
         let probe = match prep.as_ref() {
             None if src.is_empty() => Probe::Never,
             None => Probe::Literal(src.as_bytes().to_vec()),
-            Some(p) => {
-                crate::pattern::literal(p).map_or(Probe::Regex, |l| Probe::Literal(l.to_vec()))
-            }
+            Some(p) => match crate::pattern::literal(p) {
+                Some(l) => Probe::Literal(l.to_vec()),
+                None if matches!(leaf, Expr::Term(_)) && p.fold().is_some() => Probe::Fold,
+                None => Probe::Regex,
+            },
         };
         out.push(Leaf {
             name: leaf.to_string(),
@@ -291,7 +295,17 @@ pub fn answer_expr(
                 _ => None,
             })
             .collect();
-        let map = |_: usize, raw: &[u8]| finders.iter().all(|f| f.find(raw).is_some());
+        let folds: Vec<&PreparedPattern> = leaves
+            .iter()
+            .zip(&plan.candidate)
+            .filter_map(|(l, &c)| match (&l.probe, &l.prep) {
+                (Probe::Fold, Some(p)) if c => Some(p),
+                _ => None,
+            })
+            .collect();
+        let map = |_: usize, raw: &[u8]| {
+            finders.iter().all(|f| f.find(raw).is_some()) && folds.iter().all(|p| p.is_match(raw))
+        };
         let mut read_us = |ids: &[usize]| -> Result<f64, String> {
             let us = read_wall_us(docs, &manifest.files, ids, &map)?;
             sample_us += us;
@@ -354,7 +368,7 @@ pub fn answer_expr(
                     maybe: stale.clone(),
                 }
             }
-            Probe::Regex => Tri {
+            Probe::Fold | Probe::Regex => Tri {
                 yes: Vec::new(),
                 maybe: union(candidates, &stale),
             },
@@ -375,7 +389,9 @@ pub fn answer_expr(
         .iter()
         .map(|l| match (&l.probe, &l.pattern, &l.matcher) {
             (Probe::Literal(lit), ..) => verify::Leaf::Literal(lit),
-            (Probe::Regex, Some(src), Some(matcher)) => verify::Leaf::Pattern { src, matcher },
+            (Probe::Fold | Probe::Regex, Some(src), Some(matcher)) => {
+                verify::Leaf::Pattern { src, matcher }
+            }
             _ => verify::Leaf::Never,
         })
         .collect();
@@ -417,7 +433,7 @@ pub fn answer_expr(
             let regex_maybe = tris
                 .iter()
                 .zip(&leaves)
-                .filter(|(_, l)| matches!(l.probe, Probe::Regex))
+                .filter(|(_, l)| matches!(l.probe, Probe::Fold | Probe::Regex))
                 .fold(Vec::new(), |acc, (t, _)| union(&acc, &t.maybe));
             let unsure: Vec<usize> = root
                 .yes
@@ -671,8 +687,10 @@ fn queries<'a>(leaves: &'a [Leaf<'_>], plan: &'a demote::Plan, ids: &[usize]) ->
             |&i| match (&leaves[i].probe, &leaves[i].prep, &plan.within[i]) {
                 (Probe::Literal(term), _, Some(within)) => Query::LiteralWithin { term, within },
                 (Probe::Literal(term), _, None) => Query::Literal(term),
-                (Probe::Regex, Some(p), _) => Query::Regex(p),
-                (Probe::Regex, None, _) => unreachable!("a regex leaf holds its pattern"),
+                (Probe::Fold | Probe::Regex, Some(p), _) => Query::Regex(p),
+                (Probe::Fold | Probe::Regex, None, _) => {
+                    unreachable!("a pattern leaf holds its pattern")
+                }
                 (Probe::Never, ..) => unreachable!("an empty leaf is not probed"),
             },
         )
@@ -754,7 +772,11 @@ impl Judge<'_> {
                 Probe::Literal(_) if self.settled(i, doc, stale) => {
                     Some(t.yes.binary_search(&doc).is_ok())
                 }
-                Probe::Regex if t.maybe.binary_search(&doc).is_err() => Some(false),
+                Probe::Fold | Probe::Regex
+                    if self.settled(i, doc, stale) && t.maybe.binary_search(&doc).is_err() =>
+                {
+                    Some(false)
+                }
                 _ => None,
             })
             .collect();
@@ -781,8 +803,12 @@ impl Judge<'_> {
                 (Probe::Literal(_), _) => exact
                     .binary_search_by_key(&doc, |&(d, _)| d)
                     .map_or(0, |k| exact[k].1),
-                (Probe::Regex, Some(p)) if t.maybe.binary_search(&doc).is_ok() => p.count(bytes),
-                (Probe::Regex, _) => 0,
+                (Probe::Fold | Probe::Regex, Some(p))
+                    if t.maybe.binary_search(&doc).is_ok() || !self.settled(i, doc, stale) =>
+                {
+                    p.count(bytes)
+                }
+                (Probe::Fold | Probe::Regex, _) => 0,
             })
             .collect()
     }

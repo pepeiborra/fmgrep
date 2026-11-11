@@ -167,15 +167,27 @@ fn unknown_leaves_prune_as_kleene_unknown_within_their_ranges() {
 /// The plan for `expr` whose leaves count `counts`: every leaf is
 /// countable, a term literal and demotable unless [`demotable`] refuses it.
 fn arranged(expr: &Expr, counts: Vec<Vec<(Range<usize>, u64)>>) -> (Vec<bool>, demote::Plan) {
+    arranged_with(expr, counts, &[])
+}
+
+/// [`arranged`] with the terms `folds` case-folded: exact, never narrowed.
+fn arranged_with(
+    expr: &Expr,
+    counts: Vec<Vec<(Range<usize>, u64)>>,
+    folds: &[usize],
+) -> (Vec<bool>, demote::Plan) {
     let leaves = expr.leaves();
     let demotable: Vec<bool> = leaves
         .iter()
         .map(|l| matches!(l, Expr::Term(s) if demotable(s.as_bytes())))
         .collect();
-    let literal: Vec<bool> = leaves.iter().map(|l| matches!(l, Expr::Term(_))).collect();
+    let exact: Vec<bool> = leaves.iter().map(|l| matches!(l, Expr::Term(_))).collect();
+    let narrowed: Vec<bool> = (0..leaves.len())
+        .map(|i| exact[i] && !folds.contains(&i))
+        .collect();
     let groups = demote::and_groups(expr);
     let counted = demote::to_count(&groups, &vec![true; leaves.len()], &demotable);
-    let plan = demote::arrange(&groups, counts, &counted, &demotable, &literal);
+    let plan = demote::arrange(&groups, counts, &counted, &demotable, &exact, &narrowed);
     (counted, plan)
 }
 
@@ -308,6 +320,10 @@ fn answer(exact: Vec<(usize, u64)>, probe_us: u64) -> Answer {
 
 fn span(r: Range<usize>) -> Vec<Range<usize>> {
     vec![r]
+}
+
+fn span_count(r: Range<usize>, n: u64) -> Vec<(Range<usize>, u64)> {
+    vec![(r, n)]
 }
 
 const fn band(min_us: f64, max_us: f64) -> ReadBand {
@@ -520,6 +536,123 @@ fn decide_records_the_edge_or_sample_that_decided() {
     });
     assert_eq!(plan.why[2], cost(600.0, 100.0, Read::Failed));
     assert_eq!(plan.demoted, [false, false, false, false, true]);
+}
+
+#[test]
+fn a_folded_leaf_is_counted_and_the_plan_names_it() {
+    use crate::tests::support::{index_it, request, stage_corpus};
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"printk PRINTK 123\n"),
+        ("b.c", b"Print\xe2\x84\xaa pr1ntk 123 123\n"),
+        ("c.c", b"nothing\n"),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let index = tmp.path().join("idx");
+    index_it(&stage_corpus(tmp.path(), &files), &index, false);
+    let manifest = crate::manifest::read_manifest(&index).unwrap();
+    let (fm, _) =
+        super::super::load(&index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
+    let expr = Expr::And(vec![t("PrintK"), t("123"), re("pr.ntk")]);
+    let req = QueryRequest {
+        mode: crate::matching::MatchMode {
+            ignore_case: true,
+            ..Default::default()
+        },
+        ..request(&index, &manifest, &[], QueryOutput::Counts)
+    };
+    let leaves = leaves(&expr, &req).unwrap();
+    assert!(matches!(leaves[0].probe, Probe::Fold));
+    assert!(matches!(&leaves[1].probe, Probe::Literal(l) if l == b"123"));
+    assert!(matches!(leaves[2].probe, Probe::Regex));
+    let plan = demote::plan(&fm, &expr, &leaves, None);
+    assert_eq!(plan.counted, [true, true, false]);
+    assert_eq!(plan.counts[0], [(0..3, 3)]);
+    assert_eq!(plan.why[0], demote::Why::Reference);
+    assert_eq!(plan.candidate, [false, true, false]);
+    let hits: Vec<Hits> = vec![(Vec::new(), Vec::new()); 3];
+    let text = explain::Explain {
+        expr: &expr,
+        leaves: &leaves,
+        plan: &plan,
+        leaf_us: &[],
+        hits: &hits,
+        root: &Tri::default(),
+        stale: 0,
+        output: QueryOutput::Counts,
+        reads: 0,
+    }
+    .to_string();
+    assert!(
+        text.contains("PrintK    folded literal  counted 3 in 1 shard [0..3)\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_folded_leaf_may_be_reference_candidate_or_demoted() {
+    use demote::Why;
+    let fb = Expr::And(vec![t("f"), t("b")]);
+    let (_, plan) = arranged_with(
+        &fb,
+        vec![span_count(0..10, 5), span_count(0..10, 500)],
+        &[0],
+    );
+    assert_eq!(plan.why[0], Why::Reference);
+    assert_eq!(
+        (plan.groups[0].reference, plan.candidate),
+        (0, vec![false, true])
+    );
+    assert_eq!(plan.within, [None, Some(span(0..10))]);
+
+    let af = Expr::And(vec![t("a"), t("f")]);
+    let counts = || vec![span_count(0..10, 5), vec![(0..10, 500), (10..20, 7)]];
+    let (_, mut plan) = arranged_with(&af, counts(), &[1]);
+    assert_eq!(plan.candidate, [false, true]);
+    let (demoted, _) = decided(&mut plan, band(0.0, 0.0), vec![(3, 5)], 50, 1.0);
+    assert_eq!(demoted, [false, true]);
+    assert_eq!(
+        (&plan.within[1], &plan.unsettled[1][..]),
+        (&None, &[0..10, 10..20][..])
+    );
+    let (_, mut plan) = arranged_with(&af, counts(), &[1]);
+    let inf = f64::INFINITY;
+    let (demoted, _) = decided(&mut plan, band(inf, inf), vec![(3, 5)], 50, 1.0);
+    assert_eq!(demoted, [false, false]);
+    assert_eq!(plan.within, [Some(span(0..10)), None]);
+    assert!(plan.unsettled[1].is_empty());
+
+    let or = Expr::Or(vec![af, t("z")]);
+    let counts = vec![
+        span_count(0..10, 1),
+        vec![(0..10, 100), (10..20, 1)],
+        vec![],
+    ];
+    let (_, plan) = arranged_with(&or, counts, &[1]);
+    assert_eq!(plan.demoted, [false, true, false]);
+    assert_eq!(plan.unsettled[1], [0..10, 10..20]);
+    assert_eq!(plan.within[0], Some(vec![0..10, 10..20]));
+}
+
+#[test]
+fn decide_reads_a_folded_reference_from_its_candidates() {
+    let e = Expr::And(vec![t("f"), t("b")]);
+    let counts = vec![vec![(0..10, 4), (10..20, 4)], span_count(0..10, 100)];
+    let (_, mut plan) = arranged_with(&e, counts, &[0]);
+    assert_eq!(plan.groups[0].within, span(0..10));
+    let a = Answer {
+        exact: Vec::new(),
+        candidates: Some(vec![2, 5, 12]),
+        probe_us: 40,
+        counts: Vec::new(),
+    };
+    let stage1 = [Some(&a), None];
+    let mut samples = Vec::new();
+    demote::decide(&mut plan, band(0.0, f64::INFINITY), &stage1, &mut |ids| {
+        samples.push(ids.to_vec());
+        Ok(1.0)
+    });
+    assert_eq!(samples, [vec![2, 5]]);
+    assert!(matches!(plan.why[1], demote::Why::Cost { docs: 2, .. }));
 }
 
 #[test]

@@ -130,3 +130,21 @@ fn live_cap_gives_up_instead_of_answering_no() {
         Some(false)
     );
 }
+
+#[test]
+fn fold_count_sums_every_variant_and_bounds_a_give_up() {
+    let plan = plan_of("printk").expect("plan");
+    let text = b"printk PRINTK print\xe2\x84\xaa Printk".as_slice();
+    assert_eq!(fold_count(ScanCursor::from(text), &plan), 4);
+    let two = b"printk PRINTK".as_slice();
+    assert_eq!(fold_locate_capped(ScanCursor::from(two), &plan, 1), None);
+    assert!(fold_count_capped(ScanCursor::from(two), &plan, 1) >= 2);
+    assert_eq!(
+        fold_count(ScanCursor::from(b"nothing".as_slice()), &plan),
+        0
+    );
+    assert_eq!(
+        fold_count_capped(ScanCursor::from(b"nothing".as_slice()), &plan, 1),
+        0
+    );
+}

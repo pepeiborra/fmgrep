@@ -176,6 +176,41 @@ fn demoted_leaf_is_decided_by_reading() {
 }
 
 #[test]
+fn a_demoted_folded_leaf_is_decided_by_reading() {
+    // One shard: a demoted `alpha` is verified on every document of the
+    // shard holding `x`, a located one only on its own candidates.
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"Alpha x"),
+        ("b.c", b"alpha ALPHA alpha alpha"),
+        ("z.c", b"X only"),
+    ];
+    let expr = and(vec![t("alpha"), t("x")]);
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &files);
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    check(&index, "readable", std::slice::from_ref(&expr));
+    // z.c, the last document, cut off the shard: reading it fails.
+    let manifest = read_manifest(&index).unwrap();
+    assert_eq!(manifest.files.checked().unwrap().iter().last(), Some("z.c"));
+    let offsets = crate::manifest::shard_offsets(&manifest.doc_lens).unwrap();
+    let shard = std::fs::OpenOptions::new()
+        .write(true)
+        .open(index.join(DOCS_SHARD))
+        .unwrap();
+    shard.set_len(offsets[manifest.files.len() - 1]).unwrap();
+    assert_eq!(
+        at(OFF, || printed_expr(&index, &["-i", "-l"], &expr)).unwrap(),
+        "a.c\n"
+    );
+    for flags in [&["-i", "-l"][..], &["-i"]] {
+        assert!(at(OFF, || printed_expr(&index, flags, &expr)).is_ok());
+        let err = at(COSTS[0], || printed_expr(&index, flags, &expr)).unwrap_err();
+        assert!(err.contains("cannot read"), "{flags:?}: {err}");
+    }
+}
+
+#[test]
 fn demotion_over_stale_docs_equals_a_fresh_index() {
     let tmp = tempfile::tempdir().unwrap();
     let files: [(&str, &[u8]); 5] = [
