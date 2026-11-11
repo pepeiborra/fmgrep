@@ -351,3 +351,29 @@ fn a_filtered_literal_reads_or_locates_by_cost() {
         "a.c\nsub/c.c\n"
     );
 }
+
+#[test]
+fn a_filtered_folded_literal_reads_or_locates_by_cost() {
+    let tmp = tempfile::tempdir().unwrap();
+    let common = "Printk ".repeat(40) + "alpha\n";
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"printk alpha\n"),
+        ("sub/c.c", common.as_bytes()),
+        ("sub/z.h", b"nothing\n"),
+    ];
+    crate::tests::SHARD_BYTES.set(Some(16));
+    let all = dotted_tree(tmp.path(), "all", &files, true);
+    crate::tests::SHARD_BYTES.set(None);
+    // sub/z.h, the last document, cut off the shard: reading it fails.
+    let index = all.join(INDEX_DIR);
+    let manifest = read_manifest(&index).unwrap();
+    let offsets = crate::manifest::shard_offsets(&manifest.doc_lens).unwrap();
+    let shard = std::fs::OpenOptions::new()
+        .write(true)
+        .open(index.join(DOCS_SHARD))
+        .unwrap();
+    shard.set_len(offsets[manifest.files.len() - 1]).unwrap();
+    let sub = ["-g", "sub/**", "-l", "-i"];
+    assert!(query(&all, &sub, &["PRINTK"]).is_err());
+    assert_eq!(printed(&all, &sub, &["ALPHA"]), "sub/c.c\n");
+}
