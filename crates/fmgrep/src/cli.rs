@@ -137,7 +137,7 @@ fn search(
     let report = render(&p, s.json, out, |sink| run_query(&req, sink));
     drop(req);
     // Off the exit path: dropping a large tree's paths costs milliseconds.
-    std::thread::spawn(move || drop(manifest));
+    let _ = std::thread::Builder::new().spawn(move || drop(manifest));
     report.map(Outcome::Query)
 }
 
