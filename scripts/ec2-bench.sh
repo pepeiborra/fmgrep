@@ -134,7 +134,19 @@ set -euxo pipefail
     mkdir -p $TMPDIR $W/fmgrep $W/results
     tar xzf ~/src.tar.gz -C $W/fmgrep
     sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 install build-essential pkg-config
+    sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 install build-essential pkg-config unzip
+    # fmgrep asks watchman what changed: the pinned prebuilt release on x86_64 (its lib/ is empty;
+    # it cannot start without its state directory), installed only once it runs, else the Ubuntu
+    # package (watchman 4.9.0, from 2017).
+    z=watchman-v2026.11.09.00-linux
+    {
+        [[ $(uname -m) == x86_64 ]] &&
+            curl -fsSL -o $TMPDIR/$z.zip https://github.com/facebook/watchman/releases/download/v2026.11.09.00/$z.zip &&
+            echo "8833355ecd4a5004ceffeecf7fc27624c1644f4790e4c631c5fcc1fcaf0baba6  $TMPDIR/$z.zip" | sha256sum -c - &&
+            unzip -q $TMPDIR/$z.zip -d $TMPDIR && $TMPDIR/$z/bin/watchman --version &&
+            sudo install -d -m 2777 /usr/local/var/run/watchman && sudo install -m 755 $TMPDIR/$z/bin/* /usr/local/bin/
+    } || sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 install watchman || true
+    watchman --version || echo "warning: watchman is not installed: fmgrep checks every file on each load" >&2
     if [[ " $* " == *" aosp "* ]]; then
         git -c advice.detachedHead=false clone -q --depth 1 --branch v2.72 https://gerrit.googlesource.com/git-repo $W/git-repo
         [[ $(git -C $W/git-repo rev-parse HEAD) == 365629015667e04739f59070e745548a728549c8 ]]

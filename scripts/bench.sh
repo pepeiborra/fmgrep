@@ -7,7 +7,8 @@
 # clone; aosp is never cloned and needs --repo-path or FMGREP_CORPUS_AOSP.
 # Builds release, runs the harness over its default rows, and prints the
 # markdown results (default BENCH_DIR/results-<corpus>.md). Exits non-zero
-# when an fmgrep row disagrees with rg. The corpus is only read.
+# when an fmgrep row disagrees with rg. The corpus's files are only read;
+# scripts/fsmonitor.sh first has watchman watch it.
 #
 # Usage: scripts/bench.sh [--corpus ghc|linux|chromium|aosp] [--repo-path DIR]
 #                         [--results FILE] [--bench-dir DIR] [-- HARNESS_ARGS...]
@@ -21,7 +22,7 @@ RESULTS=""
 BENCH_DIR="$ROOT/target/bench"
 PASSTHROUGH=()
 
-usage() { sed -n 's/^# \{0,1\}//; 12,13p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n 's/^# \{0,1\}//; 13,14p' "${BASH_SOURCE[0]}"; }
 die() { echo "error: $2" >&2; exit "$1"; }
 
 while [[ $# -gt 0 ]]; do
@@ -118,6 +119,8 @@ else
         fi
     fi
 fi
+
+bash "$ROOT/scripts/fsmonitor.sh" "$DIR"
 
 RESULTS="${RESULTS:-$BENCH_DIR/results-$CORPUS.md}"
 mkdir -p "$(dirname "$RESULTS")"

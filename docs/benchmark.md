@@ -23,7 +23,8 @@ harness and prints its markdown, by default
 `target/bench/results-<corpus>.md`, with a JSON line per query, stamped
 with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
 row searches the checkout in place, and nothing is written under it:
-indexes and tool state go to temporary directories. Every row first runs
+indexes and tool state go to temporary directories; watchman keeps
+watching it, as under [File monitor](#file-monitor). Every row first runs
 the set's first query once, untimed and not kept, as a warm-up, then times
 every query. Every row prints each query's matching lines, and the harness
 exits 1 if an fmgrep row prints other lines than rg from a file both
@@ -36,6 +37,38 @@ files only some rows searched are listed in the results. Arguments after
 2 when it is missing.
 `--fixture` searches one file of the query set's literals instead, as a smoke
 test.
+
+## File monitor
+
+fmgrep does not call git. `fmgrep index` asks a running watchman (it
+never starts one) to watch the tree and keeps a token from it in
+`docs.journal`. On every query without a server and when a server starts,
+a load of 50,000 indexed files or more asks watchman what changed since
+that token; a smaller index, or one without a token, stats every indexed
+file ([Staleness](index-format.md#staleness)). `fmgrep index` waits at most
+5 s for watchman, so a big tree that watchman is still crawling gets no
+token, and every load of it stats every file.
+
+Before the harness runs, `scripts/bench.sh` therefore passes the checkout
+to `scripts/fsmonitor.sh`, which has watchman watch it (`watchman
+watch-project`, which starts watchman if it is not running) and waits until
+watchman has crawled it, so the crawl is over before any `fmgrep index`. It
+prints how long the crawl took. Without watchman, or when the watch fails,
+it warns, and fmgrep stats every file. fmgrep runs with its defaults, so
+on linux, chromium and aosp the fmgrep rows other than `--store-docs`
+(whose index holds the documents and checks no tree) ask watchman at each
+load, and on ghc (about 27,000 files) they stat every file. The watch
+covers an AOSP tree too.
+To do the same by hand, from the top of the checkout:
+
+```sh
+watchman watch-project .
+# returns once watchman has crawled the tree:
+watchman -j <<< "[\"query\", \"$PWD\", {\"expression\": [\"false\"], \"sync_timeout\": 600000}]"
+```
+
+`watchman watch-del .` removes the watch. `scripts/ec2-bench.sh` installs
+watchman on the instance.
 
 ## EC2
 
@@ -54,6 +87,7 @@ It looks up the Ubuntu 24.04 image, creates a key pair and a security group
 that admits SSH from your address only, and launches one instance that shuts
 down, and so terminates, after `TTL` hours whatever happens. It copies the
 committed `HEAD` there, formats the instance's NVMe storage, installs Rust,
+watchman (a pinned prebuilt release on x86_64, else the Ubuntu package),
 ripgrep, tgrep and elgrep at the versions in
 [BENCHMARKS.md](../BENCHMARKS.md), for `aosp` syncs the tree as under
 [AOSP](#aosp) with the repo launcher at v2.72 (about 11 GB to download),
