@@ -45,6 +45,9 @@ thread_local! {
     pub static WATCHMAN_PROGRAM: std::cell::RefCell<PathBuf> =
         std::cell::RefCell::new(PathBuf::from("/nonexistent/watchman"));
     /// The cache directory of searches on this thread; none when `None`.
+    /// The mountinfo text searches on this thread read; none when `None`,
+    /// so no mount check is made.
+    pub static MOUNTS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
@@ -57,6 +60,7 @@ pub struct Hooks {
     ask_from: Option<usize>,
     watchman: Option<PathBuf>,
     program: PathBuf,
+    mounts: Option<String>,
     cache: Option<PathBuf>,
     notes: Arc<Mutex<Vec<String>>>,
 }
@@ -67,6 +71,7 @@ impl Hooks {
             ask_from: ASK_FROM.get(),
             watchman: WATCHMAN.with_borrow(Clone::clone),
             program: WATCHMAN_PROGRAM.with_borrow(Clone::clone),
+            mounts: MOUNTS.with_borrow(Clone::clone),
             cache: CACHE.with_borrow(Clone::clone),
             notes: NOTES.with_borrow(Arc::clone),
         }
@@ -76,6 +81,7 @@ impl Hooks {
         ASK_FROM.set(self.ask_from);
         WATCHMAN.set(self.watchman);
         WATCHMAN_PROGRAM.set(self.program);
+        MOUNTS.set(self.mounts);
         CACHE.set(self.cache);
         NOTES.set(self.notes);
     }

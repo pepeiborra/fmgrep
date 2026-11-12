@@ -49,8 +49,9 @@ pub fn due(docs: usize) -> bool {
 /// them, where a search of as many docs would ask watchman: have watchman
 /// watch the tree, waiting at most [`ASK_WAIT`] for its reply, which comes
 /// only once its crawl ends; the watch stays, and watchman crawls the tree
-/// while the index reads it. Takes no token. Why not, or that the crawl
-/// goes on, only under `--verbose`.
+/// while the index reads it. Takes no token, and asks nothing on a network
+/// filesystem, where no search asks. Why not, or that the crawl goes on,
+/// only under `--verbose`.
 pub fn request_watch(root: &Path, files: usize) {
     if !due(files) {
         return;
@@ -58,6 +59,11 @@ pub fn request_watch(root: &Path, files: usize) {
     let Ok(root) = root.canonicalize() else {
         return;
     };
+    if let Ok(Some(fs)) = filesystem_of(&root)
+        && network(&fs)
+    {
+        return;
+    }
     #[cfg(unix)]
     let asked = watchman::Watchman::find(ASK_WAIT).and_then(|w| w.watch(&root).map(drop));
     #[cfg(not(unix))]
@@ -91,6 +97,69 @@ pub struct Token {
 pub struct Index {
     pub dir: PathBuf,
     pub started_ns: i64,
+}
+
+/// The type of the filesystem holding canonical `root`, from
+/// `/proc/self/mountinfo` on Linux; `None` elsewhere. Tests give their own
+/// mountinfo text, or none.
+fn filesystem_of(root: &Path) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    let mounts = crate::tests::MOUNTS.with_borrow(Clone::clone);
+    #[cfg(not(test))]
+    let mounts = match cfg!(target_os = "linux") {
+        true => Some(
+            std::fs::read_to_string("/proc/self/mountinfo")
+                .map_err(|e| format!("cannot read /proc/self/mountinfo ({e})"))?,
+        ),
+        false => None,
+    };
+    Ok(mounts.and_then(|m| filesystem(&m, root)))
+}
+
+/// The type of the filesystem holding `root`, from mountinfo text: the
+/// longest mount point above it, the last one mounted there.
+fn filesystem(mountinfo: &str, root: &Path) -> Option<String> {
+    let mounts = mountinfo.lines().filter_map(|line| {
+        let (head, tail) = line.split_once(" - ")?;
+        let point = unescape(head.split(' ').nth(4)?);
+        let fs = tail.split(' ').next()?;
+        root.starts_with(&point).then_some((point.len(), fs))
+    });
+    mounts
+        .max_by_key(|&(len, _)| len)
+        .map(|(_, fs)| fs.to_owned())
+}
+
+/// A mount point as mountinfo writes it, `\040` for a space.
+fn unescape(field: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = field.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|o| o.iter().all(u8::is_ascii_digit));
+        match (bytes[i], octal) {
+            (b'\\', Some(o)) => {
+                out.push(o.iter().fold(0u8, |n, d| n.wrapping_mul(8) + (d - b'0')));
+                i += 4;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Network filesystems: a file changed from another machine sends this
+/// machine no event, so watchman never lists it.
+fn network(fs: &str) -> bool {
+    let network = [
+        "nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "afs", "virtiofs", "lustre", "gpfs",
+    ];
+    network.contains(&fs)
 }
 
 /// One search's state for the next, at [`path`].
@@ -200,7 +269,8 @@ impl Record {
 }
 
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
-/// a token for the record; why watchman cannot say goes to stderr.
+/// a token for the record; why watchman cannot say goes to stderr. On a
+/// network filesystem there is no token, so no record either.
 pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
     #[cfg(unix)]
     {
@@ -208,6 +278,16 @@ pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
             cannot_answer("the tree's path is not UTF-8");
             return Asked::default();
         };
+        if let Ok(Some(fs)) = filesystem_of(root)
+            && network(&fs)
+        {
+            cannot_answer(&format!(
+                "{} is on {fs}, a network or shared filesystem: watchman does not see \
+                 changes made there from other machines",
+                root.display()
+            ));
+            return Asked::default();
+        }
         let (why, taken) = match Record::read(root_str, index).and_then(same_socket) {
             Ok(record) => {
                 let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);

@@ -148,6 +148,49 @@ fn a_record_that_cannot_be_saved_says_so() {
     );
 }
 
+#[test]
+fn the_filesystem_holding_the_tree_is_read_from_mountinfo() {
+    let mountinfo = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 0:35 / /src rw,relatime shared:20 - nfs4 srv:/export rw
+41 40 8:2 / /src/local rw,relatime shared:21 - ext4 /dev/sdb rw
+42 22 0:40 / /mnt/my\\040eden rw,nosuid - fuse.edenfs edenfs rw
+43 40 0:41 / /src rw - tmpfs tmpfs rw
+";
+    let fs = |root: &str| filesystem(mountinfo, Path::new(root));
+    assert_eq!(fs("/home/me/linux").as_deref(), Some("ext4"));
+    assert_eq!(
+        fs("/src/linux").as_deref(),
+        Some("tmpfs"),
+        "the last mount there"
+    );
+    assert_eq!(
+        fs("/src/local/x").as_deref(),
+        Some("ext4"),
+        "the longest point"
+    );
+    assert_eq!(fs("/mnt/my eden/x").as_deref(), Some("fuse.edenfs"));
+    assert_eq!(
+        fs("/srcs").as_deref(),
+        Some("ext4"),
+        "a path prefix is no mount"
+    );
+    assert_eq!(filesystem("", Path::new("/x")), None);
+    for (fs, net) in [
+        ("ext4", false),
+        ("xfs", false),
+        ("tmpfs", false),
+        ("nfs4", true),
+        ("cifs", true),
+        ("9p", true),
+        ("fuse.edenfs", false),
+        ("fuseblk", false),
+        ("virtiofs", true),
+    ] {
+        assert_eq!(network(fs), net, "{fs}");
+    }
+}
+
 #[cfg(unix)]
 mod watchman_tests {
     use std::io::{BufRead as _, BufReader, Write as _};
