@@ -62,21 +62,24 @@ impl Watchman {
         self.late.get()
     }
 
-    /// `$WATCHMAN_SOCK`, else the socket that `watchman get-sockname`
-    /// gives within [`super::FIND_WAIT`]; calls get `budget` after that.
-    /// Tests run only the program they are given.
+    /// The socket in `$WATCHMAN_SOCK`, when it is set; tests read the one
+    /// their thread gives.
+    pub fn given() -> Option<PathBuf> {
+        #[cfg(test)]
+        return crate::tests::WATCHMAN.with_borrow(Clone::clone);
+        #[cfg(not(test))]
+        return std::env::var_os("WATCHMAN_SOCK").map(PathBuf::from);
+    }
+
+    /// [`Self::given`], else the socket that `watchman get-sockname` gives
+    /// within [`super::FIND_WAIT`]; calls get `budget` after that. Tests
+    /// run only the program they are given.
     pub fn find(budget: Duration) -> Result<Self, String> {
         #[cfg(test)]
-        let (sock, program) = (
-            crate::tests::WATCHMAN.with_borrow(Clone::clone),
-            crate::tests::WATCHMAN_PROGRAM.with_borrow(Clone::clone),
-        );
+        let program = crate::tests::WATCHMAN_PROGRAM.with_borrow(Clone::clone);
         #[cfg(not(test))]
-        let (sock, program) = (
-            std::env::var_os("WATCHMAN_SOCK").map(PathBuf::from),
-            PathBuf::from("watchman"),
-        );
-        match sock {
+        let program = PathBuf::from("watchman");
+        match Self::given() {
             Some(sock) => Ok(Self::at(sock, budget)),
             None => Ok(Self::at(Self::detect(&program, super::FIND_WAIT)?, budget)),
         }

@@ -145,6 +145,30 @@ fn a_later_search_uses_the_socket_in_its_record() {
     assert_ne!(clock(tmp.path()), before, "a newer token");
 }
 
+#[test]
+fn watchman_sock_set_to_another_socket_wins_over_the_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
+        return;
+    };
+    let kept = record(tmp.path());
+    let dead = tmp.path().join("no-daemon.sock");
+    WATCHMAN.set(Some(dead.clone()));
+    std::fs::write(folder.join("c.c"), b"printk\n").unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
+    assert!(daemon.sent().is_empty(), "the record's daemon is not asked");
+    let why = notes();
+    let line = format!(
+        "watchman cannot say what changed (no watchman daemon answers on {} (",
+        dead.display()
+    );
+    assert!(why.len() == 1 && why[0].starts_with(&line), "{why:?}");
+    assert_eq!(record(tmp.path()), kept, "the record is kept as it was");
+    WATCHMAN.set(Some(daemon.sock.clone()));
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
+    assert!(notes().is_empty(), "the record serves again");
+}
+
 /// A daemon that hangs (stopped in place) gives no token: the first search
 /// checks every file and saves nothing.
 #[test]
