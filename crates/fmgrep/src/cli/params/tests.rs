@@ -162,7 +162,7 @@ fn filter_fields_are_omitted_when_empty() {
 fn a_bad_glob_fails_the_request() {
     let p = parse(r#"{"terms":["a"],"globs":["a[b"]}"#).unwrap();
     let manifest: Manifest = serde_json::from_str(
-        r#"{"format":1,"store_docs":true,"num_docs":0,"num_bytes":0,"bom_bytes":0,"index_size_bytes":0,"build_time_us":0,"files":[],"blobs":[],"doc_lens":[],"blob_lens":[]}"#,
+        r#"{"format":1,"store_docs":true,"num_docs":0,"num_bytes":0,"bom_bytes":0,"index_size_bytes":0,"build_time_us":0,"index_started_ns":0,"files":[],"blobs":[],"doc_lens":[],"blob_lens":[]}"#,
     )
     .unwrap();
     let err = p.request(Path::new("idx"), &manifest, None).err().unwrap();

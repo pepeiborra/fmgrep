@@ -1,6 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::blobs::{create_sink, finish_sink};
 use crate::docs;
@@ -28,8 +28,9 @@ pub struct IndexRequest<'a> {
 /// shards are built at once; the manifest write is outside it. Once the
 /// walk has listed the files, before it reads them, the stream asks
 /// watchman to watch the tree, so that watchman reads the tree while the
-/// index reads and builds. Any failure, error or panic, removes the output
-/// dir, so a half-written index is never queryable.
+/// index reads and builds. It records when it started. Any failure, error
+/// or panic, removes the output dir, so a half-written index is never
+/// queryable.
 pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     std::fs::read_dir(req.folder)
         .map_err(|e| format!("error: cannot list folder {}: {e}", req.folder.display()))?;
@@ -70,6 +71,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             write_walk(output, &docs.walk, started)?;
         }
         let build_time_us = start.elapsed().as_micros() as u64;
+        let since_epoch = started.duration_since(UNIX_EPOCH).unwrap_or_default();
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
             store_docs: req.store_docs,
@@ -78,6 +80,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             bom_bytes: docs.bom_bytes,
             index_size_bytes,
             build_time_us,
+            index_started_ns: i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
             files: docs.paths,
             blobs,
             doc_lens: docs.lens,
