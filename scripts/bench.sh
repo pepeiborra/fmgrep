@@ -8,7 +8,7 @@
 # Builds release, runs the harness over its default rows, and prints the
 # markdown results (default BENCH_DIR/results-<corpus>.md). Exits non-zero
 # when an fmgrep row disagrees with rg. The corpus's files are only read;
-# scripts/fsmonitor.sh first has watchman watch it.
+# scripts/fsmonitor.sh first has watchman watch it and gives it git's monitor.
 #
 # Usage: scripts/bench.sh [--corpus ghc|linux|chromium|aosp] [--repo-path DIR]
 #                         [--results FILE] [--bench-dir DIR] [-- HARNESS_ARGS...]

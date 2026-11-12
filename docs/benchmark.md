@@ -22,9 +22,10 @@ that its numbers are not comparable. It builds release binaries, runs the
 harness and prints its markdown, by default
 `target/bench/results-<corpus>.md`, with a JSON line per query, stamped
 with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
-row searches the checkout in place, and nothing is written under it:
-indexes and tool state go to temporary directories; watchman keeps
-watching it, as under [File monitor](#file-monitor). Every row first runs
+row searches the checkout in place, and no file is written under it:
+indexes and tool state go to temporary directories; only the checkout's git
+settings and `.git/` change, and watchman and git's file monitor keep
+running, as under [File monitor](#file-monitor). Every row first runs
 the set's first query once, untimed and not kept, as a warm-up, then times
 every query. Every row prints each query's matching lines, and the harness
 exits 1 if an fmgrep row prints other lines than rg from a file both
@@ -59,16 +60,40 @@ on linux, chromium and aosp the fmgrep rows other than `--store-docs`
 (whose index holds the documents and checks no tree) ask watchman at each
 load, and on ghc (about 27,000 files) they stat every file. The watch
 covers an AOSP tree too.
+
+The script also gives each corpus checkout git's file monitor and untracked
+cache, so that the checkout is in the state a developer's would be; fmgrep
+does not use them. It sets `core.untrackedCache=true` and `core.fsmonitor`:
+`true`, git's builtin daemon, where git has one (macOS, Windows, and Linux
+from git 2.55), else git's `fsmonitor-watchman` hook, copied from git's
+templates into `.git/hooks/`, when `watchman` runs; without either it warns
+and git status scans the tree. Settings the checkout already has are kept.
+It then runs `git status` twice, the first starting the monitor and filling
+the caches, and prints both wall times. An AOSP tree is not one checkout
+but about a thousand nested ones, and the git settings cover only the top
+of a checkout, so the tree gets no git monitor, and the script says so.
 To do the same by hand, from the top of the checkout:
 
 ```sh
 watchman watch-project .
 # returns once watchman has crawled the tree:
 watchman -j <<< "[\"query\", \"$PWD\", {\"expression\": [\"false\"], \"sync_timeout\": 600000}]"
+git config core.untrackedCache true
+# git with the builtin daemon (macOS, Windows, Linux from 2.55):
+git config core.fsmonitor true
+# elsewhere, with watchman installed:
+cp "$(git --exec-path)/../../share/git-core/templates/hooks/fsmonitor-watchman.sample" \
+    .git/hooks/fsmonitor-watchman
+git config core.fsmonitor .git/hooks/fsmonitor-watchman
+git status                                # starts the monitor
 ```
 
-`watchman watch-del .` removes the watch. `scripts/ec2-bench.sh` installs
-watchman on the instance.
+`watchman watch-del .` removes the watch, `git fsmonitor--daemon stop`
+stops the builtin daemon. To undo the git settings: `git config --unset
+core.fsmonitor; git config --unset core.untrackedCache; rm -f
+.git/hooks/fsmonitor-watchman`. A checkout that already sets
+`core.fsmonitor` (to `false`, say) keeps it. `scripts/ec2-bench.sh`
+installs watchman on the instance.
 
 ## EC2
 
