@@ -6,7 +6,6 @@
 //! answer but not on the watch. Detection, connects and calls share one
 //! deadline, and each failure says why.
 
-use std::cell::Cell;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -23,7 +22,6 @@ pub struct Watchman {
     sock: PathBuf,
     deadline: Instant,
     budget: Duration,
-    late: Cell<bool>,
     settle: bool,
 }
 
@@ -57,7 +55,6 @@ impl Watchman {
             sock,
             deadline: Instant::now() + budget,
             budget,
-            late: Cell::new(false),
             settle: true,
         }
     }
@@ -72,14 +69,16 @@ impl Watchman {
         })
     }
 
-    /// `$WATCHMAN_SOCK`, else the socket of a daemon already running; tests
-    /// look only at the socket their thread gives.
-    pub fn find(budget: Duration) -> Result<Self, String> {
+    /// `$WATCHMAN_SOCK`, else the socket that `watchman get-sockname`
+    /// gives; tests look only where `policy` says.
+    pub fn find(budget: Duration, policy: &super::Policy) -> Result<Self, String> {
         #[cfg(test)]
-        return match crate::tests::WATCHMAN.with_borrow(Clone::clone) {
+        match policy.sock.clone() {
             Some(sock) => Ok(Self::at(sock, budget)),
             None => Err("no watchman daemon".to_owned()),
-        };
+        }
+        #[cfg(not(test))]
+        let _ = policy;
         #[cfg(not(test))]
         match std::env::var_os("WATCHMAN_SOCK") {
             Some(sock) => Ok(Self::at(sock.into(), budget)),
@@ -111,9 +110,6 @@ impl Watchman {
                 }
                 waited => {
                     let _ = (child.kill(), child.wait());
-                    if waited.is_ok() {
-                        super::warn_late("watchman");
-                    }
                     return Err(match waited {
                         Ok(_) => format!(
                             "watchman get-sockname did not answer within {} ms",
@@ -261,19 +257,13 @@ impl Watchman {
         )
     }
 
-    /// One command's reply, or why there is none; past the deadline, the
-    /// late warning, once.
+    /// One command's reply, or why there is none.
     fn call(&self, command: &Value, root: &Path) -> Result<Value, String> {
         let left = self.deadline.checked_duration_since(Instant::now());
         match left.map(|left| self.exchange(command, left)) {
             Some(Ok(reply)) => reply.map_err(|e| self.why(root, format!("watchman: {e}"))),
             Some(Err(e)) if Instant::now() < self.deadline => Err(e),
-            _ => {
-                if !self.late.replace(true) {
-                    super::warn_late("watchman");
-                }
-                Err(self.too_late())
-            }
+            _ => Err(self.too_late()),
         }
     }
 

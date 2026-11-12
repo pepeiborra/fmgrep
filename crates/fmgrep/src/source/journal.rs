@@ -1,8 +1,11 @@
-//! Change sources: which corpus paths changed since a mark taken before the
-//! index walk or at a search's checkpoint, so a load re-checks only those.
-//! `docs.journal` holds the marks and what differed at them (`named`).
+//! Change sources: which corpus paths changed since a token taken before
+//! the index walk or at a search's checkpoint, so a load re-checks only
+//! those. `docs.journal` holds the tokens and what differed at them
+//! (`named`). When no source can say, the search checks every file and
+//! says why, once per process.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -13,37 +16,70 @@ mod watchman;
 
 pub const DOCS_JOURNAL: &str = "docs.journal";
 const VERSION: u32 = 1;
-const VAR: &str = "FMGREP_JOURNAL";
 /// Below this many docs the stat pass beats a source's fixed cost.
 const MIN_DOCS: usize = 50_000;
 
-/// Whether an index marks and a load asks.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// Whether an index takes a token and a load asks.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Knob {
     /// Where it pays off.
     Auto,
-    #[default]
     Off,
     /// Even where the stat pass is cheaper.
     On,
 }
 
 impl Knob {
-    /// `FMGREP_JOURNAL`: unset or empty, `off` or `on`.
+    /// `FMGREP_JOURNAL`: unset or empty, `off` or `on`. Tests read it as
+    /// unset; their hooks say where a load asks.
     pub fn read() -> Result<Self, String> {
         #[cfg(test)]
-        if let Some(raw) = crate::tests::JOURNAL.get() {
-            return Ok(Self::of(Some(raw)));
-        }
-        crate::env::choice(VAR, &["off", "on"]).map(Self::of)
-    }
-
-    fn of(raw: Option<&'static str>) -> Self {
-        match raw {
+        let raw: Result<Option<&str>, String> = Ok(None);
+        #[cfg(not(test))]
+        let raw = crate::env::choice("FMGREP_JOURNAL", &["off", "on"]);
+        raw.map(|raw| match raw {
             None => Self::Auto,
             Some("off") => Self::Off,
             Some(_) => Self::On,
-        }
+        })
+    }
+}
+
+/// Index time: detection, connects and calls.
+const MARK_WAIT: Duration = Duration::from_secs(5);
+/// A load's token and question, small next to the stat pass it would
+/// spare.
+const ASK_WAIT: Duration = Duration::from_millis(100);
+
+/// From how many docs a load asks watchman, and, in tests, the one socket
+/// it may reach: read on the thread that opens the index.
+#[derive(Clone, Debug)]
+pub struct Policy {
+    from: Option<usize>,
+    #[cfg(test)]
+    sock: Option<std::path::PathBuf>,
+}
+
+impl Policy {
+    pub fn here() -> Self {
+        #[cfg(test)]
+        return Self {
+            from: crate::tests::ASK_FROM.get(),
+            sock: crate::tests::WATCHMAN.with_borrow(Clone::clone),
+        };
+        #[cfg(not(test))]
+        return Self {
+            from: match Knob::read() {
+                Ok(Knob::Auto) => Some(MIN_DOCS),
+                Ok(Knob::On) => Some(0),
+                Ok(Knob::Off) | Err(_) => None,
+            },
+        };
+    }
+
+    /// Whether a load of `docs` docs asks.
+    pub fn due(&self, docs: usize) -> bool {
+        self.from.is_some_and(|from| docs >= from)
     }
 }
 
@@ -51,12 +87,6 @@ impl Knob {
 fn named_cap(docs: usize) -> usize {
     (docs / 2).max(4096)
 }
-
-/// Index time: detection, connects and calls.
-const MARK_WAIT: Duration = Duration::from_secs(5);
-/// A load's new token and question together, small next to the stat pass
-/// it would spare.
-const ASK_WAIT: Duration = Duration::from_millis(100);
 
 /// What a source vouches for since its token.
 pub enum Since {
@@ -74,7 +104,8 @@ pub struct Ask<'a> {
     pub token: &'a Value,
 }
 
-/// A filesystem change record, marked before the walk and asked at load.
+/// A filesystem change record, asked for a token before the walk and
+/// asked what changed since it at load.
 pub trait ChangeSource {
     fn kind(&self) -> &'static str;
     /// A token for now, or why there is none.
@@ -82,20 +113,7 @@ pub trait ChangeSource {
     fn since(&self, ask: &Ask<'_>) -> Since;
 }
 
-/// Every source available now, unless `knob` is off.
-fn available(knob: Knob) -> Vec<Box<dyn ChangeSource>> {
-    let mut all: Vec<Box<dyn ChangeSource>> = Vec::new();
-    #[cfg(unix)]
-    if knob != Knob::Off {
-        match watchman::Watchman::find(MARK_WAIT) {
-            Ok(w) => all.push(Box::new(w)),
-            Err(why) => note(format_args!("no watchman ({why})")),
-        }
-    }
-    all
-}
-
-/// The source that recorded `token`, within [`ASK_WAIT`].
+/// The source that took `token`, within [`ASK_WAIT`].
 fn source(token: &Token) -> Option<Box<dyn ChangeSource>> {
     match token.kind.as_str() {
         #[cfg(unix)]
@@ -118,21 +136,25 @@ fn token(source: &dyn ChangeSource, root: &Path) -> Result<Token, String> {
     })
 }
 
-/// A token of `source` for now, or `None`, saying why under `--verbose`.
-fn new_token(source: &dyn ChangeSource, root: &Path) -> Option<Token> {
-    token(source, root)
-        .map_err(|why| note(format_args!("no {} token ({why})", source.kind())))
-        .ok()
-}
-
-/// A mark per source, unless `knob` is off, before the index walk of `root`.
+/// A token per source, unless `knob` is off, before the index walk of
+/// `root`; why there is none only under `--verbose`.
 pub fn marks(root: &Path, knob: Knob) -> Vec<Token> {
-    match root.canonicalize() {
-        Ok(root) => available(knob)
-            .iter()
-            .filter_map(|s| new_token(s.as_ref(), &root))
-            .collect(),
-        Err(_) => Vec::new(),
+    let Ok(root) = root.canonicalize() else {
+        return Vec::new();
+    };
+    if knob == Knob::Off {
+        return Vec::new();
+    }
+    #[cfg(unix)]
+    let found = watchman::Watchman::find(MARK_WAIT, &Policy::here()).and_then(|w| token(&w, &root));
+    #[cfg(not(unix))]
+    let found = Err("no change source on this platform".to_owned());
+    match found {
+        Ok(token) => vec![token],
+        Err(why) => {
+            note(format_args!("no watchman token ({why})"));
+            Vec::new()
+        }
     }
 }
 
@@ -142,8 +164,6 @@ pub struct Journal {
     root: String,
     tokens: Vec<Token>,
     named: Vec<String>,
-    #[serde(skip)]
-    knob: Knob,
 }
 
 /// What a source named, for the files layout to re-check.
@@ -154,7 +174,7 @@ pub struct Replay {
 }
 
 impl Journal {
-    /// The journal of an index of canonical `root`; nothing without marks.
+    /// The journal of an index of canonical `root`; nothing without tokens.
     pub fn write_new(output: &Path, root: &str, tokens: Vec<Token>) -> Result<(), String> {
         if tokens.is_empty() {
             return Ok(());
@@ -164,7 +184,6 @@ impl Journal {
             root: root.to_owned(),
             tokens,
             named: Vec::new(),
-            knob: Knob::Off,
         };
         journal.write(output)
     }
@@ -191,8 +210,7 @@ impl Journal {
         if v.get("v").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
             return Ok(None);
         }
-        let journal: Self = serde_json::from_value(v).map_err(tampered)?;
-        Ok(Some(Self { knob, ..journal }))
+        serde_json::from_value(v).map(Some).map_err(tampered)
     }
 
     /// Atomic: a crash leaves the old file or the new one.
@@ -210,29 +228,29 @@ impl Journal {
             })
     }
 
-    /// Fresh marks for the next checkpoint, and the first vouching source's
-    /// replay with `named`; no marks when no source pays off
-    /// for `docs` docs.
-    pub fn ask(&self, root: &Path, docs: usize) -> (Vec<Token>, Option<Replay>) {
+    /// Fresh tokens for the next checkpoint, and the first vouching
+    /// source's replay with `named`, or why none vouches, for a load of
+    /// `docs` docs.
+    pub fn ask(&self, root: &Path, docs: usize) -> (Vec<Token>, Result<Replay, String>) {
         if Path::new(&self.root) != root {
-            return (Vec::new(), None);
+            return (Vec::new(), Err("the index is of another root".to_owned()));
         }
-        let forced = self.knob == Knob::On;
-        let mut asked = Vec::new();
-        for t in &self.tokens {
-            match source(t) {
-                Some(s) if forced || docs >= MIN_DOCS => asked.push((t, s)),
-                Some(s) => note(format_args!(
-                    "{} does not pay off for {docs} files",
-                    s.kind()
-                )),
-                None => {}
+        let asked: Vec<_> = self
+            .tokens
+            .iter()
+            .filter_map(|t| Some((t, source(t)?)))
+            .collect();
+        let (mut marks, mut unmarked) = (Vec::new(), None);
+        for (_, s) in &asked {
+            match token(s.as_ref(), root) {
+                Ok(token) => marks.push(token),
+                Err(why) => {
+                    note(format_args!("no new {} token ({why})", s.kind()));
+                    unmarked.get_or_insert(why);
+                }
             }
         }
-        let marks = asked
-            .iter()
-            .filter_map(|(_, s)| new_token(s.as_ref(), root))
-            .collect();
+        let mut why = "the index holds no token of a known source".to_owned();
         for (t, s) in asked {
             let ask = Ask {
                 root,
@@ -240,11 +258,11 @@ impl Journal {
             };
             match s.since(&ask) {
                 Since::Paths(paths) if paths.len() > named_cap(docs) => {
-                    note(format_args!(
-                        "{} named {} paths, too many",
+                    why = format!(
+                        "{} reported {} changed paths, too many",
                         s.kind(),
                         paths.len()
-                    ));
+                    );
                 }
                 Since::Paths(mut paths) => {
                     paths.extend(self.named.iter().cloned());
@@ -254,12 +272,12 @@ impl Journal {
                         kind: s.kind(),
                         paths,
                     };
-                    return (marks, Some(replay));
+                    return (marks, Ok(replay));
                 }
-                Since::Unknown(why) => note(format_args!("{} cannot vouch ({why})", s.kind())),
+                Since::Unknown(unknown) => why = unknown,
             }
         }
-        (marks, None)
+        (marks, Err(unmarked.unwrap_or(why)))
     }
 
     /// Rewrite under `index_dir` with `marks`, which saw `named` differ.
@@ -268,32 +286,34 @@ impl Journal {
             return;
         }
         (self.tokens, self.named) = (marks, named);
-        if let Err(e) = self.write(index_dir)
-            && crate::verbose::verbose()
-        {
-            eprintln!("note: no checkpoint: {e}");
+        if let Err(e) = self.write(index_dir) {
+            note(format_args!("no checkpoint: {e}"));
         }
     }
 }
 
-/// The warning for a source that missed its deadline.
-fn late(kind: &str) -> String {
-    format!("warning: {kind} did not answer in time; set {VAR}=off to skip it")
-}
-
 #[cfg(test)]
 thread_local! {
-    /// Late warnings on this thread.
-    pub static WARNED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The warnings given on this thread, every one.
+    pub static NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Warns, verbose or not, that `kind` missed its deadline.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn warn_late(kind: &str) {
-    let warning = late(kind);
-    eprintln!("{warning}");
+/// `line` on stderr, once per process for each `seen`.
+fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
     #[cfg(test)]
-    WARNED.with_borrow_mut(|w| w.push(warning));
+    NOTES.with_borrow_mut(|n| n.push(line.to_string()));
+    if !seen.swap(true, Ordering::Relaxed) {
+        eprintln!("warning: {line}");
+    }
+}
+
+/// No source can say what changed on a tree worth asking about.
+pub fn cannot_answer(why: &str) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(
+        &SEEN,
+        format_args!("watchman cannot say what changed ({why}); checked every file"),
+    );
 }
 
 /// Why a source is not used, under `--verbose`.

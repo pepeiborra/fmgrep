@@ -22,30 +22,36 @@ fn journal_round_trips_and_malformed_is_refused() {
     let (root, index) = dirs(tmp.path());
     let root_str = root.to_str().unwrap();
     Journal::write_new(&index, root_str, Vec::new()).unwrap();
-    assert_eq!(Journal::open(&index, Knob::On).unwrap(), None, "no marks");
+    assert_eq!(
+        Journal::open(&index, Knob::Auto).unwrap(),
+        None,
+        "no tokens"
+    );
     let tokens = vec![Token {
         kind: "elsewhere".into(),
         token: json!(1),
     }];
     Journal::write_new(&index, root_str, tokens.clone()).unwrap();
-    assert_eq!(Journal::open(&index, Knob::Off).unwrap(), None, "off");
-    let journal = Journal::open(&index, Knob::On).unwrap().expect("written");
+    let journal = Journal::open(&index, Knob::Auto).unwrap().expect("written");
     let want = Journal {
         v: 1,
         root: root_str.into(),
         tokens,
         named: Vec::new(),
-        knob: Knob::On,
     };
     assert_eq!(journal, want);
     let (marks, replay) = journal.ask(&root, 1);
-    assert!(marks.is_empty() && replay.is_none(), "an unknown kind");
-    assert!(journal.ask(&index, 1).1.is_none(), "another root");
+    assert!(marks.is_empty() && replay.is_err(), "an unknown kind");
+    assert!(journal.ask(&index, 1).1.is_err(), "another root");
     std::fs::write(index.join(DOCS_JOURNAL), br#"{"v":2}"#).unwrap();
-    assert_eq!(Journal::open(&index, Knob::On).unwrap(), None, "another v");
+    assert_eq!(
+        Journal::open(&index, Knob::Auto).unwrap(),
+        None,
+        "another v"
+    );
     for bad in [&b"{"[..], br#"{"v":1}"#, br#"{"v":1,"root":0}"#] {
         std::fs::write(index.join(DOCS_JOURNAL), bad).unwrap();
-        let err = Journal::open(&index, Knob::On).unwrap_err();
+        let err = Journal::open(&index, Knob::Auto).unwrap_err();
         assert!(
             err.contains(DOCS_JOURNAL) && err.contains("tampered"),
             "got: {err}"
@@ -54,19 +60,12 @@ fn journal_round_trips_and_malformed_is_refused() {
 }
 
 #[test]
-fn the_knob_reads_off_and_on() {
-    assert_eq!(Knob::of(None), Knob::Auto);
-    assert_eq!(Knob::of(Some("off")), Knob::Off);
-    assert_eq!(Knob::of(Some("on")), Knob::On);
-    assert!(available(Knob::Off).is_empty());
-}
-
-#[test]
-fn a_late_source_names_the_knob_that_skips_it() {
-    assert_eq!(
-        late("watchman"),
-        "warning: watchman did not answer in time; set FMGREP_JOURNAL=off to skip it"
-    );
+fn loads_ask_from_50_000_docs() {
+    assert_eq!(MIN_DOCS, 50_000);
+    crate::tests::ASK_FROM.set(Some(10));
+    assert!(!Policy::here().due(9) && Policy::here().due(10));
+    crate::tests::ASK_FROM.set(None);
+    assert!(!Policy::here().due(usize::MAX), "tests ask only when told");
 }
 
 #[cfg(unix)]
@@ -81,16 +80,25 @@ mod watchman_tests {
     use crate::source::journal::watchman::Watchman;
     use crate::tests::watchman::Daemon;
 
-    const NORMAL: u8 = 0;
-    const FRESH: u8 = 1;
-    const ERROR: u8 = 2;
-    const IGNORES: u8 = 3;
-    /// The two texts of a sync that timed out; the second came from a
-    /// real daemon.
-    const SYNC_FAILED: u8 = 4;
-    const NO_COOKIE: u8 = 5;
+    /// Under load.
+    const SLACK: Duration = Duration::from_millis(1500);
 
-    /// A daemon on a socket in `dir` answering as `mode` says.
+    /// Replies that a real daemon gives only in states a test cannot make
+    /// it hold: a query error text, two texts of a sync that timed out (the
+    /// second came from a real daemon), and the error of a sync during a
+    /// crawl, to a query or to a clock as well.
+    const ERROR: u8 = 0;
+    const SYNC_FAILED: u8 = 1;
+    const NO_COOKIE: u8 = 2;
+    const CRAWL: u8 = 3;
+    const CRAWL_CLOCK: u8 = 4;
+
+    const CRAWL_TEXT: &str = "synchronization failed: syncToNow: timed out waiting for cookie \
+                              file to be observed by watcher within 74 milliseconds: Timer \
+                              expired. (performing initial crawl)";
+
+    /// A daemon on a socket in `dir` that watches `/w` and answers as
+    /// `mode` says.
     fn fake(dir: &Path, mode: Arc<AtomicU8>) -> PathBuf {
         let sock = dir.join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -102,12 +110,10 @@ mod watchman_tests {
                 let cmd: Value = serde_json::from_str(&line).unwrap();
                 let mode = mode.load(Ordering::Relaxed);
                 let reply = match (cmd[0].as_str().unwrap(), mode) {
-                    ("watch-list", _) => json!({"roots": ["/", "/w", "/w/other"]}),
-                    ("watch-project", _) => json!({"error": "watch-project on a watched tree"}),
-                    ("get-config", IGNORES) => json!({"config": {"ignore_dirs": ["build"]}}),
+                    ("watch-list", _) => json!({"roots": ["/w"]}),
                     ("get-config", _) => json!({"config": {}}),
-                    ("clock", _) if cmd[2]["sync_timeout"].is_u64() => json!({"clock": "c:1:2"}),
-                    ("clock", _) => json!({"clock": "c:1:3"}),
+                    ("clock", CRAWL_CLOCK) => json!({"error": CRAWL_TEXT}),
+                    ("clock", _) => json!({"clock": "c:1:2"}),
                     ("query", ERROR) => json!({"error": "bad"}),
                     ("query", SYNC_FAILED) => json!({"error": "synchronization failed: \
                         syncToNow: timed out waiting for cookie file to be observed by \
@@ -115,11 +121,7 @@ mod watchman_tests {
                     ("query", NO_COOKIE) => json!({"error": "std::system_error: syncToNow: \
                         timed out waiting for cookie file to be observed by watcher within 74 \
                         milliseconds: Connection timed out"}),
-                    ("query", _) => {
-                        let asked = (&cmd[1], &cmd[2]["since"], &cmd[2]["relative_root"]);
-                        assert_eq!(asked, (&json!("/w"), &json!("c:1:2"), &json!("sub")));
-                        json!({"files": ["a.c", "d/x.c"], "is_fresh_instance": mode == FRESH})
-                    }
+                    ("query", _) => json!({"error": CRAWL_TEXT}),
                     (other, _) => panic!("unexpected {other}"),
                 };
                 writeln!(conn, "{}", json!({"unilateral": true, "log": "noise"})).unwrap();
@@ -129,58 +131,93 @@ mod watchman_tests {
         sock
     }
 
-    fn token(sock: &Path) -> Value {
-        json!({"sock": sock, "watch": "/w", "relative": "sub", "clock": "c:1:2"})
+    /// A journal of `/w/sub` holding a token of the fake on `sock`.
+    fn faked(sock: &Path) -> Journal {
+        let token = json!({"sock": sock, "watch": "/w", "relative": "sub", "clock": "c:1:1"});
+        Journal {
+            v: VERSION,
+            root: "/w/sub".into(),
+            tokens: vec![Token {
+                kind: "watchman".into(),
+                token,
+            }],
+            named: Vec::new(),
+        }
     }
 
-    #[test]
-    fn watchman_client_speaks_the_protocol() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mode = Arc::new(AtomicU8::new(NORMAL));
-        let sock = fake(tmp.path(), Arc::clone(&mode));
-        let root = Path::new("/w/sub");
-        let marked = Watchman::at(sock.clone(), Duration::from_secs(5))
-            .mark(root)
-            .expect("a clock");
-        assert_eq!(marked, token(&sock));
-        let w = Watchman::of(&marked, Duration::from_secs(5)).expect("the token's daemon");
-        let ask = |root: &Path| {
-            w.since(&Ask {
-                root,
-                token: &marked,
-            })
-        };
-        assert!(matches!(ask(root), Since::Paths(p) if p == ["a.c", "d/x.c"]));
-        assert_eq!(
-            w.mark(root).unwrap()["clock"],
-            "c:1:3",
-            "a load's mark does not sync"
-        );
-        let why = |since: Since| match since {
+    /// A private daemon of this test, which this thread finds; `None`
+    /// without watchman.
+    fn live() -> Option<Daemon> {
+        let daemon = Daemon::start()?;
+        crate::tests::WATCHMAN.set(Some(daemon.sock.clone()));
+        Some(daemon)
+    }
+
+    fn at(daemon: &Daemon) -> Watchman {
+        Watchman::at(daemon.sock.clone(), Duration::from_secs(5))
+    }
+
+    fn put(root: &Path, rel: &str) {
+        std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(root.join(rel), rel).unwrap();
+    }
+
+    fn why(since: Since) -> String {
+        match since {
             Since::Unknown(why) => why,
             Since::Paths(p) => panic!("{p:?}"),
-        };
-        assert_eq!(why(ask(Path::new("/w"))), "the token watches another root");
-        for (m, want) in [
-            (
-                FRESH,
-                "watchman restarted, added the watch again or pruned deleted files since the last search",
-            ),
-            (ERROR, "watchman: bad"),
-            (SYNC_FAILED, "watchman did not answer within 5000 ms"),
-            (NO_COOKIE, "watchman did not answer within 5000 ms"),
-        ] {
-            mode.store(m, Ordering::Relaxed);
-            assert_eq!(why(ask(root)), want, "mode {m}");
         }
-        mode.store(IGNORES, Ordering::Relaxed);
+    }
+
+    /// A token of the watch `w` for the tree `w/sub`, then the paths
+    /// changed since it, relative to the tree; a restart is refused.
+    #[test]
+    fn watchman_client_speaks_the_protocol() {
+        let Some(mut daemon) = live() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, root) = (canonical(tmp.path()), canonical(tmp.path()).join("sub"));
+        std::fs::create_dir(&root).unwrap();
+        daemon.watch(&watch);
+        let marked = ChangeSource::mark(&at(&daemon), &root).expect("a clock");
         assert_eq!(
-            w.mark(root),
-            Err("watchman's ignore_dirs are set on /w".into()),
-            "ignore_dirs hides indexed files"
+            (&marked["watch"], &marked["relative"]),
+            (&json!(watch), &json!("sub"))
         );
-        let none = Watchman::at(tmp.path().join("none"), Duration::from_secs(5));
-        let gone = none.mark(root).unwrap_err();
+        assert_eq!(marked["sock"], json!(daemon.sock));
+        daemon.sent();
+        put(&root, "a.c");
+        put(&root, "d/x.c");
+        put(&watch, "beside.c");
+        let w = Watchman::of(&marked, Duration::from_secs(5)).expect("the token's daemon");
+        let ask = |root: &Path| {
+            ChangeSource::since(
+                &w,
+                &Ask {
+                    root,
+                    token: &marked,
+                },
+            )
+        };
+        // Watchman lists the paths in no set order.
+        let Since::Paths(mut paths) = ask(&root) else {
+            panic!("no paths");
+        };
+        paths.sort();
+        assert_eq!(paths, ["a.c", "d", "d/x.c"]);
+        assert_eq!(daemon.sent(), ["query"]);
+        assert!(why(ask(&watch)).contains("another root"));
+        daemon.restart();
+        daemon.watch(&watch);
+        let w = Watchman::of(&marked, Duration::from_secs(5)).unwrap();
+        let ask = Ask {
+            root: &root,
+            token: &marked,
+        };
+        assert!(why(ChangeSource::since(&w, &ask)).contains("restarted"));
+        daemon.stop();
+        let gone = ChangeSource::mark(&at(&daemon), &root).unwrap_err();
         assert!(
             gone.starts_with("no watchman daemon answers on ")
                 && gone.ends_with("; start watchman"),
@@ -189,42 +226,36 @@ mod watchman_tests {
         assert!(Watchman::of(&json!({"watch": "/w"}), Duration::from_secs(5)).is_none());
     }
 
+    /// An error text, and both ways watchman words a sync that timed out,
+    /// which mean it did not answer in time.
     #[test]
-    fn watchman_is_asked_from_50_000_docs_unless_forced() {
+    fn an_error_text_is_the_reason() {
         let tmp = tempfile::tempdir().unwrap();
-        let sock = fake(tmp.path(), Arc::new(AtomicU8::new(NORMAL)));
-        let root = Path::new("/w/sub");
-        let tokens = vec![Token {
-            kind: "watchman".into(),
-            token: token(&sock),
-        }];
-        for (knob, docs, asks) in [
-            (Knob::Auto, 49_999, false),
-            (Knob::Auto, 50_000, true),
-            (Knob::On, 10, true),
+        let mode = Arc::new(AtomicU8::new(ERROR));
+        let sock = fake(tmp.path(), Arc::clone(&mode));
+        let journal = faked(&sock);
+        let w = Watchman::of(&journal.tokens[0].token, Duration::from_secs(5)).unwrap();
+        let ask = Ask {
+            root: Path::new("/w/sub"),
+            token: &journal.tokens[0].token,
+        };
+        for (m, want) in [
+            (ERROR, "watchman: bad"),
+            (SYNC_FAILED, "watchman did not answer within 5000 ms"),
+            (NO_COOKIE, "watchman did not answer within 5000 ms"),
+            (CRAWL, "watchman is still crawling /w/sub"),
         ] {
-            let journal = Journal {
-                v: VERSION,
-                root: "/w/sub".into(),
-                tokens: tokens.clone(),
-                named: Vec::new(),
-                knob,
-            };
-            let (marks, replay) = journal.ask(root, docs);
-            assert_eq!(
-                (marks.len(), replay.map(|r| r.kind)),
-                (usize::from(asks), asks.then_some("watchman")),
-                "{knob:?} {docs}"
-            );
+            mode.store(m, Ordering::Relaxed);
+            assert_eq!(why(ChangeSource::since(&w, &ask)), want, "mode {m}");
         }
     }
 
     /// Where no watch covers the tree, watchman is asked to watch it; else
     /// the token belongs to the deepest watch above it, `w`, not the
-    /// tree's parent nor `w/subway`.
+    /// tree's parent nor `w/subway`; no token where ignore_dirs are set.
     #[test]
-    fn watchman_takes_a_token_of_the_deepest_watch_above_the_tree() {
-        let Some((daemon, w)) = live() else {
+    fn watchman_takes_a_token_of_a_watch_already_there() {
+        let Some(daemon) = live() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -233,8 +264,12 @@ mod watchman_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(top.join("w/subway")).unwrap();
         let watched = |t: &Value| (t["watch"].clone(), t["relative"].clone());
-        let marked = w.mark(&root).expect("asked to watch it");
-        assert_eq!(watched(&marked), (json!(root), json!("")));
+        let marked = ChangeSource::mark(&at(&daemon), &root).expect("asked to watch it");
+        assert_eq!(
+            watched(&marked),
+            (json!(root), json!("")),
+            "the tree is the watch"
+        );
         let asked = ["watch-list", "watch-project", "get-config", "clock"];
         assert_eq!(daemon.sent(), asked);
         daemon.unwatch(&root);
@@ -243,63 +278,24 @@ mod watchman_tests {
             daemon.watch(dir);
         }
         assert_eq!(daemon.roots().len(), 3);
-        let w = Watchman::at(daemon.sock.clone(), Duration::from_secs(5));
-        let marked = w.mark(&root).expect("a token of the watch above");
+        let marked = ChangeSource::mark(&at(&daemon), &root).expect("a token of the watch above");
         assert_eq!(watched(&marked), (json!(top.join("w")), json!("sub")));
         let asked = ["watch-list", "get-config", "clock"];
         assert_eq!(daemon.sent(), asked, "no watch-project");
+        let w = top.join("w");
+        daemon.unwatch(&top);
+        daemon.unwatch(&w);
+        std::fs::write(w.join(".watchmanconfig"), r#"{"ignore_dirs": ["build"]}"#).unwrap();
+        daemon.watch(&w);
+        let why = format!("watchman's ignore_dirs are set on {}", w.display());
+        assert_eq!(ChangeSource::mark(&at(&daemon), &root), Err(why));
     }
 
-    const BUDGET: Duration = Duration::from_secs(1);
-    /// Under load.
-    const SLACK: Duration = Duration::from_millis(1500);
-
-    /// The late warnings on this thread since the last call.
-    fn warned() -> Vec<String> {
-        WARNED.take()
-    }
-
-    /// Mark then ask on one budget: no mark, no vouching, and within it,
-    /// with one warning.
-    fn gives_up_in_time(sock: PathBuf) {
-        warned();
-        let start = Instant::now();
-        let token = token(&sock);
-        let w = Watchman::at(sock, BUDGET);
-        let root = Path::new("/w/sub");
-        assert_eq!(
-            w.mark(root),
-            Err("watchman did not answer within 1000 ms".into())
-        );
-        let ask = Ask {
-            root,
-            token: &token,
-        };
-        assert!(matches!(w.since(&ask), Since::Unknown(_)));
-        assert!(
-            start.elapsed() < BUDGET + SLACK,
-            "took {:?}",
-            start.elapsed()
-        );
-        assert_eq!(warned(), [late("watchman")]);
-    }
-
+    /// A hung daemon (stopped in place) costs a load of any size at most
+    /// [`ASK_WAIT`], and gives no token.
     #[test]
-    fn watchman_gives_up_on_a_daemon_that_never_answers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("sock");
-        let listener = UnixListener::bind(&sock).unwrap();
-        std::thread::spawn(move || {
-            let held: Vec<_> = listener.incoming().map_while(Result::ok).collect();
-            drop(held);
-        });
-        gives_up_in_time(sock);
-    }
-
-    /// A daemon stopped in place, as a hung one.
-    #[test]
-    fn a_load_gives_up_on_watchman_within_100_ms_at_any_size() {
-        let Some((daemon, w)) = live() else {
+    fn a_load_never_waits_long_for_watchman() {
+        let Some(daemon) = live() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -309,20 +305,38 @@ mod watchman_tests {
             root: root.to_str().unwrap().into(),
             tokens: vec![Token {
                 kind: "watchman".into(),
-                token: w.mark(&root).expect("a token of the tree, watched"),
+                token: ChangeSource::mark(&at(&daemon), &root).expect("a token"),
             }],
             named: Vec::new(),
-            knob: Knob::On,
         };
         daemon.hang();
-        warned();
         let start = Instant::now();
         let (marks, replay) = journal.ask(&root, 2_000_000);
         let took = start.elapsed();
         daemon.resume();
-        assert!(marks.is_empty() && replay.is_none(), "a hung daemon");
         assert!(took < ASK_WAIT + SLACK / 3, "took {took:?}");
-        assert_eq!(warned(), [late("watchman")]);
+        let why = replay.err().unwrap();
+        assert_eq!(why, "watchman did not answer within 100 ms");
+        assert!(marks.is_empty(), "no token");
+    }
+
+    /// Late or crawling, as watchman's error texts say: the new token is
+    /// kept when the clock answered.
+    #[test]
+    fn a_load_says_why_watchman_was_late() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mode = Arc::new(AtomicU8::new(SYNC_FAILED));
+        let sock = fake(tmp.path(), Arc::clone(&mode));
+        for (m, marked, want) in [
+            (SYNC_FAILED, 1, "watchman did not answer within 100 ms"),
+            (CRAWL, 1, "watchman is still crawling /w/sub"),
+            (CRAWL_CLOCK, 0, "watchman is still crawling /w/sub"),
+        ] {
+            mode.store(m, Ordering::Relaxed);
+            let (marks, replay) = faked(&sock).ask(Path::new("/w/sub"), 1_000_000);
+            assert_eq!(replay.err().unwrap(), want, "mode {m}");
+            assert_eq!(marks.len(), marked, "mode {m}");
+        }
     }
 
     #[test]
@@ -330,12 +344,17 @@ mod watchman_tests {
         let tmp = tempfile::tempdir().unwrap();
         let sock = tmp.path().join("sock");
         let _listener = UnixListener::bind(&sock).unwrap();
-        gives_up_in_time(sock);
+        let start = Instant::now();
+        let w = Watchman::at(sock, Duration::from_secs(1));
+        let why = ChangeSource::mark(&w, Path::new("/w/sub")).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1) + SLACK);
+        assert_eq!(why, "watchman did not answer within 1000 ms");
     }
 
     #[test]
     fn watchman_detection_kills_a_stalled_child() {
         use std::os::unix::fs::PermissionsExt as _;
+        const BUDGET: Duration = Duration::from_secs(1);
         let tmp = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = tmp.path().join(name);
@@ -343,57 +362,47 @@ mod watchman_tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        warned();
         let start = Instant::now();
-        assert_eq!(
-            Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET),
-            Err("watchman get-sockname did not answer within 1000 ms".into())
-        );
+        let stalled = Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET);
         assert!(
             start.elapsed() < BUDGET + SLACK,
             "took {:?}",
             start.elapsed()
         );
-        assert_eq!(warned(), [late("watchman")]);
+        assert_eq!(
+            stalled,
+            Err("watchman get-sockname did not answer within 1000 ms".into())
+        );
         let answers = script("answers", r#"echo '{"sockname": "/s"}'"#);
         assert_eq!(Watchman::detect(&answers, BUDGET * 5), Ok("/s".into()));
         let failed = Watchman::detect(&script("fails", "exit 1"), BUDGET).unwrap_err();
+        assert!(failed.starts_with("watchman get-sockname found no watchman ("));
+        let missing = Watchman::detect(&tmp.path().join("none"), BUDGET).unwrap_err();
         assert!(
-            failed.starts_with("watchman get-sockname found no watchman ("),
-            "{failed}"
+            missing.starts_with("watchman get-sockname found no watchman ("),
+            "{missing}"
         );
-        assert!(
-            warned().is_empty(),
-            "a quick answer or failure warns nothing"
-        );
-    }
-
-    /// A private daemon of this test, which this thread finds; `None`
-    /// without watchman.
-    fn live() -> Option<(Daemon, Watchman)> {
-        let daemon = Daemon::start()?;
-        crate::tests::WATCHMAN.set(Some(daemon.sock.clone()));
-        let w = Watchman::find(Duration::from_secs(5)).expect("the test's daemon");
-        Some((daemon, w))
     }
 
     #[test]
     fn watchman_live_round_trip() {
-        let Some((_daemon, w)) = live() else {
+        let Some(daemon) = live() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let token = w.mark(&root).expect("a token of the tree, watched");
+        let token = ChangeSource::mark(&at(&daemon), &root).expect("a token of the tree");
         std::fs::write(root.join("new.c"), b"new").unwrap();
-        let w = Watchman::of(&token, Duration::from_secs(5)).unwrap();
-        let named = |token: &Value| match w.since(&Ask { root: &root, token }) {
-            Since::Paths(p) => p,
-            Since::Unknown(why) => panic!("cannot vouch: {why}"),
+        let named = |token: &Value| {
+            let w = Watchman::of(token, Duration::from_secs(5)).unwrap();
+            match ChangeSource::since(&w, &Ask { root: &root, token }) {
+                Since::Paths(p) => p,
+                Since::Unknown(why) => panic!("cannot vouch: {why}"),
+            }
         };
         assert!(named(&token).iter().any(|p| p == "new.c"));
         for i in 0..10 {
-            let token = w.mark(&root).unwrap();
+            let token = ChangeSource::mark(&at(&daemon), &root).unwrap();
             let name = format!("r{i}.c");
             std::fs::write(root.join(&name), b"raced").unwrap();
             assert!(named(&token).contains(&name), "rep {i}");
@@ -404,10 +413,9 @@ mod watchman_tests {
     fn watchman_alone_is_marked_unless_off() {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let Some((_daemon, w)) = live() else {
+        let Some(_daemon) = live() else {
             return;
         };
-        assert!(w.mark(&root).is_ok(), "the tree, watched");
         let kinds =
             |knob| -> Vec<String> { marks(&root, knob).into_iter().map(|t| t.kind).collect() };
         assert_eq!(kinds(Knob::Auto), ["watchman"]);

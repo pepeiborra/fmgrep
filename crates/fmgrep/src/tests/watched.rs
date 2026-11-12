@@ -12,6 +12,11 @@ fn replays(index: &Path) -> bool {
     docs.replay(&manifest.files)
 }
 
+/// The warnings given on this thread since the last call.
+fn notes() -> Vec<String> {
+    crate::source::NOTES.take()
+}
+
 fn put(root: &Path, rel: &str, bytes: &[u8]) {
     std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
     std::fs::write(root.join(rel), bytes).unwrap();
@@ -27,7 +32,7 @@ fn live(folder: &Path) -> Option<Daemon> {
     let daemon = Daemon::start()?;
     daemon.watch(folder);
     WATCHMAN.set(Some(daemon.sock.clone()));
-    JOURNAL.set(Some("on"));
+    ASK_FROM.set(Some(0));
     Some(daemon)
 }
 
@@ -48,18 +53,81 @@ fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Dae
 
 const AB: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("b.c", b"none\n")];
 
+fn cannot(why: &str) -> String {
+    format!("watchman cannot say what changed ({why}); checked every file")
+}
+
+/// A hung daemon (stopped in place), a watch removed and added again, and
+/// no daemon: each search says why, and checks every file.
 #[test]
-fn a_small_tree_asks_nothing() {
+fn a_load_watchman_cannot_answer_says_why_and_stats_every_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, mut daemon)) = watched(tmp.path(), AB) else {
+        return;
+    };
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    let journal = std::fs::read(output.join("docs.journal")).unwrap();
+    daemon.hang();
+    let start = std::time::Instant::now();
+    assert!(!replays(&output));
+    let took = start.elapsed();
+    daemon.resume();
+    assert!(
+        took < std::time::Duration::from_millis(1600),
+        "took {took:?}"
+    );
+    assert_eq!(notes(), [cannot("watchman did not answer within 100 ms")]);
+    assert_eq!(std::fs::read(output.join("docs.journal")).unwrap(), journal);
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    notes();
+    daemon.unwatch(&folder);
+    assert!(!replays(&output));
+    let again = "watchman restarted, added the watch again or pruned deleted files since the \
+                 last search";
+    assert_eq!(notes(), [cannot(again)]);
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let now = journal_json(&output);
+    assert_ne!(now.to_string().into_bytes(), journal, "a later token");
+    assert_eq!(now["named"], serde_json::json!(["b.c"]), "the stat pass's");
+    notes();
+    daemon.stop();
+    assert!(!replays(&output));
+    let why = notes();
+    let gone = "watchman cannot say what changed (no watchman daemon answers on ";
+    assert!(why.len() == 1 && why[0].starts_with(gone), "{why:?}");
+}
+
+#[test]
+fn an_index_without_a_token_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), AB);
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, false);
+    assert!(!output.join("docs.journal").exists());
+    ASK_FROM.set(Some(0));
+    assert!(!replays(&output));
+    let root = std::fs::canonicalize(&folder).unwrap();
+    let r = root.display();
+    let why = format!(
+        "watchman cannot say what changed (the index holds no watchman token; run 'watchman \
+         watch-project {r}', then re-index); checked every file"
+    );
+    assert_eq!(notes(), [why]);
+}
+
+#[test]
+fn a_small_tree_asks_nothing_and_says_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
         return;
     };
     let journal = std::fs::read(output.join("docs.journal")).unwrap();
-    JOURNAL.set(None);
+    ASK_FROM.set(Some(3));
     std::fs::write(folder.join("c.c"), b"printk\n").unwrap();
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
     assert!(!replays(&output));
     assert!(daemon.sent().is_empty());
+    assert!(notes().is_empty(), "no line");
     assert_eq!(std::fs::read(output.join("docs.journal")).unwrap(), journal);
 }
 
@@ -97,7 +165,7 @@ fn journal_answers_like_the_sweep() {
     std::fs::rename(folder.join("mw"), folder.join("mv2")).unwrap();
     std::fs::rename(folder.join("r.c"), folder.join("r2.c")).unwrap();
     std::fs::remove_file(folder.join("d.c")).unwrap();
-    assert!(replays(&stale));
+    assert!(replays(&stale), "{:?}", notes());
     let want = "a.c\nb.c\nig.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
     let got = printed(&stale, &["-l"], &["printk"]);
     assert_eq!(got, want, "kb/k.dat, named, is found");
@@ -152,7 +220,7 @@ fn journal_skips_the_stat_pass() {
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
     let manifest = read_manifest(&output).unwrap();
     let mut docs = crate::fetch::DocStore::open(&output, &manifest, None).unwrap();
-    assert!(docs.replay(&manifest.files));
+    assert!(docs.replay(&manifest.files), "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "journal: no doc is named");
     docs.stat_all(&manifest.files);
@@ -183,6 +251,7 @@ fn checkpoint_advances_the_token_and_keeps_changed_paths() {
     std::fs::remove_file(folder.join("n.c")).unwrap();
     assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:1\n");
     assert_eq!(journal_json(&output)["named"], serde_json::json!(["a.c"]));
+    assert!(notes().is_empty());
 }
 
 #[test]
@@ -201,22 +270,4 @@ fn read_only_index_dir_skips_the_checkpoint() {
     assert_eq!(answer, "a.c:1\nb.c:1\n");
     let now = std::fs::read(output.join("docs.journal")).unwrap();
     assert_eq!(now, journal, "no checkpoint");
-}
-
-#[test]
-fn knob_off_reads_no_journal_and_writes_none() {
-    let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
-        return;
-    };
-    let journal = std::fs::read(output.join("docs.journal")).unwrap();
-    JOURNAL.set(Some("off"));
-    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
-    let now = std::fs::read(output.join("docs.journal")).unwrap();
-    assert_eq!(now, journal, "no checkpoint");
-    let off = tmp.path().join("off");
-    index_it(&folder, &off, false);
-    assert!(!off.join("docs.journal").exists());
-    assert!(daemon.sent().is_empty(), "nothing asked");
 }

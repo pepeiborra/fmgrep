@@ -126,12 +126,16 @@ The token goes to `docs.journal` (JSON). A load asks watchman what
 changed since its token, re-checks only those paths and the ignore files,
 and skips the stat pass and the directory check; a search then rewrites
 the token with what differs now. Watchman is asked from 50,000
-documents.
-A watchman that answers too slowly or names too many paths, and an index
-without `docs.journal`, fall back to the stat pass. An edit made while a
-directory above the root is renamed away and back, and a hard-linked file
-edited outside the root, are missed by the journal. `FMGREP_JOURNAL`
-forces or disables it (`docs/tuning.md`).
+documents. A watchman that has not answered within 100 ms (one that
+hangs, or is still crawling after a restart) or reports too many changed
+paths, and an index without `docs.journal`, fall back to the stat pass; a
+late answer is never used. Such a search prints one line on stderr that
+says why and, where there is one, what to do, for example `warning:
+watchman cannot say what changed (watchman is still crawling /src);
+checked every file`.
+An edit made while a directory above the root is renamed away and back,
+and a hard-linked file edited outside the root, are missed by the journal.
+`FMGREP_JOURNAL` forces or disables it (`docs/tuning.md`).
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;

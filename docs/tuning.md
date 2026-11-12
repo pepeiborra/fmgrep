@@ -28,4 +28,4 @@ empty is the default, and any other value that does not parse is an error.
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_JOURNAL` | unset: a running watchman, where it pays off | `off` writes and reads no `docs.journal`, so every load stats every file; `on` asks watchman even on a small tree. A watchman that misses its deadline warns on stderr and falls back to the stat pass. |
+| `FMGREP_JOURNAL` | unset: a running watchman, where it pays off | `off` writes and reads no `docs.journal`, so every load stats every file and says nothing; `on` asks watchman even on a small tree. A search that cannot use watchman checks every file and says why on stderr ([index-format.md](index-format.md#staleness)). |
