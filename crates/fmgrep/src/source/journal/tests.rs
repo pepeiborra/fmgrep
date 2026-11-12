@@ -66,6 +66,7 @@ fn a_record_is_used_only_by_its_index_build() {
         &idx,
         token("c:1:2"),
         baseline.clone(),
+        64,
     );
     let record = Record::read("/src/linux", &idx).unwrap();
     let want = Record {
@@ -74,7 +75,7 @@ fn a_record_is_used_only_by_its_index_build() {
         index: "/src/linux/.fmgrep".into(),
         index_started_ns: 7,
         token: token("c:1:2"),
-        baseline,
+        baseline: Some(baseline),
     };
     assert_eq!(record, want);
     let file = path("/src/linux", "/src/linux/.fmgrep").unwrap();
@@ -106,6 +107,10 @@ fn a_record_is_used_only_by_its_index_build() {
     other["v"] = json!(2);
     std::fs::write(&file, other.to_string()).unwrap();
     assert!(Record::read("/src/linux", &idx).is_err(), "another version");
+    let many: Vec<String> = (0..65).map(|i| format!("n{i}.c")).collect();
+    save(Path::new("/src/linux"), &idx, token("c:1:3"), many, 64);
+    let over = Record::read("/src/linux", &idx).unwrap();
+    assert_eq!(over.baseline, None, "past the cap");
 }
 
 #[test]
@@ -114,14 +119,26 @@ fn a_record_that_cannot_be_saved_says_so() {
     let notes = || crate::tests::NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()));
     crate::tests::CACHE.set(None);
     notes();
-    save(Path::new("/src"), &index("/i", 1), token("c:1:2"), vec![]);
+    save(
+        Path::new("/src"),
+        &index("/i", 1),
+        token("c:1:2"),
+        vec![],
+        64,
+    );
     let none = "cannot save the watchman token (no cache directory: set XDG_CACHE_HOME or \
                 HOME); the next search checks again";
     assert_eq!(notes(), [none]);
     let file = tmp.path().join("file");
     std::fs::write(&file, b"").unwrap();
     crate::tests::CACHE.set(Some(file.join("fmgrep")));
-    save(Path::new("/src"), &index("/i", 1), token("c:1:2"), vec![]);
+    save(
+        Path::new("/src"),
+        &index("/i", 1),
+        token("c:1:2"),
+        vec![],
+        64,
+    );
     let got = notes();
     assert!(
         got.len() == 1
@@ -432,8 +449,8 @@ mod watchman_tests {
         crate::tests::CACHE.set(Some(tmp.path().join("cache")));
         let sock = fake(tmp.path(), Arc::new(AtomicU8::new(SYNC_FAILED)));
         let (root, idx) = (Path::new("/w/sub"), index("/i", 1));
-        save(root, &idx, faked(&sock), vec!["b.c".into()]);
-        let asked = ask(root, &idx);
+        save(root, &idx, faked(&sock), vec!["b.c".into()], 64);
+        let asked = ask(root, &idx, 1000);
         let token = asked.token.expect("the new token");
         assert_ne!(token.clock, faked(&sock).clock);
         assert!(asked.paths.is_none(), "every file is checked");

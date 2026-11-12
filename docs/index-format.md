@@ -151,7 +151,7 @@ index directory. The record is one line of JSON:
 | `index` | the canonical index directory |
 | `index_started_ns` | the manifest's, so a rebuilt index does not use it |
 | `token` | `sock`, `watch`, `relative`, `clock`: a watchman clock of the watch on the tree, and the daemon's socket |
-| `baseline` | the paths that may differ from the index, ascending |
+| `baseline` | the paths that may differ from the index, ascending; `null` when more than an eighth of the documents (at least 64) do |
 
 A **token** is the second of two watchman clocks synced within 100 ms,
 kept only when it is a later tick than the first. A clock answered during
@@ -212,14 +212,16 @@ change:
   watchman daemon answers on <socket>
   (<error>); start watchman` (the socket in `WATCHMAN_SOCK`),
   `watchman did not answer within 100 ms`, `watchman's ignore_dirs hide
-  part of /src`, `more than <n> paths may differ from the index; re-run
-  index` (re-checking them would cost more than the stat pass: about 7 us
-  a path against 1 us a file), `the index has no dirs.stamps; re-run
-  index`, `the
+  part of /src`, `the index has no dirs.stamps; re-run index`, `the
   manifest lists files out of order; re-run index`, `cannot resolve /src
   (<error>)`, or
   `watchman: <its own error>`. A late answer is never used; the record is
   kept, with a newer token when one was taken.
+- `warning: more than <n> paths may differ from the index; checked every file (re-run index)`:
+  re-checking them would cost more than the stat pass (about 7 us a path
+  against 1 us a file). The record then holds no baseline, and each
+  search checks every file, until no more than that many differ again
+  (then the record holds a baseline again) or the next `index`.
 - `warning: cannot save <record> (<error>); the next search checks again`.
 
 An edit made while a directory above the root is renamed away and back,
