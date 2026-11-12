@@ -293,8 +293,7 @@ mod watchman_tests {
         let none = at(&daemon);
         let gone = none.mark(&root).unwrap_err();
         assert!(
-            gone.starts_with("no watchman daemon answers on ")
-                && gone.ends_with("; start watchman"),
+            gone.starts_with("no watchman daemon answers on ") && gone.ends_with(')'),
             "{gone}"
         );
         assert!(!none.late(), "a daemon gone is not late");
@@ -509,8 +508,15 @@ mod watchman_tests {
         let tmp = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let path = tmp.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let body = format!("#!/bin/sh\n[ -n \"$PROBE\" ] && exit 0\n{body}\n");
+            std::fs::write(&path, body).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // A thread forking meanwhile may hold the file open for writing
+            // until its child execs: wait until it runs.
+            let probe = || std::process::Command::new(&path).env("PROBE", "1").status();
+            while probe().is_err() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             path
         };
         let start = Instant::now();
@@ -524,13 +530,30 @@ mod watchman_tests {
             stalled,
             Err("watchman get-sockname did not answer within 1000 ms".into())
         );
-        let answers = script("answers", r#"echo '{"sockname": "/s"}'"#);
+        let args = tmp.path().join("args");
+        let answers = script(
+            "answers",
+            &format!(
+                r#"echo "$@" > {}; echo '{{"sockname": "/s"}}'"#,
+                args.display()
+            ),
+        );
         assert_eq!(Watchman::detect(&answers, BUDGET * 5), Ok("/s".into()));
+        let args = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(args, "--no-pretty get-sockname\n", "may start the daemon");
+        // A daemon started by the client may keep its stdout open.
+        let holds = script("holds", r#"echo '{"sockname": "/s"}'; sleep 5 &"#);
+        let start = Instant::now();
+        assert_eq!(Watchman::detect(&holds, BUDGET * 5), Ok("/s".into()));
+        assert!(start.elapsed() < BUDGET, "took {:?}", start.elapsed());
         let failed = Watchman::detect(&script("fails", "exit 1"), BUDGET).unwrap_err();
-        assert!(failed.starts_with("watchman get-sockname found no watchman ("));
+        assert!(
+            failed.starts_with("watchman get-sockname failed (exit status: 1"),
+            "{failed}"
+        );
         let missing = Watchman::detect(&tmp.path().join("none"), BUDGET).unwrap_err();
         assert!(
-            missing.starts_with("watchman get-sockname found no watchman ("),
+            missing.starts_with("cannot run watchman (") && missing.ends_with("; install watchman"),
             "{missing}"
         );
     }

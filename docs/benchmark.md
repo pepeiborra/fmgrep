@@ -41,9 +41,9 @@ test.
 
 ## File monitor
 
-fmgrep does not call git. `fmgrep index` asks a running watchman (it
-never starts one) to watch a tree of 50,000 files or more, without
-waiting for the crawl, and takes no token. On every query without a
+fmgrep does not call git. `fmgrep index` asks watchman to watch a tree
+of 50,000 files or more, without waiting for the crawl, and takes no
+token; it starts the daemon when none runs, as a search does. On every query without a
 server and when a server starts, a load of 50,000 indexed files or more
 asks watchman. The first load of an index takes a token and stats every
 indexed file; after it answers it keeps the token and the paths that

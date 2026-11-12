@@ -162,6 +162,101 @@ fn a_first_search_that_gets_no_token_saves_nothing() {
     assert!(records(tmp.path()).is_empty());
 }
 
+/// A stand-in watchman client at `<tmp>/bin/watchman`: it logs each run's
+/// arguments to `<tmp>/runs` and gives `sock`, as the real client does
+/// once the daemon it started listens.
+fn stand_in(tmp: &Path, sock: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = tmp.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let program = bin.join("watchman");
+    let reply = serde_json::json!({"version": "stand-in", "sockname": sock});
+    let runs = tmp.join("runs");
+    let body = format!(
+        "#!/bin/sh\n[ -n \"$PROBE\" ] && exit 0\necho \"$@\" >> '{}'\necho '{reply}'\n",
+        runs.display()
+    );
+    std::fs::write(&program, body).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A test thread forking meanwhile may hold the file open for writing
+    // until its child execs: wait until it runs.
+    while std::process::Command::new(&program)
+        .env("PROBE", "1")
+        .status()
+        .is_err()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    program
+}
+
+fn runs(tmp: &Path) -> String {
+    std::fs::read_to_string(tmp.join("runs")).unwrap_or_default()
+}
+
+#[test]
+fn without_watchman_installed_a_search_says_so_and_checks_every_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
+        return;
+    };
+    WATCHMAN.set(None);
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let got = notes();
+    let missing = "watchman cannot say what changed (cannot run watchman (";
+    let fix = "; install watchman); checked every file";
+    assert!(
+        got.len() == 1 && got[0].starts_with(missing) && got[0].ends_with(fix),
+        "{got:?}"
+    );
+    assert!(daemon.sent().is_empty() && records(tmp.path()).is_empty());
+}
+
+/// No socket is given: `index` runs the client for one, which may start
+/// the daemon (here a stand-in gives the test's daemon), and asks the
+/// daemon to watch the tree without waiting for its read. A search runs
+/// the client too and takes the token; the next one finds the daemon
+/// through its record.
+#[test]
+fn index_and_a_search_start_watchman_and_ask_it_to_watch_the_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
+        return;
+    };
+    WATCHMAN.set(None);
+    WATCHMAN_PROGRAM.set(stand_in(tmp.path(), &daemon.sock));
+    daemon.unwatch(&folder);
+    let start = std::time::Instant::now();
+    index_it(&folder, &tmp.path().join("idx2"), false);
+    let took = start.elapsed();
+    assert!(took < std::time::Duration::from_millis(1600), "{took:?}");
+    assert_eq!(runs(tmp.path()), "--no-pretty get-sockname\n", "may start");
+    assert_eq!(daemon.sent(), ["watch-list", "watch-project"]);
+    let root = std::fs::canonicalize(&folder).unwrap();
+    assert_eq!(daemon.roots(), [root.to_str().unwrap()], "the watch");
+    assert!(notes().is_empty() && records(tmp.path()).is_empty());
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert_eq!(
+        runs(tmp.path()).lines().count(),
+        2,
+        "the search runs it too"
+    );
+    assert_eq!(notes(), [ONCE]);
+    assert_eq!(
+        record(tmp.path())["token"]["sock"],
+        daemon.sock.to_str().unwrap()
+    );
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert!(notes().is_empty(), "the token question");
+    assert_eq!(
+        runs(tmp.path()).lines().count(),
+        2,
+        "the record has the socket"
+    );
+}
+
 /// `index` asks watchman to watch the tree, does not wait for the reply
 /// beyond its 100 ms, takes no token and writes no record; the first
 /// search takes one.
@@ -416,12 +511,15 @@ fn a_small_tree_asks_nothing_and_says_nothing() {
         return;
     };
     ASK_FROM.set(Some(3));
+    WATCHMAN.set(None);
+    WATCHMAN_PROGRAM.set(stand_in(tmp.path(), &daemon.sock));
     index_it(&folder, &tmp.path().join("idx2"), false);
     assert!(daemon.sent().is_empty(), "nor does index");
     std::fs::write(folder.join("c.c"), b"printk\n").unwrap();
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
     assert!(!replays(&output));
     assert!(daemon.sent().is_empty());
+    assert_eq!(runs(tmp.path()), "", "no watchman client either");
     assert!(notes().is_empty(), "no line");
     assert!(records(tmp.path()).is_empty(), "no record");
 }
