@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use fmgrep::regex_pattern;
 use serde_json::Value;
 
-use crate::rows::{Guard, LINES, Sampler, failure, run_measured, timed};
+use crate::rows::{Guard, LINES, Sampler, failure, run_measured, timed, unsampled};
 use crate::verify::Paths;
 use crate::{Query, Row, RowKind, leaves, with_warm_up};
 
@@ -114,7 +114,7 @@ pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
         .stderr(Stdio::null());
     let mut server = Guard(serve.spawn().map_err(|e| format!("tgrep serve: {e}"))?);
     let pid = server.0.id();
-    let sampler = Sampler::start(pid, Duration::from_millis(10));
+    let mut sampler = Sampler::start(pid, Duration::from_millis(10));
     let mut last = String::new();
     loop {
         if let Ok(Some(status)) = server.0.try_wait() {
@@ -136,15 +136,17 @@ pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
 
     for (term, warm_up) in with_warm_up(terms) {
         let what = format!("tgrep {term:?}");
+        // The server's footprint and RSS leave the warm-up out.
+        let paused = warm_up.then_some(&mut sampler);
         let start = Instant::now();
-        let out = match &leaves(term)[..] {
+        let out = unsampled(paused, || match &leaves(term)[..] {
             [leaf] => {
                 let (fixed, e) = pattern(leaf);
                 let args: Vec<&str> = LINES.into_iter().chain(fixed).chain([&*e]).collect();
-                search(&mut tgrep(&args), &what)?
+                search(&mut tgrep(&args), &what)
             }
-            all => and(&tgrep, paths, all, &what)?,
-        };
+            all => and(&tgrep, paths, all, &what),
+        })?;
         let latency = start.elapsed();
         let hits = paths.hits(&what, &out)?;
         if !warm_up {

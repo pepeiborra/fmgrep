@@ -51,8 +51,9 @@ listed under the run's results, not failures.
   [docs/benchmark.md](docs/benchmark.md#elgrep-optional).
 
 Before its timed queries every row runs the set's first query once as a
-warm-up, after `ready` where the row has one: its output is checked but
-neither timed nor kept, so no row times the first query a client sends.
+warm-up, after `ready` where the row has one: its output is checked, but
+it is neither timed nor kept, nor counted in the query footprint or
+RSS, so no row times the first query a client sends.
 Latency is spawn to exit, process start-up and printing included. `p50` is
 the lower median over the literal, the regex or the intersection queries,
 beside their mean; `all` is over every query. `query footprint` is the
