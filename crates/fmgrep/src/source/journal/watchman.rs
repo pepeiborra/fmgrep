@@ -13,7 +13,7 @@
 
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -179,17 +179,19 @@ impl Watchman {
             .ok_or_else(|| "watchman sent no clock".to_owned())
     }
 
-    /// A token for now, of the watch covering `root`. Refused under
-    /// `ignore_dirs`, as watchman would hide indexed changes, or when the
-    /// two clocks do not sync in time or share a tick (a crawl's).
+    /// A token for now, of the watch covering `root`. Refused when an
+    /// `ignore_dirs` entry would hide changes under it, or when the two
+    /// clocks do not sync in time or share a tick (a crawl's).
     fn mark(&self, root: &Path) -> Result<Token, String> {
         let (watch, relative) = self.watch(root)?;
         let config = self.call(&json!(["get-config", watch]), root)?;
-        let ignores = config
-            .pointer("/config/ignore_dirs")
-            .and_then(Value::as_array);
-        if ignores.is_some_and(|d| !d.is_empty()) {
-            return Err(format!("watchman's ignore_dirs are set on {watch}"));
+        if let Some(ignores) = config.pointer("/config/ignore_dirs")
+            && hides(ignores, &relative)
+        {
+            return Err(format!(
+                "watchman's ignore_dirs hide part of {}",
+                root.display()
+            ));
         }
         let first = self.clock(&watch, root)?;
         let clock = self.clock(&watch, root)?;
@@ -350,4 +352,27 @@ pub(super) fn ticked(a: &str, b: &str) -> bool {
         Some((instance.to_owned(), tick.parse::<u64>().ok()?))
     };
     matches!((split(a), split(b)), (Some((ia, ta)), Some((ib, tb))) if ia == ib && tb > ta)
+}
+
+/// Whether an `ignore_dirs` entry (watch-relative) is at, under or above
+/// the tree at `relative`; case-blind, as some filesystems are. An entry
+/// that is not a plain relative path hides.
+pub(super) fn hides(ignores: &Value, relative: &str) -> bool {
+    let parts = |p: &str| -> Option<Vec<String>> {
+        Path::new(p)
+            .components()
+            .map(|c| match c {
+                Component::Normal(s) => s.to_str().map(str::to_lowercase),
+                _ => None,
+            })
+            .collect()
+    };
+    let (Some(tree), Some(ignores)) = (parts(relative), ignores.as_array()) else {
+        return true;
+    };
+    ignores.iter().any(|d| {
+        d.as_str()
+            .and_then(parts)
+            .is_none_or(|d| d.starts_with(&tree) || tree.starts_with(&d))
+    })
 }

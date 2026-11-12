@@ -121,10 +121,10 @@ before the walk, from the watch on the tree or on a directory above it.
 Where watchman watches neither, fmgrep asks it to watch the tree
 (`watch-project`). Watchman answers that once its crawl of the tree ends;
 `index` waits at most 5 s, and a search at most 100 ms, and the watch
-stays when they stop waiting. A watch with `ignore_dirs` gives no token.
-A token is the second of two watchman clocks, each synced, kept only
-when it is a later tick than the first. A clock answered during a crawl,
-its tail included, is the crawl's tick,
+stays when they stop waiting. A watch whose `ignore_dirs` reach into the
+tree, or above it, gives no token. A token is the second of two watchman
+clocks, each synced, kept only when it is a later tick than the first. A
+clock answered during a crawl, its tail included, is the crawl's tick,
 which files changed then get too, so `since` it misses them; such clocks
 share the tick, and a watch still crawling gives no token. The token
 goes to `docs.journal` (JSON). A load asks watchman what changed since
