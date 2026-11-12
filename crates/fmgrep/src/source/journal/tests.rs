@@ -102,7 +102,8 @@ mod watchman_tests {
                 let cmd: Value = serde_json::from_str(&line).unwrap();
                 let mode = mode.load(Ordering::Relaxed);
                 let reply = match (cmd[0].as_str().unwrap(), mode) {
-                    ("watch-project", _) => json!({"watch": "/w", "relative_path": "sub"}),
+                    ("watch-list", _) => json!({"roots": ["/", "/w", "/w/other"]}),
+                    ("watch-project", _) => json!({"error": "watch-project on a watched tree"}),
                     ("get-config", IGNORES) => json!({"config": {"ignore_dirs": ["build"]}}),
                     ("get-config", _) => json!({"config": {}}),
                     ("clock", _) if cmd[2]["sync_timeout"].is_u64() => json!({"clock": "c:1:2"}),
@@ -216,6 +217,37 @@ mod watchman_tests {
                 "{knob:?} {docs}"
             );
         }
+    }
+
+    /// Where no watch covers the tree, watchman is asked to watch it; else
+    /// the token belongs to the deepest watch above it, `w`, not the
+    /// tree's parent nor `w/subway`.
+    #[test]
+    fn watchman_takes_a_token_of_the_deepest_watch_above_the_tree() {
+        let Some((daemon, w)) = live() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let top = canonical(tmp.path());
+        let root = top.join("w/sub");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(top.join("w/subway")).unwrap();
+        let watched = |t: &Value| (t["watch"].clone(), t["relative"].clone());
+        let marked = w.mark(&root).expect("asked to watch it");
+        assert_eq!(watched(&marked), (json!(root), json!("")));
+        let asked = ["watch-list", "watch-project", "get-config", "clock"];
+        assert_eq!(daemon.sent(), asked);
+        daemon.unwatch(&root);
+        // Inner first: watch-project takes a watch above, when there is one.
+        for dir in [&top.join("w/subway"), &top.join("w"), &top] {
+            daemon.watch(dir);
+        }
+        assert_eq!(daemon.roots().len(), 3);
+        let w = Watchman::at(daemon.sock.clone(), Duration::from_secs(5));
+        let marked = w.mark(&root).expect("a token of the watch above");
+        assert_eq!(watched(&marked), (json!(top.join("w")), json!("sub")));
+        let asked = ["watch-list", "get-config", "clock"];
+        assert_eq!(daemon.sent(), asked, "no watch-project");
     }
 
     const BUDGET: Duration = Duration::from_secs(1);

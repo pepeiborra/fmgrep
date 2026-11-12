@@ -116,14 +116,17 @@ when an entry is created, removed or renamed, as POSIX requires; on one
 that does not, delete `dirs.stamps` to make every load walk the tree.
 Re-index after many edits.
 
-`index` also asks a running watchman daemon (never started; asked to watch
-the tree) for a token before the walk. The token goes to `docs.journal`
-(JSON). A load asks watchman what changed since its token, re-checks only
-those paths and the ignore files, and skips the stat pass and the directory
-check; a search then rewrites
-the token with what differs now. Watchman is asked from 50,000 documents.
-`index` waits at most 5 s for watchman, and a search at most 100 ms for
-its new token and its question together.
+`index` also asks a running watchman daemon (never started) for a token
+before the walk, from the watch on the tree or on a directory above it.
+Where watchman watches neither, fmgrep asks it to watch the tree
+(`watch-project`). Watchman answers that once its crawl of the tree ends;
+`index` waits at most 5 s, and a search at most 100 ms, and the watch
+stays when they stop waiting. A watch with `ignore_dirs` gives no token.
+The token goes to `docs.journal` (JSON). A load asks watchman what
+changed since its token, re-checks only those paths and the ignore files,
+and skips the stat pass and the directory check; a search then rewrites
+the token with what differs now. Watchman is asked from 50,000
+documents.
 A watchman that answers too slowly or names too many paths, and an index
 without `docs.journal`, fall back to the stat pass. An edit made while a
 directory above the root is renamed away and back, and a hard-linked file

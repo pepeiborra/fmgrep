@@ -1,6 +1,9 @@
-//! A running watchman daemon, never spawned: a token is the daemon's socket
-//! plus a watch-project clock; a token question is a `since` query, synced
-//! by watchman's own cookies. Detection, connects and calls share one
+//! A running watchman daemon, never spawned: a token is the daemon's
+//! socket plus a clock of a watch on the root or above it; a token question
+//! is a `since` query, synced by watchman's own cookies. Where no watch
+//! covers the root, `watch-project` adds one; watchman sends its answer
+//! once the crawl of the tree ends, so a short deadline gives up on the
+//! answer but not on the watch. Detection, connects and calls share one
 //! deadline, and each failure says why.
 
 use std::cell::Cell;
@@ -132,6 +135,35 @@ impl Watchman {
         sock.ok_or_else(|| missing(&status))
     }
 
+    /// The watch on `root` or the deepest above it, and `root` relative to
+    /// it. Without one, asks watchman to watch `root` and waits for the
+    /// answer, sent once the crawl ends, until the deadline only; the watch
+    /// stays either way.
+    fn watch(&self, root: &Path) -> Result<(String, String), String> {
+        let list = self.call(&json!(["watch-list"]), root)?;
+        let found = list
+            .get("roots")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|w| Some((w, root.strip_prefix(w).ok()?.to_str()?)))
+            .max_by_key(|(w, _)| w.len());
+        if let Some((watch, relative)) = found {
+            return Ok((watch.to_owned(), relative.to_owned()));
+        }
+        let project = match self.call(&json!(["watch-project", root]), root) {
+            Err(_) if Instant::now() >= self.deadline => return Err(asked(root)),
+            project => project?,
+        };
+        let watch = project.get("watch").and_then(Value::as_str);
+        let relative = project.get("relative_path").and_then(Value::as_str);
+        match watch {
+            Some(watch) => Ok((watch.to_owned(), relative.unwrap_or("").to_owned())),
+            None => Err("watchman sent no watch".to_owned()),
+        }
+    }
+
     /// Three quarters of what is left of the budget, at least 1 ms, for
     /// `sync_timeout`: a sync that fails says why before the deadline, and
     /// one that succeeds leaves time for the reply.
@@ -153,15 +185,11 @@ impl Watchman {
             .ok_or_else(|| "watchman sent no clock".to_owned())
     }
 
-    /// A token for now, of the watch-project root of `root`. Refused under
+    /// A token for now, of the watch covering `root`. Refused under
     /// `ignore_dirs`, as watchman would hide indexed changes, or when the
     /// clock does not sync in time.
     fn mark(&self, root: &Path) -> Result<Token, String> {
-        let project = self.call(&json!(["watch-project", root]), root)?;
-        let watch = project.get("watch").and_then(Value::as_str);
-        let watch = watch.ok_or("watchman sent no watch")?.to_owned();
-        let relative = project.get("relative_path").and_then(Value::as_str);
-        let relative = relative.unwrap_or("").to_owned();
+        let (watch, relative) = self.watch(root)?;
         let config = self.call(&json!(["get-config", watch]), root)?;
         let ignores = config
             .pointer("/config/ignore_dirs")
@@ -312,4 +340,12 @@ impl ChangeSource for Watchman {
 
 fn not_watching(root: &Path) -> String {
     format!("watchman is not watching {}", root.display())
+}
+
+/// Why a search that asked watchman to watch `root` just now cannot use it.
+fn asked(root: &Path) -> String {
+    format!(
+        "fmgrep asked watchman to watch {}; later searches ask it once its crawl ends",
+        root.display()
+    )
 }
