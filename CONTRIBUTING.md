@@ -9,7 +9,9 @@ Bug reports, fixes and measurements are welcome.
 - A test that needs watchman starts a private daemon of its own, from
   `$FMGREP_TEST_WATCHMAN` or else `watchman` on `PATH`, and never uses
   yours. Without watchman it prints one `skipped` line. CI's Watchman job
-  runs these tests on Linux, then `scripts/watchman-race.sh`.
+  runs these tests on Linux, then `scripts/watchman-race.sh`, then
+  `scripts/watchman-spawn.sh`, which starts the runner's own daemon and so
+  runs only where `CI=true`.
 - Update the docs with the code. `crates/bench/tests/docs.rs` fails when an
   `FMGREP_*` variable is missing from [docs/tuning.md](docs/tuning.md), a
   manifest field from [docs/index-format.md](docs/index-format.md), or a

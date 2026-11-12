@@ -1,6 +1,6 @@
-//! A running watchman daemon, never spawned: a token is the daemon's
-//! socket plus a clock of a watch on the root or above it; a token
-//! question is a `since` query, synced by watchman's own cookies.
+//! A watchman daemon, started by its own client when none runs: a token is
+//! the daemon's socket plus a clock of a watch on the root or above it; a
+//! token question is a `since` query, synced by watchman's own cookies.
 //! Where no watch covers the root, `watch-project` adds one; watchman
 //! sends its answer once the crawl of the tree ends, so a short deadline
 //! gives up on the answer but not on the watch. A clock answered during a
@@ -63,63 +63,73 @@ impl Watchman {
     }
 
     /// `$WATCHMAN_SOCK`, else the socket that `watchman get-sockname`
-    /// gives; tests look only at the socket they are given.
+    /// gives within [`super::FIND_WAIT`]; calls get `budget` after that.
+    /// Tests run only the program they are given.
     pub fn find(budget: Duration) -> Result<Self, String> {
         #[cfg(test)]
-        return match crate::tests::WATCHMAN.with_borrow(Clone::clone) {
-            Some(sock) => Ok(Self::at(sock, budget)),
-            None => Err("no watchman daemon".to_owned()),
-        };
+        let (sock, program) = (
+            crate::tests::WATCHMAN.with_borrow(Clone::clone),
+            crate::tests::WATCHMAN_PROGRAM.with_borrow(Clone::clone),
+        );
         #[cfg(not(test))]
-        match std::env::var_os("WATCHMAN_SOCK") {
-            Some(sock) => Ok(Self::at(sock.into(), budget)),
-            None => Ok(Self::at(
-                Self::detect(Path::new("watchman"), budget)?,
-                budget,
-            )),
+        let (sock, program) = (
+            std::env::var_os("WATCHMAN_SOCK").map(PathBuf::from),
+            PathBuf::from("watchman"),
+        );
+        match sock {
+            Some(sock) => Ok(Self::at(sock, budget)),
+            None => Ok(Self::at(Self::detect(&program, super::FIND_WAIT)?, budget)),
         }
     }
 
-    /// Asks `program` for the socket; `--no-spawn` starts no daemon, and a
-    /// child still running at the deadline is killed.
+    /// Asks `program` for the socket. Without `--no-spawn` the client
+    /// starts the daemon when none runs, and answers once it listens. The
+    /// reply is read on a helper thread, as a daemon could hold the pipe; a
+    /// child still running at the deadline is killed, and a daemon it
+    /// started keeps starting.
     pub fn detect(program: &Path, budget: Duration) -> Result<PathBuf, String> {
         let deadline = Instant::now() + budget;
-        let missing =
-            |e: &dyn std::fmt::Display| format!("watchman get-sockname found no watchman ({e})");
         let mut child = Command::new(program)
-            .args(["--no-spawn", "--no-pretty", "get-sockname"])
+            .args(["--no-pretty", "get-sockname"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| missing(&e))?;
+            .map_err(|e| format!("cannot run watchman ({e}); install watchman"))?;
+        let (tx, rx) = mpsc::channel();
+        let stdout = child.stdout.take();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            if let Some(stdout) = stdout {
+                let _ = BufReader::new(stdout).read_line(&mut line);
+            }
+            let _ = tx.send(line);
+        });
+        let line = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
         let status = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status,
+                Ok(Some(status)) => break Some(status),
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                waited => {
+                _ => {
                     let _ = (child.kill(), child.wait());
-                    return Err(match waited {
-                        Ok(_) => format!(
-                            "watchman get-sockname did not answer within {} ms",
-                            budget.as_millis()
-                        ),
-                        Err(e) => missing(&e),
-                    });
+                    break None;
                 }
             }
         };
-        let mut out = Vec::new();
-        if let Some(mut stdout) = child.stdout.take() {
-            let _ = stdout.read_to_end(&mut out);
-        }
-        let reply = serde_json::from_slice::<Value>(&out)
-            .ok()
-            .filter(|_| status.success());
+        let Ok(line) = line else {
+            return Err(format!(
+                "watchman get-sockname did not answer within {} ms",
+                budget.as_millis()
+            ));
+        };
+        let reply = serde_json::from_str::<Value>(&line).ok();
         let sock = reply.and_then(|r| Some(PathBuf::from(r.get("sockname")?.as_str()?)));
-        sock.ok_or_else(|| missing(&status))
+        sock.ok_or_else(|| match status {
+            Some(status) => format!("watchman get-sockname failed ({status})"),
+            None => "watchman get-sockname sent no socket".to_owned(),
+        })
     }
 
     /// The watch on `root` or the deepest above it, and `root` relative to
@@ -280,7 +290,7 @@ impl Watchman {
         let stream = rx.recv_timeout(left).map_err(|e| failed(&e))?;
         let stream = stream.map_err(|e| {
             format!(
-                "no watchman daemon answers on {} ({e}); start watchman",
+                "no watchman daemon answers on {} ({e})",
                 self.sock.display()
             )
         })?;

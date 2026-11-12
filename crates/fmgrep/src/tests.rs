@@ -40,6 +40,10 @@ thread_local! {
     /// The watchman socket found on this thread; none when `None`, so tests
     /// reach only a daemon they started.
     pub static WATCHMAN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The watchman client run on this thread when no socket is given: a
+    /// path where none is, unless a test puts a stand-in there.
+    pub static WATCHMAN_PROGRAM: std::cell::RefCell<PathBuf> =
+        std::cell::RefCell::new(PathBuf::from("/nonexistent/watchman"));
     /// The cache directory of searches on this thread; none when `None`.
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
@@ -52,6 +56,7 @@ thread_local! {
 pub struct Hooks {
     ask_from: Option<usize>,
     watchman: Option<PathBuf>,
+    program: PathBuf,
     cache: Option<PathBuf>,
     notes: Arc<Mutex<Vec<String>>>,
 }
@@ -61,6 +66,7 @@ impl Hooks {
         Self {
             ask_from: ASK_FROM.get(),
             watchman: WATCHMAN.with_borrow(Clone::clone),
+            program: WATCHMAN_PROGRAM.with_borrow(Clone::clone),
             cache: CACHE.with_borrow(Clone::clone),
             notes: NOTES.with_borrow(Arc::clone),
         }
@@ -69,6 +75,7 @@ impl Hooks {
     pub fn apply(self) {
         ASK_FROM.set(self.ask_from);
         WATCHMAN.set(self.watchman);
+        WATCHMAN_PROGRAM.set(self.program);
         CACHE.set(self.cache);
         NOTES.set(self.notes);
     }

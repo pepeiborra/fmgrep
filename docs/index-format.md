@@ -134,12 +134,12 @@ no tree: a PATH is refused and the cwd does not narrow the search.
 ## Watchman
 
 `index` takes no token and writes no record. Once its walk has listed
-50,000 files or more, before it reads them, it asks a running watchman
-to watch the tree when no watch covers it, as a search does (below), and
-waits at most 100 ms for the reply; watchman then crawls the tree while
-`index` reads the files and builds.
-A search of a files-layout index of 50,000 documents or more keeps
-a record between searches, in the user's cache directory
+50,000 files or more, before it reads them, it finds the daemon and asks
+it to watch the tree when no watch covers it, as a search does (below),
+and waits at most 100 ms for the reply; watchman then crawls the tree
+while `index` reads the files and builds.
+A search of a files-layout index of 50,000 documents or more
+keeps a record between searches, in the user's cache directory
 (`$XDG_CACHE_HOME/fmgrep`, else `~/.cache/fmgrep`), one per tree and
 index: `<tree name>-<16 hex digits>.json`. A search never writes into the
 index directory. The record is one line of JSON:
@@ -174,12 +174,14 @@ it again in the same way.
 written for another index build, when no watchman daemon answers on the
 socket it stores, or when watchman reports that it restarted, removed and
 added the watch again, or forgot deleted files since the record's token.
-Such a search finds a running daemon from `WATCHMAN_SOCK`, else by running
-`watchman --no-spawn get-sockname` within 100 ms, which starts no daemon.
-The search then takes a token (or keeps the one it just took from the
-record's daemon), checks every file (the stat pass), and says so once on
-stderr, with the reason: `warning: checked every file once (no record of
-an earlier search); later searches ask watchman`.
+Such a search finds the daemon from `WATCHMAN_SOCK`, else by running
+`watchman get-sockname` within 500 ms: when no daemon runs, watchman's
+client starts one and answers once it listens. Where `WATCHMAN_SOCK` is
+set, fmgrep starts no daemon. The search then takes a token (or keeps the
+one it just took from the record's daemon), checks every file (the stat
+pass), and says so once on stderr, with the reason: `warning: checked
+every file once (no record of an earlier search); later searches ask
+watchman`.
 
 **With a record it can use**, a search takes a newer token from the
 daemon on the socket the record stores, then asks it what changed since
@@ -207,10 +209,10 @@ change:
 - `warning: watchman cannot say what changed (<why>); checked every file`,
   where `<why>` is one of: `fmgrep asked watchman to watch /src; later
   searches ask it once its crawl ends`, `watchman is still crawling
-  /src`, `watchman get-sockname found no watchman (<error or exit
-  status>)`, `watchman get-sockname did not answer within 100 ms`, `no
-  watchman daemon answers on <socket>
-  (<error>); start watchman` (the socket in `WATCHMAN_SOCK`),
+  /src`, `cannot run watchman (<error>); install watchman`, `watchman
+  get-sockname did not answer within 500 ms`, `watchman get-sockname
+  failed (<exit status>)`, `no watchman daemon answers on <socket>
+  (<error>)` (the socket in `WATCHMAN_SOCK`),
   `watchman did not answer within 100 ms`, `watchman's ignore_dirs hide
   part of /src`, `the index has no dirs.stamps; re-run index`, `the
   manifest lists files out of order; re-run index`, `cannot resolve /src

@@ -5,7 +5,8 @@
 //! watchman what changed since the token (the token question), adds the
 //! answer to the baseline, re-checks those paths, and saves the new
 //! baseline with a newer token. A search that cannot use a record finds
-//! a running daemon, asks it to watch the tree when no watch covers it,
+//! the daemon (its client starts one when none runs), asks it to watch the
+//! tree when no watch covers it,
 //! takes a token and checks every file (the stat pass). The index only
 //! asks watchman to watch the tree once its walk has listed the files,
 //! without waiting for the crawl; it records no watchman state, and a
@@ -25,6 +26,10 @@ const VERSION: u32 = 1;
 /// Below this many docs the stat pass beats asking.
 const MIN_DOCS: usize = 50_000;
 
+/// `watchman get-sockname`, a process start: 2-10 ms with a daemon or
+/// without one (`--no-spawn`), more when the client starts the daemon, and
+/// up to this when a daemon hangs.
+const FIND_WAIT: Duration = Duration::from_millis(500);
 /// A load's token and question, small next to the stat pass it would
 /// spare; also what `index` gives watchman to take its request to watch
 /// the tree.
