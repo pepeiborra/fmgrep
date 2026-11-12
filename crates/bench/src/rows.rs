@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 use fmgrep::regex_pattern;
 
 use crate::verify::{Paths, rg as rg_cmd};
-use crate::{Query, Row, RowKind, Server, leaves};
+use crate::{Query, Row, RowKind, Server, leaves, with_warm_up};
 
 pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let mut row = Row::new(RowKind::Rg);
     // rg reads stdin when given no path and stdin is not a terminal.
     let (out, _, _) = timed(rg_cmd().args(["-l", "-e", "", "--"]).arg(root), None)?;
     row.searched = paths.listed("rg -l ''", &out)?;
-    for term in terms {
+    for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = match &leaves(term)[..] {
             [_] => {
                 let (pattern, fixed) =
@@ -42,9 +42,12 @@ pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
         if !out.stderr.is_empty() {
             return Err(failure(&what, &out));
         }
+        let hits = paths.hits(&what, &out)?;
+        if warm_up {
+            continue;
+        }
         row.footprint = row.footprint.max(peak.map(|p| p.footprint));
         row.query_rss = row.query_rss.max(peak.map(|p| p.rss));
-        let hits = paths.hits(&what, &out)?;
         row.queries.push(Query::new(term, latency, hits));
     }
     Ok(row)
@@ -99,7 +102,7 @@ fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
     searched
 }
 
-/// Each query through `fmgrep --server addr`.
+/// Each query through `fmgrep --server addr`, after the warm-up.
 fn clients(
     bin: &Path,
     addr: &str,
@@ -107,7 +110,7 @@ fn clients(
     terms: &[String],
     row: &mut Row,
 ) -> Result<(), String> {
-    for term in terms {
+    for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = Command::new(bin);
         let leaves = leaves(term);
         cmd.args(["--server", addr]).args(LINES);
@@ -115,7 +118,9 @@ fn clients(
         cmd.arg("--").args(leaves);
         let (out, latency, _) = timed(&mut cmd, None)?;
         let hits = paths.hits(&format!("fmgrep --server {term:?}"), &out)?;
-        row.queries.push(Query::new(term, latency, hits));
+        if !warm_up {
+            row.queries.push(Query::new(term, latency, hits));
+        }
     }
     Ok(())
 }
@@ -232,7 +237,8 @@ pub fn fmgrep(
 }
 
 /// Each query as its own `fmgrep --index` from the corpus root, as an agent
-/// without a server runs it; the footprint and RSS are the largest query's.
+/// without a server runs it, after the warm-up; the footprint and RSS are
+/// the largest timed query's.
 fn direct(
     bin: &Path,
     (paths, root): (&Paths, &Path),
@@ -244,7 +250,7 @@ fn direct(
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
     let mut largest = None;
-    for term in terms {
+    for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
         cmd.current_dir(root).arg("--index").arg(index).args(LINES);
@@ -252,6 +258,9 @@ fn direct(
         cmd.arg("--").args(leaves);
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let hits = paths.hits(&format!("fmgrep --index {term:?}"), &out)?;
+        if warm_up {
+            continue;
+        }
         row.queries.push(Query::new(term, latency, hits));
         largest = Peak::max(largest, peak);
     }
@@ -417,6 +426,36 @@ mod tests {
     fn memory_reads_rss_and_footprint_of_a_live_process() {
         let peak = memory(std::process::id()).unwrap();
         assert!(peak.rss > 0 && peak.footprint > 0);
+    }
+
+    #[test]
+    fn fmgrep_clients_send_the_first_query_once_untimed_before_the_timed_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (bin, log) = (root.join("fmgrep"), root.join("log"));
+        let script = format!("#!/bin/sh\necho \"$*\" >>'{}'\nexit 1\n", log.display());
+        crate::fake_bin::write(&bin, &script);
+        output_retry_etxtbsy(&mut Command::new(&bin)).unwrap();
+        std::fs::remove_file(&log).unwrap();
+        let paths = Paths::from_lists(&root, b"", b"", &[]);
+        let terms = ["a", "b AND c"].map(String::from);
+        let mut served = Row::new(RowKind::Fmgrep);
+        clients(&bin, "h:1", &paths, &terms, &mut served).unwrap();
+        let mut by_process = Row::new(RowKind::FmgrepDirect);
+        let tree = (&paths, root.as_path());
+        direct(&bin, tree, Path::new("/i"), &terms, &mut by_process).unwrap();
+        for row in [&served, &by_process] {
+            let timed: Vec<_> = row.queries.iter().map(|q| q.term.as_str()).collect();
+            assert_eq!(timed, ["a", "b AND c"]);
+        }
+        let runs = std::fs::read_to_string(&log).unwrap();
+        let runs: Vec<_> = runs.lines().collect();
+        let each = ["-- a", "-- a", "--and -- b c"];
+        let want: Vec<String> = ["--server h:1", "--index /i"]
+            .iter()
+            .flat_map(|how| each.map(|what| format!("{how} -n --no-heading --color never {what}")))
+            .collect();
+        assert_eq!(runs, want);
     }
 
     #[test]

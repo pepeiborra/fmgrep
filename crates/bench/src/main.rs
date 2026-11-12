@@ -188,6 +188,14 @@ pub fn leaves(query: &str) -> Vec<&str> {
     query.split(" AND ").collect()
 }
 
+/// The terms a row runs, as `(term, warm_up)`: the set's first term once as
+/// a warm-up, its output checked but neither timed nor kept, so that no row
+/// times the first query a client of it sends; then every term.
+pub fn with_warm_up(terms: &[String]) -> impl Iterator<Item = (&String, bool)> {
+    let first = terms.first().map(|t| (t, true));
+    first.into_iter().chain(terms.iter().map(|t| (t, false)))
+}
+
 /// An error line and the exit code it ends the run with.
 type Fail = (u8, String);
 
@@ -439,6 +447,14 @@ mod tests {
         }
         let names = Kind::ALL.map(Kind::name);
         assert_eq!(names, ["literal", "regex", "intersection"]);
+    }
+
+    #[test]
+    fn the_first_term_runs_once_more_first_as_the_warm_up() {
+        let terms = ["a", "b AND c"].map(String::from);
+        let runs: Vec<_> = with_warm_up(&terms).map(|(t, w)| (t.as_str(), w)).collect();
+        assert_eq!(runs, [("a", true), ("a", false), ("b AND c", false)]);
+        assert_eq!(with_warm_up(&[]).count(), 0);
     }
 
     fn kinds(rows: Result<Vec<RowName>, String>) -> Vec<RowKind> {
