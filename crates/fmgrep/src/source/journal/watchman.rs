@@ -1,6 +1,7 @@
 //! A running watchman daemon, never spawned: a token is the daemon's socket
-//! plus a watch-project clock; a replay is a `since` query, synced by
-//! watchman's own cookies. Detection, connects and calls share one deadline.
+//! plus a watch-project clock; a token question is a `since` query, synced
+//! by watchman's own cookies. Detection, connects and calls share one
+//! deadline, and each failure says why.
 
 use std::cell::Cell;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
@@ -18,6 +19,7 @@ use super::{Ask, ChangeSource, Since};
 pub struct Watchman {
     sock: PathBuf,
     deadline: Instant,
+    budget: Duration,
     late: Cell<bool>,
     settle: bool,
 }
@@ -28,13 +30,6 @@ struct Token {
     watch: String,
     relative: String,
     clock: String,
-}
-
-fn note_late() {
-    super::warn_late("watchman");
-    if crate::verbose::verbose() {
-        eprintln!("note: watchman did not answer in time; not using it");
-    }
 }
 
 /// Reads that fail once the deadline passes.
@@ -53,22 +48,19 @@ impl Read for Until<'_> {
 }
 
 impl Watchman {
-    fn until(sock: PathBuf, deadline: Instant) -> Self {
+    /// Every connect and call within `budget` from now.
+    pub fn at(sock: PathBuf, budget: Duration) -> Self {
         Self {
             sock,
-            deadline,
+            deadline: Instant::now() + budget,
+            budget,
             late: Cell::new(false),
             settle: true,
         }
     }
 
-    /// Every connect and call within `budget` from now.
-    pub fn at(sock: PathBuf, budget: Duration) -> Self {
-        Self::until(sock, Instant::now() + budget)
-    }
-
-    /// The daemon that marked `token`; its marks do not sync, as an early
-    /// clock only names more paths.
+    /// The daemon that took `token`; its tokens do not sync, as an early
+    /// clock only reports more paths.
     pub fn of(token: &Value, budget: Duration) -> Option<Self> {
         let sock = token.get("sock")?.as_str()?;
         Some(Self {
@@ -79,29 +71,35 @@ impl Watchman {
 
     /// `$WATCHMAN_SOCK`, else the socket of a daemon already running; tests
     /// look only at the socket their thread gives.
-    pub fn find(budget: Duration) -> Option<Self> {
+    pub fn find(budget: Duration) -> Result<Self, String> {
         #[cfg(test)]
-        return crate::tests::WATCHMAN
-            .with_borrow(Clone::clone)
-            .map(|sock| Self::at(sock, budget));
+        return match crate::tests::WATCHMAN.with_borrow(Clone::clone) {
+            Some(sock) => Ok(Self::at(sock, budget)),
+            None => Err("no watchman daemon".to_owned()),
+        };
         #[cfg(not(test))]
         match std::env::var_os("WATCHMAN_SOCK") {
-            Some(sock) => Some(Self::at(sock.into(), budget)),
-            None => Self::detect(Path::new("watchman"), budget),
+            Some(sock) => Ok(Self::at(sock.into(), budget)),
+            None => Ok(Self::at(
+                Self::detect(Path::new("watchman"), budget)?,
+                budget,
+            )),
         }
     }
 
     /// Asks `program` for the socket; `--no-spawn` starts no daemon, and a
     /// child still running at the deadline is killed.
-    pub fn detect(program: &Path, budget: Duration) -> Option<Self> {
+    pub fn detect(program: &Path, budget: Duration) -> Result<PathBuf, String> {
         let deadline = Instant::now() + budget;
+        let missing =
+            |e: &dyn std::fmt::Display| format!("watchman get-sockname found no watchman ({e})");
         let mut child = Command::new(program)
             .args(["--no-spawn", "--no-pretty", "get-sockname"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .map_err(|e| missing(&e))?;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -111,19 +109,27 @@ impl Watchman {
                 waited => {
                     let _ = (child.kill(), child.wait());
                     if waited.is_ok() {
-                        note_late();
+                        super::warn_late("watchman");
                     }
-                    return None;
+                    return Err(match waited {
+                        Ok(_) => format!(
+                            "watchman get-sockname did not answer within {} ms",
+                            budget.as_millis()
+                        ),
+                        Err(e) => missing(&e),
+                    });
                 }
             }
         };
         let mut out = Vec::new();
-        child.stdout.take()?.read_to_end(&mut out).ok()?;
-        let reply: Value = serde_json::from_slice(&out)
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_end(&mut out);
+        }
+        let reply = serde_json::from_slice::<Value>(&out)
             .ok()
-            .filter(|_| status.success())?;
-        let sock = reply.get("sockname")?.as_str()?;
-        Some(Self::until(sock.into(), deadline))
+            .filter(|_| status.success());
+        let sock = reply.and_then(|r| Some(PathBuf::from(r.get("sockname")?.as_str()?)));
+        sock.ok_or_else(|| missing(&status))
     }
 
     /// Three quarters of what is left of the budget, at least 1 ms, for
@@ -134,82 +140,55 @@ impl Watchman {
         u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
     }
 
-    /// One command's reply; `None` on an error or past the deadline (one note).
-    fn call(&self, command: &Value) -> Option<Value> {
-        let reply = self.exchange(command);
-        if reply.is_none() && Instant::now() >= self.deadline && !self.late.replace(true) {
-            note_late();
-        }
-        reply
+    /// A clock of `watch`, synced unless this daemon took the token.
+    fn clock(&self, watch: &str, root: &Path) -> Result<String, String> {
+        let command = match self.settle {
+            true => json!(["clock", watch, {"sync_timeout": self.sync_ms()}]),
+            false => json!(["clock", watch]),
+        };
+        let reply = self.call(&command, root)?;
+        let clock = reply.get("clock").and_then(Value::as_str);
+        clock
+            .map(str::to_owned)
+            .ok_or_else(|| "watchman sent no clock".to_owned())
     }
 
-    /// Unilateral PDUs are skipped. The connect runs on a helper thread: std
-    /// has no connect timeout.
-    fn exchange(&self, command: &Value) -> Option<Value> {
-        let left = self.deadline.checked_duration_since(Instant::now())?;
-        let (tx, rx) = mpsc::channel();
-        let sock = self.sock.clone();
-        std::thread::spawn(move || tx.send(UnixStream::connect(sock)));
-        let mut stream = rx.recv_timeout(left).ok()?.ok()?;
-        let left = self.deadline.checked_duration_since(Instant::now())?;
-        stream.set_write_timeout(Some(left)).ok()?;
-        // One write: watchman misreads a PDU whose first read is short.
-        stream.write_all(format!("{command}\n").as_bytes()).ok()?;
-        let mut lines = BufReader::new(Until(&stream, self.deadline)).lines();
-        loop {
-            let reply: Value = serde_json::from_str(&lines.next()?.ok()?).ok()?;
-            let unilateral = reply.get("unilateral").and_then(Value::as_bool) == Some(true);
-            if unilateral || reply.get("log").is_some() {
-                continue;
-            }
-            return reply.get("error").is_none().then_some(reply);
-        }
-    }
-}
-
-impl ChangeSource for Watchman {
-    fn kind(&self) -> &'static str {
-        "watchman"
-    }
-
-    /// `None` under `ignore_dirs`: watchman would hide indexed changes.
-    fn mark(&self, root: &Path) -> Option<Value> {
-        let project = self.call(&json!(["watch-project", root]))?;
-        let watch = project.get("watch")?.as_str()?;
-        let relative = project
-            .get("relative_path")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let config = self.call(&json!(["get-config", watch]))?;
+    /// A token for now, of the watch-project root of `root`. Refused under
+    /// `ignore_dirs`, as watchman would hide indexed changes, or when the
+    /// clock does not sync in time.
+    fn mark(&self, root: &Path) -> Result<Token, String> {
+        let project = self.call(&json!(["watch-project", root]), root)?;
+        let watch = project.get("watch").and_then(Value::as_str);
+        let watch = watch.ok_or("watchman sent no watch")?.to_owned();
+        let relative = project.get("relative_path").and_then(Value::as_str);
+        let relative = relative.unwrap_or("").to_owned();
+        let config = self.call(&json!(["get-config", watch]), root)?;
         let ignores = config
             .pointer("/config/ignore_dirs")
             .and_then(Value::as_array);
         if ignores.is_some_and(|d| !d.is_empty()) {
-            return None;
+            return Err(format!("watchman's ignore_dirs are set on {watch}"));
         }
-        let clock = if self.settle {
-            json!(["clock", watch, {"sync_timeout": self.sync_ms()}])
-        } else {
-            json!(["clock", watch])
-        };
-        let clock = self.call(&clock)?;
-        let token = Token {
-            sock: self.sock.to_str()?.to_owned(),
-            watch: watch.to_owned(),
-            relative: relative.to_owned(),
-            clock: clock.get("clock")?.as_str()?.to_owned(),
-        };
-        serde_json::to_value(token).ok()
+        let clock = self.clock(&watch, root)?;
+        let sock = self
+            .sock
+            .to_str()
+            .ok_or("the watchman socket is not UTF-8")?;
+        Ok(Token {
+            sock: sock.to_owned(),
+            watch,
+            relative,
+            clock,
+        })
     }
 
-    fn since(&self, ask: &Ask<'_>) -> Since {
-        let unknown = |why: &str| Since::Unknown(why.to_owned());
-        let Ok(token) = serde_json::from_value::<Token>(ask.token.clone()) else {
-            return unknown("unreadable token");
-        };
+    /// The paths under `root` changed since `token`'s clock; refused on a
+    /// fresh instance: a restart, the watch added again, or deleted files
+    /// pruned since. A recrawl is not one: it names what it statted.
+    fn since(&self, token: &Token, root: &Path) -> Result<Vec<String>, String> {
         let watched = Path::new(&token.watch).join(&token.relative);
-        if watched.components().ne(ask.root.components()) {
-            return unknown("the token watches another root");
+        if watched.components().ne(root.components()) {
+            return Err("the token watches another root".to_owned());
         }
         let mut query = json!({
             "since": token.clock,
@@ -220,22 +199,117 @@ impl ChangeSource for Watchman {
         if !token.relative.is_empty() {
             query["relative_root"] = json!(token.relative);
         }
-        let Some(reply) = self.call(&json!(["query", token.watch, query])) else {
-            return unknown("no answer");
-        };
+        let reply = self.call(&json!(["query", token.watch, query]), root)?;
         if reply.get("is_fresh_instance").and_then(Value::as_bool) != Some(false) {
-            return unknown("a fresh instance");
+            return Err("watchman restarted, added the watch again or pruned deleted files since the last search".to_owned());
         }
-        let Some(files) = reply.get("files").and_then(Value::as_array) else {
-            return unknown("no file list");
-        };
-        match files
-            .iter()
-            .map(|f| f.as_str().map(str::to_owned))
-            .collect()
-        {
-            Some(paths) => Since::Paths(paths),
-            None => unknown("a malformed file list"),
+        let files = reply.get("files").and_then(Value::as_array);
+        files
+            .and_then(|f| f.iter().map(|f| f.as_str().map(str::to_owned)).collect())
+            .ok_or_else(|| "watchman sent a malformed file list".to_owned())
+    }
+
+    /// A failed call's reason. Watchman words a sync that timed out as
+    /// "synchronization failed: ... timed out" or as "syncToNow: timed out
+    /// waiting for cookie file ...", depending on where it gave up.
+    fn why(&self, root: &Path, error: String) -> String {
+        let crawling = ["performing initial crawl", "re-crawling"];
+        let sync = ["synchronization failed", "syncToNow"];
+        if crawling.iter().any(|c| error.contains(c)) {
+            format!("watchman is still crawling {}", root.display())
+        } else if sync.iter().any(|s| error.contains(s)) && error.contains("timed out") {
+            self.too_late()
+        } else if error.contains("is not watched") {
+            not_watching(root)
+        } else {
+            error
         }
     }
+
+    fn too_late(&self) -> String {
+        format!(
+            "watchman did not answer within {} ms",
+            self.budget.as_millis()
+        )
+    }
+
+    /// One command's reply, or why there is none; past the deadline, the
+    /// late warning, once.
+    fn call(&self, command: &Value, root: &Path) -> Result<Value, String> {
+        let left = self.deadline.checked_duration_since(Instant::now());
+        match left.map(|left| self.exchange(command, left)) {
+            Some(Ok(reply)) => reply.map_err(|e| self.why(root, format!("watchman: {e}"))),
+            Some(Err(e)) if Instant::now() < self.deadline => Err(e),
+            _ => {
+                if !self.late.replace(true) {
+                    super::warn_late("watchman");
+                }
+                Err(self.too_late())
+            }
+        }
+    }
+
+    /// The reply, an error in it, or why there is neither. Unilateral PDUs
+    /// are skipped. The connect runs on a helper thread: std has no connect
+    /// timeout.
+    fn exchange(&self, command: &Value, left: Duration) -> Result<Result<Value, String>, String> {
+        let (tx, rx) = mpsc::channel();
+        let sock = self.sock.clone();
+        std::thread::spawn(move || tx.send(UnixStream::connect(sock)));
+        let failed = |e: &dyn std::fmt::Display| format!("watchman: {e}");
+        let stream = rx.recv_timeout(left).map_err(|e| failed(&e))?;
+        let stream = stream.map_err(|e| {
+            format!(
+                "no watchman daemon answers on {} ({e}); start watchman",
+                self.sock.display()
+            )
+        })?;
+        stream
+            .set_write_timeout(Some(left))
+            .map_err(|e| failed(&e))?;
+        // One write: watchman misreads a PDU whose first read is short.
+        (&stream)
+            .write_all(format!("{command}\n").as_bytes())
+            .map_err(|e| failed(&e))?;
+        let mut lines = BufReader::new(Until(&stream, self.deadline)).lines();
+        loop {
+            let line = lines.next().ok_or_else(|| failed(&"no reply"))?;
+            let reply: Value =
+                serde_json::from_str(&line.map_err(|e| failed(&e))?).map_err(|e| failed(&e))?;
+            let unilateral = reply.get("unilateral").and_then(Value::as_bool) == Some(true);
+            if unilateral || reply.get("log").is_some() {
+                continue;
+            }
+            return Ok(match reply.get("error") {
+                Some(e) => Err(e.as_str().unwrap_or("an error").to_owned()),
+                None => Ok(reply),
+            });
+        }
+    }
+}
+
+impl ChangeSource for Watchman {
+    fn kind(&self) -> &'static str {
+        "watchman"
+    }
+
+    fn mark(&self, root: &Path) -> Result<Value, String> {
+        let token = Watchman::mark(self, root)?;
+        serde_json::to_value(token).map_err(|e| e.to_string())
+    }
+
+    fn since(&self, ask: &Ask<'_>) -> Since {
+        let token = serde_json::from_value::<Token>(ask.token.clone());
+        match token.map_err(|e| format!("an unreadable token ({e})")) {
+            Ok(token) => match Watchman::since(self, &token, ask.root) {
+                Ok(paths) => Since::Paths(paths),
+                Err(why) => Since::Unknown(why),
+            },
+            Err(why) => Since::Unknown(why),
+        }
+    }
+}
+
+fn not_watching(root: &Path) -> String {
+    format!("watchman is not watching {}", root.display())
 }

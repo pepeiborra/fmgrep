@@ -77,8 +77,8 @@ pub struct Ask<'a> {
 /// A filesystem change record, marked before the walk and asked at load.
 pub trait ChangeSource {
     fn kind(&self) -> &'static str;
-    /// A token for now; `None` when `root` is not covered.
-    fn mark(&self, root: &Path) -> Option<Value>;
+    /// A token for now, or why there is none.
+    fn mark(&self, root: &Path) -> Result<Value, String>;
     fn since(&self, ask: &Ask<'_>) -> Since;
 }
 
@@ -86,10 +86,11 @@ pub trait ChangeSource {
 fn available(knob: Knob) -> Vec<Box<dyn ChangeSource>> {
     let mut all: Vec<Box<dyn ChangeSource>> = Vec::new();
     #[cfg(unix)]
-    if knob != Knob::Off
-        && let Some(w) = watchman::Watchman::find(MARK_WAIT)
-    {
-        all.push(Box::new(w));
+    if knob != Knob::Off {
+        match watchman::Watchman::find(MARK_WAIT) {
+            Ok(w) => all.push(Box::new(w)),
+            Err(why) => note(format_args!("no watchman ({why})")),
+        }
     }
     all
 }
@@ -110,11 +111,18 @@ pub struct Token {
     token: Value,
 }
 
-fn token(source: &dyn ChangeSource, root: &Path) -> Option<Token> {
+fn token(source: &dyn ChangeSource, root: &Path) -> Result<Token, String> {
     source.mark(root).map(|token| Token {
         kind: source.kind().to_owned(),
         token,
     })
+}
+
+/// A token of `source` for now, or `None`, saying why under `--verbose`.
+fn new_token(source: &dyn ChangeSource, root: &Path) -> Option<Token> {
+    token(source, root)
+        .map_err(|why| note(format_args!("no {} token ({why})", source.kind())))
+        .ok()
 }
 
 /// A mark per source, unless `knob` is off, before the index walk of `root`.
@@ -122,7 +130,7 @@ pub fn marks(root: &Path, knob: Knob) -> Vec<Token> {
     match root.canonicalize() {
         Ok(root) => available(knob)
             .iter()
-            .filter_map(|s| token(s.as_ref(), &root))
+            .filter_map(|s| new_token(s.as_ref(), &root))
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -223,7 +231,7 @@ impl Journal {
         }
         let marks = asked
             .iter()
-            .filter_map(|(_, s)| token(s.as_ref(), root))
+            .filter_map(|(_, s)| new_token(s.as_ref(), root))
             .collect();
         for (t, s) in asked {
             let ask = Ask {
