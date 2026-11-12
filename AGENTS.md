@@ -63,5 +63,6 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `warning: excluding PATH: is missing` | deleted since indexing; skipped |
 | `warning: skipping PATH: over 2147483646 bytes` | too large to index; search it with rg |
 | `note: N file(s) changed since indexing` | searches read them in full; re-index |
+| `warning: watchman cannot say what changed (...)` | answers are right but each search checks every file; do what the line says |
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md); design notes live in `docs/`.

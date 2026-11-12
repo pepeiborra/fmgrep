@@ -480,11 +480,12 @@ fn missing_doc_is_excluded_from_every_term() {
 }
 
 /// `stale` answers `terms`, and prints each of `printed_terms`, as `fresh`
-/// does: through its journal when this thread asks watchman, then through
-/// the sweep.
+/// does: through watchman when this thread asks it, then through the stat
+/// pass.
 pub(super) fn answers_like(stale: &Path, fresh: &Path, terms: &[&str], printed_terms: &[&str]) {
-    for knob in [JOURNAL.get(), Some("off")] {
-        JOURNAL.set(knob);
+    let asked = ASK_FROM.get();
+    for knob in [asked, None] {
+        ASK_FROM.set(knob);
         assert_eq!(
             totals(&query_it(stale, false, terms)),
             totals(&query_it(fresh, false, terms)),
@@ -506,6 +507,7 @@ pub(super) fn answers_like(stale: &Path, fresh: &Path, terms: &[&str], printed_t
             }
         }
     }
+    ASK_FROM.set(asked);
 }
 
 #[test]
@@ -605,13 +607,8 @@ fn pruned_added_tree_answers_like_a_fresh_index() {
     std::fs::remove_file(folder.join("gone.c")).unwrap();
     std::fs::remove_file(folder.join("d.c")).unwrap();
     let want = "a.c\nb.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nsub/c.c\nsub/new.c\nsub/t/deep/x.c\nsub/t/y.c\n";
-    let journal = JOURNAL.get();
-    for knob in [journal, Some("off")] {
-        JOURNAL.set(knob);
-        let got = printed(&stale, &["-l"], &["printk"]);
-        assert_eq!(got, want, "{knob:?}: kb/k.dat, turned text, is found");
-    }
-    JOURNAL.set(journal);
+    let got = printed(&stale, &["-l"], &["printk"]);
+    assert_eq!(got, want, "kb/k.dat, turned text, is found");
     std::fs::write(folder.join("kb/k.dat"), b"printk\0binary").unwrap();
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);

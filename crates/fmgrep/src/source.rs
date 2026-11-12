@@ -19,6 +19,8 @@ mod journal;
 mod recorded;
 mod watcher;
 
+#[cfg(test)]
+pub use journal::NOTES;
 pub use journal::{Journal, Knob, marks};
 use recorded::outermost;
 pub use recorded::{Recorded, write_walk};
@@ -326,6 +328,8 @@ pub struct Snapshot {
 pub struct Files {
     known: Arc<Known>,
     journal: Option<Journal>,
+    /// Read on the opening thread.
+    policy: journal::Policy,
     /// Taken by [`Self::replay`] before asking, for [`Self::checkpoint`].
     marks: OnceLock<Vec<journal::Token>>,
 }
@@ -353,6 +357,7 @@ impl Files {
                 complete: AtomicBool::new(false),
             }),
             journal: None,
+            policy: journal::Policy::here(),
             marks: OnceLock::new(),
         })
     }
@@ -363,25 +368,41 @@ impl Files {
     }
 
     /// Take what the journal names since its marks instead of
-    /// [`Self::stat_all`] and discovery: false when it cannot vouch.
+    /// [`Self::stat_all`] and discovery: false when it cannot vouch, saying
+    /// why on a tree worth asking about.
     pub fn replay(&self, files: &[String], lens: &[u64]) -> bool {
-        let Some(journal) = &self.journal else {
-            return false;
-        };
-        let Ok(root) = self.known.root.canonicalize() else {
-            return false;
-        };
-        if !files.is_sorted() {
+        if !self.policy.due(files.len()) {
             return false;
         }
+        if !files.is_sorted() {
+            journal::cannot_answer("the manifest lists files out of order; re-run index");
+            return false;
+        }
+        let root = match self.known.root.canonicalize() {
+            Ok(root) => root,
+            Err(e) => {
+                let root = self.known.root.display();
+                journal::cannot_answer(&format!("cannot resolve {root} ({e})"));
+                return false;
+            }
+        };
+        let Some(journal) = &self.journal else {
+            journal::cannot_answer(&format!(
+                "the index holds no watchman token; run 'watchman watch-project {r}', then \
+                 re-index",
+                r = root.display()
+            ));
+            return false;
+        };
         let asked = std::time::Instant::now();
         let (marks, replay) = journal.ask(&root, files.len());
         let _ = self.marks.set(marks);
-        let Some(replay) = replay else {
-            if crate::verbose::verbose() {
-                eprintln!("note: no change source vouches; statting every file");
+        let replay = match replay {
+            Ok(replay) => replay,
+            Err(why) => {
+                journal::cannot_answer(&why);
+                return false;
             }
-            return false;
         };
         let applied = std::time::Instant::now();
         self.known.replay(&replay.paths, files, lens);
