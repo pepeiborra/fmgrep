@@ -77,7 +77,7 @@ mod watchman_tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::source::journal::watchman::{Watchman, ticked};
+    use crate::source::journal::watchman::{Watchman, hides, ticked};
     use crate::tests::watchman::Daemon;
 
     /// Under load.
@@ -294,11 +294,38 @@ mod watchman_tests {
         assert_eq!(daemon.sent(), two_clocks, "no watch-project");
         let w = top.join("w");
         daemon.unwatch(&top);
-        daemon.unwatch(&w);
-        std::fs::write(w.join(".watchmanconfig"), r#"{"ignore_dirs": ["build"]}"#).unwrap();
-        daemon.watch(&w);
-        let why = format!("watchman's ignore_dirs are set on {}", w.display());
-        assert_eq!(ChangeSource::mark(&at(&daemon), &root), Err(why));
+        // Watchman reads ignore_dirs when it adds the watch.
+        let configured = |config: &str| {
+            daemon.unwatch(&w);
+            std::fs::write(w.join(".watchmanconfig"), config).unwrap();
+            daemon.watch(&w);
+        };
+        configured(r#"{"ignore_dirs": ["build", "Sub2/x"]}"#);
+        let mark = || ChangeSource::mark(&at(&daemon), &root);
+        assert!(mark().is_ok(), "ignore_dirs beside the tree");
+        configured(r#"{"ignore_dirs": ["build", "sub/out"]}"#);
+        let why = format!("watchman's ignore_dirs hide part of {}", root.display());
+        assert_eq!(mark(), Err(why));
+    }
+
+    #[test]
+    fn ignore_dirs_hide_at_under_or_above_the_tree() {
+        for (dirs, relative, hidden) in [
+            (json!([]), "", false),
+            (json!(["build"]), "", true),
+            (json!(["build"]), "sub", false),
+            (json!(["subway", "a/sub"]), "sub", false),
+            (json!(["sub"]), "sub", true),
+            (json!(["sub/out/"]), "sub", true),
+            (json!(["a"]), "a/b", true),
+            (json!(["A/B/c"]), "a/b", true),
+            (json!(["./sub"]), "x", true),
+            (json!(["../x"]), "x", true),
+            (json!([1]), "x", true),
+            (json!("build"), "x", true),
+        ] {
+            assert_eq!(hides(&dirs, relative), hidden, "{dirs} {relative}");
+        }
     }
 
     /// A hung daemon (stopped in place) costs a load of any size at most
