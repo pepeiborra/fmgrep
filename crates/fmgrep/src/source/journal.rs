@@ -293,7 +293,7 @@ thread_local! {
 }
 
 /// `line` on stderr, once per process for each `seen`.
-fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
+pub(super) fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
     #[cfg(test)]
     NOTES.with_borrow_mut(|n| n.push(line.to_string()));
     if !seen.swap(true, Ordering::Relaxed) {

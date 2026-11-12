@@ -216,6 +216,11 @@ impl Recorded {
         self.dirs.find(rel).is_some()
     }
 
+    /// Whether ignore file `rel` is recorded: every load checks it.
+    pub fn is_ignore(&self, rel: &str) -> bool {
+        self.ignores.find(rel).is_some()
+    }
+
     /// The recorded dirs directly in `rel`, each with its stamp.
     pub fn child_dirs(&self, rel: &str) -> Vec<(&str, Stamp)> {
         let dirs = &self.dirs;
@@ -258,10 +263,9 @@ impl Recorded {
         changed
     }
 
-    /// The root-relative dirs to walk again since `index` because an ignore
-    /// input moved, or one appeared in one of the `changed` dirs; outermost
-    /// only, ascending.
-    pub fn ignore_scopes(&self, root: &Path, changed: &[PathBuf]) -> Vec<String> {
+    /// What changed since `index` in the ignore inputs, and in the ignore
+    /// files of the `changed` dirs.
+    pub fn ignore_scopes(&self, root: &Path, changed: &[PathBuf]) -> IgnoreScopes {
         let rows: Vec<usize> = (0..self.ignores.rows.len()).collect();
         let moved = parallel(&rows, |&i| {
             let rel = self.ignores.path(i);
@@ -281,23 +285,39 @@ impl Recorded {
                 }
             })
             .collect();
+        let mut found = Vec::new();
         for dir in changed {
             let Some(rel) = dir.strip_prefix(root).ok().and_then(Path::to_str) else {
                 continue;
             };
-            let new = crate::walk::ignore_files(dir).any(|(name, s)| {
-                s.is_some()
-                    && self
-                        .ignores
-                        .find(&crate::walk::join_rel(rel, name))
-                        .is_none()
-            });
-            if new {
+            let before = found.len();
+            found.extend(
+                crate::walk::ignore_files(dir)
+                    .filter(|(_, s)| s.is_some())
+                    .map(|(name, _)| crate::walk::join_rel(rel, name))
+                    .filter(|file| self.ignores.find(file).is_none()),
+            );
+            if found.len() > before {
                 scopes.push(rel.to_owned());
             }
         }
-        outermost(scopes)
+        IgnoreScopes {
+            scopes: outermost(scopes),
+            found,
+            moved: moved.iter().filter(|&&m| m).count(),
+        }
     }
+}
+
+/// [`Recorded::ignore_scopes`]: what a changed ignore input makes a load
+/// walk again.
+pub struct IgnoreScopes {
+    /// The root-relative dirs to walk again, outermost only, ascending.
+    pub scopes: Vec<String>,
+    /// The ignore files in the changed dirs that the index did not record.
+    pub found: Vec<String>,
+    /// How many recorded ignore inputs moved.
+    pub moved: usize,
 }
 
 /// `rel` of an ignores row against `root`: `../` climbs, an absolute path is itself.

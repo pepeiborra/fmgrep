@@ -308,6 +308,80 @@ fn a_file_added_under_a_new_dir_is_found_again_from_the_checkpoint() {
     assert_eq!(journal_json(&output)["named"], serde_json::json!([]));
 }
 
+#[test]
+fn a_new_ignore_file_deep_in_the_tree_hides_its_files_from_every_later_search() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("x/y/z/k.c", b"printk\n")];
+    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+        return;
+    };
+    let hidden = serde_json::json!(["x/y/z/.ignore", "x/y/z/k.c"]);
+    put(&folder, "x/y/z/.ignore", b"k.c\n");
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    let named = || journal_json(&output)["named"].clone();
+    assert_eq!(named(), hidden, "the ignore file is kept");
+    for _ in 0..2 {
+        assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    }
+    assert_eq!(named(), hidden);
+    std::fs::remove_file(folder.join("x/y/z/.ignore")).unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nx/y/z/k.c\n");
+    assert_eq!(named(), serde_json::json!([]));
+    assert!(notes().is_empty());
+}
+
+/// What a load says while `n` ignore files differ from the index.
+fn ignores_changed(n: usize) -> String {
+    let (files, dirs) = match n {
+        1 => ("file", "its directory"),
+        _ => ("files", "their directories"),
+    };
+    format!(
+        "{n} ignore {files} changed since the index; each search reads {dirs} again (re-run \
+         index to make searches fast again)"
+    )
+}
+
+/// An edited ignore file and a new one: each load that asks watchman says
+/// so, until neither differs from the index.
+#[test]
+fn a_changed_ignore_file_warns_at_every_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs: &[(&str, &[u8])] = &[
+        (".ignore", b"*.o\n"),
+        ("a.c", b"printk\n"),
+        ("b.c", b"printk\n"),
+        ("x/y/z/k.c", b"printk\n"),
+    ];
+    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+        return;
+    };
+    assert!(replays(&output));
+    assert!(notes().is_empty(), "no ignore file changed");
+    put(&folder, ".ignore", b"*.o\nb.c\n");
+    put(&folder, "x/y/z/.ignore", b"k.c\n");
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    notes();
+    for _ in 0..2 {
+        assert!(replays(&output));
+        assert_eq!(notes(), [ignores_changed(2)]);
+    }
+    std::fs::remove_file(folder.join("x/y/z/.ignore")).unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nx/y/z/k.c\n");
+    notes();
+    assert!(replays(&output));
+    assert_eq!(notes(), [ignores_changed(1)], "the edited one");
+    put(&folder, ".ignore", b"*.o\n");
+    backdate(&folder);
+    assert_eq!(
+        printed(&output, &["-l"], &["printk"]),
+        "a.c\nb.c\nx/y/z/k.c\n"
+    );
+    notes();
+    assert!(replays(&output));
+    assert!(notes().is_empty(), "both as indexed");
+}
+
 /// a/sub keeps the stamp b/sub had; watchman reports the files under both,
 /// as for any directory moved into the tree.
 #[test]

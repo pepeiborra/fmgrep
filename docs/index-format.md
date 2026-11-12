@@ -103,7 +103,12 @@ answer, a load stats every document against its `(size, mtime)` stamp:
   root for those above it): an indexed file the rules now skip is excluded
   with no warning, and a file they now allow is added. This repeats at
   every load until the next `index`. `serve`'s watch does the same when it
-  sees an ignore file change inside the tree.
+  sees an ignore file change inside the tree. Such a load prints one line
+  on stderr per process, with the number of ignore files new, edited or
+  deleted since the index, for example `warning: 2 ignore files changed
+  since the index; each search reads their directories again (re-run
+  index to make searches fast again)`. Without `dirs.stamps`, every load
+  walks the whole tree, and prints no such line.
 
 `serve` watches the tree, following new files and directories, and exits
 2 when the watch cannot start (on Linux, out of inotify watches: raise
@@ -136,7 +141,8 @@ turn, a new one is walked).
 A path under a directory the index did not record is found through that
 directory. A search then rewrites the token, taken the same way, with
 what differs now; an added file in a new directory is kept as that
-directory. Watchman is asked from 50,000 documents. A watchman that has
+directory, and an ignore file that `ignores.stamps` does not hold is kept
+too, so that later searches apply it again and print the warning above. Watchman is asked from 50,000 documents. A watchman that has
 not answered within 100 ms (one that hangs, or is still crawling after a
 restart) or that reports more changed paths than an eighth of the
 documents (at least 64), and an index without `docs.journal`, fall back

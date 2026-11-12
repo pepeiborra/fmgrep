@@ -206,7 +206,7 @@ impl Known {
     fn discover_recorded(&self, recorded: &Arc<Recorded>, files: &[String], lens: &[u64]) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
-        let scopes = recorded.ignore_scopes(root, &changed);
+        let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));
         let prune = Arc::clone(recorded);
         let walked =
             crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {
