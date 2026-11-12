@@ -122,6 +122,8 @@ the tree) for a token before the walk. The token goes to `docs.journal`
 those paths and the ignore files, and skips the stat pass and the directory
 check; a search then rewrites
 the token with what differs now. Watchman is asked from 50,000 documents.
+`index` waits at most 5 s for watchman, and a search at most 100 ms for
+its new token and its question together.
 A watchman that answers too slowly or names too many paths, and an index
 without `docs.journal`, fall back to the stat pass. An edit made while a
 directory above the root is renamed away and back, and a hard-linked file

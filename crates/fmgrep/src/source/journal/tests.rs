@@ -233,6 +233,35 @@ mod watchman_tests {
         gives_up_in_time(sock);
     }
 
+    /// A daemon stopped in place, as a hung one.
+    #[test]
+    fn a_load_gives_up_on_watchman_within_100_ms_at_any_size() {
+        let Some((daemon, w)) = live() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let root = canonical(tmp.path());
+        let journal = Journal {
+            v: VERSION,
+            root: root.to_str().unwrap().into(),
+            tokens: vec![Token {
+                kind: "watchman".into(),
+                token: w.mark(&root).expect("a token of the tree, watched"),
+            }],
+            named: Vec::new(),
+            knob: Knob::On,
+        };
+        daemon.hang();
+        warned();
+        let start = Instant::now();
+        let (marks, replay) = journal.ask(&root, 2_000_000);
+        let took = start.elapsed();
+        daemon.resume();
+        assert!(marks.is_empty() && replay.is_none(), "a hung daemon");
+        assert!(took < ASK_WAIT + SLACK / 3, "took {took:?}");
+        assert_eq!(warned(), [late("watchman")]);
+    }
+
     #[test]
     fn watchman_gives_up_on_a_socket_that_never_accepts() {
         let tmp = tempfile::tempdir().unwrap();
