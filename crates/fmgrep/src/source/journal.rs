@@ -1,8 +1,11 @@
-//! Change sources: which corpus paths changed since a token taken before
-//! the index walk or at a search's checkpoint, so a load re-checks only
-//! those. `docs.journal` holds the tokens and what differed at them
-//! (`named`). When no source can say, the search checks every file and
-//! says why, once per process.
+//! Change sources: which corpus paths changed since a token taken at a
+//! search's checkpoint, so a load re-checks only those. `docs.journal`
+//! holds the tokens and what differed at them (`named`). The first search
+//! after an index takes the first token and checks every file; the index
+//! only asks watchman to watch the tree once its walk has listed the
+//! files, without waiting for the crawl.
+//! When no source can say, the search checks every file and says why, once
+//! per process.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +22,8 @@ const VERSION: u32 = 1;
 /// Below this many docs the stat pass beats a source's fixed cost.
 const MIN_DOCS: usize = 50_000;
 
-/// Whether an index takes a token and a load asks.
+/// Whether an index asks watchman to watch the tree and a load asks it
+/// what changed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Knob {
     /// Where it pays off.
@@ -45,10 +49,9 @@ impl Knob {
     }
 }
 
-/// Index time: detection, connects and calls.
-const MARK_WAIT: Duration = Duration::from_secs(5);
 /// A load's token and question, small next to the stat pass it would
-/// spare.
+/// spare; also what `index` gives watchman to take its request to watch
+/// the tree.
 const ASK_WAIT: Duration = Duration::from_millis(100);
 
 /// From how many docs a load asks watchman, and, in tests, the one socket
@@ -138,25 +141,40 @@ fn token(source: &dyn ChangeSource, root: &Path) -> Result<Token, String> {
     })
 }
 
-/// A token per source, unless `knob` is off, before the index walk of
-/// `root`; why there is none only under `--verbose`.
-pub fn marks(root: &Path, knob: Knob) -> Vec<Token> {
-    let Ok(root) = root.canonicalize() else {
-        return Vec::new();
-    };
-    if knob == Knob::Off {
-        return Vec::new();
+/// Once the index walk of `root` has listed `files` files, before it reads
+/// them, where a search of as many docs would ask watchman: have watchman
+/// watch the tree, waiting at most [`ASK_WAIT`] for its reply, which comes
+/// only once its crawl ends; the watch stays, and watchman crawls the tree
+/// while the index reads it. Takes no token. Why not, or that the crawl
+/// goes on, only under `--verbose`.
+pub fn request_watch(root: &Path, files: usize) {
+    let policy = Policy::here();
+    if !policy.due(files) {
+        return;
     }
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
     #[cfg(unix)]
-    let found = watchman::Watchman::find(MARK_WAIT, &Policy::here()).and_then(|w| token(&w, &root));
+    let asked = watchman::Watchman::find(ASK_WAIT, &policy).and_then(|w| w.watch(&root).map(drop));
     #[cfg(not(unix))]
-    let found = Err("no change source on this platform".to_owned());
-    match found {
-        Ok(token) => vec![token],
-        Err(why) => {
-            note(format_args!("no watchman token ({why})"));
-            Vec::new()
-        }
+    let asked: Result<(), String> = Err("no change source on this platform".to_owned());
+    if let Err(why) = asked {
+        note(format_args!("{why}"));
+    }
+}
+
+/// A first token for canonical `root`, for a search with no journal, or
+/// why there is none.
+pub fn first(root: &Path, policy: &Policy) -> Result<Vec<Token>, String> {
+    #[cfg(unix)]
+    return watchman::Watchman::find(ASK_WAIT, policy)
+        .and_then(|w| token(&w, root))
+        .map(|token| vec![token]);
+    #[cfg(not(unix))]
+    {
+        let _ = (root, policy);
+        Err("watchman is not supported on this platform".to_owned())
     }
 }
 
@@ -176,18 +194,15 @@ pub struct Replay {
 }
 
 impl Journal {
-    /// The journal of an index of canonical `root`; nothing without tokens.
-    pub fn write_new(output: &Path, root: &str, tokens: Vec<Token>) -> Result<(), String> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        let journal = Self {
+    /// A journal of canonical `root` with no token yet, for the first
+    /// checkpoint.
+    pub fn new(root: &str) -> Self {
+        Self {
             v: VERSION,
             root: root.to_owned(),
-            tokens,
+            tokens: Vec::new(),
             named: Vec::new(),
-        };
-        journal.write(output)
+        }
     }
 
     /// `None` when absent, of another version, or under [`Knob::Off`];
@@ -286,19 +301,22 @@ impl Journal {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// The warnings given on this thread, every one.
-    pub static NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// `line` on stderr, once per process for each `seen`.
 pub(super) fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
     #[cfg(test)]
-    NOTES.with_borrow_mut(|n| n.push(line.to_string()));
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_string()));
     if !seen.swap(true, Ordering::Relaxed) {
         eprintln!("warning: {line}");
     }
+}
+
+/// This search took a token, but checked every file to learn what differs.
+pub fn checked_once(why: &str) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(
+        &SEEN,
+        format_args!("checked every file once ({why}); later searches ask watchman"),
+    );
 }
 
 /// No source can say what changed on a tree worth asking about.

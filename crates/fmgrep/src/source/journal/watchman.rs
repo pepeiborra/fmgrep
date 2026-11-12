@@ -134,7 +134,7 @@ impl Watchman {
     /// it. Without one, asks watchman to watch `root` and waits for the
     /// answer, sent once the crawl ends, until the deadline only; the watch
     /// stays either way.
-    fn watch(&self, root: &Path) -> Result<(String, String), String> {
+    pub fn watch(&self, root: &Path) -> Result<(String, String), String> {
         let list = self.call(&json!(["watch-list"]), root)?;
         let found = list
             .get("roots")
