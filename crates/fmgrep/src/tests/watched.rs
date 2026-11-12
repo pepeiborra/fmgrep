@@ -174,7 +174,7 @@ fn checkpoint_advances_the_token_and_keeps_changed_paths() {
     // sync.
     daemon.watch(&folder);
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nn.c\n");
-    let asked = ["watch-project", "get-config", "clock", "query"];
+    let asked = ["watch-list", "get-config", "clock", "query"];
     assert_eq!(daemon.sent(), asked);
     let after = journal_json(&output);
     assert_ne!(clock(&after), clock(&before), "{after}");
