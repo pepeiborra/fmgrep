@@ -1,56 +1,20 @@
-use std::path::PathBuf;
-
 use serde_json::json;
 
 use super::*;
 
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap()
+fn token(clock: &str) -> Token {
+    Token {
+        sock: "/run/watchman/sock".into(),
+        watch: "/src".into(),
+        relative: "linux".into(),
+        clock: clock.into(),
+    }
 }
 
-/// `<tmp>/root` and `<tmp>/idx`, canonical.
-fn dirs(tmp: &Path) -> (PathBuf, PathBuf) {
-    let (root, index) = (canonical(tmp).join("root"), canonical(tmp).join("idx"));
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&index).unwrap();
-    (root, index)
-}
-
-#[test]
-fn journal_round_trips_and_malformed_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (root, index) = dirs(tmp.path());
-    let root_str = root.to_str().unwrap();
-    assert_eq!(Journal::open(&index, Knob::Auto).unwrap(), None, "none yet");
-    let tokens = vec![Token {
-        kind: "elsewhere".into(),
-        token: json!(1),
-    }];
-    Journal::new(root_str).checkpoint(&index, tokens.clone(), Vec::new());
-    let journal = Journal::open(&index, Knob::Auto).unwrap().expect("written");
-    let want = Journal {
-        v: 1,
-        root: root_str.into(),
-        tokens,
-        named: Vec::new(),
-    };
-    assert_eq!(journal, want);
-    let (marks, replay) = journal.ask(&root);
-    assert!(marks.is_empty() && replay.is_err(), "an unknown kind");
-    assert!(journal.ask(&index).1.is_err(), "another root");
-    std::fs::write(index.join(DOCS_JOURNAL), br#"{"v":2}"#).unwrap();
-    assert_eq!(
-        Journal::open(&index, Knob::Auto).unwrap(),
-        None,
-        "another v"
-    );
-    for bad in [&b"{"[..], br#"{"v":1}"#, br#"{"v":1,"root":0}"#] {
-        std::fs::write(index.join(DOCS_JOURNAL), bad).unwrap();
-        let err = Journal::open(&index, Knob::Auto).unwrap_err();
-        assert!(
-            err.contains(DOCS_JOURNAL) && err.contains("tampered"),
-            "got: {err}"
-        );
+fn index(dir: &str, started_ns: i64) -> Index {
+    Index {
+        dir: dir.into(),
+        started_ns,
     }
 }
 
@@ -58,15 +22,120 @@ fn journal_round_trips_and_malformed_is_refused() {
 fn loads_ask_from_50_000_docs() {
     assert_eq!(MIN_DOCS, 50_000);
     crate::tests::ASK_FROM.set(Some(10));
-    assert!(!Policy::here().due(9) && Policy::here().due(10));
+    assert!(!due(9) && due(10));
     crate::tests::ASK_FROM.set(None);
-    assert!(!Policy::here().due(usize::MAX), "tests ask only when told");
+    assert!(!due(usize::MAX), "tests ask only when told");
+}
+
+#[test]
+fn the_cap_is_where_the_stat_pass_gets_cheaper() {
+    assert_eq!(named_cap(1_250_000), 156_250);
+    assert_eq!(named_cap(10), 64, "a small tree's floor");
+}
+
+#[test]
+fn a_record_is_named_by_its_tree_and_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    crate::tests::CACHE.set(Some(tmp.path().into()));
+    let one = path("/src/linux", "/src/linux/.fmgrep").unwrap();
+    assert_eq!(one.parent(), Some(tmp.path()));
+    let name = one.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("linux-") && name.ends_with(".json") && name.len() == 27,
+        "{name}"
+    );
+    assert_eq!(fnv(b""), 0xcbf2_9ce4_8422_2325, "FNV-1a's offset basis");
+    assert_eq!(fnv(b"a"), 0xaf63_dc4c_8601_ec8c);
+    let other_index = path("/src/linux", "/idx/linux").unwrap();
+    let other_tree = path("/src/linux2", "/src/linux/.fmgrep").unwrap();
+    assert!(one != other_index && one != other_tree && other_index != other_tree);
+    assert_eq!(path("/", "/idx").unwrap().file_name().unwrap().len(), 26);
+    crate::tests::CACHE.set(None);
+    assert_eq!(path("/src/linux", "/src/linux/.fmgrep"), None);
+}
+
+#[test]
+fn a_record_is_used_only_by_its_index_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    crate::tests::CACHE.set(Some(cache.clone()));
+    let idx = index("/src/linux/.fmgrep", 7);
+    let baseline = vec!["a.c".to_owned(), "new".to_owned()];
+    save(
+        Path::new("/src/linux"),
+        &idx,
+        token("c:1:2"),
+        baseline.clone(),
+    );
+    let record = Record::read("/src/linux", &idx).unwrap();
+    let want = Record {
+        v: 1,
+        root: "/src/linux".into(),
+        index: "/src/linux/.fmgrep".into(),
+        index_started_ns: 7,
+        token: token("c:1:2"),
+        baseline,
+    };
+    assert_eq!(record, want);
+    let file = path("/src/linux", "/src/linux/.fmgrep").unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.starts_with(r#"{"v":1,"root":"/src/linux","index":"#),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&cache).unwrap().count(),
+        1,
+        "no temp left"
+    );
+    let rebuilt = Record::read("/src/linux", &index("/src/linux/.fmgrep", 8));
+    assert!(
+        rebuilt
+            .unwrap_err()
+            .ends_with(" was written for another index build")
+    );
+    std::fs::remove_file(&file).unwrap();
+    let none = Record::read("/src/linux", &idx).unwrap_err();
+    assert_eq!(none, "no record of an earlier search");
+    for bad in [&b"{"[..], br#"{"v":1}"#, b""] {
+        std::fs::write(&file, bad).unwrap();
+        let err = Record::read("/src/linux", &idx).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+    }
+    let mut other = serde_json::to_value(&want).unwrap();
+    other["v"] = json!(2);
+    std::fs::write(&file, other.to_string()).unwrap();
+    assert!(Record::read("/src/linux", &idx).is_err(), "another version");
+}
+
+#[test]
+fn a_record_that_cannot_be_saved_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let notes = || crate::tests::NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()));
+    crate::tests::CACHE.set(None);
+    notes();
+    save(Path::new("/src"), &index("/i", 1), token("c:1:2"), vec![]);
+    let none = "cannot save the watchman token (no cache directory: set XDG_CACHE_HOME or \
+                HOME); the next search checks again";
+    assert_eq!(notes(), [none]);
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    crate::tests::CACHE.set(Some(file.join("fmgrep")));
+    save(Path::new("/src"), &index("/i", 1), token("c:1:2"), vec![]);
+    let got = notes();
+    assert!(
+        got.len() == 1
+            && got[0].starts_with("cannot save ")
+            && got[0].contains("/file/fmgrep/src-"),
+        "{got:?}"
+    );
 }
 
 #[cfg(unix)]
 mod watchman_tests {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
@@ -104,7 +173,7 @@ mod watchman_tests {
                 let mut conn = conn.unwrap();
                 let mut line = String::new();
                 BufReader::new(&conn).read_line(&mut line).unwrap();
-                let cmd: Value = serde_json::from_str(&line).unwrap();
+                let cmd: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let mode = mode.load(Ordering::Relaxed);
                 let reply = match (cmd[0].as_str().unwrap(), mode) {
                     ("watch-list", _) => json!({"roots": ["/w"]}),
@@ -130,17 +199,13 @@ mod watchman_tests {
         sock
     }
 
-    /// A journal of `/w/sub` holding a token of the fake on `sock`.
-    fn faked(sock: &Path) -> Journal {
-        let token = json!({"sock": sock, "watch": "/w", "relative": "sub", "clock": "c:1:1"});
-        Journal {
-            v: VERSION,
-            root: "/w/sub".into(),
-            tokens: vec![Token {
-                kind: "watchman".into(),
-                token,
-            }],
-            named: Vec::new(),
+    /// A token of the fake on `sock`, of the tree `/w/sub`.
+    fn faked(sock: &Path) -> Token {
+        Token {
+            sock: sock.to_str().unwrap().into(),
+            watch: "/w".into(),
+            relative: "sub".into(),
+            clock: "c:1:1".into(),
         }
     }
 
@@ -156,20 +221,18 @@ mod watchman_tests {
         Watchman::at(daemon.sock.clone(), Duration::from_secs(5))
     }
 
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().unwrap()
+    }
+
     fn put(root: &Path, rel: &str) {
         std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
         std::fs::write(root.join(rel), rel).unwrap();
     }
 
-    fn why(since: Since) -> String {
-        match since {
-            Since::Unknown(why) => why,
-            Since::Paths(p) => panic!("{p:?}"),
-        }
-    }
-
     /// A token of the watch `w` for the tree `w/sub`, then the paths
-    /// changed since it, relative to the tree; a restart is refused.
+    /// changed since it, relative to the tree; a restart and a watch gone
+    /// are refused.
     #[test]
     fn watchman_client_speaks_the_protocol() {
         let Some(mut daemon) = live() else {
@@ -179,79 +242,72 @@ mod watchman_tests {
         let (watch, root) = (canonical(tmp.path()), canonical(tmp.path()).join("sub"));
         std::fs::create_dir(&root).unwrap();
         daemon.watch(&watch);
-        let marked = ChangeSource::mark(&at(&daemon), &root).expect("a clock");
+        let marked = at(&daemon).mark(&root).expect("a clock");
+        let w = watch.to_str().unwrap();
         assert_eq!(
-            (&marked["watch"], &marked["relative"]),
-            (&json!(watch), &json!("sub"))
+            (marked.watch.as_str(), marked.relative.as_str()),
+            (w, "sub")
         );
-        assert_eq!(marked["sock"], json!(daemon.sock));
+        assert_eq!(Path::new(&marked.sock), daemon.sock);
         daemon.sent();
         put(&root, "a.c");
         put(&root, "d/x.c");
         put(&watch, "beside.c");
-        let w = Watchman::of(&marked, Duration::from_secs(5)).expect("the token's daemon");
-        let ask = |root: &Path| {
-            ChangeSource::since(
-                &w,
-                &Ask {
-                    root,
-                    token: &marked,
-                },
-            )
-        };
+        let since = |root: &Path| at(&daemon).since(&marked, root);
         // Watchman lists the paths in no set order.
-        let Since::Paths(mut paths) = ask(&root) else {
-            panic!("no paths");
-        };
+        let mut paths = since(&root).unwrap();
         paths.sort();
         assert_eq!(paths, ["a.c", "d", "d/x.c"]);
         assert_eq!(daemon.sent(), ["query"]);
-        assert!(why(ask(&watch)).contains("another root"));
+        let another = since(&watch).unwrap_err();
+        assert_eq!(another, "the token watches another root");
+        daemon.unwatch(&watch);
+        let gone = format!("watchman is not watching {}", root.display());
+        assert_eq!(since(&root), Err(gone), "the watch is gone");
+        daemon.watch(&watch);
+        let restarted = since(&root).unwrap_err();
+        assert!(restarted.contains("restarted"), "{restarted}");
+        let marked = at(&daemon).mark(&root).unwrap();
         daemon.restart();
         daemon.watch(&watch);
-        let w = Watchman::of(&marked, Duration::from_secs(5)).unwrap();
-        let ask = Ask {
-            root: &root,
-            token: &marked,
-        };
-        assert!(why(ChangeSource::since(&w, &ask)).contains("restarted"));
+        let restarted = at(&daemon).since(&marked, &root).unwrap_err();
+        assert!(restarted.contains("restarted"), "{restarted}");
         daemon.stop();
-        let gone = ChangeSource::mark(&at(&daemon), &root).unwrap_err();
+        let none = at(&daemon);
+        let gone = none.mark(&root).unwrap_err();
         assert!(
             gone.starts_with("no watchman daemon answers on ")
                 && gone.ends_with("; start watchman"),
             "{gone}"
         );
-        assert!(Watchman::of(&json!({"watch": "/w"}), Duration::from_secs(5)).is_none());
+        assert!(!none.late(), "a daemon gone is not late");
     }
 
-    /// An error text, and both ways watchman words a sync that timed out,
-    /// which mean it did not answer in time.
+    /// An error text, and the texts of a sync that timed out, which mean
+    /// it did not answer in time, so the record is kept.
     #[test]
     fn an_error_text_is_the_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let mode = Arc::new(AtomicU8::new(ERROR));
         let sock = fake(tmp.path(), Arc::clone(&mode));
-        let journal = faked(&sock);
-        let w = Watchman::of(&journal.tokens[0].token, Duration::from_secs(5)).unwrap();
-        let ask = Ask {
-            root: Path::new("/w/sub"),
-            token: &journal.tokens[0].token,
-        };
-        for (m, want) in [
-            (ERROR, "watchman: bad"),
-            (SYNC_FAILED, "watchman did not answer within 5000 ms"),
-            (NO_COOKIE, "watchman did not answer within 5000 ms"),
-            (CRAWL, "watchman is still crawling /w/sub"),
+        let root = Path::new("/w/sub");
+        for (m, want, late) in [
+            (ERROR, "watchman: bad", false),
+            (SYNC_FAILED, "watchman did not answer within 5000 ms", true),
+            (NO_COOKIE, "watchman did not answer within 5000 ms", true),
+            (CRAWL, "watchman is still crawling /w/sub", true),
         ] {
             mode.store(m, Ordering::Relaxed);
-            assert_eq!(why(ChangeSource::since(&w, &ask)), want, "mode {m}");
+            let w = Watchman::at(sock.clone(), Duration::from_secs(5));
+            assert_eq!(w.since(&faked(&sock), root), Err(want.into()), "mode {m}");
+            assert_eq!(w.late(), late, "mode {m}");
         }
     }
 
     /// Where no watch covers the tree, watchman is asked to watch it; else
     /// the token belongs to the deepest watch above it, `w`, not the
-    /// tree's parent nor `w/subway`; no token where ignore_dirs are set.
+    /// tree's parent nor `w/subway`; no token where ignore_dirs hide part
+    /// of the tree.
     #[test]
     fn watchman_takes_a_token_of_a_watch_already_there() {
         let Some(daemon) = live() else {
@@ -262,11 +318,13 @@ mod watchman_tests {
         let root = top.join("w/sub");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(top.join("w/subway")).unwrap();
-        let watched = |t: &Value| (t["watch"].clone(), t["relative"].clone());
-        let marked = ChangeSource::mark(&at(&daemon), &root).expect("asked to watch it");
+        let watched = |t: &Token| (t.watch.clone(), t.relative.clone());
+        let mark = || at(&daemon).mark(&root);
+        let marked = mark().expect("asked to watch it");
+        let tree = root.to_str().unwrap().to_owned();
         assert_eq!(
             watched(&marked),
-            (json!(root), json!("")),
+            (tree, String::new()),
             "the tree is the watch"
         );
         let asked = [
@@ -277,17 +335,19 @@ mod watchman_tests {
             "clock",
         ];
         assert_eq!(daemon.sent(), asked);
+        assert!(at(&daemon).since(&marked, &root).is_ok());
         daemon.unwatch(&root);
         // Inner first: watch-project takes a watch above, when there is one.
         for dir in [&top.join("w/subway"), &top.join("w"), &top] {
             daemon.watch(dir);
         }
         assert_eq!(daemon.roots().len(), 3);
-        let marked = ChangeSource::mark(&at(&daemon), &root).expect("a token of the watch above");
-        assert_eq!(watched(&marked), (json!(top.join("w")), json!("sub")));
+        let marked = mark().expect("a token of the watch above");
+        let w = top.join("w");
+        let above = (w.to_str().unwrap().to_owned(), "sub".to_owned());
+        assert_eq!(watched(&marked), above);
         let two_clocks = ["watch-list", "get-config", "clock", "clock"];
         assert_eq!(daemon.sent(), two_clocks, "no watch-project");
-        let w = top.join("w");
         daemon.unwatch(&top);
         // Watchman reads ignore_dirs when it adds the watch.
         let configured = |config: &str| {
@@ -296,7 +356,6 @@ mod watchman_tests {
             daemon.watch(&w);
         };
         configured(r#"{"ignore_dirs": ["build", "Sub2/x"]}"#);
-        let mark = || ChangeSource::mark(&at(&daemon), &root);
         assert!(mark().is_ok(), "ignore_dirs beside the tree");
         configured(r#"{"ignore_dirs": ["build", "sub/out"]}"#);
         let why = format!("watchman's ignore_dirs hide part of {}", root.display());
@@ -323,75 +382,79 @@ mod watchman_tests {
         }
     }
 
-    /// A hung daemon (stopped in place) costs a load of any size at most
+    /// A hung daemon (stopped in place) costs a search at most
     /// [`ASK_WAIT`], and gives no token.
     #[test]
-    fn a_load_never_waits_long_for_watchman() {
+    fn a_search_never_waits_long_for_watchman() {
         let Some(daemon) = live() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let journal = Journal {
-            v: VERSION,
-            root: root.to_str().unwrap().into(),
-            tokens: vec![Token {
-                kind: "watchman".into(),
-                token: ChangeSource::mark(&at(&daemon), &root).expect("a token"),
-            }],
-            named: Vec::new(),
-        };
+        let old = at(&daemon).mark(&root).expect("a token");
         daemon.hang();
         let start = Instant::now();
-        let (marks, replay) = journal.ask(&root);
+        let w = Watchman::at(daemon.sock.clone(), ASK_WAIT);
+        let got = w.mark(&root).and_then(|_| w.since(&old, &root));
         let took = start.elapsed();
         daemon.resume();
-        assert!(took < ASK_WAIT + SLACK / 3, "took {took:?}");
-        let why = replay.err().unwrap();
-        assert_eq!(why, "watchman did not answer within 100 ms");
-        assert!(marks.is_empty(), "no token");
+        assert!(took < ASK_WAIT + SLACK, "took {took:?}");
+        assert_eq!(got, Err("watchman did not answer within 100 ms".into()));
+        assert!(w.late());
     }
 
-    /// Late or crawling, as watchman's error texts say: the new token is
-    /// kept when the clock answered.
+    /// Late or crawling, as watchman's error texts say, to the token
+    /// question or to the clocks.
     #[test]
-    fn a_load_says_why_watchman_was_late() {
+    fn a_search_says_why_watchman_was_late() {
         let tmp = tempfile::tempdir().unwrap();
         let mode = Arc::new(AtomicU8::new(SYNC_FAILED));
         let sock = fake(tmp.path(), Arc::clone(&mode));
-        for (m, marked, want) in [
-            (SYNC_FAILED, 1, "watchman did not answer within 100 ms"),
-            (CRAWL, 1, "watchman is still crawling /w/sub"),
-            (CRAWL_CLOCK, 0, "watchman is still crawling /w/sub"),
+        let root = Path::new("/w/sub");
+        for (m, want) in [
+            (SYNC_FAILED, "watchman did not answer within 100 ms"),
+            (CRAWL, "watchman is still crawling /w/sub"),
+            (CRAWL_CLOCK, "watchman is still crawling /w/sub"),
         ] {
             mode.store(m, Ordering::Relaxed);
-            let (marks, replay) = faked(&sock).ask(Path::new("/w/sub"));
-            assert_eq!(replay.err().unwrap(), want, "mode {m}");
-            assert_eq!(marks.len(), marked, "mode {m}");
+            let w = Watchman::at(sock.clone(), ASK_WAIT);
+            let got = w.mark(root).and_then(|_| w.since(&faked(&sock), root));
+            assert_eq!(got, Err(want.into()), "mode {m}");
+            assert!(w.late(), "mode {m}");
         }
     }
 
+    /// The new token came and only the token question was late: the search
+    /// keeps the new token, to save with what its stat pass finds.
+    #[test]
+    fn a_late_answer_keeps_the_new_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::tests::CACHE.set(Some(tmp.path().join("cache")));
+        let sock = fake(tmp.path(), Arc::new(AtomicU8::new(SYNC_FAILED)));
+        let (root, idx) = (Path::new("/w/sub"), index("/i", 1));
+        save(root, &idx, faked(&sock), vec!["b.c".into()]);
+        let asked = ask(root, &idx);
+        let token = asked.token.expect("the new token");
+        assert_ne!(token.clock, faked(&sock).clock);
+        assert!(asked.paths.is_none(), "every file is checked");
+        let notes = crate::tests::NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()));
+        let late = "watchman cannot say what changed (watchman did not answer within 100 ms); \
+                    checked every file";
+        assert_eq!(notes, [late]);
+    }
+
     /// A crawl's tail answers syncs at once, all with the crawl's tick, which
-    /// changes made then get too: no token, at a first search or a later
-    /// one.
+    /// changes made then get too: no token.
     #[test]
     fn a_clock_from_a_crawls_tail_is_no_token() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = fake(tmp.path(), Arc::new(AtomicU8::new(STUCK)));
-        let (_, index) = dirs(tmp.path());
-        let root = Path::new("/w/sub");
-        let w = Watchman::at(sock.clone(), ASK_WAIT);
-        let why = token(&w, root).unwrap_err();
-        assert_eq!(why, "watchman is still crawling /w/sub");
-        faked(&sock).write(&index).unwrap();
-        let before = std::fs::read(index.join(DOCS_JOURNAL)).unwrap();
-        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (marks, replay) = journal.ask(root);
-        assert!(marks.is_empty());
-        let named = replay.map(|r| r.paths).unwrap_or_default();
-        journal.checkpoint(&index, marks, named);
-        let after = std::fs::read(index.join(DOCS_JOURNAL)).unwrap();
-        assert_eq!(after, before, "a load checkpoints nothing");
+        let w = Watchman::at(sock, Duration::from_secs(5));
+        assert_eq!(
+            w.mark(Path::new("/w/sub")),
+            Err("watchman is still crawling /w/sub".into())
+        );
+        assert!(w.late());
     }
 
     #[test]
@@ -409,50 +472,6 @@ mod watchman_tests {
         }
     }
 
-    /// After a restart the old clock is from another instance: a load
-    /// takes a new token, which is kept with what the stat pass found, and
-    /// the next load asks watchman again.
-    #[test]
-    fn a_restarted_watchman_is_trusted_once_it_syncs() {
-        let Some(mut daemon) = live() else {
-            return;
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let (root, index) = dirs(tmp.path());
-        let journal = Journal {
-            v: VERSION,
-            root: root.to_str().unwrap().into(),
-            tokens: vec![Token {
-                kind: "watchman".into(),
-                token: ChangeSource::mark(&at(&daemon), &root).expect("a token"),
-            }],
-            named: Vec::new(),
-        };
-        journal.write(&index).unwrap();
-        let stat_pass_found = || vec!["e1.c".to_owned()];
-        daemon.restart();
-        daemon.watch(&root);
-        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (marks, replay) = journal.ask(&root);
-        let why = replay.err().unwrap();
-        assert!(
-            why.contains("restarted"),
-            "the old clock cannot vouch: {why}"
-        );
-        assert_eq!(marks.len(), 1);
-        journal.checkpoint(&index, marks, stat_pass_found());
-        put(&root, "a.c");
-        put(&root, "d/x.c");
-        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (_, replay) = journal.ask(&root);
-        let paths = replay.unwrap_or_else(|why| panic!("{why}")).paths;
-        assert_eq!(
-            paths,
-            ["a.c", "d", "d/x.c", "e1.c"],
-            "and keeps what the stat pass found"
-        );
-    }
-
     #[test]
     fn watchman_gives_up_on_a_socket_that_never_accepts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -460,9 +479,10 @@ mod watchman_tests {
         let _listener = UnixListener::bind(&sock).unwrap();
         let start = Instant::now();
         let w = Watchman::at(sock, Duration::from_secs(1));
-        let why = ChangeSource::mark(&w, Path::new("/w/sub")).unwrap_err();
+        let why = w.mark(Path::new("/w/sub")).unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(1) + SLACK);
         assert_eq!(why, "watchman did not answer within 1000 ms");
+        assert!(w.late());
     }
 
     #[test]
@@ -505,18 +525,12 @@ mod watchman_tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let token = ChangeSource::mark(&at(&daemon), &root).expect("a token of the tree");
+        let token = at(&daemon).mark(&root).expect("a token of the tree");
         std::fs::write(root.join("new.c"), b"new").unwrap();
-        let named = |token: &Value| {
-            let w = Watchman::of(token, Duration::from_secs(5)).unwrap();
-            match ChangeSource::since(&w, &Ask { root: &root, token }) {
-                Since::Paths(p) => p,
-                Since::Unknown(why) => panic!("cannot vouch: {why}"),
-            }
-        };
+        let named = |token: &Token| at(&daemon).since(token, &root).unwrap();
         assert!(named(&token).iter().any(|p| p == "new.c"));
         for i in 0..10 {
-            let token = ChangeSource::mark(&at(&daemon), &root).unwrap();
+            let token = at(&daemon).mark(&root).unwrap();
             let name = format!("r{i}.c");
             std::fs::write(root.join(&name), b"raced").unwrap();
             assert!(named(&token).contains(&name), "rep {i}");

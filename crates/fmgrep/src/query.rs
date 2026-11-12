@@ -100,9 +100,9 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 }
 
 /// Load the persisted index and its documents, and check coverage. Alongside
-/// the index load the files layout replays its journal, else stats every doc
-/// and discovers added files; under `watch` it watches the root from before
-/// both, and a watch that cannot start is an error.
+/// the index load the files layout re-checks what watchman names, else
+/// stats every doc and discovers added files; under `watch` it watches the
+/// root from before both, and a watch that cannot start is an error.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
@@ -172,7 +172,7 @@ pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<Out
 }
 
 /// Answer every term, or the expression, from `index` and `loaded`; then
-/// checkpoint the journal.
+/// save the watchman token and what differs.
 pub fn answer(
     index: &DocfmIndex,
     loaded: &mut Loaded,
@@ -194,7 +194,7 @@ pub fn answer(
             answer_terms(index, loaded, req, &terms, sink)?
         }
     };
-    loaded.docs.checkpoint(req.index_dir, &req.manifest.files);
+    loaded.docs.checkpoint(&req.manifest.files);
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter
         && !report.queries.iter().any(matched)

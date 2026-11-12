@@ -1,8 +1,8 @@
 //! What the files layout knows of each file since indexing: fresh, stale
 //! (scanned in full), gone (excluded), ignored (excluded silently: an ignore
-//! rule now skips it) or added (not in the manifest; scanned in full). A
-//! change journal, when it vouches, names what to re-check instead of the
-//! stat pass and discovery.
+//! rule now skips it) or added (not in the manifest; scanned in full).
+//! Watchman and the saved baseline, when they can say, name what to
+//! re-check instead of the stat pass and discovery.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ mod journal;
 mod recorded;
 mod watcher;
 
-pub use journal::{Journal, Knob, request_watch};
+pub use journal::{Index, Knob, request_watch};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
@@ -141,7 +141,7 @@ struct Known {
     /// The walk's rule, loaded on first use.
     rules: Mutex<Option<ignore::IncrementalIgnore>>,
     /// Ignore files the index did not record, seen by this load: the
-    /// stored paths keep them, so later loads walk their dirs again.
+    /// baseline keeps them, so later loads walk their dirs again.
     new_ignores: Mutex<Vec<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
@@ -259,8 +259,8 @@ impl Known {
 
     /// Take root-relative `paths` (any order) as all that may differ in
     /// ascending `files`, instead of the stat pass and discovery: the number
-    /// kept, or Err when they cost more than the stat pass (nothing is
-    /// touched then).
+    /// kept, or why not when they cost more than the stat pass (nothing is
+    /// touched then: past [`journal::named_cap`]).
     ///
     /// A path under a dir the index did not record is dropped: under an
     /// ignored or hidden dir, or under a new dir that its listed parent
@@ -340,7 +340,7 @@ impl Known {
         Ok(kept)
     }
 
-    /// Keep `found` (ignore files) for the stored paths.
+    /// Keep `found` (ignore files) for the baseline.
     fn keep_ignores(&self, found: Vec<String>) {
         let mut ignores = self
             .new_ignores
@@ -350,7 +350,7 @@ impl Known {
     }
 
     /// The dirs of `changes` to walk again. Keeps its new ignore files for
-    /// the stored paths, and warns when any ignore file moved or is new
+    /// the baseline, and warns when any ignore file moved or is new
     /// since the index: every load walks the dirs they govern again.
     fn apply_ignores(&self, changes: recorded::IgnoreScopes) -> Vec<String> {
         self.keep_ignores(changes.found);
@@ -431,11 +431,10 @@ pub struct Snapshot {
 /// each doc since.
 pub struct Files {
     known: Arc<Known>,
-    journal: Option<Journal>,
-    /// Read on the opening thread.
-    policy: journal::Policy,
-    /// Taken by [`Self::replay`] before asking, for [`Self::checkpoint`].
-    marks: OnceLock<Vec<journal::Token>>,
+    /// The index a load asks watchman about, and keeps a record of.
+    index: Option<journal::Index>,
+    /// Taken by [`Self::replay`] before re-checking, for [`Self::checkpoint`].
+    token: OnceLock<journal::Token>,
 }
 
 impl Files {
@@ -461,22 +460,24 @@ impl Files {
                 new_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
             }),
-            journal: None,
-            policy: journal::Policy::here(),
-            marks: OnceLock::new(),
+            index: None,
+            token: OnceLock::new(),
         })
     }
 
-    /// Replay `journal` rather than stat every doc, when it vouches.
-    pub fn journal(&mut self, journal: Journal) {
-        self.journal = Some(journal);
+    /// Let [`Self::replay`] ask watchman, for `index`.
+    pub fn ask(&mut self, index: journal::Index) {
+        self.index = Some(index);
     }
 
-    /// Take what the journal names since its marks instead of
-    /// [`Self::stat_all`] and discovery: false when it cannot vouch, saying
-    /// why on a tree worth asking about.
+    /// Re-check what may differ (what watchman names, plus the saved
+    /// baseline) instead of [`Self::stat_all`] and discovery: false when no
+    /// ask is due, or, saying why on stderr, when watchman cannot say.
     pub fn replay(&self, files: &[String], lens: &[u64]) -> bool {
-        if !self.policy.due(files.len()) {
+        let Some(index) = &self.index else {
+            return false;
+        };
+        if !journal::due(files.len()) {
             return false;
         }
         if !files.is_sorted() {
@@ -495,37 +496,27 @@ impl Files {
             journal::cannot_answer("the index has no dirs.stamps; re-run index");
             return false;
         };
-        let Some(journal) = &self.journal else {
-            // The first search after an index takes the token for the next.
-            match journal::first(&root, &self.policy) {
-                Ok(marks) => {
-                    let _ = self.marks.set(marks);
-                    journal::checked_once("no earlier search took a watchman token");
-                }
-                Err(why) => journal::cannot_answer(&why),
-            }
+        let asked = std::time::Instant::now();
+        let answer = journal::ask(&root, index);
+        if let Some(token) = answer.token {
+            let _ = self.token.set(token);
+        }
+        let Some(paths) = answer.paths else {
             return false;
         };
-        let asked = std::time::Instant::now();
-        let (marks, replay) = journal.ask(&root);
-        let _ = self.marks.set(marks);
         let applied = std::time::Instant::now();
-        let kept = replay.and_then(|replay| {
-            let kept = self.known.replay(recorded, &replay.paths, files, lens)?;
-            Ok((replay, kept))
-        });
-        let (replay, kept) = match kept {
-            Ok(done) => done,
+        let kept = match self.known.replay(recorded, &paths, files, lens) {
+            Ok(kept) => kept,
             Err(why) => {
                 journal::cannot_answer(&why);
                 return false;
             }
         };
         if crate::verbose::verbose() {
-            let (n, ask, apply) = (replay.paths.len(), applied - asked, applied.elapsed());
-            let kind = replay.kind;
+            let (n, ask, apply) = (paths.len(), applied - asked, applied.elapsed());
             eprintln!(
-                "note: {kind} named {n} path(s), {kept} kept (ask {ask:.1?}, apply {apply:.1?})"
+                "note: watchman and the baseline named {n} path(s), {kept} kept (ask \
+                 {ask:.1?}, apply {apply:.1?})"
             );
             let n = self.known.added().live().count();
             if n > 0 {
@@ -537,49 +528,41 @@ impl Files {
         true
     }
 
-    /// Once every doc is known, rewrite the journal under `index_dir` from
-    /// [`Self::replay`]'s marks and what differs now; the first search
-    /// writes it.
-    pub fn checkpoint(&mut self, index_dir: &Path, files: &[String]) {
-        let Some(marks) = self.marks.take() else {
+    /// Once every doc is known, save [`Self::replay`]'s token and what
+    /// differs now (the baseline) in the user's cache.
+    pub fn checkpoint(&mut self, files: &[String]) {
+        let (Some(token), Some(index)) = (self.token.take(), &self.index) else {
             return;
         };
         if !self.known.complete.load(Ordering::Acquire) {
             return;
         }
-        let journal = match self.journal.take() {
-            Some(journal) => journal,
-            None => match self.known.root.canonicalize() {
-                Ok(root) => match root.to_str() {
-                    Some(root) => Journal::new(root),
-                    None => return,
-                },
-                Err(_) => return,
-            },
+        let Ok(root) = self.known.root.canonicalize() else {
+            return;
         };
         let snap = self.snapshot();
-        let mut named: Vec<String> = snap
+        let mut baseline: Vec<String> = snap
             .stale
             .iter()
             .chain(&snap.gone)
             .map(|&id| files[id].clone())
             .collect();
         let recorded = self.known.recorded.as_deref();
-        named.extend(
+        baseline.extend(
             snap.added
                 .iter()
                 .map(|&doc| unrecorded(recorded, &snap.names[doc - files.len()]).to_owned()),
         );
         let ignores = self.known.new_ignores.lock();
-        named.extend(
+        baseline.extend(
             ignores
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .cloned(),
         );
-        named.sort_unstable();
-        named.dedup();
-        journal.checkpoint(index_dir, marks, named);
+        baseline.sort_unstable();
+        baseline.dedup();
+        journal::save(&root, index, token, baseline);
     }
 
     /// Never take `index_dir` for an added file. Before any watch or

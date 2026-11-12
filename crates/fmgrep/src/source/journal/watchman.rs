@@ -1,16 +1,16 @@
 //! A running watchman daemon, never spawned: a token is the daemon's
-//! socket plus a clock of a watch on the root or above it; a token question
-//! is a `since` query, synced by watchman's own cookies. Where no watch
-//! covers the root, `watch-project` adds one; watchman sends its answer
-//! once the crawl of the tree ends, so a short deadline gives up on the
-//! answer but not on the watch. A clock answered during a crawl, its tail
-//! included, is the crawl's tick, synced or not; files changed then get
-//! that tick too, so `since` it misses them. Each batch after a crawl
-//! ticks first, so a token is a second synced clock past the first; one
-//! equal to it, or a clock that does not sync in time, gives none.
-//! Detection, connects and calls share one deadline, and each failure says
-//! why.
+//! socket plus a clock of a watch on the root or above it; a token
+//! question is a `since` query, synced by watchman's own cookies.
+//! Where no watch covers the root, `watch-project` adds one; watchman
+//! sends its answer once the crawl of the tree ends, so a short deadline
+//! gives up on the answer but not on the watch. A clock answered during a
+//! crawl, its tail included, is the crawl's tick, synced or not; files
+//! changed then get that tick too, so `since` it misses them. Each batch
+//! after a crawl ticks first, so a token is a second synced clock past the
+//! first; one equal to it, or a clock that does not sync in time, gives
+//! none. Connects and calls share one deadline, and each failure says why.
 
+use std::cell::Cell;
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
@@ -18,23 +18,17 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Ask, ChangeSource, Since};
+use super::Token;
 
 pub struct Watchman {
     sock: PathBuf,
     deadline: Instant,
     budget: Duration,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Token {
-    sock: String,
-    watch: String,
-    relative: String,
-    clock: String,
+    /// A call failed for want of time, or during a crawl: later it may
+    /// answer.
+    late: Cell<bool>,
 }
 
 /// Reads that fail once the deadline passes.
@@ -59,25 +53,23 @@ impl Watchman {
             sock,
             deadline: Instant::now() + budget,
             budget,
+            late: Cell::new(false),
         }
     }
 
-    /// The daemon that took `token`.
-    pub fn of(token: &Value, budget: Duration) -> Option<Self> {
-        let sock = token.get("sock")?.as_str()?;
-        Some(Self::at(sock.into(), budget))
+    /// Whether a call failed for want of time or during a crawl.
+    pub fn late(&self) -> bool {
+        self.late.get()
     }
 
     /// `$WATCHMAN_SOCK`, else the socket that `watchman get-sockname`
-    /// gives; tests look only where `policy` says.
-    pub fn find(budget: Duration, policy: &super::Policy) -> Result<Self, String> {
+    /// gives; tests look only at the socket they are given.
+    pub fn find(budget: Duration) -> Result<Self, String> {
         #[cfg(test)]
-        match policy.sock.clone() {
+        return match crate::tests::WATCHMAN.with_borrow(Clone::clone) {
             Some(sock) => Ok(Self::at(sock, budget)),
             None => Err("no watchman daemon".to_owned()),
-        }
-        #[cfg(not(test))]
-        let _ = policy;
+        };
         #[cfg(not(test))]
         match std::env::var_os("WATCHMAN_SOCK") {
             Some(sock) => Ok(Self::at(sock.into(), budget)),
@@ -148,7 +140,7 @@ impl Watchman {
             return Ok((watch.to_owned(), relative.to_owned()));
         }
         let project = match self.call(&json!(["watch-project", root]), root) {
-            Err(_) if Instant::now() >= self.deadline => return Err(asked(root)),
+            Err(_) if self.late() => return Err(asked(root)),
             project => project?,
         };
         let watch = project.get("watch").and_then(Value::as_str);
@@ -182,7 +174,7 @@ impl Watchman {
     /// A token for now, of the watch covering `root`. Refused when an
     /// `ignore_dirs` entry would hide changes under it, or when the two
     /// clocks do not sync in time or share a tick (a crawl's).
-    fn mark(&self, root: &Path) -> Result<Token, String> {
+    pub fn mark(&self, root: &Path) -> Result<Token, String> {
         let (watch, relative) = self.watch(root)?;
         let config = self.call(&json!(["get-config", watch]), root)?;
         if let Some(ignores) = config.pointer("/config/ignore_dirs")
@@ -196,6 +188,7 @@ impl Watchman {
         let first = self.clock(&watch, root)?;
         let clock = self.clock(&watch, root)?;
         if !ticked(&first, &clock) {
+            self.late.set(true);
             return Err(format!("watchman is still crawling {}", root.display()));
         }
         let sock = self
@@ -213,7 +206,7 @@ impl Watchman {
     /// The paths under `root` changed since `token`'s clock; refused on a
     /// fresh instance: a restart, the watch added again, or deleted files
     /// pruned since. A recrawl is not one: it names what it statted.
-    fn since(&self, token: &Token, root: &Path) -> Result<Vec<String>, String> {
+    pub fn since(&self, token: &Token, root: &Path) -> Result<Vec<String>, String> {
         let watched = Path::new(&token.watch).join(&token.relative);
         if watched.components().ne(root.components()) {
             return Err("the token watches another root".to_owned());
@@ -244,8 +237,10 @@ impl Watchman {
         let crawling = ["performing initial crawl", "re-crawling"];
         let sync = ["synchronization failed", "syncToNow"];
         if crawling.iter().any(|c| error.contains(c)) {
+            self.late.set(true);
             format!("watchman is still crawling {}", root.display())
         } else if sync.iter().any(|s| error.contains(s)) && error.contains("timed out") {
+            self.late.set(true);
             self.too_late()
         } else if error.contains("is not watched") {
             not_watching(root)
@@ -267,7 +262,10 @@ impl Watchman {
         match left.map(|left| self.exchange(command, left)) {
             Some(Ok(reply)) => reply.map_err(|e| self.why(root, format!("watchman: {e}"))),
             Some(Err(e)) if Instant::now() < self.deadline => Err(e),
-            _ => Err(self.too_late()),
+            _ => {
+                self.late.set(true);
+                Err(self.too_late())
+            }
         }
     }
 
@@ -306,28 +304,6 @@ impl Watchman {
                 Some(e) => Err(e.as_str().unwrap_or("an error").to_owned()),
                 None => Ok(reply),
             });
-        }
-    }
-}
-
-impl ChangeSource for Watchman {
-    fn kind(&self) -> &'static str {
-        "watchman"
-    }
-
-    fn mark(&self, root: &Path) -> Result<Value, String> {
-        let token = Watchman::mark(self, root)?;
-        serde_json::to_value(token).map_err(|e| e.to_string())
-    }
-
-    fn since(&self, ask: &Ask<'_>) -> Since {
-        let token = serde_json::from_value::<Token>(ask.token.clone());
-        match token.map_err(|e| format!("an unreadable token ({e})")) {
-            Ok(token) => match Watchman::since(self, &token, ask.root) {
-                Ok(paths) => Since::Paths(paths),
-                Err(why) => Since::Unknown(why),
-            },
-            Err(why) => Since::Unknown(why),
         }
     }
 }
