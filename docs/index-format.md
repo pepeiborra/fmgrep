@@ -171,9 +171,10 @@ crawling /src`. A search with a record whose watch was removed asks for
 it again in the same way.
 
 **A search cannot use a record** when there is none yet, when it was
-written for another index build, when no watchman daemon answers on the
-socket it stores, or when watchman reports that it restarted, removed and
-added the watch again, or forgot deleted files since the record's token.
+written for another index build, when `WATCHMAN_SOCK` is set to another
+socket than the one it stores, when no watchman daemon answers on that
+socket, or when watchman reports that it restarted, removed and added the
+watch again, or forgot deleted files since the record's token.
 Such a search finds the daemon from `WATCHMAN_SOCK`, else by running
 `watchman get-sockname` within 500 ms: when no daemon runs, watchman's
 client starts one and answers once it listens. Where `WATCHMAN_SOCK` is

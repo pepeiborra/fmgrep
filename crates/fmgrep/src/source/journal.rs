@@ -240,7 +240,7 @@ pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
             cannot_answer("the tree's path is not UTF-8");
             return Asked::default();
         };
-        let (why, taken) = match Record::read(root_str, index) {
+        let (why, taken) = match Record::read(root_str, index).and_then(same_socket) {
             Ok(record) => {
                 let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
                 match later(&w, &record, root, docs) {
@@ -261,6 +261,20 @@ pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
         let _ = (root, index, docs);
         cannot_answer("watchman is not supported on this platform");
         Asked::default()
+    }
+}
+
+/// `record`, unless `WATCHMAN_SOCK` gives another socket than the one it
+/// keeps: the variable chooses the daemon.
+#[cfg(unix)]
+fn same_socket(record: Record) -> Result<Record, String> {
+    match watchman::Watchman::given() {
+        Some(sock) if sock != Path::new(&record.token.sock) => Err(format!(
+            "WATCHMAN_SOCK is {}, and the record keeps {}",
+            sock.display(),
+            record.token.sock
+        )),
+        _ => Ok(record),
     }
 }
 
