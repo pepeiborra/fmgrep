@@ -59,7 +59,9 @@ on linux, chromium and aosp the fmgrep rows other than `--store-docs`
 (whose index holds the documents and checks no tree) ask watchman at each
 load, and on ghc (about 27,000 files) they stat every file. The watch
 covers an AOSP tree too.
-To do the same by hand, from the top of the checkout:
+To do the same by hand, from the top of the checkout (the query below
+puts `$PWD` into a JSON string as it is, so a path holding `"` or `\`
+needs them escaped):
 
 ```sh
 watchman watch-project .

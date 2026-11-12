@@ -20,9 +20,11 @@ if ! command -v watchman >/dev/null; then
     echo "warning: watchman is not installed: fmgrep checks every file of $DIR on each load" >&2
 elif ! OUT="$(watchman --no-pretty watch-project "$DIR")"; then
     echo "warning: watchman watch-project $DIR failed (${OUT:-no output}): fmgrep checks every file on each load" >&2
+elif ! WATCH="$(printf '%s' "$OUT" | sed -nE 's/.*"watch": *"(([^"\\]|\\.)*)".*/\1/p')" || [[ -z $WATCH ]]; then
+    echo "warning: watchman watch-project $DIR named no watch ($OUT): fmgrep checks every file on each load" >&2
 else
-    WATCH="$(printf '%s' "$OUT" | sed -n 's/.*"watch": *"\([^"]*\)".*/\1/p')"
-    WATCH="${WATCH:-$DIR}"
+    # WATCH is the root as watchman's JSON spells it, escapes kept, so it
+    # goes back into the query as it is.
     SECONDS=0
     if watchman --no-pretty -j <<<"[\"query\", \"$WATCH\", {\"expression\": [\"false\"], \"sync_timeout\": 600000}]" >/dev/null; then
         echo "watchman watches $DIR (watch $WATCH, crawled in ${SECONDS} s)" >&2
