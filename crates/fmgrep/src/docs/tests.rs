@@ -28,12 +28,48 @@ fn stage_corpus(dir: &Path) {
     std::fs::write(dir.join("sub").join("c.c"), b"nested").unwrap();
 }
 
+/// [`super::stream_while`], ignoring the number of files listed.
+fn stream_while<R>(
+    folder: &Path,
+    output: &Path,
+    cap: u64,
+    store_docs: bool,
+    build: impl FnOnce(&Cuts) -> Result<R, String>,
+) -> Result<(Docs, R), String> {
+    super::stream_while(folder, output, cap, store_docs, |_| (), build)
+}
+
 /// Stream with a build that consumes nothing: the write pass alone.
 fn stream(folder: &Path, output: &Path) -> Docs {
     std::fs::create_dir_all(output).unwrap();
     stream_while(folder, output, u64::MAX, true, |_| Ok(()))
         .unwrap()
         .0
+}
+
+/// The stream gives the number of files listed, the skipped one
+/// included, before it reads the first: a.c, rewritten then, is read as
+/// rewritten.
+#[test]
+fn the_stream_gives_the_file_count_before_it_reads_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    std::fs::create_dir_all(&folder).unwrap();
+    stage_corpus(&folder);
+    let output = tmp.path().join("idx");
+    std::fs::create_dir_all(&output).unwrap();
+    let mut listed = None;
+    let a = folder.join("a.c");
+    let rewrite = |files: usize| {
+        listed = Some(files);
+        std::fs::write(a, b"printk, rewritten").unwrap();
+    };
+    let (docs, ()) =
+        super::stream_while(&folder, &output, u64::MAX, true, rewrite, |_| Ok(())).unwrap();
+    assert_eq!(listed, Some(5), "a.c b.c e.c nul.bin sub/c.c");
+    assert_eq!(docs.num_docs(), 4, "nul.bin is skipped");
+    let at = docs.paths.iter().position(|p| p == "a.c").unwrap();
+    assert_eq!(docs.lens[at], 17);
 }
 
 #[test]

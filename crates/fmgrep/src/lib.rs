@@ -73,4 +73,6 @@ pub use walk::{DocMeta, discover_index_meta};
 
 use term::RegexError;
 use unified::UNIFIED_SEPARATOR;
-use walk::{Document, Stamp, for_each_index_doc};
+#[cfg(test)]
+use walk::for_each_index_doc;
+use walk::{Document, Stamp};

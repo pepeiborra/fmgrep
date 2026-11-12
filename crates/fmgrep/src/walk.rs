@@ -172,6 +172,18 @@ fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
 pub fn for_each_index_doc(
     root: &Path,
     exclude: Option<&Path>,
+    f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
+) -> Result<WalkNotes, String> {
+    for_each_listed_doc(root, exclude, |_| {}, f)
+}
+
+/// [`for_each_index_doc`], calling `listed` with the number of files the
+/// walk listed, the ones it will skip included, once it has listed them
+/// all and before it reads the first.
+pub fn for_each_listed_doc(
+    root: &Path,
+    exclude: Option<&Path>,
+    listed: impl FnOnce(usize),
     mut f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
 ) -> Result<WalkNotes, String> {
     let (rels, notes) = list(root, exclude)?;
@@ -181,6 +193,7 @@ pub fn for_each_index_doc(
             root.display()
         ));
     }
+    listed(rels.len());
     let pool = read_pool()?;
     let mut kept = 0usize;
     let mut skipped = 0usize;

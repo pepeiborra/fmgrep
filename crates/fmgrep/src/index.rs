@@ -7,7 +7,7 @@ use crate::docs;
 use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manifest};
 use crate::plan::shard_bytes;
 use crate::sharded::DocfmIndex;
-use crate::source::{Journal, Knob, marks, write_stamps, write_walk};
+use crate::source::{Knob, request_watch, write_stamps, write_walk};
 use crate::wire::IndexSummary;
 
 /// The default index directory, under the indexed folder.
@@ -25,9 +25,11 @@ pub struct IndexRequest<'a> {
 ///
 /// `build_time_us` is the index wall — the document stream, construction and
 /// the blob flush, all of it, so the number keeps its meaning however many
-/// shards are built at once; the journal marks and the manifest write are
-/// outside it. Any failure, error or panic, removes the output dir, so a
-/// half-written index is never queryable.
+/// shards are built at once; the manifest write is outside it. Once the
+/// walk has listed the files, before it reads them, the stream asks
+/// watchman to watch the tree, so that watchman reads the tree while the
+/// index reads and builds. Any failure, error or panic, removes the output
+/// dir, so a half-written index is never queryable.
 pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     std::fs::read_dir(req.folder)
         .map_err(|e| format!("error: cannot list folder {}: {e}", req.folder.display()))?;
@@ -40,16 +42,26 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     };
     create_output_dir(&output)?;
     let persist = |output: &Path| -> Result<Manifest, String> {
-        let marks = match req.store_docs {
-            true => Vec::new(),
-            false => marks(req.folder, Knob::read()?),
-        };
+        // A bad FMGREP_JOURNAL fails before any work.
+        let knob = Knob::read()?;
         let start = Instant::now();
         let started = SystemTime::now();
         let mut sink = create_sink(output)?;
         let cap = shard_bytes()?;
+        #[cfg(test)]
+        let hooks = crate::tests::Hooks::here();
+        // On the stream's thread, once the walk has listed the files: the
+        // reads wait for the request, which has its own time limits, and
+        // this thread's test hooks go with it.
+        let listed = |files: usize| {
+            #[cfg(test)]
+            hooks.apply();
+            if !req.store_docs && knob != Knob::Off {
+                request_watch(req.folder, files);
+            }
+        };
         let (docs, index_size_bytes) =
-            docs::stream_while(req.folder, output, cap, req.store_docs, |cuts| {
+            docs::stream_while(req.folder, output, cap, req.store_docs, listed, |cuts| {
                 DocfmIndex::build_into(cuts, cap, None, req.store_docs, &mut sink)
             })?;
         let (blobs, blob_lens) = finish_sink(sink)?;
@@ -58,9 +70,6 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             write_walk(output, &docs.walk, started)?;
         }
         let build_time_us = start.elapsed().as_micros() as u64;
-        if let Some(root) = docs.root.as_deref().filter(|_| !req.store_docs) {
-            Journal::write_new(output, root, marks)?;
-        }
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
             store_docs: req.store_docs,

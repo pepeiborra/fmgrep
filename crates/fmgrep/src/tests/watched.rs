@@ -14,7 +14,7 @@ fn replays(index: &Path) -> bool {
 
 /// The warnings given on this thread since the last call.
 fn notes() -> Vec<String> {
-    crate::source::NOTES.take()
+    NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()))
 }
 
 fn put(root: &Path, rel: &str, bytes: &[u8]) {
@@ -37,7 +37,8 @@ fn live(folder: &Path) -> Option<Daemon> {
 }
 
 /// `files` under `<tmp>/corpus`, backdated, indexed at `<tmp>/idx` while
-/// [`live`] watches the tree.
+/// [`live`] watches the tree, then searched once, which takes the first
+/// token.
 fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
     let folder = tmp.join("corpus");
     for (rel, bytes) in files {
@@ -47,9 +48,16 @@ fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Dae
     let daemon = live(&folder)?;
     let output = tmp.join("idx");
     index_it(&folder, &output, false);
+    assert_eq!(daemon.sent(), ["watch-list"], "index takes no token");
+    assert!(!output.join("docs.journal").exists());
+    query_it(&output, false, &["printk"]);
+    assert_eq!(notes(), [ONCE]);
     daemon.sent();
     Some((folder, output, daemon))
 }
+
+/// What the first search after an index says.
+const ONCE: &str = "checked every file once (no earlier search took a watchman token); later searches ask watchman";
 
 const AB: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("b.c", b"none\n")];
 
@@ -97,22 +105,36 @@ fn a_load_watchman_cannot_answer_says_why_and_stats_every_file() {
     assert!(why.len() == 1 && why[0].starts_with(gone), "{why:?}");
 }
 
+/// `index` asks watchman to watch the tree, does not wait for the reply
+/// beyond its 100 ms, and takes no token; the first search takes one.
 #[test]
-fn an_index_without_a_token_says_so() {
+fn index_asks_for_a_watch_without_waiting_and_a_search_takes_the_token() {
+    use std::time::{Duration, Instant};
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(tmp.path(), AB);
-    let output = tmp.path().join("idx");
-    index_it(&folder, &output, false);
-    assert!(!output.join("docs.journal").exists());
+    let Some(daemon) = Daemon::start() else {
+        return;
+    };
+    WATCHMAN.set(Some(daemon.sock.clone()));
     ASK_FROM.set(Some(0));
-    assert!(!replays(&output));
+    let output = tmp.path().join("idx");
+    let start = Instant::now();
+    index_it(&folder, &output, false);
+    let took = start.elapsed();
+    assert!(took < Duration::from_millis(1600), "took {took:?}");
+    assert_eq!(daemon.sent(), ["watch-list", "watch-project"]);
     let root = std::fs::canonicalize(&folder).unwrap();
-    let r = root.display();
-    let why = format!(
-        "watchman cannot say what changed (the index holds no watchman token; run 'watchman \
-         watch-project {r}', then re-index); checked every file"
-    );
-    assert_eq!(notes(), [why]);
+    assert_eq!(daemon.roots(), [root.to_str().unwrap()], "the watch");
+    assert!(!output.join("docs.journal").exists(), "no token");
+    assert!(notes().is_empty(), "index prints nothing");
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(notes(), [ONCE]);
+    assert!(output.join("docs.journal").exists(), "the first token");
+    put(&folder, "b.c", b"printk now\n");
+    daemon.sent();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert_eq!(daemon.sent().last().unwrap(), "query");
+    assert!(notes().is_empty());
 }
 
 #[test]
@@ -123,6 +145,8 @@ fn a_small_tree_asks_nothing_and_says_nothing() {
     };
     let journal = std::fs::read(output.join("docs.journal")).unwrap();
     ASK_FROM.set(Some(3));
+    index_it(&folder, &tmp.path().join("idx2"), false);
+    assert!(daemon.sent().is_empty(), "nor does index");
     std::fs::write(folder.join("c.c"), b"printk\n").unwrap();
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
     assert!(!replays(&output));
@@ -155,6 +179,8 @@ fn journal_answers_like_the_sweep() {
     };
     let stale = tmp.path().join("idx");
     index_it(&folder, &stale, false);
+    query_it(&stale, false, &["printk"]);
+    assert_eq!(notes(), [ONCE], "the first search takes the token");
     put(&folder, ".ignore", b"a2.c\n");
     put(&folder, "a.c", b"printk one\nprintk printk\n");
     put(&folder, "b.c", b"printk added\naa\n");
@@ -183,27 +209,6 @@ fn journal_answers_like_the_sweep() {
 }
 
 #[test]
-fn journal_replays_edits_made_after_its_mark() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = stage_corpus(tmp.path(), &[("a.c", b"printk\n"), ("b.c", b"none\n")]);
-    let Some(_daemon) = live(&folder) else {
-        return;
-    };
-    let early = crate::source::marks(&folder, crate::source::Knob::On);
-    std::fs::write(folder.join("a.c"), b"printk printk during\n").unwrap();
-    let stale = tmp.path().join("idx");
-    index_it(&folder, &stale, false);
-    let mut journal = journal_json(&stale);
-    journal["tokens"] = serde_json::to_value(early).unwrap();
-    std::fs::write(stale.join("docs.journal"), journal.to_string()).unwrap();
-    std::fs::write(folder.join("b.c"), b"printk after\n").unwrap();
-    let fresh = tmp.path().join("fresh");
-    index_it(&folder, &fresh, false);
-    assert!(replays(&stale));
-    answers_like(&stale, &fresh, &["printk", "during", "after"], &["printk"]);
-}
-
-#[test]
 fn journal_skips_the_stat_pass() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(
@@ -215,6 +220,8 @@ fn journal_skips_the_stat_pass() {
     };
     let output = tmp.path().join("idx");
     index_it(&folder, &output, false);
+    query_it(&output, false, &["printk"]);
+    assert_eq!(notes(), [ONCE], "the first search takes the token");
     let mut stamps = std::fs::read(output.join("docs.stamps")).unwrap();
     stamps[0] ^= 1;
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
@@ -284,7 +291,7 @@ fn named_changes_answer_like_a_fresh_index() {
     index_it(&folder, &fresh, false);
     let terms = ["printk", "/pr[i1]ntk/", "aa", "deep", "now"];
     answers_like(&stale, &fresh, &terms, &["printk", "aa", "deep"]);
-    assert!(notes().is_empty(), "{:?}", notes());
+    assert_eq!(notes(), [ONCE], "fresh's first search only");
 }
 
 #[test]
@@ -327,7 +334,8 @@ fn a_new_ignore_file_deep_in_the_tree_hides_its_files_from_every_later_search() 
     std::fs::remove_file(folder.join("x/y/z/.ignore")).unwrap();
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nx/y/z/k.c\n");
     assert_eq!(named(), serde_json::json!([]));
-    assert!(notes().is_empty());
+    let while_new = vec![ignores_changed(1); 3];
+    assert_eq!(notes(), while_new, "each search while it is there");
 }
 
 /// What a load says while `n` ignore files differ from the index.

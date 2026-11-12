@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::{DOCS_SHARD, SHARD_WRITE_BUFFER};
 use crate::plan::Cutter;
-use crate::walk::WalkNotes;
+use crate::walk::{WalkNotes, for_each_listed_doc};
 
 use feed::CutSource;
 pub use feed::{Cut, Cuts};
@@ -39,14 +39,17 @@ pub struct Docs {
 
 /// Stream every indexable document under `folder` while `build` consumes the
 /// shards of at most `cap` text bytes it closes; `store_docs` also copies
-/// them into `<output>/docs.shard`. `build` runs on the caller's thread, so
-/// its refusal keeps the caller's unwind path, and a stream error is reported
-/// over a build error: it is the earlier cause.
+/// them into `<output>/docs.shard`. `listed` gets the number of files the
+/// walk listed, on the stream's thread, before the first is read. `build`
+/// runs on the caller's thread, so its refusal keeps the caller's unwind
+/// path, and a stream error is reported over a build error: it is the
+/// earlier cause.
 pub fn stream_while<R>(
     folder: &Path,
     output: &Path,
     cap: u64,
     store_docs: bool,
+    listed: impl FnOnce(usize) + Send,
     build: impl FnOnce(&Cuts) -> Result<R, String>,
 ) -> Result<(Docs, R), String> {
     let source = if store_docs {
@@ -57,7 +60,7 @@ pub fn stream_while<R>(
     let (cuts, writer) = feed::feed(source.clone());
     // A plain thread: the stream blocks for the whole build and must never run a shard build.
     let (streamed, built) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| stream_into(folder, output, &source, cap, writer));
+        let worker = scope.spawn(|| stream_into(folder, output, &source, cap, listed, writer));
         let built = {
             // Scoped, so a build that gives up stops the stream before the
             // join below waits for it.
@@ -121,6 +124,7 @@ fn stream_into(
     output: &Path,
     source: &CutSource,
     cap: u64,
+    listed: impl FnOnce(usize),
     mut writer: feed::Writer,
 ) -> Result<Docs, String> {
     let mut out = match source {
@@ -142,7 +146,7 @@ fn stream_into(
     let mut bom_bytes = 0u64;
     let mut file_lens = Vec::new();
     let mut id = 0u64;
-    let walked = crate::for_each_index_doc(folder, Some(output), |path, text, stamp, read| {
+    let walked = for_each_listed_doc(folder, Some(output), listed, |path, text, stamp, read| {
         if writer.aborted() {
             return Err(ABORTED.to_string());
         }

@@ -19,9 +19,7 @@ mod journal;
 mod recorded;
 mod watcher;
 
-#[cfg(test)]
-pub use journal::NOTES;
-pub use journal::{Journal, Knob, marks};
+pub use journal::{Journal, Knob, request_watch};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
@@ -498,11 +496,14 @@ impl Files {
             return false;
         };
         let Some(journal) = &self.journal else {
-            journal::cannot_answer(&format!(
-                "the index holds no watchman token; run 'watchman watch-project {r}', then \
-                 re-index",
-                r = root.display()
-            ));
+            // The first search after an index takes the token for the next.
+            match journal::first(&root, &self.policy) {
+                Ok(marks) => {
+                    let _ = self.marks.set(marks);
+                    journal::checked_once("no earlier search took a watchman token");
+                }
+                Err(why) => journal::cannot_answer(&why),
+            }
             return false;
         };
         let asked = std::time::Instant::now();
@@ -537,14 +538,25 @@ impl Files {
     }
 
     /// Once every doc is known, rewrite the journal under `index_dir` from
-    /// [`Self::replay`]'s marks and what differs now.
+    /// [`Self::replay`]'s marks and what differs now; the first search
+    /// writes it.
     pub fn checkpoint(&mut self, index_dir: &Path, files: &[String]) {
-        let (Some(journal), Some(marks)) = (self.journal.take(), self.marks.take()) else {
+        let Some(marks) = self.marks.take() else {
             return;
         };
         if !self.known.complete.load(Ordering::Acquire) {
             return;
         }
+        let journal = match self.journal.take() {
+            Some(journal) => journal,
+            None => match self.known.root.canonicalize() {
+                Ok(root) => match root.to_str() {
+                    Some(root) => Journal::new(root),
+                    None => return,
+                },
+                Err(_) => return,
+            },
+        };
         let snap = self.snapshot();
         let mut named: Vec<String> = snap
             .stale

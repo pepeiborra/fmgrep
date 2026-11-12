@@ -120,9 +120,13 @@ pub fn load(
     })?;
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
     let (files, docs_ref) = (&manifest.files, &docs);
+    #[cfg(test)]
+    let hooks = crate::tests::Hooks::here();
     // Plain threads: fixed blocking passes that overlap the load.
     let index = std::thread::scope(|scope| {
         let fresh = scope.spawn(move || {
+            #[cfg(test)]
+            hooks.apply();
             if docs_ref.replay(files) {
                 return;
             }

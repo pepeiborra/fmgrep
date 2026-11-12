@@ -42,18 +42,23 @@ test.
 ## File monitor
 
 fmgrep does not call git. `fmgrep index` asks a running watchman (it
-never starts one) to watch the tree and keeps a token from it in
-`docs.journal`. On every query without a server and when a server starts,
-a load of 50,000 indexed files or more asks watchman what changed since
-that token; a smaller index, or one without a token, stats every indexed
-file ([Staleness](index-format.md#staleness)). `fmgrep index` waits at most
-5 s for watchman, so a big tree that watchman is still crawling gets no
-token, and every load of it stats every file.
+never starts one) to watch a tree of 50,000 files or more, without
+waiting for the crawl, and takes no token. On every query without a
+server and when a server starts, a load of 50,000 indexed files or more
+asks watchman. The first load of an index takes a token, keeps it in
+`docs.journal` and stats every indexed file; each later load asks
+watchman what changed since the token. A smaller index, or a load that
+watchman cannot answer, stats every indexed file
+([Staleness](index-format.md#staleness)); while watchman crawls a big
+tree, every load of it stats every file. Each fmgrep row builds its own
+index, so its first load is the server's start or the warm-up query: no
+timed query takes the first token.
 
 Before the harness runs, `scripts/bench.sh` therefore passes the checkout
 to `scripts/fsmonitor.sh`, which has watchman watch it (`watchman
 watch-project`, which starts watchman if it is not running) and waits until
-watchman has crawled it, so the crawl is over before any `fmgrep index`. It
+watchman has crawled it, so the crawl is over before any fmgrep row and
+no timed row runs during it. It
 prints how long the crawl took. Without watchman, or when the watch fails,
 it warns, and fmgrep stats every file. fmgrep runs with its defaults, so
 on linux, chromium and aosp the fmgrep rows other than `--store-docs`

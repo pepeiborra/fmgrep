@@ -16,6 +16,7 @@ pub(crate) mod watchman;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::cli::{Outcome, dispatch};
 use crate::index::INDEX_DIR;
@@ -39,6 +40,31 @@ thread_local! {
     /// The watchman socket found on this thread; none when `None`, so tests
     /// reach only a daemon they started.
     pub static WATCHMAN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The warnings given by this thread's searches, every one.
+    pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
     /// The cause a watch started on this thread fails with.
     pub static WATCH_FAILS: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// This thread's watchman hooks, for a thread a load spawns.
+pub struct Hooks {
+    ask_from: Option<usize>,
+    watchman: Option<PathBuf>,
+    notes: Arc<Mutex<Vec<String>>>,
+}
+
+impl Hooks {
+    pub fn here() -> Self {
+        Self {
+            ask_from: ASK_FROM.get(),
+            watchman: WATCHMAN.with_borrow(Clone::clone),
+            notes: NOTES.with_borrow(Arc::clone),
+        }
+    }
+
+    pub fn apply(self) {
+        ASK_FROM.set(self.ask_from);
+        WATCHMAN.set(self.watchman);
+        NOTES.set(self.notes);
+    }
 }

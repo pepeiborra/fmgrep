@@ -21,17 +21,12 @@ fn journal_round_trips_and_malformed_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let (root, index) = dirs(tmp.path());
     let root_str = root.to_str().unwrap();
-    Journal::write_new(&index, root_str, Vec::new()).unwrap();
-    assert_eq!(
-        Journal::open(&index, Knob::Auto).unwrap(),
-        None,
-        "no tokens"
-    );
+    assert_eq!(Journal::open(&index, Knob::Auto).unwrap(), None, "none yet");
     let tokens = vec![Token {
         kind: "elsewhere".into(),
         token: json!(1),
     }];
-    Journal::write_new(&index, root_str, tokens.clone()).unwrap();
+    Journal::new(root_str).checkpoint(&index, tokens.clone(), Vec::new());
     let journal = Journal::open(&index, Knob::Auto).unwrap().expect("written");
     let want = Journal {
         v: 1,
@@ -377,14 +372,15 @@ mod watchman_tests {
     }
 
     /// A crawl's tail answers syncs at once, all with the crawl's tick, which
-    /// changes made then get too: no token, at index or at load.
+    /// changes made then get too: no token, at a first search or a later
+    /// one.
     #[test]
     fn a_clock_from_a_crawls_tail_is_no_token() {
         let tmp = tempfile::tempdir().unwrap();
         let sock = fake(tmp.path(), Arc::new(AtomicU8::new(STUCK)));
         let (_, index) = dirs(tmp.path());
         let root = Path::new("/w/sub");
-        let w = Watchman::at(sock.clone(), MARK_WAIT);
+        let w = Watchman::at(sock.clone(), ASK_WAIT);
         let why = token(&w, root).unwrap_err();
         assert_eq!(why, "watchman is still crawling /w/sub");
         faked(&sock).write(&index).unwrap();
@@ -525,19 +521,5 @@ mod watchman_tests {
             std::fs::write(root.join(&name), b"raced").unwrap();
             assert!(named(&token).contains(&name), "rep {i}");
         }
-    }
-
-    #[test]
-    fn watchman_alone_is_marked_unless_off() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = canonical(tmp.path());
-        let Some(_daemon) = live() else {
-            return;
-        };
-        let kinds =
-            |knob| -> Vec<String> { marks(&root, knob).into_iter().map(|t| t.kind).collect() };
-        assert_eq!(kinds(Knob::Auto), ["watchman"]);
-        assert_eq!(kinds(Knob::On), ["watchman"]);
-        assert!(kinds(Knob::Off).is_empty());
     }
 }
