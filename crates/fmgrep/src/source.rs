@@ -142,6 +142,9 @@ struct Known {
     recorded: Option<Arc<Recorded>>,
     /// The walk's rule, loaded on first use.
     rules: Mutex<Option<ignore::IncrementalIgnore>>,
+    /// Ignore files the index did not record, seen by this load: the
+    /// stored paths keep them, so later loads walk their dirs again.
+    new_ignores: Mutex<Vec<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
 }
@@ -277,6 +280,7 @@ impl Known {
     ) -> Result<usize, String> {
         let root = &self.root;
         let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        let mut named_ignores = Vec::new();
         for rel in paths {
             let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
             if rel.is_empty() || !recorded.is_dir(parent) || self.excluded(root, rel) {
@@ -290,8 +294,14 @@ impl Known {
             } else if !name.starts_with('.') {
                 dirs.push(parent.to_owned());
             }
-            scopes.extend(crate::walk::ignore_file_dir(rel).map(str::to_owned));
+            if let Some(dir) = crate::walk::ignore_file_dir(rel) {
+                scopes.push(dir.to_owned());
+                if !recorded.is_ignore(rel) && root.join(rel).exists() {
+                    named_ignores.push(rel.clone());
+                }
+            }
         }
+        self.keep_ignores(named_ignores);
         let cap = journal::named_cap(files.len());
         if kept > cap {
             return Err(format!(
@@ -326,10 +336,37 @@ impl Known {
             move |rel| prune.is_dir(rel)
         });
         self.add(&self.text_only(root, added::unlisted(walked, files)));
-        scopes.extend(recorded.ignore_scopes(root, &listed));
+        scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed)));
         self.discover_scopes(scopes, files, lens);
         self.complete.store(true, Ordering::Release);
         Ok(kept)
+    }
+
+    /// Keep `found` (ignore files) for the stored paths.
+    fn keep_ignores(&self, found: Vec<String>) {
+        let mut ignores = self
+            .new_ignores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ignores.extend(found);
+    }
+
+    /// The dirs of `changes` to walk again. Keeps its new ignore files for
+    /// the stored paths, and warns when any ignore file moved or is new
+    /// since the index: every load walks the dirs they govern again.
+    fn apply_ignores(&self, changes: recorded::IgnoreScopes) -> Vec<String> {
+        self.keep_ignores(changes.found);
+        let mut new = self
+            .new_ignores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        new.sort_unstable();
+        new.dedup();
+        let n = changes.moved + new.len();
+        if n > 0 {
+            ignores_changed(n);
+        }
+        changes.scopes
     }
 
     /// [`Self::discover`] of the outermost of root-relative `scopes`.
@@ -339,6 +376,23 @@ impl Known {
             self.discover(root, &root.join(scope), files, lens);
         }
     }
+}
+
+/// `n` ignore files moved or are new since the index, which every load
+/// applies by walking the dirs they govern again.
+fn ignores_changed(n: usize) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    let (files, dirs) = match n {
+        1 => ("file", "its directory"),
+        _ => ("files", "their directories"),
+    };
+    journal::warn(
+        &SEEN,
+        format_args!(
+            "{n} ignore {files} changed since the index; each search reads {dirs} again \
+             (re-run index to make searches fast again)"
+        ),
+    );
 }
 
 /// Added file `rel`, or its topmost ancestor the walk did not record: a
@@ -406,6 +460,7 @@ impl Files {
                 added: Mutex::default(),
                 recorded: None,
                 rules: Mutex::default(),
+                new_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
             }),
             journal: None,
@@ -502,6 +557,13 @@ impl Files {
             snap.added
                 .iter()
                 .map(|&doc| unrecorded(recorded, &snap.names[doc - files.len()]).to_owned()),
+        );
+        let ignores = self.known.new_ignores.lock();
+        named.extend(
+            ignores
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .cloned(),
         );
         named.sort_unstable();
         named.dedup();

@@ -153,13 +153,17 @@ fn ignore_scopes_name_the_dir_of_a_moved_row_and_the_root_above_it() {
         "a/b/c.c",
     ];
     let (root, recorded) = recorded_tree(tmp.path(), &files);
-    assert!(recorded.ignore_scopes(&root, &[]).is_empty());
+    let scopes = || {
+        let got = recorded.ignore_scopes(&root, &[]);
+        (got.scopes, got.moved)
+    };
+    assert_eq!(scopes(), (vec![], 0));
     std::fs::write(root.join("sub/.ignore"), b"x\ny\n").unwrap();
-    assert_eq!(recorded.ignore_scopes(&root, &[]), ["sub"]);
+    assert_eq!(scopes(), (vec!["sub".to_owned()], 1));
     std::fs::remove_file(root.join("a/b/.rgignore")).unwrap();
-    assert_eq!(recorded.ignore_scopes(&root, &[]), ["a/b", "sub"]);
+    assert_eq!(scopes(), (vec!["a/b".to_owned(), "sub".to_owned()], 2));
     std::fs::write(root.join("../.ignore"), b"*.c\n").unwrap();
-    assert_eq!(recorded.ignore_scopes(&root, &[]), [""]);
+    assert_eq!(scopes(), (vec![String::new()], 3));
 }
 
 #[test]
@@ -202,9 +206,13 @@ fn a_new_ignore_file_in_a_changed_dir_is_a_scope() {
     std::fs::write(root.join("e/g.c"), b"x\n").unwrap();
     let changed = recorded.changes(&root, &|_| false);
     assert_eq!(changed, [root.join("c"), root.join("e")]);
-    assert_eq!(recorded.ignore_scopes(&root, &changed), ["c"]);
+    let got = recorded.ignore_scopes(&root, &changed);
+    assert_eq!(
+        (got.scopes, got.found, got.moved),
+        (vec!["c".to_owned()], vec!["c/.gitignore".to_owned()], 0)
+    );
     assert!(
-        recorded.ignore_scopes(&root, &[]).is_empty(),
+        recorded.ignore_scopes(&root, &[]).scopes.is_empty(),
         "only a changed dir is checked"
     );
 }

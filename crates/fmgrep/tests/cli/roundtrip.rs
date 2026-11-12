@@ -116,6 +116,42 @@ fn missing_file_is_warned_once_and_excluded() {
     }
 }
 
+/// Files source, no watchman: a search applies the ignore files new since
+/// the index, with one warning per process on its cost, until re-index.
+#[test]
+fn a_new_ignore_file_is_applied_and_warned_once() {
+    let (tmp, docs) = stage();
+    std::fs::create_dir(docs.join("sub")).unwrap();
+    std::fs::write(docs.join("sub/d.bin"), b"printk in sub\n").unwrap();
+    let index_dir = do_index(&docs, false);
+    let search = |index: &Path| run(&query_argv(index, false, &["printk", "hello"]));
+    let out = search(&index_dir);
+    assert_eq!(stderr(&out), "");
+    assert_eq!(counts(&out.stdout), [(4, 3), (1, 1)]);
+    // Older than 2 s, so that the fresh index below records their stamps:
+    // it records a newer one as unknown, which every load takes as changed.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    for (rel, text) in [(".ignore", b"b.bin\n"), ("sub/.ignore", b"d.bin\n")] {
+        let file = std::fs::File::create(docs.join(rel)).unwrap();
+        std::io::Write::write_all(&mut &file, text).unwrap();
+        file.set_modified(old).unwrap();
+    }
+    let warning = "warning: 2 ignore files changed since the index; each search reads their \
+                   directories again (re-run index to make searches fast again)\n";
+    for _ in 0..2 {
+        let out = search(&index_dir);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stderr(&out), warning);
+        assert_eq!(counts(&out.stdout), [(2, 1), (1, 1)]);
+    }
+    let fresh = tmp.path().join("fresh");
+    let out = run(&index_argv(&docs, &fresh, false, &[]));
+    assert!(out.status.success(), "index: {}", stderr(&out));
+    let out = search(&fresh);
+    assert_eq!(stderr(&out), "");
+    assert_eq!(counts(&out.stdout), [(2, 1), (1, 1)]);
+}
+
 /// `index` with no `--output` writes `.fmgrep`, which a search finds from
 /// any directory below, searching that directory's subtree as rg does.
 #[test]

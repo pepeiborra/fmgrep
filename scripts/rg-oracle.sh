@@ -12,8 +12,9 @@
 # ours must agree. Without --store-docs every case runs twice: on the indexed
 # tree, backdated so discovery prunes by directory stamp, then on a stale one
 # (files edited, deleted, renamed and added after index, .gitignore edited in
-# place), where each search must print exactly three warnings: the deleted
-# file, the one moved with its directory, and the one turned binary.
+# place), where each search must print exactly four warnings: the deleted
+# file, the one moved with its directory, the one turned binary, and the
+# changed ignore file.
 #
 # --serve repeats every case through `--server` (lines `srv`): same stdout and
 # exit status, empty stderr.
@@ -913,7 +914,7 @@ await_watch() {
 cases
 if [[ "$STORE_DOCS" == false ]]; then
     PASS="[stale] "
-    WARNINGS=3
+    WARNINGS=4
     printf 'alpha new\nbeta\nalpha two alpha\nalpha\nzeta\n' > "$CORPUS/a.txt"
     printf 'no hits here\nbut alpha now\n' > "$CORPUS/b.txt"
     rm -f "$CORPUS/d.txt"
