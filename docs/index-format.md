@@ -214,9 +214,10 @@ change:
   failed (<exit status>)`, `no watchman daemon answers on <socket>
   (<error>)` (the socket in `WATCHMAN_SOCK`),
   `watchman did not answer within 100 ms`, `watchman's ignore_dirs hide
-  part of /src`, `the index has no dirs.stamps; re-run index`, `the
-  manifest lists files out of order; re-run index`, `cannot resolve /src
-  (<error>)`, or
+  part of /src`, `/src is on nfs4, a network or shared filesystem:
+  watchman does not see changes made there from other machines`, `the
+  index has no dirs.stamps; re-run index`, `the manifest lists files out
+  of order; re-run index`, `cannot resolve /src (<error>)`, or
   `watchman: <its own error>`. A late answer is never used; the record is
   kept, with a newer token when one was taken.
 - `warning: more than <n> paths may differ from the index; checked every file (re-run index)`:
@@ -228,8 +229,14 @@ change:
 
 An edit made while a directory above the root is renamed away and back,
 and a hard-linked file edited outside the root, are missed by watchman.
-On a network filesystem watchman sees only the changes made from this
-machine, so a later search misses a file changed from another one.
+
+On a network or shared filesystem (NFS, SMB, 9p, Ceph, AFS, Lustre, GPFS
+or virtiofs, as `/proc/self/mountinfo` says) watchman sees only the changes
+made from this machine, so a token would miss a file changed from
+another one. There `index` asks for no watch, and a search takes no
+token and saves no record: every search checks every file and prints
+the `watchman cannot say what changed` line. This check is made on Linux
+only; elsewhere the type of the filesystem is not read.
 
 ## Shards
 
