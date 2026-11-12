@@ -6,7 +6,13 @@ use std::process::{Command, Output};
 
 fn bench(cwd: &Path, env: &[(&str, &Path)], args: &[&str]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_bench"));
-    cmd.current_dir(cwd).args(args).env("FMGREP_JOURNAL", "off");
+    cmd.current_dir(cwd)
+        .args(args)
+        .env("WATCHMAN_SOCK", "/nonexistent")
+        .env(
+            "XDG_CACHE_HOME",
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("cache"),
+        );
     for var in [
         "FMGREP_CORPUS_GHC",
         "FMGREP_CORPUS_LINUX",
@@ -325,7 +331,10 @@ fn served_tree(fmgrep: &Path, dir: &Path, name: &str) -> (std::path::PathBuf, Se
     let index = dir.join(format!("{name}.idx"));
     let fmgrep = |args: &[&std::ffi::OsStr]| {
         let mut cmd = Command::new(fmgrep);
-        cmd.args(args).env("FMGREP_JOURNAL", "off");
+        cmd.args(args).env("WATCHMAN_SOCK", "/nonexistent").env(
+            "XDG_CACHE_HOME",
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("cache"),
+        );
         cmd
     };
     let mut built = fmgrep(&[

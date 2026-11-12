@@ -19,7 +19,7 @@ mod journal;
 mod recorded;
 mod watcher;
 
-pub use journal::{Index, Knob, request_watch};
+pub use journal::{Index, request_watch};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
