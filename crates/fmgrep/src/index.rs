@@ -7,7 +7,7 @@ use crate::docs;
 use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manifest};
 use crate::plan::shard_bytes;
 use crate::sharded::DocfmIndex;
-use crate::source::{Knob, request_watch, write_stamps, write_walk};
+use crate::source::{request_watch, write_stamps, write_walk};
 use crate::wire::IndexSummary;
 
 /// The default index directory, under the indexed folder.
@@ -43,8 +43,6 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     };
     create_output_dir(&output)?;
     let persist = |output: &Path| -> Result<Manifest, String> {
-        // A bad FMGREP_JOURNAL fails before any work.
-        let knob = Knob::read()?;
         let start = Instant::now();
         let started = SystemTime::now();
         let mut sink = create_sink(output)?;
@@ -57,7 +55,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         let listed = |files: usize| {
             #[cfg(test)]
             hooks.apply();
-            if !req.store_docs && knob != Knob::Off {
+            if !req.store_docs {
                 request_watch(req.folder, files);
             }
         };

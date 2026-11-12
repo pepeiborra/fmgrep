@@ -123,8 +123,7 @@ Re-index after many edits.
 
 On a tree of 50,000 files or more, a search asks watchman instead (see
 Watchman below). Below that, the stat pass is cheaper and watchman is
-never asked. `FMGREP_JOURNAL=off` keeps fmgrep away from watchman, and
-`on` asks it at any size ([tuning.md](tuning.md)).
+never asked.
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;

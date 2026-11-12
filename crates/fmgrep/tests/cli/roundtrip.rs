@@ -282,23 +282,15 @@ fn tampered_blob_is_refused_loudly() {
 fn failed_build_removes_the_output() {
     let (tmp, docs) = stage();
     let index_dir = tmp.path().join("idx");
-    for (var, raw) in [
-        ("FMGREP_SHARD_BYTES", "nope"),
-        ("FMGREP_JOURNAL", "nope"),
-        ("FMGREP_JOURNAL", "!off"),
-    ] {
-        let out = fmgrep()
-            .args(index_argv(&docs, &index_dir, false, &[]))
-            .env(var, raw)
-            .output()
-            .expect("spawn");
-        assert_eq!(out.status.code(), Some(2), "{var}={raw}");
-        assert!(stderr(&out).contains(var), "{}", stderr(&out));
-        if var == "FMGREP_JOURNAL" {
-            assert!(stderr(&out).contains("off, on"), "{}", stderr(&out));
-        }
-        assert!(!index_dir.exists(), "a failed index must persist nothing");
-    }
+    let (var, raw) = ("FMGREP_SHARD_BYTES", "nope");
+    let out = fmgrep()
+        .args(index_argv(&docs, &index_dir, false, &[]))
+        .env(var, raw)
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2), "{var}={raw}");
+    assert!(stderr(&out).contains(var), "{}", stderr(&out));
+    assert!(!index_dir.exists(), "a failed index must persist nothing");
 }
 
 #[test]

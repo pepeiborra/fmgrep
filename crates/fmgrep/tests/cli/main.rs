@@ -11,7 +11,10 @@ mod serve;
 
 fn fmgrep() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fmgrep"));
-    cmd.env("FMGREP_JOURNAL", "off");
+    cmd.env("WATCHMAN_SOCK", "/nonexistent").env(
+        "XDG_CACHE_HOME",
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("cache"),
+    );
     cmd
 }
 

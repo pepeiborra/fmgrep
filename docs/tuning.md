@@ -24,8 +24,12 @@ empty is the default, and any other value that does not parse is an error.
 | `FMGREP_BUILD_BYTES` | half of physical memory, else `8GB` | The build's memory budget. Shards built at once are this over `8 x FMGREP_SHARD_BYTES` (a shard needs about 8 bytes per text byte while it builds), at most the build pool size: build wall against peak memory. |
 | `RAYON_NUM_THREADS` | machine parallelism | Threads for the build, and for a search's shard probes and directory walk. |
 
-## Search (developer)
+## Search
 
-| variable | default | trades |
-|---|---|---|
-| `FMGREP_JOURNAL` | unset: watchman, started when no daemon runs, where it pays off | `off` asks watchman nothing and writes and reads no record in the user's cache, so every load stats every file and says nothing; `on` asks watchman even on a small tree. A search that cannot use watchman checks every file and says why on stderr ([index-format.md](index-format.md#watchman)). |
+No variable. A search asks watchman what changed when the tree holds
+50,000 files or more, starting the daemon and adding the watch when they
+are missing, and says on stderr when watchman cannot answer; watchman's
+own `WATCHMAN_SOCK` names its socket. To keep fmgrep from watchman, set
+`WATCHMAN_SOCK` to a path where no daemon listens: fmgrep then starts no
+daemon, asks for no watch, uses no record of an earlier search and checks
+every file. See [index-format.md](index-format.md#watchman).

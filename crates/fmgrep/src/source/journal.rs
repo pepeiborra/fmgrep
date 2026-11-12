@@ -35,46 +35,14 @@ const FIND_WAIT: Duration = Duration::from_millis(500);
 /// the tree.
 const ASK_WAIT: Duration = Duration::from_millis(100);
 
-/// Whether an index asks watchman to watch the tree and a load asks it
-/// what changed.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Knob {
-    /// Where it pays off.
-    Auto,
-    Off,
-    /// Even where the stat pass is cheaper.
-    On,
-}
-
-impl Knob {
-    /// `FMGREP_JOURNAL`: unset or empty, `off` or `on`. Tests read it as
-    /// unset; their hooks say where a load asks.
-    pub fn read() -> Result<Self, String> {
-        #[cfg(test)]
-        let raw: Result<Option<&str>, String> = Ok(None);
-        #[cfg(not(test))]
-        let raw = crate::env::choice("FMGREP_JOURNAL", &["off", "on"]);
-        raw.map(|raw| match raw {
-            None => Self::Auto,
-            Some("off") => Self::Off,
-            Some(_) => Self::On,
-        })
-    }
-}
-
-/// Whether a load of `docs` docs asks watchman: from [`MIN_DOCS`], at any
-/// size under `FMGREP_JOURNAL=on`, never under `off`.
+/// Whether a load of `docs` docs asks watchman.
 pub fn due(docs: usize) -> bool {
     #[cfg(test)]
     return crate::tests::ASK_FROM
         .get()
         .is_some_and(|from| docs >= from);
     #[cfg(not(test))]
-    return match Knob::read() {
-        Ok(Knob::Auto) => docs >= MIN_DOCS,
-        Ok(Knob::On) => true,
-        Ok(Knob::Off) | Err(_) => false,
-    };
+    return docs >= MIN_DOCS;
 }
 
 /// Once the index walk of `root` has listed `files` files, before it reads
