@@ -128,8 +128,9 @@ struct Record {
     index: String,
     index_started_ns: i64,
     token: Token,
-    /// Ascending root-relative paths that may differ from the index.
-    baseline: Vec<String>,
+    /// Ascending root-relative paths that may differ from the index; `None`
+    /// when more than [`named_cap`] do.
+    baseline: Option<Vec<String>>,
 }
 
 /// What a load learned before it re-checks anything.
@@ -225,9 +226,9 @@ impl Record {
     }
 }
 
-/// What may differ under canonical `root` from `index`, and a token for
-/// the record; why watchman cannot say goes to stderr.
-pub fn ask(root: &Path, index: &Index) -> Asked {
+/// What may differ under canonical `root` from `index`, of `docs` docs, and
+/// a token for the record; why watchman cannot say goes to stderr.
+pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
     #[cfg(unix)]
     {
         let Some(root_str) = root.to_str() else {
@@ -237,7 +238,7 @@ pub fn ask(root: &Path, index: &Index) -> Asked {
         let (why, taken) = match Record::read(root_str, index) {
             Ok(record) => {
                 let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
-                match later(&w, &record, root) {
+                match later(&w, &record, root, docs) {
                     Ok(asked) => return asked,
                     Err((why, token)) if w.late() => {
                         cannot_answer(&why);
@@ -252,7 +253,7 @@ pub fn ask(root: &Path, index: &Index) -> Asked {
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, index);
+        let _ = (root, index, docs);
         cannot_answer("watchman is not supported on this platform");
         Asked::default()
     }
@@ -265,13 +266,21 @@ fn later(
     w: &watchman::Watchman,
     record: &Record,
     root: &Path,
+    docs: usize,
 ) -> Result<Asked, (String, Option<Token>)> {
     let token = w.mark(root).map_err(|why| (why, None))?;
+    let Some(baseline) = &record.baseline else {
+        over(named_cap(docs));
+        return Ok(Asked {
+            token: Some(token),
+            paths: None,
+        });
+    };
     let mut paths = match w.since(&record.token, root) {
         Ok(paths) => paths,
         Err(why) => return Err((why, Some(token))),
     };
-    paths.extend(record.baseline.iter().cloned());
+    paths.extend(baseline.iter().cloned());
     Ok(Asked {
         token: Some(token),
         paths: Some(paths),
@@ -304,7 +313,7 @@ fn first(root: &Path, taken: Option<Token>, why: &str) -> Asked {
 
 /// Save `token` and `baseline` (ascending, deduped) as what differs from
 /// `index` under canonical `root` at it, after the search answered.
-pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>) {
+pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap: usize) {
     let (Some(root), Some(dir)) = (root.to_str(), index.dir.to_str()) else {
         return cannot_save(format_args!("the record (the index path is not UTF-8)"));
     };
@@ -314,7 +323,7 @@ pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>) {
         index: dir.to_owned(),
         index_started_ns: index.started_ns,
         token,
-        baseline,
+        baseline: (baseline.len() <= cap).then_some(baseline),
     };
     record.write();
 }
@@ -352,6 +361,17 @@ fn cannot_save(what: std::fmt::Arguments<'_>) {
     warn(
         &SEEN,
         format_args!("cannot save {what}; the next search checks again"),
+    );
+}
+
+/// More paths may differ than re-checking them beats the stat pass.
+pub fn over(cap: usize) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(
+        &SEEN,
+        format_args!(
+            "more than {cap} paths may differ from the index; checked every file (re-run index)"
+        ),
     );
 }
 

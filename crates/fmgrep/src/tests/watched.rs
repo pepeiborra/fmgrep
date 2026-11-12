@@ -304,7 +304,7 @@ fn two_trees_or_two_indexes_keep_two_records() {
 }
 
 #[test]
-fn past_the_limit_the_record_keeps_every_path() {
+fn past_the_limit_the_record_holds_no_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
         return;
@@ -315,16 +315,15 @@ fn past_the_limit_the_record_keeps_every_path() {
     }
     let found = printed(&output, &["-l"], &["printk"]);
     assert_eq!(found.lines().count(), 66);
-    let over = cannot("more than 64 paths may differ from the index; re-run index");
-    assert_eq!(notes(), [over.as_str()]);
-    assert_eq!(baseline(tmp.path()).as_array().map(Vec::len), Some(65));
+    let over = "more than 64 paths may differ from the index; checked every file (re-run index)";
+    assert_eq!(notes(), [over]);
+    assert_eq!(baseline(tmp.path()), serde_json::Value::Null);
     let after = clock(tmp.path());
     assert_ne!(after, before);
     daemon.sent();
     assert_eq!(printed(&output, &["-l"], &["printk"]), found);
     assert_eq!(notes(), [over], "every search, until re-index");
-    let asked = ["watch-list", "get-config", "clock", "clock", "query"];
-    assert_eq!(daemon.sent(), asked, "the token question too");
+    assert_eq!(daemon.sent(), TAKES, "no token question");
     assert_ne!(clock(tmp.path()), after);
 }
 

@@ -259,7 +259,7 @@ impl Known {
 
     /// Take root-relative `paths` (any order) as all that may differ in
     /// ascending `files`, instead of the stat pass and discovery: the number
-    /// kept, or why not when they cost more than the stat pass (nothing is
+    /// kept, or Err when they cost more than the stat pass (nothing is
     /// touched then: past [`journal::named_cap`]).
     ///
     /// A path under a dir the index did not record is dropped: under an
@@ -275,7 +275,7 @@ impl Known {
         paths: &[String],
         files: &[String],
         lens: &[u64],
-    ) -> Result<usize, String> {
+    ) -> Result<usize, ()> {
         let root = &self.root;
         let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
         let mut named_ignores = Vec::new();
@@ -300,11 +300,8 @@ impl Known {
             }
         }
         self.keep_ignores(named_ignores);
-        let cap = journal::named_cap(files.len());
-        if kept > cap {
-            return Err(format!(
-                "more than {cap} paths may differ from the index; re-run index"
-            ));
+        if kept > journal::named_cap(files.len()) {
+            return Err(());
         }
         let seek = |key: &str| files.partition_point(|f| f.as_str() < key);
         let (mut listed, mut seen) = (Vec::new(), std::collections::HashSet::new());
@@ -497,7 +494,7 @@ impl Files {
             return false;
         };
         let asked = std::time::Instant::now();
-        let answer = journal::ask(&root, index);
+        let answer = journal::ask(&root, index, files.len());
         if let Some(token) = answer.token {
             let _ = self.token.set(token);
         }
@@ -507,8 +504,8 @@ impl Files {
         let applied = std::time::Instant::now();
         let kept = match self.known.replay(recorded, &paths, files, lens) {
             Ok(kept) => kept,
-            Err(why) => {
-                journal::cannot_answer(&why);
+            Err(()) => {
+                journal::over(journal::named_cap(files.len()));
                 return false;
             }
         };
@@ -562,7 +559,8 @@ impl Files {
         );
         baseline.sort_unstable();
         baseline.dedup();
-        journal::save(&root, index, token, baseline);
+        let cap = journal::named_cap(files.len());
+        journal::save(&root, index, token, baseline, cap);
     }
 
     /// Never take `index_dir` for an added file. Before any watch or
@@ -995,7 +993,7 @@ mod tests {
 
     /// `fix`'s files with its record, after a replay of `named`.
     #[cfg(unix)]
-    fn replayed(fix: &Fix, named: &[&str]) -> (Files, Result<usize, String>) {
+    fn replayed(fix: &Fix, named: &[&str]) -> (Files, Result<usize, ()>) {
         let mut files = open_files(fix);
         let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
         files.record(Recorded::open(&fix.index).unwrap().unwrap());
@@ -1043,8 +1041,7 @@ mod tests {
         let many: Vec<String> = (0..65).map(|i| format!("n{i}.c")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         let (files, kept) = replayed(&fix, &many);
-        let over = "more than 64 paths may differ from the index; re-run index";
-        assert_eq!(kept, Err(over.into()));
+        assert_eq!(kept, Err(()), "past 64, the cap of a small tree");
         assert!(!files.changed(), "past the cap nothing is touched");
     }
 
