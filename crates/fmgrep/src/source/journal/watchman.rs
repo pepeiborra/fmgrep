@@ -3,8 +3,13 @@
 //! is a `since` query, synced by watchman's own cookies. Where no watch
 //! covers the root, `watch-project` adds one; watchman sends its answer
 //! once the crawl of the tree ends, so a short deadline gives up on the
-//! answer but not on the watch. Detection, connects and calls share one
-//! deadline, and each failure says why.
+//! answer but not on the watch. A clock answered during a crawl, its tail
+//! included, is the crawl's tick, synced or not; files changed then get
+//! that tick too, so `since` it misses them. Each batch after a crawl
+//! ticks first, so a token is a second synced clock past the first; one
+//! equal to it, or a clock that does not sync in time, gives none.
+//! Detection, connects and calls share one deadline, and each failure says
+//! why.
 
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::os::unix::net::UnixStream;
@@ -22,7 +27,6 @@ pub struct Watchman {
     sock: PathBuf,
     deadline: Instant,
     budget: Duration,
-    settle: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -55,18 +59,13 @@ impl Watchman {
             sock,
             deadline: Instant::now() + budget,
             budget,
-            settle: true,
         }
     }
 
-    /// The daemon that took `token`; its tokens do not sync, as an early
-    /// clock only reports more paths.
+    /// The daemon that took `token`.
     pub fn of(token: &Value, budget: Duration) -> Option<Self> {
         let sock = token.get("sock")?.as_str()?;
-        Some(Self {
-            settle: false,
-            ..Self::at(sock.into(), budget)
-        })
+        Some(Self::at(sock.into(), budget))
     }
 
     /// `$WATCHMAN_SOCK`, else the socket that `watchman get-sockname`
@@ -168,13 +167,12 @@ impl Watchman {
         u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
     }
 
-    /// A clock of `watch`, synced unless this daemon took the token.
+    /// A clock of `watch`, synced.
     fn clock(&self, watch: &str, root: &Path) -> Result<String, String> {
-        let command = match self.settle {
-            true => json!(["clock", watch, {"sync_timeout": self.sync_ms()}]),
-            false => json!(["clock", watch]),
-        };
-        let reply = self.call(&command, root)?;
+        let reply = self.call(
+            &json!(["clock", watch, {"sync_timeout": self.sync_ms()}]),
+            root,
+        )?;
         let clock = reply.get("clock").and_then(Value::as_str);
         clock
             .map(str::to_owned)
@@ -183,7 +181,7 @@ impl Watchman {
 
     /// A token for now, of the watch covering `root`. Refused under
     /// `ignore_dirs`, as watchman would hide indexed changes, or when the
-    /// clock does not sync in time.
+    /// two clocks do not sync in time or share a tick (a crawl's).
     fn mark(&self, root: &Path) -> Result<Token, String> {
         let (watch, relative) = self.watch(root)?;
         let config = self.call(&json!(["get-config", watch]), root)?;
@@ -193,7 +191,11 @@ impl Watchman {
         if ignores.is_some_and(|d| !d.is_empty()) {
             return Err(format!("watchman's ignore_dirs are set on {watch}"));
         }
+        let first = self.clock(&watch, root)?;
         let clock = self.clock(&watch, root)?;
+        if !ticked(&first, &clock) {
+            return Err(format!("watchman is still crawling {}", root.display()));
+        }
         let sock = self
             .sock
             .to_str()
@@ -338,4 +340,14 @@ fn asked(root: &Path) -> String {
         "fmgrep asked watchman to watch {}; later searches ask it once its crawl ends",
         root.display()
     )
+}
+
+/// Whether clock `b` is of `a`'s instance with a later tick; a clock is
+/// `c:<start>:<pid>:<root number>:<tick>`.
+pub(super) fn ticked(a: &str, b: &str) -> bool {
+    let split = |c: &str| {
+        let (instance, tick) = c.rsplit_once(':')?;
+        Some((instance.to_owned(), tick.parse::<u64>().ok()?))
+    };
+    matches!((split(a), split(b)), (Some((ia, ta)), Some((ib, tb))) if ia == ib && tb > ta)
 }

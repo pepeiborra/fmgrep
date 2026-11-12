@@ -77,7 +77,7 @@ mod watchman_tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::source::journal::watchman::Watchman;
+    use crate::source::journal::watchman::{Watchman, ticked};
     use crate::tests::watchman::Daemon;
 
     /// Under load.
@@ -85,13 +85,15 @@ mod watchman_tests {
 
     /// Replies that a real daemon gives only in states a test cannot make
     /// it hold: a query error text, two texts of a sync that timed out (the
-    /// second came from a real daemon), and the error of a sync during a
-    /// crawl, to a query or to a clock as well.
+    /// second came from a real daemon), the error of a sync during a crawl,
+    /// to a query or to a clock as well, and the clocks of a crawl's tail,
+    /// which share one tick.
     const ERROR: u8 = 0;
     const SYNC_FAILED: u8 = 1;
     const NO_COOKIE: u8 = 2;
     const CRAWL: u8 = 3;
     const CRAWL_CLOCK: u8 = 4;
+    const STUCK: u8 = 5;
 
     const CRAWL_TEXT: &str = "synchronization failed: syncToNow: timed out waiting for cookie \
                               file to be observed by watcher within 74 milliseconds: Timer \
@@ -103,7 +105,7 @@ mod watchman_tests {
         let sock = dir.join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
+            for (tick, conn) in listener.incoming().enumerate() {
                 let mut conn = conn.unwrap();
                 let mut line = String::new();
                 BufReader::new(&conn).read_line(&mut line).unwrap();
@@ -113,7 +115,8 @@ mod watchman_tests {
                     ("watch-list", _) => json!({"roots": ["/w"]}),
                     ("get-config", _) => json!({"config": {}}),
                     ("clock", CRAWL_CLOCK) => json!({"error": CRAWL_TEXT}),
-                    ("clock", _) => json!({"clock": "c:1:2"}),
+                    ("clock", STUCK) => json!({"clock": "c:1:2"}),
+                    ("clock", _) => json!({"clock": format!("c:1:{tick}")}),
                     ("query", ERROR) => json!({"error": "bad"}),
                     ("query", SYNC_FAILED) => json!({"error": "synchronization failed: \
                         syncToNow: timed out waiting for cookie file to be observed by \
@@ -121,7 +124,8 @@ mod watchman_tests {
                     ("query", NO_COOKIE) => json!({"error": "std::system_error: syncToNow: \
                         timed out waiting for cookie file to be observed by watcher within 74 \
                         milliseconds: Connection timed out"}),
-                    ("query", _) => json!({"error": CRAWL_TEXT}),
+                    ("query", CRAWL | CRAWL_CLOCK) => json!({"error": CRAWL_TEXT}),
+                    ("query", _) => json!({"error": "bad"}),
                     (other, _) => panic!("unexpected {other}"),
                 };
                 writeln!(conn, "{}", json!({"unilateral": true, "log": "noise"})).unwrap();
@@ -270,7 +274,13 @@ mod watchman_tests {
             (json!(root), json!("")),
             "the tree is the watch"
         );
-        let asked = ["watch-list", "watch-project", "get-config", "clock"];
+        let asked = [
+            "watch-list",
+            "watch-project",
+            "get-config",
+            "clock",
+            "clock",
+        ];
         assert_eq!(daemon.sent(), asked);
         daemon.unwatch(&root);
         // Inner first: watch-project takes a watch above, when there is one.
@@ -280,8 +290,8 @@ mod watchman_tests {
         assert_eq!(daemon.roots().len(), 3);
         let marked = ChangeSource::mark(&at(&daemon), &root).expect("a token of the watch above");
         assert_eq!(watched(&marked), (json!(top.join("w")), json!("sub")));
-        let asked = ["watch-list", "get-config", "clock"];
-        assert_eq!(daemon.sent(), asked, "no watch-project");
+        let two_clocks = ["watch-list", "get-config", "clock", "clock"];
+        assert_eq!(daemon.sent(), two_clocks, "no watch-project");
         let w = top.join("w");
         daemon.unwatch(&top);
         daemon.unwatch(&w);
@@ -337,6 +347,88 @@ mod watchman_tests {
             assert_eq!(replay.err().unwrap(), want, "mode {m}");
             assert_eq!(marks.len(), marked, "mode {m}");
         }
+    }
+
+    /// A crawl's tail answers syncs at once, all with the crawl's tick, which
+    /// changes made then get too: no token, at index or at load.
+    #[test]
+    fn a_clock_from_a_crawls_tail_is_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = fake(tmp.path(), Arc::new(AtomicU8::new(STUCK)));
+        let (_, index) = dirs(tmp.path());
+        let root = Path::new("/w/sub");
+        let w = Watchman::at(sock.clone(), MARK_WAIT);
+        let why = token(&w, root).unwrap_err();
+        assert_eq!(why, "watchman is still crawling /w/sub");
+        faked(&sock).write(&index).unwrap();
+        let before = std::fs::read(index.join(DOCS_JOURNAL)).unwrap();
+        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
+        let (marks, replay) = journal.ask(root, 1_000_000);
+        assert!(marks.is_empty());
+        let named = replay.map(|r| r.paths).unwrap_or_default();
+        journal.checkpoint(&index, marks, named);
+        let after = std::fs::read(index.join(DOCS_JOURNAL)).unwrap();
+        assert_eq!(after, before, "a load checkpoints nothing");
+    }
+
+    #[test]
+    fn a_token_is_a_clock_ticked_past_the_first() {
+        for (a, b, later) in [
+            ("c:1731333968:123:1:41", "c:1731333968:123:1:42", true),
+            ("c:1731333968:123:1:42", "c:1731333968:123:1:42", false),
+            ("c:1731333968:123:1:42", "c:1731333968:123:1:41", false),
+            ("c:1731333968:123:1:41", "c:1731333968:123:2:42", false),
+            ("c:1731333968:123:1:41", "c:1731339999:456:1:42", false),
+            ("c:1:x", "c:1:2", false),
+            ("n:foo", "c:1:2", false),
+        ] {
+            assert_eq!(ticked(a, b), later, "{a} {b}");
+        }
+    }
+
+    /// After a restart the old clock is from another instance: a load
+    /// takes a new token, which is kept with what the stat pass found, and
+    /// the next load asks watchman again.
+    #[test]
+    fn a_restarted_watchman_is_trusted_once_it_syncs() {
+        let Some(mut daemon) = live() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, index) = dirs(tmp.path());
+        let journal = Journal {
+            v: VERSION,
+            root: root.to_str().unwrap().into(),
+            tokens: vec![Token {
+                kind: "watchman".into(),
+                token: ChangeSource::mark(&at(&daemon), &root).expect("a token"),
+            }],
+            named: Vec::new(),
+        };
+        journal.write(&index).unwrap();
+        let docs = 1_000_000;
+        let stat_pass_found = || vec!["e1.c".to_owned()];
+        daemon.restart();
+        daemon.watch(&root);
+        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
+        let (marks, replay) = journal.ask(&root, docs);
+        let why = replay.err().unwrap();
+        assert!(
+            why.contains("restarted"),
+            "the old clock cannot vouch: {why}"
+        );
+        assert_eq!(marks.len(), 1);
+        journal.checkpoint(&index, marks, stat_pass_found());
+        put(&root, "a.c");
+        put(&root, "d/x.c");
+        let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
+        let (_, replay) = journal.ask(&root, docs);
+        let paths = replay.unwrap_or_else(|why| panic!("{why}")).paths;
+        assert_eq!(
+            paths,
+            ["a.c", "d", "d/x.c", "e1.c"],
+            "and keeps what the stat pass found"
+        );
     }
 
     #[test]
