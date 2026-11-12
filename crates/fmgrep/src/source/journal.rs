@@ -1,26 +1,34 @@
-//! Change sources: which corpus paths changed since a token taken at a
-//! search's checkpoint, so a load re-checks only those. `docs.journal`
-//! holds the tokens and what differed at them (`named`). The first search
-//! after an index takes the first token and checks every file; the index
-//! only asks watchman to watch the tree once its walk has listed the
-//! files, without waiting for the crawl.
-//! When no source can say, the search checks every file and says why, once
-//! per process.
+//! What changed since the last search, so a load re-checks only that. A
+//! search keeps a record in the user's cache directory, one per tree and
+//! index: the baseline (the paths that may differ from the index) and a
+//! watchman token, with the daemon's socket and watch. A later search asks
+//! watchman what changed since the token (the token question), adds the
+//! answer to the baseline, re-checks those paths, and saves the new
+//! baseline with a newer token. A search that cannot use a record finds
+//! a running daemon, asks it to watch the tree when no watch covers it,
+//! takes a token and checks every file (the stat pass). The index only
+//! asks watchman to watch the tree once its walk has listed the files,
+//! without waiting for the crawl; it records no watchman state, and a
+//! search writes nothing into it. When watchman cannot answer, the search
+//! checks every file and says why, once per process.
 
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[cfg(unix)]
 mod watchman;
 
-pub const DOCS_JOURNAL: &str = "docs.journal";
 const VERSION: u32 = 1;
-/// Below this many docs the stat pass beats a source's fixed cost.
+/// Below this many docs the stat pass beats asking.
 const MIN_DOCS: usize = 50_000;
+
+/// A load's token and question, small next to the stat pass it would
+/// spare; also what `index` gives watchman to take its request to watch
+/// the tree.
+const ASK_WAIT: Duration = Duration::from_millis(100);
 
 /// Whether an index asks watchman to watch the tree and a load asks it
 /// what changed.
@@ -49,40 +57,42 @@ impl Knob {
     }
 }
 
-/// A load's token and question, small next to the stat pass it would
-/// spare; also what `index` gives watchman to take its request to watch
-/// the tree.
-const ASK_WAIT: Duration = Duration::from_millis(100);
-
-/// From how many docs a load asks watchman, and, in tests, the one socket
-/// it may reach: read on the thread that opens the index.
-#[derive(Clone, Debug)]
-pub struct Policy {
-    from: Option<usize>,
+/// Whether a load of `docs` docs asks watchman: from [`MIN_DOCS`], at any
+/// size under `FMGREP_JOURNAL=on`, never under `off`.
+pub fn due(docs: usize) -> bool {
     #[cfg(test)]
-    sock: Option<std::path::PathBuf>,
+    return crate::tests::ASK_FROM
+        .get()
+        .is_some_and(|from| docs >= from);
+    #[cfg(not(test))]
+    return match Knob::read() {
+        Ok(Knob::Auto) => docs >= MIN_DOCS,
+        Ok(Knob::On) => true,
+        Ok(Knob::Off) | Err(_) => false,
+    };
 }
 
-impl Policy {
-    pub fn here() -> Self {
-        #[cfg(test)]
-        return Self {
-            from: crate::tests::ASK_FROM.get(),
-            sock: crate::tests::WATCHMAN.with_borrow(Clone::clone),
-        };
-        #[cfg(not(test))]
-        return Self {
-            from: match Knob::read() {
-                Ok(Knob::Auto) => Some(MIN_DOCS),
-                Ok(Knob::On) => Some(0),
-                Ok(Knob::Off) | Err(_) => None,
-            },
-        };
+/// Once the index walk of `root` has listed `files` files, before it reads
+/// them, where a search of as many docs would ask watchman: have watchman
+/// watch the tree, waiting at most [`ASK_WAIT`] for its reply, which comes
+/// only once its crawl ends; the watch stays, and watchman crawls the tree
+/// while the index reads it. Takes no token. Why not, or that the crawl
+/// goes on, only under `--verbose`.
+pub fn request_watch(root: &Path, files: usize) {
+    if !due(files) {
+        return;
     }
-
-    /// Whether a load of `docs` docs asks.
-    pub fn due(&self, docs: usize) -> bool {
-        self.from.is_some_and(|from| docs >= from)
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
+    #[cfg(unix)]
+    let asked = watchman::Watchman::find(ASK_WAIT).and_then(|w| w.watch(&root).map(drop));
+    #[cfg(not(unix))]
+    let asked: Result<(), String> = Err("no change source on this platform".to_owned());
+    if let Err(why) = asked
+        && crate::verbose::verbose()
+    {
+        eprintln!("note: {why}");
     }
 }
 
@@ -93,212 +103,220 @@ pub fn named_cap(docs: usize) -> usize {
     (docs / 8).max(64)
 }
 
-/// What a source vouches for since its token.
-pub enum Since {
-    /// Only these corpus-relative paths may differ; a named directory is
-    /// listed again, one level.
-    Paths(Vec<String>),
-    /// Why it cannot vouch.
-    Unknown(String),
+/// A watchman clock of the watch on a tree, and the daemon that gave it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Token {
+    pub sock: String,
+    pub watch: String,
+    /// The tree, relative to `watch`.
+    pub relative: String,
+    pub clock: String,
 }
 
-/// One load-time question to a source.
-pub struct Ask<'a> {
-    /// Canonical.
-    pub root: &'a Path,
-    pub token: &'a Value,
+/// The index a record is of: its canonical directory, and when it began.
+#[derive(Clone, Debug)]
+pub struct Index {
+    pub dir: PathBuf,
+    pub started_ns: i64,
 }
 
-/// A filesystem change record, asked for a token before the walk and
-/// asked what changed since it at load.
-pub trait ChangeSource {
-    fn kind(&self) -> &'static str;
-    /// A token for now, or why there is none.
-    fn mark(&self, root: &Path) -> Result<Value, String>;
-    fn since(&self, ask: &Ask<'_>) -> Since;
+/// One search's state for the next, at [`path`].
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Record {
+    v: u32,
+    root: String,
+    index: String,
+    index_started_ns: i64,
+    token: Token,
+    /// Ascending root-relative paths that may differ from the index.
+    baseline: Vec<String>,
 }
 
-/// The source that took `token`, within [`ASK_WAIT`].
-fn source(token: &Token) -> Option<Box<dyn ChangeSource>> {
-    match token.kind.as_str() {
-        #[cfg(unix)]
-        "watchman" => watchman::Watchman::of(&token.token, ASK_WAIT)
-            .map(|w| Box::new(w) as Box<dyn ChangeSource>),
-        _ => None,
+/// What a load learned before it re-checks anything.
+#[derive(Debug, Default)]
+pub struct Asked {
+    /// Taken now, for the record written once the search answered.
+    pub token: Option<Token>,
+    /// What may differ, unsorted; `None`: check every file.
+    pub paths: Option<Vec<String>>,
+}
+
+/// `$XDG_CACHE_HOME/fmgrep`, else `$HOME/.cache/fmgrep`; tests use only
+/// the directory they are given.
+fn cache_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    return crate::tests::CACHE.with_borrow(Clone::clone);
+    #[cfg(not(test))]
+    {
+        let var = |name| std::env::var_os(name).map(PathBuf::from);
+        let xdg = var("XDG_CACHE_HOME").filter(|p| p.is_absolute());
+        let home = var("HOME").filter(|p| p.is_absolute());
+        Some(
+            xdg.or_else(|| home.map(|h| h.join(".cache")))?
+                .join("fmgrep"),
+        )
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Token {
-    kind: String,
-    token: Value,
-}
-
-fn token(source: &dyn ChangeSource, root: &Path) -> Result<Token, String> {
-    source.mark(root).map(|token| Token {
-        kind: source.kind().to_owned(),
-        token,
+/// FNV-1a, 64 bits: stable across builds, so a record keeps its name.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-/// Once the index walk of `root` has listed `files` files, before it reads
-/// them, where a search of as many docs would ask watchman: have watchman
-/// watch the tree, waiting at most [`ASK_WAIT`] for its reply, which comes
-/// only once its crawl ends; the watch stays, and watchman crawls the tree
-/// while the index reads it. Takes no token. Why not, or that the crawl
-/// goes on, only under `--verbose`.
-pub fn request_watch(root: &Path, files: usize) {
-    let policy = Policy::here();
-    if !policy.due(files) {
-        return;
+/// The record of tree `root` and index directory `index`, both canonical:
+/// `<cache>/<basename of root>-<16 hex>.json`.
+fn path(root: &str, index: &str) -> Option<PathBuf> {
+    let base = Path::new(root).file_name().and_then(|n| n.to_str());
+    let hash = fnv(format!("{root}\0{index}").as_bytes());
+    Some(cache_dir()?.join(format!("{}-{hash:016x}.json", base.unwrap_or("root"))))
+}
+
+impl Record {
+    /// The record of `root` and `index`, or why there is none to use.
+    fn read(root: &str, index: &Index) -> Result<Self, String> {
+        let dir = index.dir.to_str().ok_or("the index path is not UTF-8")?;
+        let path = path(root, dir).ok_or("no cache directory")?;
+        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "no record of an earlier search".to_owned(),
+            _ => format!("cannot read {} ({e})", path.display()),
+        })?;
+        let record: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("{} is malformed ({e})", path.display()))?;
+        let ours = record.v == VERSION
+            && record.root == root
+            && record.index == dir
+            && record.index_started_ns == index.started_ns;
+        match ours {
+            true => Ok(record),
+            false => Err(format!(
+                "{} was written for another index build",
+                path.display()
+            )),
+        }
     }
-    let Ok(root) = root.canonicalize() else {
-        return;
-    };
-    #[cfg(unix)]
-    let asked = watchman::Watchman::find(ASK_WAIT, &policy).and_then(|w| w.watch(&root).map(drop));
-    #[cfg(not(unix))]
-    let asked: Result<(), String> = Err("no change source on this platform".to_owned());
-    if let Err(why) = asked {
-        note(format_args!("{why}"));
+
+    /// Atomic: a crash leaves the old file or the new one, and two writers
+    /// leave one of theirs. Says why it could not, once per process.
+    fn write(&self) {
+        let Some(path) = path(&self.root, &self.index) else {
+            return cannot_save(format_args!(
+                "the watchman token (no cache directory: set XDG_CACHE_HOME or HOME)"
+            ));
+        };
+        static WRITES: AtomicUsize = AtomicUsize::new(0);
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("record");
+        let tmp = path.with_file_name(format!(".{name}.{}.{n}", std::process::id()));
+        let bytes = serde_json::to_vec(self).expect("a record serializes");
+        let wrote = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&tmp, bytes))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = wrote {
+            let _ = std::fs::remove_file(&tmp);
+            cannot_save(format_args!("{} ({e})", path.display()));
+        }
     }
 }
 
-/// A first token for canonical `root`, for a search with no journal, or
-/// why there is none.
-pub fn first(root: &Path, policy: &Policy) -> Result<Vec<Token>, String> {
+/// What may differ under canonical `root` from `index`, and a token for
+/// the record; why watchman cannot say goes to stderr.
+pub fn ask(root: &Path, index: &Index) -> Asked {
     #[cfg(unix)]
-    return watchman::Watchman::find(ASK_WAIT, policy)
-        .and_then(|w| token(&w, root))
-        .map(|token| vec![token]);
+    {
+        let Some(root_str) = root.to_str() else {
+            cannot_answer("the tree's path is not UTF-8");
+            return Asked::default();
+        };
+        let (why, taken) = match Record::read(root_str, index) {
+            Ok(record) => {
+                let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
+                match later(&w, &record, root) {
+                    Ok(asked) => return asked,
+                    Err((why, token)) if w.late() => {
+                        cannot_answer(&why);
+                        return Asked { token, paths: None };
+                    }
+                    Err(not_used) => not_used,
+                }
+            }
+            Err(why) => (why, None),
+        };
+        first(root, taken, &why)
+    }
     #[cfg(not(unix))]
     {
-        let _ = (root, policy);
-        Err("watchman is not supported on this platform".to_owned())
+        let _ = (root, index);
+        cannot_answer("watchman is not supported on this platform");
+        Asked::default()
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct Journal {
-    v: u32,
-    root: String,
-    tokens: Vec<Token>,
-    named: Vec<String>,
+/// A search with `record`: a newer token, then the token question, plus
+/// the baseline; or why not, with the token if it was taken.
+#[cfg(unix)]
+fn later(
+    w: &watchman::Watchman,
+    record: &Record,
+    root: &Path,
+) -> Result<Asked, (String, Option<Token>)> {
+    let token = w.mark(root).map_err(|why| (why, None))?;
+    let mut paths = match w.since(&record.token, root) {
+        Ok(paths) => paths,
+        Err(why) => return Err((why, Some(token))),
+    };
+    paths.extend(record.baseline.iter().cloned());
+    Ok(Asked {
+        token: Some(token),
+        paths: Some(paths),
+    })
 }
 
-/// What a source named, for the files layout to re-check.
-pub struct Replay {
-    pub kind: &'static str,
-    /// Ascending, deduped.
-    pub paths: Vec<String>,
-}
-
-impl Journal {
-    /// A journal of canonical `root` with no token yet, for the first
-    /// checkpoint.
-    pub fn new(root: &str) -> Self {
-        Self {
-            v: VERSION,
-            root: root.to_owned(),
-            tokens: Vec::new(),
-            named: Vec::new(),
-        }
-    }
-
-    /// `None` when absent, of another version, or under [`Knob::Off`];
-    /// malformed is refused.
-    pub fn open(index_dir: &Path, knob: Knob) -> Result<Option<Self>, String> {
-        if knob == Knob::Off {
-            return Ok(None);
-        }
-        let path = index_dir.join(DOCS_JOURNAL);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("error: cannot read {}: {e}", path.display())),
-        };
-        let tampered = |e: serde_json::Error| {
-            format!(
-                "error: {} is malformed ({e}); refusing a tampered index",
-                path.display()
-            )
-        };
-        let v: Value = serde_json::from_slice(&bytes).map_err(tampered)?;
-        if v.get("v").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
-            return Ok(None);
-        }
-        serde_json::from_value(v).map(Some).map_err(tampered)
-    }
-
-    /// Atomic: a crash leaves the old file or the new one.
-    fn write(&self, dir: &Path) -> Result<(), String> {
-        let path = dir.join(DOCS_JOURNAL);
-        let tmp = dir.join(format!(".{DOCS_JOURNAL}.{}", std::process::id()));
-        let failed =
-            |e: &dyn std::fmt::Display| format!("error: cannot write {}: {e}", path.display());
-        let bytes = serde_json::to_vec(self).map_err(|e| failed(&e))?;
-        std::fs::write(&tmp, bytes)
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
-                failed(&e)
-            })
-    }
-
-    /// Fresh tokens for the next checkpoint, and the first vouching
-    /// source's replay with `named`, or why none vouches.
-    pub fn ask(&self, root: &Path) -> (Vec<Token>, Result<Replay, String>) {
-        if Path::new(&self.root) != root {
-            return (Vec::new(), Err("the index is of another root".to_owned()));
-        }
-        let asked: Vec<_> = self
-            .tokens
-            .iter()
-            .filter_map(|t| Some((t, source(t)?)))
-            .collect();
-        let (mut marks, mut unmarked) = (Vec::new(), None);
-        for (_, s) in &asked {
-            match token(s.as_ref(), root) {
-                Ok(token) => marks.push(token),
-                Err(why) => {
-                    note(format_args!("no new {} token ({why})", s.kind()));
-                    unmarked.get_or_insert(why);
-                }
+/// A search that cannot use a record, for reason `why`: find the daemon
+/// and take a token, unless one was `taken` just now; every file is
+/// checked.
+#[cfg(unix)]
+fn first(root: &Path, taken: Option<Token>, why: &str) -> Asked {
+    let taken = match taken {
+        Some(token) => Ok(token),
+        None => watchman::Watchman::find(ASK_WAIT).and_then(|w| w.mark(root)),
+    };
+    match taken {
+        Ok(token) => {
+            checked_once(why);
+            Asked {
+                token: Some(token),
+                paths: None,
             }
         }
-        let mut why = "the index holds no token of a known source".to_owned();
-        for (t, s) in asked {
-            let ask = Ask {
-                root,
-                token: &t.token,
-            };
-            match s.since(&ask) {
-                Since::Paths(mut paths) => {
-                    paths.extend(self.named.iter().cloned());
-                    paths.sort_unstable();
-                    paths.dedup();
-                    let replay = Replay {
-                        kind: s.kind(),
-                        paths,
-                    };
-                    return (marks, Ok(replay));
-                }
-                Since::Unknown(unknown) => why = unknown,
-            }
+        Err(why) => {
+            cannot_answer(&why);
+            Asked::default()
         }
-        (marks, Err(unmarked.unwrap_or(why)))
     }
+}
 
-    /// Rewrite under `index_dir` with `marks`, which saw `named` differ.
-    pub fn checkpoint(mut self, index_dir: &Path, marks: Vec<Token>, named: Vec<String>) {
-        if marks.is_empty() {
-            return;
-        }
-        (self.tokens, self.named) = (marks, named);
-        if let Err(e) = self.write(index_dir) {
-            note(format_args!("no checkpoint: {e}"));
-        }
-    }
+/// Save `token` and `baseline` (ascending, deduped) as what differs from
+/// `index` under canonical `root` at it, after the search answered.
+pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>) {
+    let (Some(root), Some(dir)) = (root.to_str(), index.dir.to_str()) else {
+        return cannot_save(format_args!("the record (the index path is not UTF-8)"));
+    };
+    let record = Record {
+        v: VERSION,
+        root: root.to_owned(),
+        index: dir.to_owned(),
+        index_started_ns: index.started_ns,
+        token,
+        baseline,
+    };
+    record.write();
 }
 
 /// `line` on stderr, once per process for each `seen`.
@@ -310,16 +328,7 @@ pub(super) fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
     }
 }
 
-/// This search took a token, but checked every file to learn what differs.
-pub fn checked_once(why: &str) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        format_args!("checked every file once ({why}); later searches ask watchman"),
-    );
-}
-
-/// No source can say what changed on a tree worth asking about.
+/// No usable answer from watchman on a tree worth asking about.
 pub fn cannot_answer(why: &str) {
     static SEEN: AtomicBool = AtomicBool::new(false);
     warn(
@@ -328,11 +337,22 @@ pub fn cannot_answer(why: &str) {
     );
 }
 
-/// Why a source is not used, under `--verbose`.
-fn note(why: std::fmt::Arguments<'_>) {
-    if crate::verbose::verbose() {
-        eprintln!("note: {why}");
-    }
+/// This search took a token, but checked every file for its baseline.
+fn checked_once(why: &str) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(
+        &SEEN,
+        format_args!("checked every file once ({why}); later searches ask watchman"),
+    );
+}
+
+/// The record could not be written.
+fn cannot_save(what: std::fmt::Arguments<'_>) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(
+        &SEEN,
+        format_args!("cannot save {what}; the next search checks again"),
+    );
 }
 
 #[cfg(test)]

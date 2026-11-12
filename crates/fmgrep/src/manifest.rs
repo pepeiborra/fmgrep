@@ -39,7 +39,8 @@ pub struct Manifest {
     /// shard concurrency.
     pub build_time_us: u64,
     /// When the index began, in ns since the Unix epoch: before it listed or
-    /// read anything.
+    /// read anything. A search's record names the build it was written for
+    /// by it.
     pub index_started_ns: i64,
     /// Corpus-relative path per doc, ascending by id: what a search reports as
     /// a match's file.

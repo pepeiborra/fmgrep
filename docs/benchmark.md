@@ -45,9 +45,11 @@ fmgrep does not call git. `fmgrep index` asks a running watchman (it
 never starts one) to watch a tree of 50,000 files or more, without
 waiting for the crawl, and takes no token. On every query without a
 server and when a server starts, a load of 50,000 indexed files or more
-asks watchman. The first load of an index takes a token, keeps it in
-`docs.journal` and stats every indexed file; each later load asks
-watchman what changed since the token. A smaller index, or a load that
+asks watchman. The first load of an index takes a token and stats every
+indexed file; after it answers it keeps the token and the paths that
+differ from the index in a small record in the user's cache directory
+(`$XDG_CACHE_HOME/fmgrep`, else `~/.cache/fmgrep`), one per tree and
+index. Each later load asks watchman what changed since that token. A smaller index, or a load that
 watchman cannot answer, stats every indexed file
 ([Staleness](index-format.md#staleness)); while watchman crawls a big
 tree, every load of it stats every file. Each fmgrep row builds its own

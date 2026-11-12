@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{DOCS_SHARD, Manifest, shard_offsets};
-use crate::source::{Files, Journal, Knob, Recorded, Stamps, Watch};
+use crate::source::{Files, Index, Recorded, Stamps, Watch};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -116,7 +116,7 @@ const STALE_CACHE_BYTES: u64 = 64 << 20;
 impl DocStore {
     /// The manifest's layout. Stored docs ignore `corpus_root`; a missing
     /// `docs.shard` surfaces only on the first non-empty fetch. The files
-    /// layout maps `docs.stamps`, reads the journal and the walk record, and
+    /// layout maps `docs.stamps` and reads the walk record, and
     /// checks `corpus_root` (else the manifest's) is a directory.
     pub fn open(
         index_dir: &Path,
@@ -136,9 +136,12 @@ impl DocStore {
                 if let Some(recorded) = Recorded::open(index_dir)? {
                     files.record(recorded);
                 }
-                if let Some(journal) = Journal::open(index_dir, Knob::read()?)? {
-                    files.journal(journal);
-                }
+                // As given if it does not resolve: the record's name only.
+                let dir = index_dir.canonicalize();
+                files.ask(Index {
+                    dir: dir.unwrap_or_else(|_| index_dir.to_path_buf()),
+                    started_ns: manifest.index_started_ns,
+                });
                 Source::Files(files)
             }
         };
@@ -182,8 +185,9 @@ impl DocStore {
         }
     }
 
-    /// Replay the journal instead of [`Self::stat_all`] and discovery: false
-    /// when it cannot vouch, or for stored docs.
+    /// Re-check what watchman and the saved baseline name instead of
+    /// [`Self::stat_all`] and discovery: false when watchman cannot say, or
+    /// for stored docs.
     pub fn replay(&self, files: &[String]) -> bool {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
@@ -191,11 +195,11 @@ impl DocStore {
         }
     }
 
-    /// Once the stat pass and discovery, or the replay, are done: advance the
-    /// journal under `index_dir`, once.
-    pub fn checkpoint(&mut self, index_dir: &Path, files: &[String]) {
+    /// Once the stat pass and discovery, or the replay, are done: save the
+    /// watchman token and what differs, once, in the user's cache.
+    pub fn checkpoint(&mut self, files: &[String]) {
         if let Source::Files(f) = &mut self.source {
-            f.checkpoint(index_dir, files);
+            f.checkpoint(files);
         }
     }
 

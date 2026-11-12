@@ -40,6 +40,8 @@ thread_local! {
     /// The watchman socket found on this thread; none when `None`, so tests
     /// reach only a daemon they started.
     pub static WATCHMAN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The cache directory of searches on this thread; none when `None`.
+    pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
     /// The cause a watch started on this thread fails with.
@@ -50,6 +52,7 @@ thread_local! {
 pub struct Hooks {
     ask_from: Option<usize>,
     watchman: Option<PathBuf>,
+    cache: Option<PathBuf>,
     notes: Arc<Mutex<Vec<String>>>,
 }
 
@@ -58,6 +61,7 @@ impl Hooks {
         Self {
             ask_from: ASK_FROM.get(),
             watchman: WATCHMAN.with_borrow(Clone::clone),
+            cache: CACHE.with_borrow(Clone::clone),
             notes: NOTES.with_borrow(Arc::clone),
         }
     }
@@ -65,6 +69,7 @@ impl Hooks {
     pub fn apply(self) {
         ASK_FROM.set(self.ask_from);
         WATCHMAN.set(self.watchman);
+        CACHE.set(self.cache);
         NOTES.set(self.notes);
     }
 }

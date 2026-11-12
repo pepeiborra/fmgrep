@@ -17,7 +17,6 @@ directory.
 | `docs.stamps` | default | one mtime per document, and the file length of each UTF-16 one |
 | `dirs.stamps` | default | every walked directory's `(size, mtime)` |
 | `ignores.stamps` | default | every ignore file's `(size, mtime)` |
-| `docs.journal` | default, once a search took a watchman token | change-source tokens, written by the first search, rewritten by each later one |
 | `docs.shard` | `--store-docs` | the documents, concatenated |
 
 A search opens the index at `--index PATH` (default: the current
@@ -85,7 +84,8 @@ The walk under PATH defines the document set:
 ## Staleness
 
 A files-layout index answers over the tree as it is now. Before the first
-answer, a load stats every document against its `(size, mtime)` stamp:
+answer, a load stats every document against its `(size, mtime)` stamp
+(the stat pass):
 
 - a changed file is scanned in full by every search, so answers equal a
   fresh index of the current tree;
@@ -97,8 +97,7 @@ answer, a load stats every document against its `(size, mtime)` stamp:
   those whose stamp moved, and walks new directories below them in full;
 - a file the walk skipped as non-text is sniffed again whenever its
   directory is listed: one rewritten in place as text is found once its
-  directory's stamp moves, or when a change source or `serve`'s watch
-  names it;
+  directory's stamp moves, or when watchman or `serve`'s watch names it;
 - when an ignore file in `ignores.stamps` changes, or one appears in a
   listed directory, the load walks the directory it governs in full (the
   root for those above it): an indexed file the rules now skip is excluded
@@ -122,47 +121,111 @@ when an entry is created, removed or renamed, as POSIX requires; on one
 that does not, delete `dirs.stamps` to make every load walk the tree.
 Re-index after many edits.
 
-Once its walk has listed 50,000 files or more, before it reads them,
-`index` asks a running watchman daemon (never started) to watch the tree,
-unless a watch on the tree or on a directory above it covers it
-(`watch-project`). Watchman answers that only once its crawl of the tree
-ends; `index` waits at most 100 ms, and the watch stays when it stops
-waiting, so watchman crawls the tree while `index` reads the files and
-builds. `index` takes no token. The first
-search takes one, from the watch on the tree or on a directory above it,
-asking watchman to watch the tree in the same way when no watch covers it,
-and checks every file once; it waits at most 100 ms too. A watch whose
-`ignore_dirs` reach into the tree, or above it, gives no token. A token is
-the second of two watchman clocks, each synced, kept only when it is a
-later tick than the first. A clock answered during a crawl, its tail
-included, is the crawl's tick, which files changed then get too, so
-`since` it misses them; such clocks share the tick, and a watch still
-crawling gives no token. The token goes to `docs.journal` (JSON). A load
-asks watchman what changed since its token, re-checks only those paths and
-the ignore files, and skips the stat pass and the directory check: a
-reported file is statted, and a reported directory and the parent of any
-other reported path are listed again one level (a recorded subdirectory
-whose stamp moved is listed in turn, a new one is walked). A path under a directory the index did not record is
-found through that directory. A search then rewrites the token, taken the
-same way, with what differs now; an added file in a new directory is kept
-as that directory, and an ignore file that `ignores.stamps` does not hold
-is kept too, so that later searches apply it again and print the warning
-above. Watchman is asked from
-50,000 documents. A watchman that has not answered within 100 ms (one that
-hangs, or is still crawling after a restart) or that reports more changed
-paths than an eighth of the documents (at least 64), and a first search,
-fall back to the stat pass; a late answer is never used. Such a search
-prints one line on stderr that says why and, where there is one, what to
-do, for example `warning: watchman cannot say what changed (watchman is
-still crawling /src); checked every file`. An edit made while a directory
-above the root is renamed away and back, and a hard-linked file edited
-outside the root, are missed by the journal. `FMGREP_JOURNAL` forces or
-disables it (`docs/tuning.md`).
+On a tree of 50,000 files or more, a search asks watchman instead (see
+Watchman below). Below that, the stat pass is cheaper and watchman is
+never asked. `FMGREP_JOURNAL=off` keeps fmgrep away from watchman, and
+`on` asks it at any size ([tuning.md](tuning.md)).
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;
 `serve` neither stats nor watches the tree. Written with `--output`, it has
 no tree: a PATH is refused and the cwd does not narrow the search.
+
+## Watchman
+
+`index` takes no token and writes no record. Once its walk has listed
+50,000 files or more, before it reads them, it asks a running watchman
+to watch the tree when no watch covers it, as a search does (below), and
+waits at most 100 ms for the reply; watchman then crawls the tree while
+`index` reads the files and builds.
+A search of a files-layout index of 50,000 documents or more keeps
+a record between searches, in the user's cache directory
+(`$XDG_CACHE_HOME/fmgrep`, else `~/.cache/fmgrep`), one per tree and
+index: `<tree name>-<16 hex digits>.json`. A search never writes into the
+index directory. The record is one line of JSON:
+
+| field | holds |
+|---|---|
+| `v` | `1` |
+| `root` | the canonical tree |
+| `index` | the canonical index directory |
+| `index_started_ns` | the manifest's, so a rebuilt index does not use it |
+| `token` | `sock`, `watch`, `relative`, `clock`: a watchman clock of the watch on the tree, and the daemon's socket |
+| `baseline` | the paths that may differ from the index, ascending |
+
+A **token** is the second of two watchman clocks synced within 100 ms,
+kept only when it is a later tick than the first. A clock answered during
+a crawl, its tail included, is the crawl's tick, which files changed then
+get too, so `since` it misses them; such clocks share the tick, and a
+watch still crawling gives no token. A watch whose `ignore_dirs` reach
+into the tree, or above it, gives no token.
+
+The token comes from the watch on the tree or on a directory above it.
+Where no watch covers the tree, the search asks watchman to watch it
+(`watch-project`). Watchman answers that only once its crawl of the tree
+ends, so the search stops waiting at its 100 ms limit; the watch stays,
+and watchman goes on crawling. That search checks every file and says
+`fmgrep asked watchman to watch /src; later searches ask it once its
+crawl ends`; each search during the crawl says `watchman is still
+crawling /src`. A search with a record whose watch was removed asks for
+it again in the same way.
+
+**A search cannot use a record** when there is none yet, when it was
+written for another index build, when no watchman daemon answers on the
+socket it stores, or when watchman reports that it restarted, removed and
+added the watch again, or forgot deleted files since the record's token.
+Such a search finds a running daemon from `WATCHMAN_SOCK`, else by running
+`watchman --no-spawn get-sockname` within 100 ms, which starts no daemon.
+The search then takes a token (or keeps the one it just took from the
+record's daemon), checks every file (the stat pass), and says so once on
+stderr, with the reason: `warning: checked every file once (no record of
+an earlier search); later searches ask watchman`.
+
+**With a record it can use**, a search takes a newer token from the
+daemon on the socket the record stores, then asks it what changed since
+the record's token (the token question), within 100 ms for both. It
+re-checks the paths that watchman reports as changed plus the baseline,
+and skips the stat pass and the directory check: a reported file is
+statted, and a reported directory and the parent of any other reported
+path are listed again one level (a recorded subdirectory whose stamp
+moved is listed in turn, a new one is walked). A path under a directory the index did not record is found
+through that directory. The ignore files are checked as the stat pass
+checks them.
+
+After it answers, a search saves its token and what differs now as the new
+baseline: the stale and gone files, each added file, or its topmost
+directory the index did not record, and each ignore file the index did not
+record, so that later searches walk its directory again and print the
+warning above. The write is a
+rename, so two searches at once leave one whole record. `serve` saves at
+its first query.
+
+When watchman cannot answer, the search checks every file and prints one
+line on stderr per process that says why and what to do; stdout does not
+change:
+
+- `warning: watchman cannot say what changed (<why>); checked every file`,
+  where `<why>` is one of: `fmgrep asked watchman to watch /src; later
+  searches ask it once its crawl ends`, `watchman is still crawling
+  /src`, `watchman get-sockname found no watchman (<error or exit
+  status>)`, `watchman get-sockname did not answer within 100 ms`, `no
+  watchman daemon answers on <socket>
+  (<error>); start watchman` (the socket in `WATCHMAN_SOCK`),
+  `watchman did not answer within 100 ms`, `watchman's ignore_dirs hide
+  part of /src`, `more than <n> paths may differ from the index; re-run
+  index` (re-checking them would cost more than the stat pass: about 7 us
+  a path against 1 us a file), `the index has no dirs.stamps; re-run
+  index`, `the
+  manifest lists files out of order; re-run index`, `cannot resolve /src
+  (<error>)`, or
+  `watchman: <its own error>`. A late answer is never used; the record is
+  kept, with a newer token when one was taken.
+- `warning: cannot save <record> (<error>); the next search checks again`.
+
+An edit made while a directory above the root is renamed away and back,
+and a hard-linked file edited outside the root, are missed by watchman.
+On a network filesystem watchman sees only the changes made from this
+machine, so a later search misses a file changed from another one.
 
 ## Shards
 
@@ -258,5 +321,6 @@ them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
 
 The same tree, the same ignore files outside it (see Documents) and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and
 `docs.shard` bytes, whatever the thread counts. `docs.stamps`,
-`dirs.stamps` and `ignores.stamps` follow the mtimes. Only `build_time_us`
-differs in the manifest, besides `corpus_root` when the tree moves.
+`dirs.stamps` and `ignores.stamps` follow the mtimes. Only
+`build_time_us` and `index_started_ns` differ in the manifest, besides
+`corpus_root` when the tree moves.
