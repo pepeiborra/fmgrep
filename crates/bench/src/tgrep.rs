@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::rows::{Guard, LINES, Sampler, failure, run_measured, timed};
 use crate::verify::Paths;
-use crate::{Query, Row, RowKind, leaves};
+use crate::{Query, Row, RowKind, leaves, with_warm_up};
 
 pub struct Tgrep {
     pub bin: PathBuf,
@@ -134,7 +134,7 @@ pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
     let out = search(&mut tgrep(&["-l", "-e="]), "tgrep -l ''")?;
     row.searched = paths.listed("tgrep -l ''", &out)?;
 
-    for term in terms {
+    for (term, warm_up) in with_warm_up(terms) {
         let what = format!("tgrep {term:?}");
         let start = Instant::now();
         let out = match &leaves(term)[..] {
@@ -147,7 +147,9 @@ pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
         };
         let latency = start.elapsed();
         let hits = paths.hits(&what, &out)?;
-        row.queries.push(Query::new(term, latency, hits));
+        if !warm_up {
+            row.queries.push(Query::new(term, latency, hits));
+        }
     }
     drop(server);
     let peak = sampler.stop();

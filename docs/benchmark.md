@@ -23,11 +23,13 @@ harness and prints its markdown, by default
 `target/bench/results-<corpus>.md`, with a JSON line per query, stamped
 with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
 row searches the checkout in place, and nothing is written under it:
-indexes and tool state go to temporary directories. Every row prints each
-query's matching lines, and the harness exits 1 if an fmgrep row prints
-other lines than rg from a file both searched; a tgrep or elgrep row that
-does is noted under the table, and files only some rows searched are
-listed in the results. Arguments after `--` go to the harness;
+indexes and tool state go to temporary directories. Every row first runs
+the set's first query once, untimed and not kept, as a warm-up, then times
+every query. Every row prints each query's matching lines, and the harness
+exits 1 if an fmgrep row prints other lines than rg from a file both
+searched; a tgrep or elgrep row that does is noted under the table, and
+files only some rows searched are listed in the results. Arguments after
+`--` go to the harness;
 `target/release/bench --help` lists them. The corpus checkout is
 `FMGREP_CORPUS_GHC`, `FMGREP_CORPUS_LINUX`, `FMGREP_CORPUS_CHROMIUM` or
 `FMGREP_CORPUS_AOSP`, by default `target/bench/<corpus>`; the harness exits

@@ -20,7 +20,7 @@ use crate::report::bytes;
 use crate::rows::{LINES, Peak, Sampler, and_pipe, failure, memory, timed};
 use crate::tgrep::dir_size;
 use crate::verify::Paths;
-use crate::{Query, Row, RowKind, leaves};
+use crate::{Query, Row, RowKind, leaves, with_warm_up};
 
 pub struct Elgrep {
     pub bin: PathBuf,
@@ -133,8 +133,8 @@ pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
     let mut quoted: Vec<String> = flags.iter().map(|f| quote(f)).collect();
     quoted.push("--debug".to_string());
     let (prog, quoted) = (quote(&e.bin.to_string_lossy()), quoted.join(" "));
-    let mut scans = Scans::default();
-    for term in terms {
+    let (mut scans, mut warm_up_scans) = (Scans::default(), Scans::default());
+    for (term, warm_up) in with_warm_up(terms) {
         let (mut cmd, stages) = match &leaves(term)[..] {
             [_] => {
                 let (pattern, fixed) =
@@ -160,10 +160,18 @@ pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
         let stderrs: Vec<&[u8]> = std::iter::once(&out.stderr[..])
             .chain(files.iter().map(Vec::as_slice))
             .collect();
-        scans.add(&stderrs).map_err(|l| failure(&what, &out) + &l)?;
+        let tally = if warm_up {
+            &mut warm_up_scans
+        } else {
+            &mut scans
+        };
+        tally.add(&stderrs).map_err(|l| failure(&what, &out) + &l)?;
+        let hits = paths.hits(&what, &out)?;
+        if warm_up {
+            continue;
+        }
         row.footprint = row.footprint.max(peak.map(|p| p.footprint));
         row.query_rss = row.query_rss.max(peak.map(|p| p.rss));
-        let hits = paths.hits(&what, &out)?;
         row.queries.push(Query::new(term, latency, hits));
     }
     match daemon.map(Daemon::stop) {
