@@ -83,15 +83,17 @@ impl Policy {
     }
 }
 
-/// Named paths past this cost more than the stat pass of `docs` docs.
-fn named_cap(docs: usize) -> usize {
-    (docs / 2).max(4096)
+/// Re-checking a named path costs about 7 µs, the stat pass about 1 µs a
+/// doc: past this many named paths the stat pass is cheaper. Never below
+/// 64, where either costs microseconds.
+pub fn named_cap(docs: usize) -> usize {
+    (docs / 8).max(64)
 }
 
 /// What a source vouches for since its token.
 pub enum Since {
-    /// Only these corpus-relative paths may differ; a directory stands for
-    /// its subtree, `""` for the root.
+    /// Only these corpus-relative paths may differ; a named directory is
+    /// listed again, one level.
     Paths(Vec<String>),
     /// Why it cannot vouch.
     Unknown(String),
@@ -229,9 +231,8 @@ impl Journal {
     }
 
     /// Fresh tokens for the next checkpoint, and the first vouching
-    /// source's replay with `named`, or why none vouches, for a load of
-    /// `docs` docs.
-    pub fn ask(&self, root: &Path, docs: usize) -> (Vec<Token>, Result<Replay, String>) {
+    /// source's replay with `named`, or why none vouches.
+    pub fn ask(&self, root: &Path) -> (Vec<Token>, Result<Replay, String>) {
         if Path::new(&self.root) != root {
             return (Vec::new(), Err("the index is of another root".to_owned()));
         }
@@ -257,13 +258,6 @@ impl Journal {
                 token: &t.token,
             };
             match s.since(&ask) {
-                Since::Paths(paths) if paths.len() > named_cap(docs) => {
-                    why = format!(
-                        "{} reported {} changed paths, too many",
-                        s.kind(),
-                        paths.len()
-                    );
-                }
                 Since::Paths(mut paths) => {
                     paths.extend(self.named.iter().cloned());
                     paths.sort_unstable();

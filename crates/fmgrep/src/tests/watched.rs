@@ -252,6 +252,85 @@ fn checkpoint_advances_the_token_and_keeps_changed_paths() {
 }
 
 #[test]
+fn named_changes_answer_like_a_fresh_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs: &[(&str, &[u8])] = &[
+        (".ignore", b"ig/\n"),
+        ("a.c", b"printk one\n"),
+        ("ig/x.c", b"printk ignored\n"),
+        ("kb/k.dat", b"printk\0binary"),
+        ("r.c", b"printk renamed\n"),
+        ("sub/keep.c", b"printk kept\n"),
+        ("sub/mw/m.c", b"printk moved\n"),
+        ("sub/s.c", b"printk deleted\n"),
+    ];
+    let Some((folder, stale, _daemon)) = watched(tmp.path(), docs) else {
+        return;
+    };
+    let at = |rel: &str| folder.join(rel);
+    put(&folder, "a.c", b"printk one\nprintk printk\n");
+    put(&folder, "b.c", b"printk added\naa\n");
+    std::fs::remove_file(at("sub/s.c")).unwrap();
+    std::fs::rename(at("sub/mw"), at("sub/mv2")).unwrap();
+    put(&folder, "new/deep/n.c", b"deep printk\n");
+    put(&folder, "kb/k.dat", b"printk text now\n");
+    put(&folder, "ig/y.c", b"printk still ignored\n");
+    std::fs::rename(at("r.c"), at("r2.c")).unwrap();
+    assert!(replays(&stale), "{:?}", notes());
+    let want = "a.c\nb.c\nkb/k.dat\nnew/deep/n.c\nr2.c\nsub/keep.c\nsub/mv2/m.c\n";
+    assert_eq!(printed(&stale, &["-l"], &["printk"]), want);
+    put(&folder, "kb/k.dat", b"printk\0binary");
+    let fresh = tmp.path().join("fresh");
+    index_it(&folder, &fresh, false);
+    let terms = ["printk", "/pr[i1]ntk/", "aa", "deep", "now"];
+    answers_like(&stale, &fresh, &terms, &["printk", "aa", "deep"]);
+    assert!(notes().is_empty(), "{:?}", notes());
+}
+
+#[test]
+fn a_file_added_under_a_new_dir_is_found_again_from_the_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, _daemon)) = watched(tmp.path(), AB) else {
+        return;
+    };
+    put(&folder, "new/sub/n.c", b"printk new\n");
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nnew/sub/n.c\n");
+    assert_eq!(journal_json(&output)["named"], serde_json::json!(["new"]));
+    let again = "a.c\nnew/sub/n.c\n";
+    assert_eq!(
+        printed(&output, &["-l"], &["printk"]),
+        again,
+        "nothing changed since"
+    );
+    assert_eq!(journal_json(&output)["named"], serde_json::json!(["new"]));
+    std::fs::remove_dir_all(folder.join("new")).unwrap();
+    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(journal_json(&output)["named"], serde_json::json!([]));
+}
+
+/// a/sub keeps the stamp b/sub had; watchman reports the files under both,
+/// as for any directory moved into the tree.
+#[test]
+fn a_dir_swapped_in_is_listed_down_to_its_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let docs: &[(&str, &[u8])] = &[
+        ("a/sub/f.c", b"printk old\n"),
+        ("b/sub/f.c", b"printk newer\n"),
+    ];
+    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+        return;
+    };
+    std::fs::remove_dir_all(folder.join("a")).unwrap();
+    std::fs::rename(folder.join("b"), folder.join("a")).unwrap();
+    assert_eq!(printed(&output, &["-l"], &["newer"]), "a/sub/f.c\n");
+    assert_eq!(
+        journal_json(&output)["named"],
+        serde_json::json!(["a/sub/f.c", "b/sub/f.c"])
+    );
+    assert!(notes().is_empty());
+}
+
+#[test]
 fn read_only_index_dir_skips_the_checkpoint() {
     use std::os::unix::fs::PermissionsExt as _;
     let tmp = tempfile::tempdir().unwrap();

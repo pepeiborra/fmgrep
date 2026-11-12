@@ -162,6 +162,37 @@ fn ignore_scopes_name_the_dir_of_a_moved_row_and_the_root_above_it() {
     assert_eq!(recorded.ignore_scopes(&root, &[]), [""]);
 }
 
+#[test]
+fn direct_skips_each_subdirectory_run() {
+    let paths = ["a", "a-b", "a.c", "a/b", "a/b/c", "a/d", "a0", "b"];
+    let seek = |k: &str| paths.partition_point(|p| *p < k);
+    let at = |dir| -> Vec<&str> {
+        let ids = direct(dir, paths.len(), |i| paths[i], seek);
+        ids.into_iter().map(|i| paths[i]).collect()
+    };
+    assert_eq!(at(""), ["a", "a-b", "a.c", "a0", "b"]);
+    assert_eq!(at("a"), ["a/b", "a/d"]);
+    assert_eq!(at("a/b"), ["a/b/c"]);
+    assert!(at("z").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn child_dirs_are_the_recorded_dirs_one_level_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, recorded) = recorded_tree(tmp.path(), &["a.c", "c/d.c", "c/e/f.c", "c-x/g.c"]);
+    let names = |rel| -> Vec<&str> {
+        recorded
+            .child_dirs(rel)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    };
+    assert_eq!(names(""), ["c", "c-x"]);
+    assert_eq!(names("c"), ["c/e"]);
+    assert!(names("c/e").is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_new_ignore_file_in_a_changed_dir_is_a_scope() {
