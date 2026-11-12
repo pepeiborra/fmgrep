@@ -122,10 +122,15 @@ Where watchman watches neither, fmgrep asks it to watch the tree
 (`watch-project`). Watchman answers that once its crawl of the tree ends;
 `index` waits at most 5 s, and a search at most 100 ms, and the watch
 stays when they stop waiting. A watch with `ignore_dirs` gives no token.
-The token goes to `docs.journal` (JSON). A load asks watchman what
-changed since its token, re-checks only those paths and the ignore files,
-and skips the stat pass and the directory check; a search then rewrites
-the token with what differs now. Watchman is asked from 50,000
+A token is the second of two watchman clocks, each synced, kept only
+when it is a later tick than the first. A clock answered during a crawl,
+its tail included, is the crawl's tick,
+which files changed then get too, so `since` it misses them; such clocks
+share the tick, and a watch still crawling gives no token. The token
+goes to `docs.journal` (JSON). A load asks watchman what changed since
+its token, re-checks only those paths and the ignore files, and skips the
+stat pass and the directory check; a search then rewrites the token,
+taken the same way, with what differs now. Watchman is asked from 50,000
 documents. A watchman that has not answered within 100 ms (one that
 hangs, or is still crawling after a restart) or reports too many changed
 paths, and an index without `docs.journal`, fall back to the stat pass; a

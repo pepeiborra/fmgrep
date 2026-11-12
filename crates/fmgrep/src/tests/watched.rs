@@ -238,11 +238,8 @@ fn checkpoint_advances_the_token_and_keeps_changed_paths() {
     let before = journal_json(&output);
     std::fs::write(folder.join("a.c"), b"printk edited\n").unwrap();
     std::fs::write(folder.join("n.c"), b"printk new\n").unwrap();
-    // Watchman sees the edits before the search's clock, which does not
-    // sync.
-    daemon.watch(&folder);
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nn.c\n");
-    let asked = ["watch-list", "get-config", "clock", "query"];
+    let asked = ["watch-list", "get-config", "clock", "clock", "query"];
     assert_eq!(daemon.sent(), asked);
     let after = journal_json(&output);
     assert_ne!(clock(&after), clock(&before), "{after}");
