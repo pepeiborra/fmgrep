@@ -40,9 +40,9 @@ fn journal_round_trips_and_malformed_is_refused() {
         named: Vec::new(),
     };
     assert_eq!(journal, want);
-    let (marks, replay) = journal.ask(&root, 1);
+    let (marks, replay) = journal.ask(&root);
     assert!(marks.is_empty() && replay.is_err(), "an unknown kind");
-    assert!(journal.ask(&index, 1).1.is_err(), "another root");
+    assert!(journal.ask(&index).1.is_err(), "another root");
     std::fs::write(index.join(DOCS_JOURNAL), br#"{"v":2}"#).unwrap();
     assert_eq!(
         Journal::open(&index, Knob::Auto).unwrap(),
@@ -348,7 +348,7 @@ mod watchman_tests {
         };
         daemon.hang();
         let start = Instant::now();
-        let (marks, replay) = journal.ask(&root, 2_000_000);
+        let (marks, replay) = journal.ask(&root);
         let took = start.elapsed();
         daemon.resume();
         assert!(took < ASK_WAIT + SLACK / 3, "took {took:?}");
@@ -370,7 +370,7 @@ mod watchman_tests {
             (CRAWL_CLOCK, 0, "watchman is still crawling /w/sub"),
         ] {
             mode.store(m, Ordering::Relaxed);
-            let (marks, replay) = faked(&sock).ask(Path::new("/w/sub"), 1_000_000);
+            let (marks, replay) = faked(&sock).ask(Path::new("/w/sub"));
             assert_eq!(replay.err().unwrap(), want, "mode {m}");
             assert_eq!(marks.len(), marked, "mode {m}");
         }
@@ -390,7 +390,7 @@ mod watchman_tests {
         faked(&sock).write(&index).unwrap();
         let before = std::fs::read(index.join(DOCS_JOURNAL)).unwrap();
         let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (marks, replay) = journal.ask(root, 1_000_000);
+        let (marks, replay) = journal.ask(root);
         assert!(marks.is_empty());
         let named = replay.map(|r| r.paths).unwrap_or_default();
         journal.checkpoint(&index, marks, named);
@@ -433,12 +433,11 @@ mod watchman_tests {
             named: Vec::new(),
         };
         journal.write(&index).unwrap();
-        let docs = 1_000_000;
         let stat_pass_found = || vec!["e1.c".to_owned()];
         daemon.restart();
         daemon.watch(&root);
         let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (marks, replay) = journal.ask(&root, docs);
+        let (marks, replay) = journal.ask(&root);
         let why = replay.err().unwrap();
         assert!(
             why.contains("restarted"),
@@ -449,7 +448,7 @@ mod watchman_tests {
         put(&root, "a.c");
         put(&root, "d/x.c");
         let journal = Journal::open(&index, Knob::Auto).unwrap().unwrap();
-        let (_, replay) = journal.ask(&root, docs);
+        let (_, replay) = journal.ask(&root);
         let paths = replay.unwrap_or_else(|why| panic!("{why}")).paths;
         assert_eq!(
             paths,

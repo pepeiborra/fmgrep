@@ -92,17 +92,54 @@ impl Table {
     }
 
     fn find(&self, rel: &str) -> Option<usize> {
+        let at = self.seek(rel);
+        (at < self.rows.len() && self.path(at) == rel).then_some(at)
+    }
+
+    /// The first row not below `key`.
+    fn seek(&self, key: &str) -> usize {
         let (mut lo, mut hi) = (0, self.rows.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.path(mid).cmp(rel) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(mid),
+            if self.path(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        None
+        lo
     }
+}
+
+/// The items of an ascending path list directly in directory `dir` (`""`
+/// the root), skipping each subdirectory's run; `path(i)` reads item `i`,
+/// `seek(key)` is the first item not below `key`.
+pub fn direct<'a>(
+    dir: &str,
+    len: usize,
+    path: impl Fn(usize) -> &'a str,
+    seek: impl Fn(&str) -> usize,
+) -> Vec<usize> {
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    let (mut at, mut out) = (seek(&prefix), Vec::new());
+    while at < len {
+        let Some(rest) = path(at).strip_prefix(prefix.as_str()) else {
+            break;
+        };
+        match rest.find('/') {
+            // `0` follows `/`: past every path under that subdirectory.
+            Some(slash) => at = seek(&format!("{prefix}{}0", &rest[..slash])),
+            None => {
+                out.extend((!rest.is_empty()).then_some(at));
+                at += 1;
+            }
+        }
+    }
+    out
 }
 
 /// `None` when absent or of another layout.
@@ -177,6 +214,16 @@ impl Recorded {
 
     pub fn is_dir(&self, rel: &str) -> bool {
         self.dirs.find(rel).is_some()
+    }
+
+    /// The recorded dirs directly in `rel`, each with its stamp.
+    pub fn child_dirs(&self, rel: &str) -> Vec<(&str, Stamp)> {
+        let dirs = &self.dirs;
+        let path = |i| dirs.path(i);
+        direct(rel, dirs.rows.len(), path, |k| dirs.seek(k))
+            .into_iter()
+            .map(|i| (dirs.path(i), dirs.rows[i].1))
+            .collect()
     }
 
     /// The recorded dirs the walk from `root` still reaches (`excluded`

@@ -22,8 +22,8 @@ mod watcher;
 #[cfg(test)]
 pub use journal::NOTES;
 pub use journal::{Journal, Knob, marks};
-use recorded::outermost;
 pub use recorded::{Recorded, write_walk};
+use recorded::{direct, outermost};
 
 /// Per-doc mtimes and UTF-16 file lengths of a files-layout index, at the
 /// index root.
@@ -256,39 +256,80 @@ impl Known {
         self.stat_ids(&ids, files, lens);
     }
 
-    /// Take ascending `paths` as all that changed in ascending `files`:
-    /// re-stat the docs at or under each and reconcile each, then walk again
-    /// what a changed ignore input affects.
-    fn replay(&self, paths: &[String], files: &[String], lens: &[u64]) {
+    /// Take root-relative `paths` (any order) as all that may differ in
+    /// ascending `files`, instead of the stat pass and discovery: the number
+    /// kept, or Err when they cost more than the stat pass (nothing is
+    /// touched then).
+    ///
+    /// A path under a dir the index did not record is dropped: under an
+    /// ignored or hidden dir, or under a new dir that its listed parent
+    /// finds. A named doc is statted. A named dir, and the parent of any
+    /// other named path that is not hidden, are listed again, one level:
+    /// the docs in each are statted, a recorded subdir that moved is listed
+    /// in turn, one that went has its docs statted, a new one is walked.
+    /// Then the ignore inputs, as discovery does.
+    fn replay(
+        &self,
+        recorded: &Arc<Recorded>,
+        paths: &[String],
+        files: &[String],
+        lens: &[u64],
+    ) -> Result<usize, String> {
         let root = &self.root;
-        let by_path: Vec<usize> = (0..files.len()).collect();
-        let mut ids = Vec::new();
-        if paths
-            .iter()
-            .any(|rel| docs_at(root, &root.join(rel), files, &by_path, &mut ids))
-        {
-            self.stat_all(files, lens);
-            self.discover(root, root, files, lens);
-        } else {
-            ids.sort_unstable();
-            ids.dedup();
-            self.stat_ids(&ids, files, lens);
-            parallel(paths, |rel| {
-                self.reconcile_path(root, &root.join(rel), files, lens)
-            });
-            let mut scopes = match &self.recorded {
-                Some(recorded) => recorded.ignore_scopes(root, &[]),
-                None => vec![String::new()],
-            };
-            scopes.extend(
-                paths
-                    .iter()
-                    .filter_map(|p| crate::walk::ignore_file_dir(p))
-                    .map(str::to_owned),
-            );
-            self.discover_scopes(scopes, files, lens);
+        let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        for rel in paths {
+            let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+            if rel.is_empty() || !recorded.is_dir(parent) || self.excluded(root, rel) {
+                continue;
+            }
+            kept += 1;
+            if let Ok(id) = files.binary_search_by(|f| f.as_str().cmp(rel)) {
+                ids.push(id);
+            } else if recorded.is_dir(rel) {
+                dirs.push(rel.clone());
+            } else if !name.starts_with('.') {
+                dirs.push(parent.to_owned());
+            }
+            scopes.extend(crate::walk::ignore_file_dir(rel).map(str::to_owned));
         }
+        let cap = journal::named_cap(files.len());
+        if kept > cap {
+            return Err(format!(
+                "more than {cap} paths may differ from the index; re-run index"
+            ));
+        }
+        let seek = |key: &str| files.partition_point(|f| f.as_str() < key);
+        let (mut listed, mut seen) = (Vec::new(), std::collections::HashSet::new());
+        while let Some(dir) = dirs.pop() {
+            if !seen.insert(dir.clone()) {
+                continue;
+            }
+            ids.extend(direct(&dir, files.len(), |i| files[i].as_str(), seek));
+            for (child, stamp) in recorded.child_dirs(&dir) {
+                match std::fs::symlink_metadata(root.join(child)) {
+                    Ok(m) if m.is_dir() && Stamp::of(&m) == stamp => {}
+                    Ok(m) if m.is_dir() => dirs.push(child.to_owned()),
+                    _ => ids.extend(added::docs_under(files, child)),
+                }
+            }
+            listed.push(if dir.is_empty() {
+                root.clone()
+            } else {
+                root.join(dir)
+            });
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        self.stat_ids(&ids, files, lens);
+        let prune = Arc::clone(recorded);
+        let walked = crate::walk::walk_changed(root, listed.clone(), self.exclude.as_deref(), {
+            move |rel| prune.is_dir(rel)
+        });
+        self.add(&self.text_only(root, added::unlisted(walked, files)));
+        scopes.extend(recorded.ignore_scopes(root, &listed));
+        self.discover_scopes(scopes, files, lens);
         self.complete.store(true, Ordering::Release);
+        Ok(kept)
     }
 
     /// [`Self::discover`] of the outermost of root-relative `scopes`.
@@ -297,6 +338,17 @@ impl Known {
         for scope in outermost(scopes) {
             self.discover(root, &root.join(scope), files, lens);
         }
+    }
+}
+
+/// Added file `rel`, or its topmost ancestor the walk did not record: a
+/// replay drops a path under an unrecorded dir, but lists that dir's
+/// parent for the dir itself, and walks it.
+fn unrecorded<'a>(recorded: Option<&Recorded>, rel: &'a str) -> &'a str {
+    let new = |i: &usize| recorded.is_some_and(|r| !r.is_dir(&rel[..*i]));
+    match rel.match_indices('/').map(|(i, _)| i).find(new) {
+        Some(i) => &rel[..i],
+        None => rel,
     }
 }
 
@@ -386,6 +438,10 @@ impl Files {
                 return false;
             }
         };
+        let Some(recorded) = &self.known.recorded else {
+            journal::cannot_answer("the index has no dirs.stamps; re-run index");
+            return false;
+        };
         let Some(journal) = &self.journal else {
             journal::cannot_answer(&format!(
                 "the index holds no watchman token; run 'watchman watch-project {r}', then \
@@ -395,22 +451,25 @@ impl Files {
             return false;
         };
         let asked = std::time::Instant::now();
-        let (marks, replay) = journal.ask(&root, files.len());
+        let (marks, replay) = journal.ask(&root);
         let _ = self.marks.set(marks);
-        let replay = match replay {
-            Ok(replay) => replay,
+        let applied = std::time::Instant::now();
+        let kept = replay.and_then(|replay| {
+            let kept = self.known.replay(recorded, &replay.paths, files, lens)?;
+            Ok((replay, kept))
+        });
+        let (replay, kept) = match kept {
+            Ok(done) => done,
             Err(why) => {
                 journal::cannot_answer(&why);
                 return false;
             }
         };
-        let applied = std::time::Instant::now();
-        self.known.replay(&replay.paths, files, lens);
         if crate::verbose::verbose() {
             let (n, ask, apply) = (replay.paths.len(), applied - asked, applied.elapsed());
             let kind = replay.kind;
             eprintln!(
-                "note: {kind} named {n} path(s) to re-check (ask {ask:.1?}, apply {apply:.1?})"
+                "note: {kind} named {n} path(s), {kept} kept (ask {ask:.1?}, apply {apply:.1?})"
             );
             let n = self.known.added().live().count();
             if n > 0 {
@@ -438,12 +497,14 @@ impl Files {
             .chain(&snap.gone)
             .map(|&id| files[id].clone())
             .collect();
+        let recorded = self.known.recorded.as_deref();
         named.extend(
             snap.added
                 .iter()
-                .map(|&doc| snap.names[doc - files.len()].clone()),
+                .map(|&doc| unrecorded(recorded, &snap.names[doc - files.len()]).to_owned()),
         );
         named.sort_unstable();
+        named.dedup();
         journal.checkpoint(index_dir, marks, named);
     }
 
@@ -849,40 +910,101 @@ mod tests {
         assert!(!files.warned(1) && !files.warned(2));
     }
 
+    /// `docs` and a binary `kb/k.bin` under `<dir>/corpus`, backdated and
+    /// recorded as `index` records them.
+    #[cfg(unix)]
+    fn stage_named(dir: &Path, docs: &[&str]) -> Fix {
+        let path = dir.join("corpus");
+        for rel in docs.iter().chain(&["kb/k.bin"]) {
+            std::fs::create_dir_all(path.join(rel).parent().unwrap()).unwrap();
+            let bytes = if rel.ends_with(".bin") {
+                &b"\0\n"[..]
+            } else {
+                b"x\n"
+            };
+            std::fs::write(path.join(rel), bytes).unwrap();
+        }
+        crate::tests::support::backdate(&path);
+        write_stamps(dir, &vec![0; docs.len()], &[]).unwrap();
+        let walk = crate::for_each_index_doc(&path, None, |_, _, _, _| Ok(())).unwrap();
+        write_walk(dir, &walk, std::time::SystemTime::now()).unwrap();
+        Fix {
+            path,
+            index: dir.to_path_buf(),
+            files: docs.iter().map(|d| d.to_string()).collect(),
+            lens: vec![2; docs.len()],
+        }
+    }
+
+    /// `fix`'s files with its record, after a replay of `named`.
+    #[cfg(unix)]
+    fn replayed(fix: &Fix, named: &[&str]) -> (Files, Result<usize, String>) {
+        let mut files = open_files(fix);
+        let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
+        files.record(Recorded::open(&fix.index).unwrap().unwrap());
+        let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
+        let kept = files.known.replay(&recorded, &named, &fix.files, &fix.lens);
+        (files, kept)
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn replay_restats_named_docs_and_walks_named_dirs() {
+    fn replay_rechecks_what_is_named_and_lists_named_dirs_one_level() {
         let tmp = tempfile::tempdir().unwrap();
-        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
+        let docs = ["a.c", "d/in/i.c", "d/m.c", "d/x.c", "keep/k.c", "z.c"];
+        let fix = stage_named(tmp.path(), &docs);
+        let at = |rel: &str| fix.path.join(rel);
+        let added = |f: &Files| {
+            let s = f.snapshot();
+            let n = fix.files.len();
+            s.added
+                .iter()
+                .map(|&d| s.names[d - n].clone())
+                .collect::<Vec<_>>()
+        };
+        std::fs::write(at("a.c"), b"xy\n").unwrap();
+        // Same size, mtime restored: the stamp holds, so it stays fresh.
+        std::fs::write(at("z.c"), b"y\n").unwrap();
+        crate::tests::support::set_mtime(&at("z.c"), crate::tests::support::T0);
+        std::fs::remove_file(at("d/x.c")).unwrap();
+        std::fs::rename(at("d/in"), at("d/out")).unwrap();
+        std::fs::write(at("kb/k.bin"), b"now text\n").unwrap();
+        std::fs::remove_file(at("keep/k.c")).unwrap();
+        let named = ["a.c", "z.c", "d", "kb/k.bin", "gone/dir/x.c", ".hidden"];
+        let (files, kept) = replayed(&fix, &named);
+        assert_eq!(kept, Ok(5), "a path under an unrecorded dir is dropped");
+        let want = [STALE, GONE, FRESH, GONE, FRESH, FRESH];
+        assert_eq!(files.kinds(), want, "keep/k.c is not named, nor its dir");
+        assert_eq!(added(&files), ["d/out/i.c", "kb/k.bin"]);
+        // A new file in the root: the root is listed, then each recorded
+        // dir in it whose stamp moved.
+        std::fs::write(at("top.c"), b"x\n").unwrap();
+        let (files, kept) = replayed(&fix, &["top.c"]);
+        assert_eq!(kept, Ok(1));
+        assert_eq!(files.kinds(), [STALE, GONE, FRESH, GONE, GONE, FRESH]);
+        assert_eq!(added(&files), ["d/out/i.c", "top.c"], "kb did not move");
+        let many: Vec<String> = (0..65).map(|i| format!("n{i}.c")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (files, kept) = replayed(&fix, &many);
+        let over = "more than 64 paths may differ from the index; re-run index";
+        assert_eq!(kept, Err(over.into()));
+        assert!(!files.changed(), "past the cap nothing is touched");
+    }
+
+    #[test]
+    fn an_added_file_is_entered_as_its_topmost_unrecorded_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"a"]);
+        std::fs::create_dir_all(fix.path.join("old")).unwrap();
         let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
         write_walk(&fix.index, &walk, std::time::SystemTime::now()).unwrap();
-        std::fs::write(fix.path.join(&fix.files[0]), b"printk changed").unwrap();
-        std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
-        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
-        std::fs::create_dir_all(fix.path.join("sub/deep")).unwrap();
-        std::fs::write(fix.path.join("sub/deep/n.c"), b"new").unwrap();
-        std::fs::write(fix.path.join("sub/bin.dat"), b"a\0b").unwrap();
-        std::fs::create_dir(fix.path.join("rl")).unwrap();
-        std::fs::write(fix.path.join("rl/r.c"), b"unnamed dir").unwrap();
-        std::fs::write(fix.path.join("unnamed.c"), b"unseen").unwrap();
-        let mut files = open_files(&fix);
-        files.record(Recorded::open(&fix.index).unwrap().unwrap());
-        let named = ["d0000.c", "d0002.c", "sub"].map(String::from);
-        files.known.replay(&named, &fix.files, &fix.lens);
-        assert_eq!(files.kinds(), [STALE, FRESH, GONE], "only named docs");
-        let snap = files.snapshot();
-        let added: Vec<&str> = snap
-            .added
-            .iter()
-            .map(|&d| snap.names[d - 3].as_str())
-            .collect();
-        assert_eq!(added, ["sub/deep/n.c"]);
-        files.known.replay(&[String::new()], &fix.files, &fix.lens);
-        assert_eq!(
-            files.kinds(),
-            [STALE, STALE, GONE],
-            "the root is everything"
-        );
-        assert_eq!(files.snapshot().added.len(), 3);
+        let recorded = Recorded::open(&fix.index).unwrap().unwrap();
+        let r = Some(&recorded);
+        assert_eq!(unrecorded(r, "n.c"), "n.c");
+        assert_eq!(unrecorded(r, "old/n.c"), "old/n.c");
+        assert_eq!(unrecorded(r, "new/sub/n.c"), "new");
+        assert_eq!(unrecorded(r, "old/new/n.c"), "old/new");
+        assert_eq!(unrecorded(None, "new/sub/n.c"), "new/sub/n.c");
     }
 
     /// Wait up to 60 s for `done`: a loaded box can hold events that long.

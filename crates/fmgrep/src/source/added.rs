@@ -99,7 +99,10 @@ fn seek(files: &[String], from: usize, rel: &str) -> usize {
 }
 
 /// Ids of ascending `files` at or under `rel`, `""` the root.
-fn docs_under<'a>(files: &'a [String], rel: &'a str) -> impl Iterator<Item = usize> + 'a {
+pub(super) fn docs_under<'a>(
+    files: &'a [String],
+    rel: &'a str,
+) -> impl Iterator<Item = usize> + 'a {
     let exact = files.binary_search_by(|f| f.as_str().cmp(rel)).ok();
     let dir = format!("{rel}/");
     let lo = match rel {
@@ -112,7 +115,7 @@ fn docs_under<'a>(files: &'a [String], rel: &'a str) -> impl Iterator<Item = usi
 }
 
 /// Ascending `walked` minus ascending `files`.
-fn unlisted(walked: Vec<String>, files: &[String]) -> Vec<String> {
+pub(super) fn unlisted(walked: Vec<String>, files: &[String]) -> Vec<String> {
     let mut at = 0;
     walked
         .into_iter()
@@ -145,8 +148,17 @@ impl Known {
         }
     }
 
+    /// Make each of `found` a live added file.
+    pub(super) fn add(&self, found: &[String]) {
+        let mut added = self.added();
+        let changed = found.iter().fold(false, |c, rel| added.set(rel, true) | c);
+        if changed {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     /// The paths of `rels` whose first bytes allow text, in order.
-    fn text_only(&self, root: &Path, rels: Vec<String>) -> Vec<String> {
+    pub(super) fn text_only(&self, root: &Path, rels: Vec<String>) -> Vec<String> {
         let keep = parallel(&rels, |rel| sniff_text(&root.join(rel)));
         rels.into_iter()
             .zip(keep)
@@ -206,7 +218,7 @@ impl Known {
     }
 
     /// Whether `rel` is at or under the index dir.
-    fn excluded(&self, root: &Path, rel: &str) -> bool {
+    pub(super) fn excluded(&self, root: &Path, rel: &str) -> bool {
         self.exclude
             .as_deref()
             .and_then(|x| x.strip_prefix(root).ok())
