@@ -126,9 +126,11 @@ impl Watchman {
         Some(Self::until(sock.into(), deadline))
     }
 
-    /// What is left of the budget, at least 1 ms, for `sync_timeout`.
-    fn left_ms(&self) -> u64 {
-        let left = self.deadline.saturating_duration_since(Instant::now());
+    /// Three quarters of what is left of the budget, at least 1 ms, for
+    /// `sync_timeout`: a sync that fails says why before the deadline, and
+    /// one that succeeds leaves time for the reply.
+    fn sync_ms(&self) -> u64 {
+        let left = self.deadline.saturating_duration_since(Instant::now()) * 3 / 4;
         u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
     }
 
@@ -186,7 +188,7 @@ impl ChangeSource for Watchman {
             return None;
         }
         let clock = if self.settle {
-            json!(["clock", watch, {"sync_timeout": self.left_ms()}])
+            json!(["clock", watch, {"sync_timeout": self.sync_ms()}])
         } else {
             json!(["clock", watch])
         };
@@ -213,7 +215,7 @@ impl ChangeSource for Watchman {
             "since": token.clock,
             "fields": ["name"],
             "empty_on_fresh_instance": true,
-            "sync_timeout": self.left_ms(),
+            "sync_timeout": self.sync_ms(),
         });
         if !token.relative.is_empty() {
             query["relative_root"] = json!(token.relative);

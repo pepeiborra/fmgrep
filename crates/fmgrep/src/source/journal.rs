@@ -52,11 +52,11 @@ fn named_cap(docs: usize) -> usize {
     (docs / 2).max(4096)
 }
 
-/// A source's whole answer for `docs` docs: 2 us a doc within 1-5 s.
-fn budget(docs: usize) -> Duration {
-    let per_doc = u32::try_from(docs).map_or(Duration::MAX, |n| Duration::from_micros(2) * n);
-    per_doc.clamp(Duration::from_secs(1), Duration::from_secs(5))
-}
+/// Index time: detection, connects and calls.
+const MARK_WAIT: Duration = Duration::from_secs(5);
+/// A load's new token and question together, small next to the stat pass
+/// it would spare.
+const ASK_WAIT: Duration = Duration::from_millis(100);
 
 /// What a source vouches for since its token.
 pub enum Since {
@@ -87,18 +87,18 @@ fn available(knob: Knob) -> Vec<Box<dyn ChangeSource>> {
     let mut all: Vec<Box<dyn ChangeSource>> = Vec::new();
     #[cfg(unix)]
     if knob != Knob::Off
-        && let Some(w) = watchman::Watchman::find(budget(usize::MAX))
+        && let Some(w) = watchman::Watchman::find(MARK_WAIT)
     {
         all.push(Box::new(w));
     }
     all
 }
 
-/// The source that recorded `token`, within the budget for `docs` docs.
-fn source(token: &Token, docs: usize) -> Option<Box<dyn ChangeSource>> {
+/// The source that recorded `token`, within [`ASK_WAIT`].
+fn source(token: &Token) -> Option<Box<dyn ChangeSource>> {
     match token.kind.as_str() {
         #[cfg(unix)]
-        "watchman" => watchman::Watchman::of(&token.token, budget(docs))
+        "watchman" => watchman::Watchman::of(&token.token, ASK_WAIT)
             .map(|w| Box::new(w) as Box<dyn ChangeSource>),
         _ => None,
     }
@@ -212,7 +212,7 @@ impl Journal {
         let forced = self.knob == Knob::On;
         let mut asked = Vec::new();
         for t in &self.tokens {
-            match source(t, docs) {
+            match source(t) {
                 Some(s) if forced || docs >= MIN_DOCS => asked.push((t, s)),
                 Some(s) => note(format_args!(
                     "{} does not pay off for {docs} files",
