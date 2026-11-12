@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
-pub const MANIFEST_FORMAT: u32 = 6;
+pub const MANIFEST_FORMAT: u32 = 7;
 
 pub const MANIFEST_JSON: &str = "manifest.json";
 
@@ -38,6 +38,9 @@ pub struct Manifest {
     /// it. Not a sum of per-shard spans, so it keeps its meaning whatever the
     /// shard concurrency.
     pub build_time_us: u64,
+    /// When the index began, in ns since the Unix epoch: before it listed or
+    /// read anything.
+    pub index_started_ns: i64,
     /// Corpus-relative path per doc, ascending by id: what a search reports as
     /// a match's file.
     pub files: Vec<String>,
@@ -252,6 +255,7 @@ mod tests {
             bom_bytes: 0,
             index_size_bytes: 1,
             build_time_us: 1,
+            index_started_ns: 0,
             files: (0..docs.len()).map(|i| format!("doc{i}.txt")).collect(),
             blobs: (0..blobs.len()).map(|i| format!("{i:08}.bin")).collect(),
             doc_lens: docs.iter().map(|d| d.len() as u64).collect(),
@@ -296,6 +300,7 @@ mod tests {
             bom_bytes: 3,
             index_size_bytes: 99,
             build_time_us: 7,
+            index_started_ns: 9,
             files: vec!["a/one.hs".into(), "b/two.hs".into()],
             blobs: vec!["shard-00000000-00000002.bin".into()],
             doc_lens: vec![6, 4],
@@ -316,6 +321,7 @@ mod tests {
             "\"bom_bytes\":",
             "\"index_size_bytes\":",
             "\"build_time_us\":",
+            "\"index_started_ns\":",
             "\"files\":",
             "\"blobs\":",
             "\"doc_lens\":",
@@ -327,7 +333,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
             at += pos + key.len();
         }
-        assert!(json.starts_with("{\"format\":6,"), "{json}");
+        assert!(json.starts_with("{\"format\":7,"), "{json}");
         for gone in ["engine", "index_name", "num_files_indexed"] {
             assert!(!json.contains(&format!("\"{gone}\"")), "{gone}: {json}");
         }

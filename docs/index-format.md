@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 6): what each
+The on-disk layout `fmgrep index` writes (manifest format 7): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -33,13 +33,14 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `6` |
+| `format` | u32 | `7` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | usize | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
 | `bom_bytes` | u64 | leading UTF-8 BOM bytes over all documents |
 | `index_size_bytes` | u64 | the structures' size, plus the document text with `store_docs`; an accounting figure, not a file size |
 | `build_time_us` | u64 | the index wall: walk, construction and blob flush |
+| `index_started_ns` | i64 | when the index began, before it listed or read anything, in ns since the epoch |
 | `files` | [string] | corpus-relative path per document, by id |
 | `blobs` | [string] | one `shard-<start>-<end>.bin` label per shard |
 | `doc_lens` | [u64] | byte length per document, parallel to `files` |
@@ -51,7 +52,7 @@ tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 6, naming the remedy: re-run `fmgrep index`. Old
+- a `format` other than 7, naming the remedy: re-run `fmgrep index`. Old
   indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
