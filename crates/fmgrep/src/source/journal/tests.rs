@@ -85,6 +85,10 @@ mod watchman_tests {
     const FRESH: u8 = 1;
     const ERROR: u8 = 2;
     const IGNORES: u8 = 3;
+    /// The two texts of a sync that timed out; the second came from a
+    /// real daemon.
+    const SYNC_FAILED: u8 = 4;
+    const NO_COOKIE: u8 = 5;
 
     /// A daemon on a socket in `dir` answering as `mode` says.
     fn fake(dir: &Path, mode: Arc<AtomicU8>) -> PathBuf {
@@ -104,6 +108,12 @@ mod watchman_tests {
                     ("clock", _) if cmd[2]["sync_timeout"].is_u64() => json!({"clock": "c:1:2"}),
                     ("clock", _) => json!({"clock": "c:1:3"}),
                     ("query", ERROR) => json!({"error": "bad"}),
+                    ("query", SYNC_FAILED) => json!({"error": "synchronization failed: \
+                        syncToNow: timed out waiting for cookie file to be observed by \
+                        watcher within 74 milliseconds: Timer expired."}),
+                    ("query", NO_COOKIE) => json!({"error": "std::system_error: syncToNow: \
+                        timed out waiting for cookie file to be observed by watcher within 74 \
+                        milliseconds: Connection timed out"}),
                     ("query", _) => {
                         let asked = (&cmd[1], &cmd[2]["since"], &cmd[2]["relative_root"]);
                         assert_eq!(asked, (&json!("/w"), &json!("c:1:2"), &json!("sub")));
@@ -145,18 +155,36 @@ mod watchman_tests {
             "c:1:3",
             "a load's mark does not sync"
         );
-        assert!(
-            matches!(ask(Path::new("/w")), Since::Unknown(_)),
-            "another root"
-        );
-        for m in [FRESH, ERROR] {
+        let why = |since: Since| match since {
+            Since::Unknown(why) => why,
+            Since::Paths(p) => panic!("{p:?}"),
+        };
+        assert_eq!(why(ask(Path::new("/w"))), "the token watches another root");
+        for (m, want) in [
+            (
+                FRESH,
+                "watchman restarted, added the watch again or pruned deleted files since the last search",
+            ),
+            (ERROR, "watchman: bad"),
+            (SYNC_FAILED, "watchman did not answer within 5000 ms"),
+            (NO_COOKIE, "watchman did not answer within 5000 ms"),
+        ] {
             mode.store(m, Ordering::Relaxed);
-            assert!(matches!(ask(root), Since::Unknown(_)), "mode {m}");
+            assert_eq!(why(ask(root)), want, "mode {m}");
         }
         mode.store(IGNORES, Ordering::Relaxed);
-        assert!(w.mark(root).is_none(), "ignore_dirs hides indexed files");
+        assert_eq!(
+            w.mark(root),
+            Err("watchman's ignore_dirs are set on /w".into()),
+            "ignore_dirs hides indexed files"
+        );
         let none = Watchman::at(tmp.path().join("none"), Duration::from_secs(5));
-        assert!(none.mark(root).is_none(), "no daemon");
+        let gone = none.mark(root).unwrap_err();
+        assert!(
+            gone.starts_with("no watchman daemon answers on ")
+                && gone.ends_with("; start watchman"),
+            "{gone}"
+        );
         assert!(Watchman::of(&json!({"watch": "/w"}), Duration::from_secs(5)).is_none());
     }
 
@@ -207,7 +235,10 @@ mod watchman_tests {
         let token = token(&sock);
         let w = Watchman::at(sock, BUDGET);
         let root = Path::new("/w/sub");
-        assert!(w.mark(root).is_none());
+        assert_eq!(
+            w.mark(root),
+            Err("watchman did not answer within 1000 ms".into())
+        );
         let ask = Ask {
             root,
             token: &token,
@@ -282,7 +313,10 @@ mod watchman_tests {
         };
         warned();
         let start = Instant::now();
-        assert!(Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET).is_none());
+        assert_eq!(
+            Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET),
+            Err("watchman get-sockname did not answer within 1000 ms".into())
+        );
         assert!(
             start.elapsed() < BUDGET + SLACK,
             "took {:?}",
@@ -290,8 +324,12 @@ mod watchman_tests {
         );
         assert_eq!(warned(), [late("watchman")]);
         let answers = script("answers", r#"echo '{"sockname": "/s"}'"#);
-        assert!(Watchman::detect(&answers, BUDGET * 5).is_some());
-        assert!(Watchman::detect(&script("fails", "exit 1"), BUDGET).is_none());
+        assert_eq!(Watchman::detect(&answers, BUDGET * 5), Ok("/s".into()));
+        let failed = Watchman::detect(&script("fails", "exit 1"), BUDGET).unwrap_err();
+        assert!(
+            failed.starts_with("watchman get-sockname found no watchman ("),
+            "{failed}"
+        );
         assert!(
             warned().is_empty(),
             "a quick answer or failure warns nothing"
@@ -337,7 +375,7 @@ mod watchman_tests {
         let Some((_daemon, w)) = live() else {
             return;
         };
-        assert!(w.mark(&root).is_some(), "the tree, watched");
+        assert!(w.mark(&root).is_ok(), "the tree, watched");
         let kinds =
             |knob| -> Vec<String> { marks(&root, knob).into_iter().map(|t| t.kind).collect() };
         assert_eq!(kinds(Knob::Auto), ["watchman"]);
