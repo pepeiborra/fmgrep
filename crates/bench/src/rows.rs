@@ -102,13 +102,15 @@ fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
     searched
 }
 
-/// Each query through `fmgrep --server addr`, after the warm-up.
+/// Each query through `fmgrep --server addr`, after the warm-up, which the
+/// server's `sampler`, if any, does not sample.
 fn clients(
     bin: &Path,
     addr: &str,
     paths: &Paths,
     terms: &[String],
     row: &mut Row,
+    mut sampler: Option<&mut Sampler>,
 ) -> Result<(), String> {
     for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = Command::new(bin);
@@ -116,7 +118,8 @@ fn clients(
         cmd.args(["--server", addr]).args(LINES);
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
-        let (out, latency, _) = timed(&mut cmd, None)?;
+        let paused = sampler.as_deref_mut().filter(|_| warm_up);
+        let (out, latency, _) = unsampled(paused, || timed(&mut cmd, None))?;
         let hits = paths.hits(&format!("fmgrep --server {term:?}"), &out)?;
         if !warm_up {
             row.queries.push(Query::new(term, latency, hits));
@@ -158,7 +161,7 @@ pub fn server(
 ) -> Result<Row, String> {
     let mut row = Row::new(server.name);
     row.searched = searched(paths, docs);
-    clients(bin, &server.addr, paths, terms, &mut row)?;
+    clients(bin, &server.addr, paths, terms, &mut row, None)?;
     Ok(row)
 }
 
@@ -208,7 +211,7 @@ pub fn fmgrep(
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
     let mut server = Guard(serve.spawn().map_err(|e| format!("fmgrep serve: {e}"))?);
-    let sampler = Sampler::start(server.0.id(), Duration::from_millis(10));
+    let mut sampler = Sampler::start(server.0.id(), Duration::from_millis(10));
     // Ready once the bound address is printed as the first stdout line.
     let mut out = BufReader::new(server.0.stdout.take().expect("piped"));
     let mut addr = String::new();
@@ -220,7 +223,7 @@ pub fn fmgrep(
     row.ready = Some(start.elapsed());
     std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
 
-    clients(bin, &addr, paths, terms, &mut row)?;
+    clients(bin, &addr, paths, terms, &mut row, Some(&mut sampler))?;
     let mut shutdown = Command::new(bin);
     let (out, _, _) = timed(shutdown.args(["--server", &addr, "--shutdown"]), None)?;
     if !out.status.success() {
@@ -370,12 +373,42 @@ impl Peak {
     }
 }
 
-/// Samples a process's memory every `tick` and keeps each field's peak.
-pub struct Sampler(Arc<AtomicBool>, JoinHandle<Option<Peak>>);
+/// Samples a process's memory every `tick` and keeps each field's peak;
+/// paused, it takes no sample.
+pub struct Sampler {
+    pid: u32,
+    tick: Duration,
+    peak: Option<Peak>,
+    running: Option<(Arc<AtomicBool>, JoinHandle<Option<Peak>>)>,
+}
 
 impl Sampler {
     pub fn start(pid: u32, tick: Duration) -> Self {
+        let mut sampler = Self {
+            pid,
+            tick,
+            peak: None,
+            running: None,
+        };
+        sampler.resume();
+        sampler
+    }
+
+    /// Takes no more samples until `resume`; the peak so far is kept.
+    pub fn pause(&mut self) {
+        if let Some((stop, handle)) = self.running.take() {
+            stop.store(true, Ordering::Relaxed);
+            self.peak = Peak::max(self.peak, handle.join().unwrap_or_default());
+        }
+    }
+
+    /// Samples again, from now.
+    pub fn resume(&mut self) {
+        if self.running.is_some() {
+            return;
+        }
         let stop = Arc::new(AtomicBool::new(false));
+        let (pid, tick) = (self.pid, self.tick);
         let (flag, mut peak) = (Arc::clone(&stop), memory(pid));
         let handle = std::thread::spawn(move || {
             loop {
@@ -386,13 +419,24 @@ impl Sampler {
                 peak = Peak::max(peak, memory(pid));
             }
         });
-        Self(stop, handle)
+        self.running = Some((stop, handle));
     }
 
-    pub fn stop(self) -> Option<Peak> {
-        self.0.store(true, Ordering::Relaxed);
-        self.1.join().unwrap_or_default()
+    pub fn stop(mut self) -> Option<Peak> {
+        self.pause();
+        self.peak
     }
+}
+
+/// `f()`, with `sampler`, if any, paused while it runs.
+pub fn unsampled<T>(sampler: Option<&mut Sampler>, f: impl FnOnce() -> T) -> T {
+    let Some(sampler) = sampler else {
+        return f();
+    };
+    sampler.pause();
+    let out = f();
+    sampler.resume();
+    out
 }
 
 /// Footprint is macOS `phys_footprint` or Linux resident minus shared pages.
@@ -429,6 +473,32 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_sampler_leaves_out_what_runs_meanwhile() {
+        const BIG: u64 = 256 << 20;
+        let pid = std::process::id();
+        let before = memory(pid).unwrap().footprint;
+        // Mapped and unmapped by hand, as an allocator may keep a freed block.
+        let hold = || unsafe {
+            let (len, rw) = (BIG as usize, libc::PROT_READ | libc::PROT_WRITE);
+            let anon = libc::MAP_PRIVATE | libc::MAP_ANON;
+            let block = libc::mmap(std::ptr::null_mut(), len, rw, anon, -1, 0);
+            assert_ne!(block, libc::MAP_FAILED);
+            std::ptr::write_bytes(block.cast::<u8>(), 1, len);
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(libc::munmap(block, len), 0);
+        };
+        let mut sampler = Sampler::start(pid, Duration::from_millis(1));
+        unsampled(Some(&mut sampler), hold);
+        std::thread::sleep(Duration::from_millis(20));
+        let paused = sampler.stop().unwrap().footprint;
+        let sampler = Sampler::start(pid, Duration::from_millis(1));
+        hold();
+        let sampled = sampler.stop().unwrap().footprint;
+        assert!(paused < before + BIG / 2, "{paused}, {before} before");
+        assert!(sampled >= before + BIG / 2, "{sampled}, {before} before");
+    }
+
+    #[test]
     fn fmgrep_clients_send_the_first_query_once_untimed_before_the_timed_ones() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -440,7 +510,7 @@ mod tests {
         let paths = Paths::from_lists(&root, b"", b"", &[]);
         let terms = ["a", "b AND c"].map(String::from);
         let mut served = Row::new(RowKind::Fmgrep);
-        clients(&bin, "h:1", &paths, &terms, &mut served).unwrap();
+        clients(&bin, "h:1", &paths, &terms, &mut served, None).unwrap();
         let mut by_process = Row::new(RowKind::FmgrepDirect);
         let tree = (&paths, root.as_path());
         direct(&bin, tree, Path::new("/i"), &terms, &mut by_process).unwrap();
