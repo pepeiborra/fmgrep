@@ -34,6 +34,9 @@ const FIND_WAIT: Duration = Duration::from_millis(500);
 /// spare; also what `index` gives watchman to take its request to watch
 /// the tree.
 const ASK_WAIT: Duration = Duration::from_millis(100);
+/// A search through a server's token and question: they spare a git
+/// status of the checkout, which takes far longer on a large one.
+const CHECKOUT_WAIT: Duration = Duration::from_millis(500);
 
 /// Whether a load of `docs` docs asks watchman.
 pub fn due(docs: usize) -> bool {
@@ -582,7 +585,7 @@ pub fn remembered(root: &Path, of: &Of) -> Remembered {
     {
         let why = match Record::read(root_str, of).and_then(same_socket) {
             Ok(record) => {
-                let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
+                let w = watchman::Watchman::at(record.token.sock.clone().into(), CHECKOUT_WAIT);
                 match w.mark(root) {
                     Ok(token) => {
                         let (baseline, extra) = (record.baseline, record.extra);
@@ -605,7 +608,7 @@ pub fn remembered(root: &Path, of: &Of) -> Remembered {
             }
             Err(why) => why,
         };
-        match watchman::Watchman::find(ASK_WAIT).and_then(|w| w.mark(root)) {
+        match watchman::Watchman::find(CHECKOUT_WAIT).and_then(|w| w.mark(root)) {
             Ok(token) => Remembered::Fresh { token, why },
             Err(why) => Remembered::Cannot(why),
         }
