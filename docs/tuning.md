@@ -3,7 +3,8 @@
 Every `FMGREP_*` environment variable, and rayon's `RAYON_NUM_THREADS`,
 with its default and what it trades.
 
-No variable changes an answer, and only `FMGREP_SHARD_BYTES` changes the
+No variable changes an answer, except `FMGREP_SERVER`, which chooses the
+server that answers a search; only `FMGREP_SHARD_BYTES` changes the
 blobs.
 
 Value grammar: a byte size is `<n>`, `<n>KB`, `<n>MB` or `<n>GB` over
@@ -26,7 +27,11 @@ empty is the default, and any other value that does not parse is an error.
 
 ## Search
 
-No variable. A search asks watchman what changed when the tree holds
+| variable | default | trades |
+|---|---|---|
+| `FMGREP_SERVER` | unset | `HOST:PORT` of a `fmgrep serve`. A search with no `--server` and no `--index` goes there when no `.fmgrep` is found by walking up from the cwd. An index found wins, with a warning that starts `Using local index`. `--status` reads it; `--shutdown` needs `--server`. Empty is unset. |
+
+A search asks watchman what changed when the tree holds
 50,000 files or more, starting the daemon and adding the watch when they
 are missing, and says on stderr when watchman cannot answer; watchman's
 own `WATCHMAN_SOCK` names its socket. To keep fmgrep from watchman, set

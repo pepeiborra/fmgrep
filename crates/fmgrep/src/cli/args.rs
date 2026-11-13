@@ -16,7 +16,11 @@ A search reads the .fmgrep of the nearest enclosing directory. Put -- first
 to search for a TERM named index or serve. Trailing TERMs naming files or
 directories are PATHs, as in rg; with --expr every argument is one. Without
 a PATH only the cwd's subtree is searched, as in rg; from outside the indexed
-tree, all of it.";
+tree, all of it.
+
+Environment:
+  FMGREP_SERVER=HOST:PORT  with no --server, --index or enclosing .fmgrep,
+                           search through that server";
 
 const ENV: &str = "\
 Environment:
@@ -160,19 +164,17 @@ pub struct Search {
         help_heading = "Server"
     )]
     pub server: Option<String>,
-    /// Report on the server
+    /// Report on the server (--server or FMGREP_SERVER)
     #[arg(
         long,
-        requires = "server",
-        conflicts_with_all = ["shutdown", "terms", "expr", "expr_json", "and", "or"],
+        conflicts_with_all = ["shutdown", "index", "terms", "expr", "expr_json", "and", "or"],
         help_heading = "Server"
     )]
     pub status: bool,
-    /// Stop the server
+    /// Stop the server (--server only)
     #[arg(
         long,
-        requires = "server",
-        conflicts_with_all = ["terms", "expr", "expr_json", "and", "or"],
+        conflicts_with_all = ["index", "terms", "expr", "expr_json", "and", "or"],
         help_heading = "Server"
     )]
     pub shutdown: bool,

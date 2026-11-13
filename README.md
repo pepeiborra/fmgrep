@@ -123,6 +123,10 @@ $ fmgrep --server 127.0.0.1:7777 --shutdown
 
 `--server` takes every search flag but `--index` and prints what the local
 search would; the server answers ([details](docs/protocol.md#--server)).
+`FMGREP_SERVER=127.0.0.1:7777` does the same for every search that finds
+no `.fmgrep` by walking up from the cwd. An index found wins, and the
+search says so on stderr with a line that starts `warning: Using local
+index`.
 Before each query the server asks [watchman](https://facebook.github.io/watchman/)
 what changed in the tree, so it needs watchman installed; when no daemon
 runs, watchman's client starts one. To serve a tree that does not change

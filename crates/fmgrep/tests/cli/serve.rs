@@ -280,6 +280,98 @@ fn served_paths_print_as_the_local_search() {
     shutdown(&mut server, &addr);
 }
 
+/// `argv` from `cwd` with `FMGREP_SERVER` set to `server`.
+fn run_env(cwd: &Path, server: &str, argv: &[&str]) -> Output {
+    fmgrep()
+        .current_dir(cwd)
+        .env("FMGREP_SERVER", server)
+        .args(argv)
+        .output()
+        .expect("spawn fmgrep")
+}
+
+/// An address where no server listens: a port that was just free.
+fn closed_port() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+/// `FMGREP_SERVER` stands for `--server` where no index is found by walking
+/// up; an index found wins, with a warning; `--index` and an empty value
+/// leave the variable out; `--status` reads it and `--shutdown` does not.
+#[test]
+fn fmgrep_server_gives_the_server() {
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let addr = server.addr();
+    let away = tmp.path().join("away");
+    std::fs::create_dir(&away).unwrap();
+    let words = ["-l", "printk"];
+    let flag = run_in(&away, &[&["--server", &addr][..], &words].concat());
+    assert_eq!(flag.status.code(), Some(0), "{}", stderr(&flag));
+    let env = run_env(&away, &addr, &words);
+    assert_eq!((env.status.code(), &env.stdout), (Some(0), &flag.stdout));
+    assert_eq!(stderr(&env), "");
+
+    // An index found by walking up wins: it sees a file the server misses.
+    std::fs::write(docs.join("d.bin"), b"printk added\n").unwrap();
+    ok(&["index", &docs.display().to_string()]);
+    let local = run_in(&docs, &words);
+    assert_eq!(
+        String::from_utf8_lossy(&local.stdout),
+        "a.bin\nb.bin\nd.bin\n"
+    );
+    let env = run_env(&docs, &addr, &words);
+    assert_eq!((env.status.code(), &env.stdout), (Some(0), &local.stdout));
+    let lines: Vec<String> = stderr(&env).lines().map(str::to_owned).collect();
+    let dotdir = std::fs::canonicalize(&docs).unwrap().join(".fmgrep");
+    let want = format!(
+        "warning: Using local index {}, not the server at {addr} (FMGREP_SERVER)",
+        dotdir.display()
+    );
+    assert_eq!(lines, [want]);
+
+    // `--index` searches locally and says nothing; empty is unset.
+    let env = run_env(&away, &addr, &[&["--index", &index][..], &words].concat());
+    assert_eq!(
+        String::from_utf8_lossy(&env.stdout),
+        "a.bin\nb.bin\nd.bin\n"
+    );
+    assert_eq!(stderr(&env), "");
+    let empty = run_env(&away, "", &words);
+    assert_eq!(empty.status.code(), Some(2));
+    assert!(
+        stderr(&empty).contains("no .fmgrep index"),
+        "{}",
+        stderr(&empty)
+    );
+
+    let status = run_env(&away, &addr, &["--status"]);
+    assert_eq!(status.status.code(), Some(0), "{}", stderr(&status));
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["files"], DOCS.len());
+    let stop = run_env(&away, &addr, &["--shutdown"]);
+    assert_eq!(stop.status.code(), Some(2));
+    assert_eq!(
+        stderr(&stop),
+        "error: --shutdown needs --server ADDR; FMGREP_SERVER does not stop a server\n"
+    );
+    let status = run_in(&away, &["--status"]);
+    assert_eq!(status.status.code(), Some(2));
+    assert_eq!(
+        stderr(&status),
+        "error: --status needs --server ADDR or FMGREP_SERVER\n"
+    );
+    shutdown(&mut server, &addr);
+
+    let closed = closed_port();
+    let out = run_env(&away, &closed, &words);
+    assert_eq!(out.status.code(), Some(2));
+    let want = format!("error: cannot reach the server at {closed} (FMGREP_SERVER): ");
+    assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
+}
+
 /// The server scopes a search to the client's cwd.
 #[test]
 fn a_client_below_the_served_tree_searches_its_subtree() {

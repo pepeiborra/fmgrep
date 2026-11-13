@@ -186,7 +186,16 @@ Serving continues after any error.
 `--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
 headings follow the client's stdout, as in rg. `--status` prints the
 status object and `--shutdown` stops the server. An error response exits
-2, as `error: server: <message>`, after any output already received.
+2, as `error: server: <message>`, after any output already received. A
+server that cannot be reached exits 2, as `error: cannot reach the server
+at ADDR: <cause>`.
+
+`FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
+neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
+the cwd. When it finds one, that index answers, and stderr says
+`warning: Using local index <dir>, not the server at ADDR
+(FMGREP_SERVER)`. `--status` reads the variable; `--shutdown` needs
+`--server`. An empty value is unset.
 
 ## CLI --json
 

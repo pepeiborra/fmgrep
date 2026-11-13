@@ -457,7 +457,10 @@ pub fn manage(addr: &str, shutdown: bool, out: &mut dyn Write) -> Result<Outcome
 
 /// One method without params.
 fn ask<T: serde::de::DeserializeOwned>(addr: &str, method: &str) -> Result<T, String> {
-    let mut conn = Conn::open(addr)?;
+    ask_on(&mut Conn::open(addr)?, method)
+}
+
+fn ask_on<T: serde::de::DeserializeOwned>(conn: &mut Conn, method: &str) -> Result<T, String> {
     let result = conn.call(method, serde_json::json!({}), &mut |_| Ok(()))?;
     conn.decode(result)
 }
@@ -466,16 +469,20 @@ pub fn status(addr: &str) -> Result<ServeStatus, String> {
     ask(addr, "status")
 }
 
+/// `status`, on a connection that stays open.
+pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
+    ask_on(conn, "status")
+}
+
 /// Send one request to a server and print its result as a search would.
 pub fn run_client(
-    addr: &str,
+    conn: &mut Conn,
     p: &QueryParams,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let mut conn = Conn::open(addr)?;
     let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
     let mut pipe = Pipe::new(&mut *out);
     let result = conn.call("query", sent, &mut |b| match printed {
