@@ -149,10 +149,9 @@ index directory. The record is one line of JSON:
 
 | field | holds |
 |---|---|
-| `v` | `1` |
+| `v` | `2`; a record of another version is not used |
 | `root` | the canonical tree |
-| `index` | the canonical index directory |
-| `index_started_ns` | the manifest's, so a rebuilt index does not use it |
+| `of` | what the baseline differs from: `index <canonical index directory>@<the manifest's index_started_ns>`, so a rebuilt index does not use it |
 | `token` | `sock`, `watch`, `relative`, `clock`: a watchman clock of the watch on the tree, and the daemon's socket |
 | `baseline` | the paths that may differ from the index, ascending; `null` when more than an eighth of the documents (at least 64) do |
 

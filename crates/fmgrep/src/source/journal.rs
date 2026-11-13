@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 mod watchman;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Below this many docs the stat pass beats asking.
 const MIN_DOCS: usize = 50_000;
 
@@ -181,8 +181,8 @@ fn network(fs: &str) -> bool {
 struct Record {
     v: u32,
     root: String,
-    index: String,
-    index_started_ns: i64,
+    /// What the baseline differs from: `index <dir>@<started_ns>`.
+    of: String,
     token: Token,
     /// Ascending root-relative paths that may differ from the index; `None`
     /// when more than [`named_cap`] do.
@@ -243,42 +243,62 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The record of tree `root` and index directory `index`, both canonical:
+/// The record of canonical tree `root` and `key`:
 /// `<cache>/<basename of root>-<16 hex>.json`.
-fn path(root: &str, index: &str) -> Option<PathBuf> {
+fn path(root: &str, key: &str) -> Option<PathBuf> {
     let base = Path::new(root).file_name().and_then(|n| n.to_str());
-    let hash = fnv(format!("{root}\0{index}").as_bytes());
+    let hash = fnv(format!("{root}\0{key}").as_bytes());
     Some(cache_dir()?.join(format!("{}-{hash:016x}.json", base.unwrap_or("root"))))
 }
 
+/// What a record's baseline differs from: `key` names its file, and `of`,
+/// which the record keeps, must match for the record to be used.
+pub struct Of {
+    key: String,
+    of: String,
+    /// Says what a record of another `of` was written for.
+    other: &'static str,
+}
+
+impl Index {
+    /// The index directory names the file, its build the baseline.
+    fn of(&self) -> Result<Of, String> {
+        let dir = self.dir.to_str().ok_or("the index path is not UTF-8")?;
+        Ok(Of {
+            key: dir.to_owned(),
+            of: format!("index {dir}@{}", self.started_ns),
+            other: "another index build",
+        })
+    }
+}
+
 impl Record {
-    /// The record of `root` and `index`, or why there is none to use.
-    fn read(root: &str, index: &Index) -> Result<Self, String> {
-        let dir = index.dir.to_str().ok_or("the index path is not UTF-8")?;
-        let path = path(root, dir).ok_or("no cache directory")?;
+    /// The record of `root` and `of`, or why there is none to use.
+    fn read(root: &str, of: &Of) -> Result<Self, String> {
+        let path = path(root, &of.key).ok_or("no cache directory")?;
         let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "no record of an earlier search".to_owned(),
             _ => format!("cannot read {} ({e})", path.display()),
         })?;
-        let record: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{} is malformed ({e})", path.display()))?;
-        let ours = record.v == VERSION
-            && record.root == root
-            && record.index == dir
-            && record.index_started_ns == index.started_ns;
-        match ours {
-            true => Ok(record),
-            false => Err(format!(
-                "{} was written for another index build",
+        let malformed = |e: serde_json::Error| format!("{} is malformed ({e})", path.display());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(malformed)?;
+        if value.get("v").and_then(serde_json::Value::as_u64) != Some(u64::from(VERSION)) {
+            return Err(format!(
+                "{} was written by another fmgrep version",
                 path.display()
-            )),
+            ));
+        }
+        let record: Self = serde_json::from_value(value).map_err(malformed)?;
+        match record.root == root && record.of == of.of {
+            true => Ok(record),
+            false => Err(format!("{} was written for {}", path.display(), of.other)),
         }
     }
 
     /// Atomic: a crash leaves the old file or the new one, and two writers
     /// leave one of theirs. Says why it could not, once per process.
-    fn write(&self) {
-        let Some(path) = path(&self.root, &self.index) else {
+    fn write(&self, key: &str) {
+        let Some(path) = path(&self.root, key) else {
             return cannot_save(format_args!(
                 "the watchman token (no cache directory: set XDG_CACHE_HOME or HOME)"
             ));
@@ -326,7 +346,8 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
     };
     #[cfg(unix)]
     {
-        let (why, taken) = match Record::read(root_str, index).and_then(same_socket) {
+        let record = index.of().and_then(|of| Record::read(root_str, &of));
+        let (why, taken) = match record.and_then(same_socket) {
             Ok(record) => {
                 let sock = record.token.sock.clone().into();
                 let w = watchman::Watchman::at(sock, ASK_WAIT).served(served);
@@ -502,18 +523,17 @@ fn first(root: &Path, taken: Option<Token>, served: bool) -> Result<Token, (Stri
 /// Save `token` and `baseline` (ascending, deduped) as what differs from
 /// `index` under canonical `root` at it, after the search answered.
 pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap: usize) {
-    let (Some(root), Some(dir)) = (root.to_str(), index.dir.to_str()) else {
+    let (Some(root), Ok(of)) = (root.to_str(), index.of()) else {
         return cannot_save(format_args!("the record (the index path is not UTF-8)"));
     };
     let record = Record {
         v: VERSION,
         root: root.to_owned(),
-        index: dir.to_owned(),
-        index_started_ns: index.started_ns,
+        of: of.of,
         token,
         baseline: (baseline.len() <= cap).then_some(baseline),
     };
-    record.write();
+    record.write(&of.key);
 }
 
 /// `line` on stderr, once per process for each `seen`.

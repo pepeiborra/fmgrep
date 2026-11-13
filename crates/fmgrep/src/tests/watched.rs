@@ -115,9 +115,9 @@ fn a_first_search_takes_a_token_then_checks_every_file() {
     let root = std::fs::canonicalize(&folder).unwrap();
     let index = std::fs::canonicalize(&output).unwrap();
     assert_eq!(record["root"], root.to_str().unwrap());
-    assert_eq!(record["index"], index.to_str().unwrap());
     let started = read_manifest(&output).unwrap().index_started_ns;
-    assert_eq!(record["index_started_ns"], started);
+    let of = format!("index {}@{started}", index.to_str().unwrap());
+    assert_eq!(record["of"], of);
     let token = &record["token"];
     assert_eq!(
         token["sock"],
@@ -407,7 +407,8 @@ fn a_rebuilt_index_does_not_use_the_old_record() {
     assert_eq!(records(tmp.path()), first, "the same file, rewritten");
     assert_eq!(baseline(tmp.path()), serde_json::json!([]));
     let started = read_manifest(&output).unwrap().index_started_ns;
-    assert_eq!(record(tmp.path())["index_started_ns"], started);
+    let of = record(tmp.path())["of"].as_str().unwrap().to_owned();
+    assert!(of.ends_with(&format!("@{started}")), "{of}");
 }
 
 #[test]

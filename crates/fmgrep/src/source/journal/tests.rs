@@ -68,12 +68,12 @@ fn a_record_is_used_only_by_its_index_build() {
         baseline.clone(),
         64,
     );
-    let record = Record::read("/src/linux", &idx).unwrap();
+    let of = idx.of().unwrap();
+    let record = Record::read("/src/linux", &of).unwrap();
     let want = Record {
-        v: 1,
+        v: 2,
         root: "/src/linux".into(),
-        index: "/src/linux/.fmgrep".into(),
-        index_started_ns: 7,
+        of: "index /src/linux/.fmgrep@7".into(),
         token: token("c:1:2"),
         baseline: Some(baseline),
     };
@@ -81,7 +81,7 @@ fn a_record_is_used_only_by_its_index_build() {
     let file = path("/src/linux", "/src/linux/.fmgrep").unwrap();
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(
-        text.starts_with(r#"{"v":1,"root":"/src/linux","index":"#),
+        text.starts_with(r#"{"v":2,"root":"/src/linux","of":"index /src/linux/.fmgrep@7","#),
         "{text}"
     );
     assert_eq!(
@@ -89,27 +89,32 @@ fn a_record_is_used_only_by_its_index_build() {
         1,
         "no temp left"
     );
-    let rebuilt = Record::read("/src/linux", &index("/src/linux/.fmgrep", 8));
+    let rebuilt = Record::read("/src/linux", &index("/src/linux/.fmgrep", 8).of().unwrap());
     assert!(
         rebuilt
             .unwrap_err()
             .ends_with(" was written for another index build")
     );
     std::fs::remove_file(&file).unwrap();
-    let none = Record::read("/src/linux", &idx).unwrap_err();
+    let none = Record::read("/src/linux", &of).unwrap_err();
     assert_eq!(none, "no record of an earlier search");
-    for bad in [&b"{"[..], br#"{"v":1}"#, b""] {
+    for bad in [&b"{"[..], br#"{"v":2}"#, b""] {
         std::fs::write(&file, bad).unwrap();
-        let err = Record::read("/src/linux", &idx).unwrap_err();
+        let err = Record::read("/src/linux", &of).unwrap_err();
         assert!(err.contains("malformed"), "{err}");
     }
-    let mut other = serde_json::to_value(&want).unwrap();
-    other["v"] = json!(2);
-    std::fs::write(&file, other.to_string()).unwrap();
-    assert!(Record::read("/src/linux", &idx).is_err(), "another version");
+    // A record of fmgrep 0.1's format names the index and its build apart.
+    let old = json!({"v": 1, "root": "/src/linux", "index": "/src/linux/.fmgrep",
+        "index_started_ns": 7, "token": token("c:1:2"), "baseline": []});
+    std::fs::write(&file, old.to_string()).unwrap();
+    let err = Record::read("/src/linux", &of).unwrap_err();
+    assert!(
+        err.ends_with(" was written by another fmgrep version"),
+        "{err}"
+    );
     let many: Vec<String> = (0..65).map(|i| format!("n{i}.c")).collect();
     save(Path::new("/src/linux"), &idx, token("c:1:3"), many, 64);
-    let over = Record::read("/src/linux", &idx).unwrap();
+    let over = Record::read("/src/linux", &idx.of().unwrap()).unwrap();
     assert_eq!(over.baseline, None, "past the cap");
 }
 
