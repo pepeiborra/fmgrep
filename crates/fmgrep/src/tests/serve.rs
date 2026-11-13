@@ -14,7 +14,12 @@ fn serve_stdio(index: &Path, requests: &[&str]) -> Vec<serde_json::Value> {
         .map(|r| format!("{r}\n"))
         .collect::<String>();
     let mut out = Vec::new();
-    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    let words = argv(&[
+        "serve",
+        "--stdio",
+        "--no-watch",
+        &index.display().to_string(),
+    ]);
     assert!(matches!(
         dispatch_to(&words, &mut input.as_bytes(), &mut out, false),
         Ok(Outcome::Done)
@@ -221,13 +226,20 @@ impl Write for Chan {
 
 type Server = std::thread::JoinHandle<Result<Outcome, String>>;
 
-/// `serve <flags>` on an ephemeral port; returns its readiness address.
+/// The flags of a server of a tree that does not change while it serves.
+const FIXED: &[&str] = &["--no-watch"];
+
+/// `serve <flags>` on an ephemeral port, with this thread's watchman
+/// hooks; returns its readiness address.
 fn spawn_server(index: &Path, flags: &[&str]) -> (String, Server) {
     let (tx, rx) = mpsc::channel();
     let mut words = argv(&["serve", &index.display().to_string()]);
     words.extend(argv(flags));
-    let server =
-        std::thread::spawn(move || dispatch_to(&words, &mut &b""[..], &mut Chan(tx), false));
+    let hooks = Hooks::here();
+    let server = std::thread::spawn(move || {
+        hooks.apply();
+        dispatch_to(&words, &mut &b""[..], &mut Chan(tx), false)
+    });
     let mut ready = Vec::new();
     while !ready.ends_with(b"\n") {
         ready.extend(rx.recv().expect("readiness line"));
@@ -251,7 +263,7 @@ fn serve_tcp_round_trip() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
-        let (addr, server) = spawn_server(&index, &[]);
+        let (addr, server) = spawn_server(&index, FIXED);
         let terms = ["printk", "aa", "/pr[i1]ntk/"];
 
         let (_, json) = client(&addr, &[&["--json", "--"][..], &terms].concat()).unwrap();
@@ -296,7 +308,7 @@ fn serve_tcp_round_trip() {
 fn server_errors_surface_on_the_client() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), true);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let query = query_it_err(&index, true, &["("]);
     assert_eq!(
         client(&addr, &["--regex", "--", "("]).err().unwrap(),
@@ -315,7 +327,12 @@ fn server_errors_surface_on_the_client() {
 }
 
 fn serve_err(index: &Path) -> String {
-    match dispatch(argv(&["serve", "--stdio", &index.display().to_string()])) {
+    match dispatch(argv(&[
+        "serve",
+        "--stdio",
+        "--no-watch",
+        &index.display().to_string(),
+    ])) {
         Err(e) => e,
         Ok(_) => panic!("serve must refuse {}", index.display()),
     }
@@ -390,7 +407,12 @@ fn serve_reads_a_moved_tree_through_its_dotdir() {
     index_it(&folder, &folder.join(INDEX_DIR), false);
     let moved = tmp.path().join("moved");
     std::fs::rename(&folder, &moved).unwrap();
-    let words = argv(&["serve", "--stdio", &moved.display().to_string()]);
+    let words = argv(&[
+        "serve",
+        "--stdio",
+        "--no-watch",
+        &moved.display().to_string(),
+    ]);
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["pr[i1]ntk"],"regex":true}}"#;
     let mut out = Vec::new();
     let served = dispatch_to(
@@ -418,25 +440,16 @@ fn served_totals(addr: &str, terms: &[&str]) -> Vec<u64> {
     served_report(addr, terms).0
 }
 
-/// Apply `change` and poll `addr` until `terms` total `want`, for up to 60 s:
-/// a loaded box can hold the watcher's events that long. `change` repeats
-/// each poll, as FSEvents can miss changes made just after the watch starts.
-fn served_eventually(addr: &str, change: impl Fn(), terms: &[&str], want: &[u64]) {
-    let start = std::time::Instant::now();
-    change();
-    let mut got = served_report(addr, terms);
-    while got.0 != want && start.elapsed() < std::time::Duration::from_secs(60) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        change();
-        got = served_report(addr, terms);
-    }
-    assert_eq!(
-        got.0,
-        want,
-        "{terms:?} after {:?}; last report: {}",
-        start.elapsed(),
-        got.1
-    );
+/// A private daemon that watches `corpus`, which servers started on this
+/// thread ask, keeping their records in `<tmp>/cache`; `None` without
+/// watchman.
+#[cfg(unix)]
+pub(super) fn watching(tmp: &Path, corpus: &Path) -> Option<super::watchman::Daemon> {
+    let daemon = super::watchman::Daemon::start()?;
+    daemon.watch(corpus);
+    WATCHMAN.set(Some(daemon.sock.clone()));
+    CACHE.set(Some(tmp.join("cache")));
+    Some(daemon)
 }
 
 #[test]
@@ -445,7 +458,7 @@ fn serve_rescans_stale_files_per_request() {
     let index = staged(tmp.path(), false);
     let corpus = tmp.path().join("corpus");
     std::fs::write(corpus.join("a.c"), b"printk\n").unwrap();
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [2, 2]);
     std::fs::write(corpus.join("a.c"), b"printk printk printk\n").unwrap();
     assert_eq!(
@@ -453,11 +466,38 @@ fn serve_rescans_stale_files_per_request() {
         [4],
         "a stale file is read per request"
     );
-    // Fresh at load: the watcher sees the change.
-    let rewrite_b = || std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
-    served_eventually(&addr, rewrite_b, &["printk"], &[3]);
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+/// Each change is seen by the next query, with no wait: the server asks
+/// watchman before it answers.
+#[cfg(unix)]
+#[test]
+fn each_served_query_sees_the_changes_made_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), false);
+    let corpus = tmp.path().join("corpus");
+    std::fs::write(corpus.join("ab.c"), b"printk before\n").unwrap();
+    let Some(daemon) = watching(tmp.path(), &corpus) else {
+        return;
+    };
+    let (addr, server) = spawn_server(&index, &[]);
+    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [5, 5]);
+    std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [4], "an edit");
+    std::fs::create_dir_all(corpus.join("new/deep")).unwrap();
+    std::fs::write(corpus.join("new/deep/n.c"), b"printk after printk\n").unwrap();
+    std::fs::write(corpus.join("bin.dat"), b"printk\0").unwrap();
+    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [6, 6]);
+    let (_, listed) = client(&addr, &["-l", "--", "printk"]).unwrap();
+    assert_eq!(listed, "a.c\nab.c\nnew/deep/n.c\n");
+    std::fs::remove_file(corpus.join("ab.c")).unwrap();
     std::fs::remove_file(corpus.join("a.c")).unwrap();
-    served_eventually(&addr, || {}, &["printk", "/pr[i1]ntk/"], &[0, 0]);
+    assert_eq!(served_totals(&addr, &["printk"]), [2], "deletes");
+    std::fs::write(corpus.join("ab.c"), b"printk back\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [3], "back");
+    assert_eq!(daemon.sent().last().unwrap(), "query");
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }
@@ -466,7 +506,7 @@ fn serve_rescans_stale_files_per_request() {
 fn serve_no_watch_sees_a_change_only_when_read() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), false);
-    let (addr, server) = spawn_server(&index, &["--no-watch"]);
+    let (addr, server) = spawn_server(&index, FIXED);
     std::fs::write(tmp.path().join("corpus").join("b.c"), b"aaaa\n").unwrap();
     // Room for a watcher to act; a slow box only weakens the check.
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -481,38 +521,12 @@ fn serve_no_watch_sees_a_change_only_when_read() {
 }
 
 #[test]
-fn serve_finds_files_added_before_and_after_load() {
-    let tmp = tempfile::tempdir().unwrap();
-    let index = staged(tmp.path(), false);
-    let corpus = tmp.path().join("corpus");
-    std::fs::write(corpus.join("ab.c"), b"printk before\n").unwrap();
-    let (addr, server) = spawn_server(&index, &[]);
-    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [5, 5]);
-    let add = || {
-        std::fs::create_dir_all(corpus.join("new/deep")).unwrap();
-        std::fs::write(corpus.join("new/deep/n.c"), b"printk after printk\n").unwrap();
-        std::fs::write(corpus.join("bin.dat"), b"printk\0").unwrap();
-    };
-    served_eventually(&addr, add, &["printk", "/pr[i1]ntk/"], &[7, 7]);
-    let (_, listed) = client(&addr, &["-l", "--", "printk"]).unwrap();
-    assert_eq!(listed, "a.c\nab.c\nb.c\nnew/deep/n.c\n");
-    let remove = || {
-        let _ = std::fs::remove_file(corpus.join("ab.c"));
-    };
-    served_eventually(&addr, remove, &["printk"], &[6]);
-    let back = || std::fs::write(corpus.join("ab.c"), b"printk back\n").unwrap();
-    served_eventually(&addr, back, &["printk"], &[7]);
-    client(&addr, &["--shutdown"]).unwrap();
-    server.join().unwrap().unwrap();
-}
-
-#[test]
 fn serve_no_watch_finds_only_files_added_before_load() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), false);
     let corpus = tmp.path().join("corpus");
     std::fs::write(corpus.join("ab.c"), b"printk before\n").unwrap();
-    let (addr, server) = spawn_server(&index, &["--no-watch"]);
+    let (addr, server) = spawn_server(&index, FIXED);
     assert_eq!(served_totals(&addr, &["printk"]), [5]);
     std::fs::write(corpus.join("c.c"), b"printk after\n").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -653,7 +667,7 @@ fn serve_refuses_bad_expr_params() {
 fn server_expr_json_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), true);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let want = timeless(query_expr(&index, &[], AND_EXPR));
     let (_, json) = client(&addr, &["--json", "--expr-json", AND_EXPR]).unwrap();
     assert_eq!(
@@ -699,7 +713,7 @@ fn served_searches_honour_the_filter() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let tree = dotted_tree(tmp.path(), "all", &FILES, store_docs);
-        let (addr, server) = spawn_server(&tree.join(INDEX_DIR), &[]);
+        let (addr, server) = spawn_server(&tree.join(INDEX_DIR), FIXED);
         let sub = tree.join("sub").display().to_string();
         let b = tree.join("b.h").display().to_string();
         for (flags, terms) in [
@@ -747,7 +761,7 @@ fn a_path_needs_the_served_tree() {
     let tree = dotted_tree(tmp.path(), "all", &FILES, false);
     let index = tmp.path().join("docs");
     index_it(&tree, &index, true);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let sub = tree.join("sub").display().to_string();
     let err = client(&addr, &["--", "printk", &sub]).err().unwrap();
     assert_eq!(

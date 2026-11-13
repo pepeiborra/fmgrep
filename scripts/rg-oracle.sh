@@ -17,7 +17,12 @@
 # changed ignore file.
 #
 # --serve repeats every case through `--server` (lines `srv`): same stdout and
-# exit status, empty stderr.
+# exit status, empty stderr. The server asks a private watchman daemon (its
+# own socket, state and log under a temporary directory; never the user's
+# daemon), from $FMGREP_TEST_WATCHMAN or else `watchman` on PATH, before
+# each query, so it serves the stale pass without a restart. Without
+# watchman (FMGREP_TEST_WATCHMAN set empty, or none on PATH) it serves with
+# --no-watch and is started again after the stale edits, with a note.
 #
 # --corpus DIR indexes DIR instead and checks AND / OR pairs of GHC terms:
 # -l, -c and --count-matches against rg over the manifest's files, the
@@ -79,12 +84,43 @@ stop_server() {
     SERVER=""
     ADDR=""
 }
-trap 'stop_server; rm -rf "$WORK"' EXIT
+DAEMON=""
+stop_daemon() {
+    if [[ -n "$DAEMON" ]]; then
+        kill "$DAEMON" 2> /dev/null || true
+        wait "$DAEMON" 2> /dev/null || true
+    fi
+}
+trap 'stop_server; stop_daemon; rm -rf "$WORK"' EXIT
+# Records of the server's tokens stay in the work directory.
+export XDG_CACHE_HOME="$WORK/cache"
+# Flags of every server: none when it asks the private daemon.
+SERVE_FLAGS=(--no-watch)
+if [[ "$SERVE" == true ]]; then
+    WATCHMAN="${FMGREP_TEST_WATCHMAN-$(command -v watchman || true)}"
+    if [[ -n "$WATCHMAN" ]]; then
+        # min_acceptable_nice_value: watchman refuses to start at a raised
+        # nice value; root_files []: watch the tree itself.
+        mkdir -p "$WORK/w"
+        echo '{"min_acceptable_nice_value": 19, "root_files": []}' > "$WORK/w/config.json"
+        WATCHMAN_CONFIG_FILE="$WORK/w/config.json" "$WATCHMAN" --foreground \
+            --sockname="$WORK/w/sock" --statefile="$WORK/w/state" --logfile="$WORK/w/log" \
+            --pidfile="$WORK/w/pid" < /dev/null >> "$WORK/w/out" 2>&1 &
+        DAEMON=$!
+        for _ in $(seq 200); do
+            [[ -S "$WORK/w/sock" ]] && break
+            sleep 0.05
+        done
+        [[ -S "$WORK/w/sock" ]] || { echo "watchman did not start"; cat "$WORK/w/out"; exit 2; }
+        export WATCHMAN_SOCK="$WORK/w/sock"
+        SERVE_FLAGS=()
+    fi
+fi
 # `serve $1` in the background (`$2` in errors): pid into `$3`, address into `$4`.
 spawn_serve() {
     local ready="$WORK/ready.$3"
     : > "$ready"
-    "$BIN" serve "$1" > "$ready" 2>> "$WORK/serve.err" &
+    "$BIN" serve "$1" ${SERVE_FLAGS[@]+"${SERVE_FLAGS[@]}"} > "$ready" 2>> "$WORK/serve.err" &
     printf -v "$3" %s "$!"
     for _ in $(seq 300); do
         [[ -s "$ready" ]] && break
@@ -896,20 +932,6 @@ alone "cwd-ctx        " "--heading -n -C 1" "--heading -n -C 1" ""
 alone "cwd-only       " "--heading -n -o" "--heading -n -o"   ""
 }
 
-# Under --serve, wait until the server's watch agrees with a local search.
-await_watch() {
-    [[ -n "$ADDR" ]] || return 0
-    local deadline=$((SECONDS + 10))
-    until [[ "$( cd "$CORPUS" && "$BIN" --server "$ADDR" -c -- alpha)" == "$( cd "$CORPUS" && "$BIN" -c -- alpha 2> /dev/null)" ]]; do
-        if ((SECONDS >= deadline)); then
-            echo "note: the watch missed the edits in 10 s; restarting serve"
-            stop_server
-            start_server
-            return 0
-        fi
-        sleep 0.1
-    done
-}
 
 cases
 if [[ "$STORE_DOCS" == false ]]; then
@@ -938,9 +960,16 @@ if [[ "$STORE_DOCS" == false ]]; then
     printf 'ig/\nn.md\n' > "$CORPUS/.gitignore"
     printf 'alpha never seen\n' > "$CORPUS/ig/new.txt"
     RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
-    await_watch
+    # One query sees gone.txt added; the cases see it deleted.
+    if [[ -n "$ADDR" && -n "$DAEMON" ]]; then
+        ( cd "$CORPUS" && "$BIN" --server "$ADDR" -c -- alpha ) > /dev/null
+    fi
     rm -f "$CORPUS/gone.txt"
-    await_watch
+    if [[ -n "$ADDR" && -z "$DAEMON" ]]; then
+        echo "note: no watchman; serving the stale tree from a new --no-watch server"
+        stop_server
+        start_server
+    fi
     cases
 fi
 

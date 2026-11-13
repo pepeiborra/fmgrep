@@ -77,6 +77,11 @@ impl Loaded {
         self.watch.take()
     }
 
+    /// Before a served query, re-check what changed since the last one.
+    pub fn recheck(&self, manifest: &Manifest) {
+        self.docs.recheck(&manifest.files);
+    }
+
     /// Indexed files missing at load.
     pub fn gone(&self) -> usize {
         self.docs.gone()
@@ -102,7 +107,8 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout re-checks what watchman names, else
 /// stats every doc and discovers added files; under `watch` it watches the
-/// root from before both, and a watch that cannot start is an error.
+/// root from before both, and a watch that cannot start is an error, and
+/// [`Loaded::recheck`] asks watchman again.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
@@ -110,7 +116,7 @@ pub fn load(
     watch: bool,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
-    let docs = DocStore::open(index_dir, manifest, corpus_root)?;
+    let docs = DocStore::open(index_dir, manifest, corpus_root, watch)?;
     let watch = watch.then(|| docs.watch()).flatten().transpose();
     let watch = watch.map_err(|e| {
         format!(

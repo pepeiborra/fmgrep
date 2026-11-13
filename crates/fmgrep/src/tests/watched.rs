@@ -10,22 +10,22 @@ use super::*;
 /// baseline name.
 fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
-    let docs = crate::fetch::DocStore::open(index, &manifest, None).unwrap();
+    let docs = crate::fetch::DocStore::open(index, &manifest, None, false).unwrap();
     docs.replay(&manifest.files)
 }
 
 /// The warnings given on this thread since the last call.
-fn notes() -> Vec<String> {
+pub(super) fn notes() -> Vec<String> {
     NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()))
 }
 
-fn put(root: &Path, rel: &str, bytes: &[u8]) {
+pub(super) fn put(root: &Path, rel: &str, bytes: &[u8]) {
     std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
     std::fs::write(root.join(rel), bytes).unwrap();
 }
 
 /// The records in `<tmp>/cache`.
-fn records(tmp: &Path) -> Vec<PathBuf> {
+pub(super) fn records(tmp: &Path) -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir(tmp.join("cache")) else {
         return Vec::new();
     };
@@ -35,13 +35,13 @@ fn records(tmp: &Path) -> Vec<PathBuf> {
 }
 
 /// The one record in `<tmp>/cache`.
-fn record(tmp: &Path) -> serde_json::Value {
+pub(super) fn record(tmp: &Path) -> serde_json::Value {
     let all = records(tmp);
     assert_eq!(all.len(), 1, "{all:?}");
     serde_json::from_slice(&std::fs::read(&all[0]).unwrap()).unwrap()
 }
 
-fn clock(tmp: &Path) -> serde_json::Value {
+pub(super) fn clock(tmp: &Path) -> serde_json::Value {
     record(tmp)["token"]["clock"].clone()
 }
 
@@ -63,7 +63,7 @@ fn live(tmp: &Path, folder: &Path) -> Option<Daemon> {
 
 /// `files` under `<tmp>/corpus`, backdated, indexed at `<tmp>/idx` while
 /// [`live`] watches the tree, which the index only checks for.
-fn indexed(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
+pub(super) fn indexed(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
     let folder = tmp.join("corpus");
     for (rel, bytes) in files {
         put(&folder, rel, bytes);
@@ -87,15 +87,15 @@ fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Dae
 }
 
 /// What the first search after an index says.
-const ONCE: &str = "checked every file once (no record of an earlier search); later searches \
+pub(super) const ONCE: &str = "checked every file once (no record of an earlier search); later searches \
                     ask watchman";
 
-const AB: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("b.c", b"none\n")];
+pub(super) const AB: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("b.c", b"none\n")];
 
 /// The requests of a search that takes a token and has none to ask with.
-const TAKES: [&str; 4] = ["watch-list", "get-config", "clock", "clock"];
+pub(super) const TAKES: [&str; 4] = ["watch-list", "get-config", "clock", "clock"];
 
-fn cannot(why: &str) -> String {
+pub(super) fn cannot(why: &str) -> String {
     format!("watchman cannot say what changed ({why}); checked every file")
 }
 
@@ -915,11 +915,49 @@ fn watchman_skips_the_stat_pass() {
     stamps[0] ^= 1;
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
     let manifest = read_manifest(&output).unwrap();
-    let mut docs = crate::fetch::DocStore::open(&output, &manifest, None).unwrap();
+    let mut docs = crate::fetch::DocStore::open(&output, &manifest, None, false).unwrap();
     assert!(docs.replay(&manifest.files), "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");
     docs.stat_all(&manifest.files);
     docs.begin();
     assert_eq!(docs.stale(), [0], "the stat pass: the tampered stamp");
+}
+
+#[test]
+fn a_private_daemon_watches_logs_restarts_and_hangs() {
+    use serde_json::json;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::time::{Duration, Instant};
+    let Some(mut daemon) = Daemon::start() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::write(root.join("a.c"), b"a").unwrap();
+    daemon.watch(&root);
+    assert_eq!(daemon.roots(), [root.to_str().unwrap()]);
+    let clock = json!(["clock", root, {"sync_timeout": 10_000}]);
+    let first = daemon.call(&clock).unwrap()["clock"].clone();
+    assert_eq!(daemon.sent(), ["clock"]);
+    daemon.restart();
+    assert_eq!(daemon.roots(), [root.to_str().unwrap()], "watched again");
+    let again = daemon.call(&clock).unwrap()["clock"].clone();
+    assert_ne!(first, again, "another instance");
+    daemon.hang();
+    let start = Instant::now();
+    let mut conn = std::os::unix::net::UnixStream::connect(&daemon.sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let command = format!("{}\n", json!(["watch-list"]));
+    conn.write_all(command.as_bytes()).unwrap();
+    let mut line = String::new();
+    assert!(
+        BufReader::new(&conn).read_line(&mut line).is_err(),
+        "no reply while it hangs: {line}"
+    );
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    daemon.resume();
+    daemon.unwatch(&root);
+    assert!(daemon.roots().is_empty());
 }
