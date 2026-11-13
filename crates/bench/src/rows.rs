@@ -205,9 +205,11 @@ pub fn fmgrep(
 
     let start = Instant::now();
     let mut serve = Command::new(bin);
+    // A server of a fixed commit, as the supported remote server is.
     serve
         .arg("serve")
         .arg(&index)
+        .arg("--no-watch")
         .stdin(Stdio::null())
         .stdout(Stdio::piped());
     let mut server = Guard(serve.spawn().map_err(|e| format!("fmgrep serve: {e}"))?);

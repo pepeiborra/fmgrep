@@ -226,7 +226,7 @@ pub fn markdown(run: &Run, rows: &[Row], found: &Found) -> String {
     }
     let ran = |kinds: &[RowKind]| rows.iter().any(|r| kinds.contains(&r.name.kind));
     let served = if ran(&[RowKind::Fmgrep, RowKind::FmgrepStoreDocs]) {
-        ", or `fmgrep --server` against one `fmgrep serve`"
+        ", or `fmgrep --server` against one `fmgrep serve --no-watch`"
     } else {
         ""
     };
@@ -682,7 +682,7 @@ mod tests {
             ],
         );
         assert_eq!(md.matches("already running").count(), 1, "{md}");
-        assert!(!md.contains("against one `fmgrep serve`"), "{md}");
+        assert!(!md.contains("against one `fmgrep serve"), "{md}");
         let (_, served) = run_of(false, PIN);
         let mut fmgrep = served.into_iter().nth(1).unwrap();
         fmgrep.name = RowKind::Fmgrep.into();
@@ -690,7 +690,7 @@ mod tests {
         let md = markdown(&run, &rows, &found);
         assert_has(
             &md,
-            &["against one `fmgrep serve`, or `fmgrep --server` against the"],
+            &["against one `fmgrep serve --no-watch`, or `fmgrep --server` against the"],
         );
         let trace = trace(&run, &rows, &found);
         for name in ["fmgrep@a", "fmgrep@b"] {
