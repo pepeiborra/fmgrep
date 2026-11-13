@@ -84,6 +84,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             doc_lens: docs.lens,
             blob_lens,
             corpus_root: docs.root,
+            commit: None,
         };
         write_manifest(output, &manifest)?;
         Ok(manifest)

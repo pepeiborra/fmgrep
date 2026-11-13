@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
-pub const MANIFEST_FORMAT: u32 = 7;
+pub const MANIFEST_FORMAT: u32 = 8;
 
 pub const MANIFEST_JSON: &str = "manifest.json";
 
@@ -57,6 +57,20 @@ pub struct Manifest {
     /// Absolute UTF-8 path; present iff not `store_docs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_root: Option<String>,
+    /// The commit whose files the documents are, byte for byte; only a
+    /// `store_docs` index records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
+}
+
+/// A version-control commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Commit {
+    /// `git`.
+    pub vcs: String,
+    /// The full hex id.
+    pub id: String,
 }
 
 impl Manifest {
@@ -155,6 +169,12 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
             ));
         }
         (true, None) => {}
+    }
+    if manifest.commit.is_some() && !manifest.store_docs {
+        return Err(format!(
+            "error: {} reads documents from files but records a commit; refusing a tampered index",
+            manifest_path.display()
+        ));
     }
     if manifest.bom_bytes > manifest.num_bytes {
         return Err(format!(
@@ -262,6 +282,7 @@ mod tests {
             doc_lens: docs.iter().map(|d| d.len() as u64).collect(),
             blob_lens: blobs.iter().map(|b| b.len() as u64).collect(),
             corpus_root: None,
+            commit: None,
         }
     }
 
@@ -307,6 +328,7 @@ mod tests {
             doc_lens: vec![6, 4],
             blob_lens: vec![11],
             corpus_root: Some("/corpus".into()),
+            commit: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Manifest = serde_json::from_str(&json).unwrap();
@@ -334,7 +356,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
             at += pos + key.len();
         }
-        assert!(json.starts_with("{\"format\":7,"), "{json}");
+        assert!(json.starts_with("{\"format\":8,"), "{json}");
         for gone in ["engine", "index_name", "num_files_indexed"] {
             assert!(!json.contains(&format!("\"{gone}\"")), "{gone}: {json}");
         }
@@ -349,6 +371,32 @@ mod tests {
         };
         let json = serde_json::to_string(&stored).unwrap();
         assert!(json.ends_with("\"blob_lens\":[11]}"), "{json}");
+        let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d".to_owned();
+        let pinned = Manifest {
+            commit: Some(Commit {
+                vcs: "git".into(),
+                id: id.clone(),
+            }),
+            ..stored
+        };
+        let json = serde_json::to_string(&pinned).unwrap();
+        let tail = format!("\"blob_lens\":[11],\"commit\":{{\"vcs\":\"git\",\"id\":\"{id}\"}}}}");
+        assert!(json.ends_with(&tail), "{json}");
+        assert_eq!(serde_json::from_str::<Manifest>(&json).unwrap(), pinned);
+    }
+
+    #[test]
+    fn a_commit_needs_stored_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        stage(&dir, &[b"hello"], &[b"blob"]);
+        let commit = serde_json::json!({"vcs": "git", "id": "1a2b"});
+        retag(&dir, "commit", commit);
+        assert!(read_manifest(&dir).unwrap().commit.is_some());
+        retag(&dir, "store_docs", serde_json::json!(false));
+        retag(&dir, "corpus_root", serde_json::json!("/corpus"));
+        let err = read_manifest(&dir).unwrap_err();
+        assert!(err.contains("commit") && err.contains("tampered"), "{err}");
     }
 
     #[test]
@@ -356,7 +404,7 @@ mod tests {
         // Every other layout fails at the explicit format check — never a
         // missing-field error, never a silent rebuild.
         let tmp = tempfile::tempdir().unwrap();
-        for format in [1u32, 2, 3, 4, 5, 12] {
+        for format in [1u32, 2, 3, 4, 5, 7, 12] {
             let dir = tmp.path().join(format!("idx{format}"));
             stage(&dir, &[b"hello"], &[b"blob"]);
             retag(&dir, "format", serde_json::json!(format));

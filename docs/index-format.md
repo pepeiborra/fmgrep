@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 7): what each
+The on-disk layout `fmgrep index` writes (manifest format 8): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -32,7 +32,7 @@ are refused.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `7` |
+| `format` | u32 | `8` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | usize | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
@@ -45,16 +45,18 @@ are refused.
 | `doc_lens` | [u64] | byte length per document, parallel to `files` |
 | `blob_lens` | [u64] | byte length per blob, parallel to `blobs` |
 | `corpus_root` | string | absolute path of the tree; present iff not `store_docs` |
+| `commit` | `{vcs, id}` | the served commit: the commit whose files the documents are, byte for byte, as `{"vcs":"git","id":"<40 hex>"}`; only with `store_docs`, and absent when the index cannot vouch for one |
 
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
 
 A load refuses, with exit 2:
 
-- a `format` other than 7, naming the remedy: re-run `fmgrep index`. Old
+- a `format` other than 8, naming the remedy: re-run `fmgrep index`. Old
   indexes are refused, never upgraded;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
+- a `commit` without `store_docs`;
 - `bom_bytes > num_bytes`;
 - `files` / `doc_lens` or `blobs` / `blob_lens` of different lengths;
 - labels that do not partition `0..num_docs`, or a `blobs.shard` whose
