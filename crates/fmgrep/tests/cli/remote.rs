@@ -27,8 +27,32 @@ pub struct Remote {
 
 impl Remote {
     pub fn new(files: &[(&str, &str)]) -> Self {
+        Self::after(&[], files)
+    }
+
+    /// The served commit holds `files`, on top of a commit that holds
+    /// `first` (none when empty).
+    pub fn after(first: &[(&str, &str)], files: &[(&str, &str)]) -> Self {
         let s = Sandbox::new();
-        let origin = s.repo("origin", files);
+        let origin = match first {
+            [] => s.repo("origin", files),
+            first => {
+                let origin = s.repo("origin", first);
+                for entry in std::fs::read_dir(&origin).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name() != ".git" {
+                        let path = entry.path();
+                        match path.is_dir() {
+                            true => std::fs::remove_dir_all(path).unwrap(),
+                            false => std::fs::remove_file(path).unwrap(),
+                        }
+                    }
+                }
+                s.write(&origin, files);
+                s.commit(&origin, "served");
+                origin
+            }
+        };
         let commit = s.head(&origin);
         let (index, note) = s.index(&origin, "idx");
         assert!(note.contains(&commit), "{note}");

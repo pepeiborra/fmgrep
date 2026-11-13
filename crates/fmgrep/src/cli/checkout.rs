@@ -103,9 +103,7 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     }
     match head.as_deref() {
         Some("(initial)") | None => return Err("the checkout has no commit yet".to_owned()),
-        Some(h) if h != commit => {
-            return Err(format!("HEAD is not the served commit {}", short(commit)));
-        }
+        Some(h) if h != commit => skip.extend(committed(top, commit, h)?),
         Some(_) => {}
     }
     hidden(top)?;
@@ -125,6 +123,40 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     skip.sort_unstable();
     skip.dedup();
     Ok(skip)
+}
+
+/// The paths where commit `head` differs from the served commit `commit`,
+/// in either direction: `git diff-tree -r --raw --no-renames`. A
+/// submodule on either side refuses.
+fn committed(top: &Path, commit: &str, head: &str) -> Result<Vec<String>, String> {
+    let out = vcs::git(
+        top,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--raw",
+            "--no-renames",
+            commit,
+            head,
+        ],
+    )?;
+    let mut paths = Vec::new();
+    let mut records = vcs::records(&out);
+    // `:<mode> <mode> <oid> <oid> <status>`, then the path.
+    while let (Some(meta), Some(path)) = (records.next(), records.next()) {
+        let path = std::str::from_utf8(path).map_err(|_| "a changed path is not UTF-8")?;
+        let modes = String::from_utf8_lossy(meta);
+        if modes
+            .split(' ')
+            .take(2)
+            .any(|m| m.trim_start_matches(':') == "160000")
+        {
+            return Err(format!("the checkout holds a submodule ({path})"));
+        }
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
 }
 
 /// The reason of a checkout that differs in more than [`MAX_SKIP`] files.

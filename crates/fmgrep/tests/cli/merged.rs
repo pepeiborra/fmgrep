@@ -122,6 +122,134 @@ fn each_uncommitted_change_answers_as_a_local_index() {
     }
 }
 
+/// A checkout whose HEAD moved from the served commit: commits on top, a
+/// branch, a stash, a rebase, a merge conflict, HEAD behind the commit,
+/// a soft reset. The paths where the two commits differ are searched
+/// here too.
+#[test]
+fn a_checkout_whose_head_moved_answers_as_a_local_index() {
+    let first = [
+        (".gitignore", "*.log\n"),
+        ("a.c", "printk old a\n"),
+        ("old.c", "printk old\n"),
+        ("z.c", "zzz other\n"),
+    ];
+    let r = Remote::after(&first, &FILES);
+    let back = format!("{}~1", r.commit);
+    let cases: [(&str, Change); 9] = [
+        ("a commit on top", |r, c| {
+            r.s.write(c, &[("a.c", "none\n"), ("dir/n.c", "printk n\n")]);
+            r.s.commit(c, "top");
+        }),
+        ("commits on top", |r, c| {
+            r.s.write(c, &[("z.c", "printk z\n")]);
+            r.s.commit(c, "one");
+            std::fs::remove_file(c.join("e.c")).unwrap();
+            r.s.commit(c, "two");
+            r.s.write(c, &[("dir/b.c", "uncommitted\n")]);
+        }),
+        ("another branch", |r, c| {
+            r.s.git(c, &["checkout", "-q", "-b", "other"]);
+            r.s.write(c, &[("a.c", "printk other branch\n")]);
+            r.s.commit(c, "other");
+        }),
+        ("another branch and back", |r, c| {
+            r.s.git(c, &["checkout", "-q", "-b", "other"]);
+            r.s.write(c, &[("a.c", "printk other branch\n")]);
+            r.s.commit(c, "other");
+            r.s.git(c, &["checkout", "-q", "main"]);
+        }),
+        ("stash and pop", |r, c| {
+            r.s.write(c, &[("a.c", "printk stashed\n")]);
+            r.s.git(c, &["stash", "-q"]);
+            r.s.write(c, &[("z.c", "printk between\n")]);
+            r.s.git(c, &["stash", "pop", "-q"]);
+        }),
+        ("rebase", |r, c| {
+            r.s.git(c, &["checkout", "-q", "-b", "base"]);
+            r.s.write(c, &[("dir/sub/c.h", "printk rebased base\n")]);
+            r.s.commit(c, "base");
+            r.s.git(c, &["checkout", "-q", "main"]);
+            r.s.write(c, &[("a.c", "printk mine\n")]);
+            r.s.commit(c, "mine");
+            r.s.git(c, &["rebase", "-q", "base"]);
+        }),
+        ("a merge conflict", |r, c| {
+            r.s.git(c, &["checkout", "-q", "-b", "theirs"]);
+            r.s.write(c, &[("a.c", "printk theirs\n")]);
+            r.s.commit(c, "theirs");
+            r.s.git(c, &["checkout", "-q", "main"]);
+            r.s.write(c, &[("a.c", "printk ours\n")]);
+            r.s.commit(c, "ours");
+            let merged = r.s.git_output(c, &["merge", "-q", "theirs"]);
+            assert!(!merged.status.success(), "a conflict");
+        }),
+        ("HEAD behind", |r, c| {
+            let back = format!("{}~1", r.commit);
+            r.s.git(c, &["checkout", "-q", &back]);
+        }),
+        ("a soft reset", |r, c| {
+            let back = format!("{}~1", r.commit);
+            r.s.git(c, &["reset", "-q", "--soft", &back]);
+        }),
+    ];
+    let _ = back;
+    for (name, change) in cases {
+        reset(&r);
+        r.s.git(&r.client, &["checkout", "-q", "-f", "main"]);
+        for branch in ["other", "base", "theirs"] {
+            let _ = r.s.git_output(&r.client, &["branch", "-q", "-D", branch]);
+        }
+        reset(&r);
+        change(&r, &r.client);
+        for args in [
+            &["printk"][..],
+            &["-l", "printk", "dir"],
+            &["--json", "--matches", "printk"],
+        ] {
+            r.same("", args);
+        }
+        let _ = name;
+    }
+}
+
+/// A partial clone (`--filter=blob:none`) of a later commit lacks the
+/// served commit's blobs: the search answers as a local index of the
+/// checkout, and no git that it runs fetches (git's trace2 log of every
+/// git run holds no fetch).
+#[test]
+fn a_partial_clone_answers_and_fetches_nothing() {
+    let mut r = Remote::new(&FILES);
+    r.s.git(&r.origin, &["config", "uploadpack.allowFilter", "true"]);
+    r.s.write(
+        &r.origin,
+        &[("a.c", "printk a2\n"), ("dir/n.c", "printk n\n")],
+    );
+    r.s.commit(&r.origin, "second");
+    let url = format!("file://{}", r.origin.display());
+    let clone = ["clone", "-q", "--filter=blob:none", &url, "partial"];
+    r.s.git(r.s.tmp.path(), &clone);
+    r.client = std::fs::canonicalize(r.s.path("partial")).unwrap();
+    let missing = r.s.git(
+        &r.client,
+        &["rev-list", "--objects", "--missing=print", "--all"],
+    );
+    assert!(missing.lines().any(|l| l.starts_with('?')), "{missing}");
+    r.s.write(&r.client, &[("e.c", "printk e edited\n")]);
+    let log = r.s.path("trace2.json");
+    let config = format!("[trace2]\n\teventTarget = {}\n", log.display());
+    std::fs::write(r.s.global_config(), config).unwrap();
+    for args in [&["printk"][..], &["-l", "printk", "dir"]] {
+        r.same("", args);
+    }
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains(r#""status""#),
+        "the log holds the client's git runs"
+    );
+    assert!(!log.contains(r#""fetch""#), "{log}");
+}
+
 /// One change set that interleaves the client's files with the server's,
 /// in every output mode.
 #[test]
@@ -202,15 +330,7 @@ type Unsound = (Change, &'static str);
 fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     let r = Remote::new(&FILES);
     let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
-    let cases: [Unsound; 10] = [
-        (
-            |r, c| {
-                r.s.write(c, &[("a.c", "printk top\n")]);
-                r.s.commit(c, "top");
-                r.s.write(c, &[("a.c", "none\n")]);
-            },
-            "HEAD is not the served commit {short}",
-        ),
+    let cases: [Unsound; 9] = [
         (
             |r, c| {
                 r.s.git(c, &["update-index", "--assume-unchanged", "z.c"]);
@@ -287,8 +407,7 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
         let out = r.search(&r.client, &["-l", "printk"]);
         let why = why
             .replace("{tmp}", &tmp.display().to_string())
-            .replace("{client}", &r.client.display().to_string())
-            .replace("{short}", &r.commit[..7]);
+            .replace("{client}", &r.client.display().to_string());
         assert_eq!(stderr(&out), crate::remote::ignored(&why));
         assert_eq!(stdout(&out), served, "{why}");
     }
