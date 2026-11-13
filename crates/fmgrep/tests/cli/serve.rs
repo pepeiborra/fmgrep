@@ -413,7 +413,12 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
     let index = do_index(&docs, false).display().to_string();
     let away = tmp.path().join("away");
     std::fs::create_dir(&away).unwrap();
-    for argv in [&["--help"][..], &["--version"], &["serve", "--help"]] {
+    for argv in [
+        &["--help"][..],
+        &["--version"],
+        &["serve", "--help"],
+        &["status", "--help"],
+    ] {
         let out = run_bad(&away, argv);
         assert_eq!(out.status.code(), Some(0), "{argv:?}: {}", stderr(&out));
     }
@@ -446,6 +451,20 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
         (hits.into(), "".into())
     );
 
+    // `status` reads the local index and never the variable.
+    let local = run_in(&docs, &["status", "--json"]);
+    assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
+    let out = run_bad(&docs, &["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
+    let out = run_bad(&away, &["status"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("no .fmgrep index"),
+        "{}",
+        stderr(&out)
+    );
+
     // A search or `--status` that would reach the server fails.
     for argv in [&words[..], &["--status"]] {
         let out = run_bad(&away, argv);
@@ -456,6 +475,56 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
             "error: FMGREP_SERVER=\"\\xFF\\xFE\" is not UTF-8\n"
         );
     }
+}
+
+/// `fmgrep status` reports on the local index whatever `FMGREP_SERVER`
+/// holds; `fmgrep --status` reports on the server; `fmgrep -- status`
+/// searches for the word.
+#[test]
+fn status_reads_the_local_index_and_dash_dash_status_the_server() {
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let addr = server.addr();
+    std::fs::write(docs.join("s.txt"), b"status\n").unwrap();
+    ok(&["index", &docs.display().to_string()]);
+    let away = tmp.path().join("away");
+    std::fs::create_dir(&away).unwrap();
+
+    let local = run_in(&docs, &["status", "--json"]);
+    assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
+    let m: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
+    assert_eq!(m["num_docs"], DOCS.len() + 1);
+    for value in [addr.as_str(), "not an address", ""] {
+        let out = run_env(&docs, value, &["status", "--json"]);
+        assert_eq!(out.status.code(), Some(0), "{value}: {}", stderr(&out));
+        assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
+        let out = run_env(&away, value, &["status"]);
+        assert_eq!(out.status.code(), Some(2), "{value}");
+        assert!(out.stdout.is_empty(), "{value}");
+        assert!(
+            stderr(&out).contains("no .fmgrep index"),
+            "{}",
+            stderr(&out)
+        );
+    }
+
+    // `--status` asks the server, which serves the index without s.txt.
+    let out = run_env(&docs, &addr, &["--status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let served: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(served["files"], DOCS.len());
+
+    // `-- status` is a search: through the server from away, of the local
+    // index (with the warning) under docs.
+    let out = run_env(&away, &addr, &["-l", "--", "status"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!((out.stdout.len(), stderr(&out)), (0, "".into()));
+    let out = run_env(&docs, &addr, &["-l", "--", "status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "s.txt\n");
+    assert!(stderr(&out).starts_with("warning: Using local index"));
+    shutdown(&mut server, &addr);
 }
 
 /// `--server` that cannot be reached: an index found by walking up answers,
