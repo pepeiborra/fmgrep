@@ -3,7 +3,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -126,7 +125,7 @@ pub struct ServeRequest<'a> {
     pub corpus_root: Option<&'a Path>,
     /// None: requests on the input, responses on the output.
     pub listen: Option<SocketAddr>,
-    /// Watch a files-layout index's root for changes.
+    /// Ask watchman what changed before each query, for a files layout.
     pub watch: bool,
 }
 
@@ -425,21 +424,10 @@ pub fn run_serve(
             Some(listener)
         }
     };
-    let watch = session.docs.take_watch();
-    let stop = AtomicBool::new(false);
-    // Plain threads: they live as long as the session.
-    std::thread::scope(|scope| {
-        let (stop, files, lens) = (&stop, &req.manifest.files, &req.manifest.doc_lens);
-        if let Some(watch) = watch {
-            scope.spawn(move || watch.run(files, lens, stop));
-        }
-        let served = match listener {
-            None => serve_lines(&mut session, input, out).map(|_| ()),
-            Some(listener) => serve_tcp(&mut session, listener),
-        };
-        stop.store(true, Ordering::Relaxed);
-        served
-    })
+    match listener {
+        None => serve_lines(&mut session, input, out).map(|_| ()),
+        Some(listener) => serve_tcp(&mut session, listener),
+    }
 }
 
 /// `--status` (printed) or `--shutdown`.

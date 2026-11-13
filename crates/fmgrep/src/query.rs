@@ -16,7 +16,6 @@ use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::DocfmIndex;
 use crate::sink::{DocMatches, MatchSink};
-use crate::source::Watch;
 use crate::wire::{OutputReport, QueryReport};
 
 /// What a search answers. The manifest is read once by the dispatcher and
@@ -46,7 +45,6 @@ mod read;
 pub struct Loaded {
     docs: DocStore,
     pub load_wall: Duration,
-    watch: Option<Watch>,
     band: boolean::ReadBand,
     locate_us: f64,
 }
@@ -70,11 +68,6 @@ impl Loaded {
                 start.elapsed().as_micros()
             );
         }
-    }
-
-    /// The watch [`load`] started, if asked to.
-    pub fn take_watch(&mut self) -> Option<Watch> {
-        self.watch.take()
     }
 
     /// Before a served query, re-check what changed since the last one.
@@ -106,24 +99,16 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout re-checks what watchman names, else
-/// stats every doc and discovers added files; under `watch` it watches the
-/// root from before both, and a watch that cannot start is an error, and
+/// stats every doc and discovers added files; under `each_query`,
 /// [`Loaded::recheck`] asks watchman again.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
     corpus_root: Option<&Path>,
-    watch: bool,
+    each_query: bool,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
-    let docs = DocStore::open(index_dir, manifest, corpus_root, watch)?;
-    let watch = watch.then(|| docs.watch()).flatten().transpose();
-    let watch = watch.map_err(|e| {
-        format!(
-            "error: {e}; without a watch, answers would miss later changes \
-             (pass --no-watch to serve a tree that does not change)"
-        )
-    })?;
+    let docs = DocStore::open(index_dir, manifest, corpus_root, each_query)?;
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
     let (files, docs_ref) = (&manifest.files, &docs);
     #[cfg(test)]
@@ -147,7 +132,6 @@ pub fn load(
     let loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
-        watch,
         band: boolean::ReadBand::DEFAULT,
         locate_us: read::locate_us(None),
     };

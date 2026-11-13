@@ -8,7 +8,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
 
 use rayon::prelude::*;
 
@@ -17,7 +16,6 @@ use crate::Stamp;
 mod added;
 mod journal;
 mod recorded;
-mod watcher;
 
 pub use journal::{Index, request_watch};
 pub use recorded::{Recorded, write_walk};
@@ -122,8 +120,6 @@ const WARNED: u8 = 4;
 /// Docs above this are statted on several threads.
 const PARALLEL_STAT_MIN: usize = 64;
 const STAT_THREADS: usize = 16;
-/// How often an idle watcher checks its stop flag.
-const WATCH_TICK: Duration = Duration::from_millis(50);
 
 /// What stats and reads learned about each doc.
 struct Known {
@@ -803,104 +799,6 @@ impl Files {
             }
         }
     }
-
-    /// Watch the root, recursively; events queue until [`Watch::run`].
-    pub fn watch(&self) -> Result<Watch, String> {
-        let failed =
-            |e: &dyn std::fmt::Display| format!("cannot watch {}: {e}", self.known.root.display());
-        #[cfg(test)]
-        if let Some(cause) = crate::tests::WATCH_FAILS.get() {
-            return Err(failed(&cause));
-        }
-        let root = self.known.root.canonicalize().map_err(|e| failed(&e))?;
-        let feed = watcher::Feed::new(&root).map_err(|e| failed(&e))?;
-        Ok(Watch {
-            known: Arc::clone(&self.known),
-            root,
-            feed,
-        })
-    }
-}
-
-/// Filesystem events on the corpus root, re-checking the paths they name.
-pub struct Watch {
-    known: Arc<Known>,
-    /// Canonical, as events name paths.
-    root: PathBuf,
-    feed: watcher::Feed,
-}
-
-impl Watch {
-    /// Re-stat and re-check for added files what each burst names, and walk
-    /// again the dir of each ignore file it names, until `stop`; lost events
-    /// or a root event redo all.
-    pub fn run(mut self, files: &[String], lens: &[u64], stop: &AtomicBool) {
-        let mut by_path: Vec<usize> = (0..files.len()).collect();
-        by_path.sort_by(|&a, &b| files[a].cmp(&files[b]));
-        while !stop.load(Ordering::Relaxed) {
-            let burst = match self.feed.next(WATCH_TICK) {
-                watcher::Next::Idle => continue,
-                watcher::Next::Closed => return,
-                watcher::Next::Burst(burst) => burst,
-            };
-            let mut all = burst.rescan;
-            let mut ids = Vec::new();
-            let mut named = Vec::new();
-            for path in burst.paths {
-                all |= docs_at(&self.root, &path, files, &by_path, &mut ids);
-                named.push(path);
-            }
-            self.known.reload_rules();
-            if all {
-                self.known.stat_all(files, lens, false);
-                self.known.discover(&self.root, &self.root, files, lens);
-            } else {
-                ids.sort_unstable();
-                ids.dedup();
-                self.known.stat_ids(&ids, files, lens, false);
-                named.sort_unstable();
-                named.dedup();
-                let mut scopes = Vec::new();
-                for path in &named {
-                    let rel = path.strip_prefix(&self.root).ok().and_then(Path::to_str);
-                    match rel.and_then(crate::walk::ignore_file_dir) {
-                        Some(dir) => scopes.push(dir.to_owned()),
-                        None => self.known.reconcile_path(&self.root, path, files, lens),
-                    }
-                }
-                self.known.discover_scopes(scopes, files, lens);
-            }
-        }
-    }
-}
-
-/// Push the docs at or under `path`, via `by_path` (`files` ids by path);
-/// true when `path` holds `root`.
-fn docs_at(
-    root: &Path,
-    path: &Path,
-    files: &[String],
-    by_path: &[usize],
-    ids: &mut Vec<usize>,
-) -> bool {
-    if root.starts_with(path) {
-        return true;
-    }
-    let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
-        return false;
-    };
-    let at = by_path.partition_point(|&id| files[id].as_str() < rel);
-    if by_path.get(at).is_some_and(|&id| files[id] == rel) {
-        ids.push(by_path[at]);
-    }
-    let dir = format!("{rel}/");
-    let lo = by_path.partition_point(|&id| files[id].as_str() < dir.as_str());
-    ids.extend(
-        by_path[lo..]
-            .iter()
-            .take_while(|&&id| files[id].starts_with(&dir)),
-    );
-    false
 }
 
 #[cfg(test)]
@@ -1256,71 +1154,5 @@ mod tests {
         assert_eq!(unrecorded(r, "new/sub/n.c"), "new");
         assert_eq!(unrecorded(r, "old/new/n.c"), "old/new");
         assert_eq!(unrecorded(None, "new/sub/n.c"), "new/sub/n.c");
-    }
-
-    /// Wait up to 60 s for `done`: a loaded box can hold events that long.
-    pub(super) fn eventually(done: impl Fn() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while std::time::Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        done()
-    }
-
-    /// Stops the watcher when dropped, so a failed assertion inside the
-    /// scope fails instead of joining the watcher forever.
-    pub(super) struct StopOnDrop<'a>(pub(super) &'a AtomicBool);
-
-    impl Drop for StopOnDrop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-
-    #[test]
-    fn watch_restats_what_events_name_and_returns_on_stop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
-        std::fs::create_dir(fix.path.join("sub")).unwrap();
-        let files = open_files(&fix);
-        let watch = files.watch().unwrap();
-        files.stat_all(&fix.files, &fix.lens);
-        let stop = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-            let _stop = StopOnDrop(&stop);
-            let saw = || format!("kinds {:?}, snapshot {:?}", files.kinds(), files.snapshot());
-            // FSEvents can miss changes made just after the watch starts, so
-            // the write repeats until one is seen.
-            let changed = || {
-                std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
-                files.snapshot().stale == [1]
-            };
-            assert!(eventually(changed), "{}", saw());
-            std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
-            assert!(eventually(|| files.snapshot().gone == [2]), "{}", saw());
-        });
-    }
-
-    #[test]
-    fn watch_maps_a_directory_event_to_the_docs_under_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fix = stage_files(tmp.path(), &[b"a"]);
-        let files = open_files(&fix);
-        let watch = files.watch().unwrap();
-        let names: Vec<String> = ["a/b", "a/b/c.c", "a/b/d.c", "a/bc.c", "z.c"]
-            .map(String::from)
-            .to_vec();
-        let by_path: Vec<usize> = (0..names.len()).collect();
-        let mut ids = Vec::new();
-        let root = &watch.root;
-        let mut at = |path: &Path| docs_at(root, path, &names, &by_path, &mut ids);
-        assert!(!at(&root.join("a/b")));
-        assert!(at(root));
-        assert!(!at(Path::new("/elsewhere/a/b")));
-        assert_eq!(ids, [0, 1, 2]);
     }
 }

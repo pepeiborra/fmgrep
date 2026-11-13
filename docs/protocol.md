@@ -21,10 +21,11 @@ response line each, after any [frames](#streamed-output).
 - `--stdio`: requests on stdin, responses on stdout, ending at EOF.
 - A load that fails (no index, an old format, a damaged index) exits 2
   before the readiness line, with the message a search would print.
-- `serve` watches the tree for changed and added files unless `--no-watch`
-  is given ([Staleness](index-format.md#staleness)). A watch that cannot
-  start (on Linux, out of inotify watches) exits 2 before the readiness
-  line.
+- Before each query, `serve` asks watchman what changed in the tree since
+  the query before, unless `--no-watch` is given
+  ([Watchman](index-format.md#watchman)). When watchman cannot answer, that
+  query checks every file, and the server says why on its stderr; the
+  response does not.
 - `serve` needs its documents: `docs.shard`, or the tree with
   `docs.stamps` and at most half the indexed files. Otherwise it exits 2
   before the readiness line.

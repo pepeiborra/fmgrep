@@ -1,10 +1,11 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
 use super::super::tests::Fix;
-use super::super::tests::{StopOnDrop, eventually, open_files, stage_files};
+use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
@@ -61,117 +62,6 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
         files.read_added(fix.files.len() + 1).as_deref(),
         Some(&b"printk"[..])
     );
-}
-
-#[test]
-fn watch_registers_created_renamed_and_new_dir_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fix = stage_files(tmp.path(), &[b"printk"]);
-    let root = fix.path.clone();
-    let files = open_files(&fix);
-    let watch = files.watch().unwrap();
-    files.discover(&fix.files, &fix.lens);
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-        let _stop = StopOnDrop(&stop);
-        // FSEvents can miss changes made just after the watch starts.
-        let created = || {
-            write(&root, "x.c", b"printk");
-            live(&files) == ["x.c"]
-        };
-        assert!(eventually(created), "{:?}", live(&files));
-        std::fs::rename(root.join("x.c"), root.join("y.c")).unwrap();
-        assert!(eventually(|| live(&files) == ["y.c"]), "{:?}", live(&files));
-        write(&root, "nd/sub/z.c", b"printk");
-        write(&root, "nd/bin.dat", b"\0");
-        let want = ["y.c", "nd/sub/z.c"];
-        assert!(eventually(|| live(&files) == want), "{:?}", live(&files));
-        std::fs::remove_dir_all(root.join("nd")).unwrap();
-        assert!(eventually(|| live(&files) == ["y.c"]), "{:?}", live(&files));
-    });
-}
-
-#[test]
-fn watch_follows_an_ignore_file_edit_and_its_revert() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
-    let root = fix.path.clone();
-    let files = open_files(&fix);
-    let watch = files.watch().unwrap();
-    files.stat_all(&fix.files, &fix.lens);
-    files.discover(&fix.files, &fix.lens);
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-        let _stop = StopOnDrop(&stop);
-        let ignored = || {
-            write(&root, ".ignore", b"d0001.c\n");
-            files.snapshot().gone == [1]
-        };
-        assert!(eventually(ignored), "{:?}", files.snapshot());
-        assert_eq!(files.known.kind(1), IGNORED);
-        assert_eq!(files.known.state[1].load(Ordering::Acquire) & WARNED, 0);
-        std::fs::remove_file(root.join(".ignore")).unwrap();
-        assert!(
-            eventually(|| files.snapshot().gone.is_empty()),
-            "{:?}",
-            files.snapshot()
-        );
-        assert!(!files.changed(), "statted again: fresh");
-    });
-}
-
-#[test]
-fn watch_never_adds_an_ignored_file_or_dir() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fix = stage_files(tmp.path(), &[b"printk"]);
-    let root = fix.path.clone();
-    write(&root, ".ignore", b"*.gen\nig/\n");
-    let files = open_files(&fix);
-    let watch = files.watch().unwrap();
-    files.discover(&fix.files, &fix.lens);
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-        let _stop = StopOnDrop(&stop);
-        let created = || {
-            write(&root, "x.gen", b"printk");
-            write(&root, "ig/deep/y.c", b"printk");
-            write(&root, ".hid.c", b"printk");
-            write(&root, "z.c", b"printk");
-            live(&files) == ["z.c"]
-        };
-        assert!(eventually(created), "{:?}", live(&files));
-    });
-}
-
-#[test]
-fn watch_drops_a_deleted_added_file_and_readds_it_when_recreated() {
-    let tmp = tempfile::tempdir().unwrap();
-    let fix = stage_files(tmp.path(), &[b"printk"]);
-    let root = fix.path.clone();
-    write(&root, "x.c", b"printk");
-    let files = open_files(&fix);
-    let watch = files.watch().unwrap();
-    files.discover(&fix.files, &fix.lens);
-    let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| watch.run(&fix.files, &fix.lens, &stop));
-        let _stop = StopOnDrop(&stop);
-        assert_eq!(files.snapshot().added, [1]);
-        let deleted = || {
-            let _ = std::fs::remove_file(root.join("x.c"));
-            files.snapshot().added.is_empty()
-        };
-        assert!(eventually(deleted), "{:?}", live(&files));
-        write(&root, "x.c", b"printk again");
-        assert!(
-            eventually(|| files.snapshot().added == [1]),
-            "the slot is kept: {:?}",
-            files.snapshot()
-        );
-    });
 }
 
 #[test]
@@ -319,8 +209,13 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     std::fs::write(&k, b"printk now text").unwrap();
     let files = discovered(&fix, &fix.files, false);
     assert!(live(&files).is_empty(), "its unchanged dir is not listed");
-    files.known.reconcile_path(root, &k, &fix.files, &fix.lens);
-    assert_eq!(live(&files), ["kb/k.bin"], "named by the watcher");
+    let recorded = files.known.recorded.clone().unwrap();
+    let named = ["kb/k.bin".to_owned()];
+    assert_eq!(
+        files.known.replay(&recorded, &named, &fix.files, &fix.lens),
+        Ok(1)
+    );
+    assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");
     set_mtime(&root.join("kb"), T0 + Duration::from_secs(1));
     assert_eq!(
         live(&discovered(&fix, &fix.files, false)),

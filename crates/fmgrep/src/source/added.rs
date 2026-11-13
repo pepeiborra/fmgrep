@@ -1,5 +1,6 @@
 //! Files under the root that the manifest does not list: registered by
-//! discovery and the watcher, and scanned in full like stale docs.
+//! discovery and by what watchman reports, and scanned in full like stale
+//! docs.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -223,35 +224,6 @@ impl Known {
             .as_deref()
             .and_then(|x| x.strip_prefix(root).ok())
             .is_some_and(|x| Path::new(rel).starts_with(x))
-    }
-
-    /// Reconcile what is at `path` now: a text file not in ascending `files`
-    /// is added, a directory is walked, anything else is dropped; what the
-    /// walk's rule skips is left alone.
-    pub fn reconcile_path(&self, root: &Path, path: &Path, files: &[String], lens: &[u64]) {
-        let Some(rel) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
-            return;
-        };
-        if rel.is_empty() || self.excluded(root, rel) {
-            return;
-        }
-        let meta = std::fs::symlink_metadata(path).ok();
-        let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-        if !is_dir && files.binary_search_by(|f| f.as_str().cmp(rel)).is_ok()
-            || self.ignored(rel, is_dir)
-        {
-            return;
-        }
-        if is_dir {
-            return self.discover(root, path, files, lens);
-        }
-        let text = meta.is_some_and(|m| m.is_file()) && sniff_text(path);
-        let found = if text {
-            vec![rel.to_owned()]
-        } else {
-            Vec::new()
-        };
-        self.reconcile(rel, &found);
     }
 
     pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {

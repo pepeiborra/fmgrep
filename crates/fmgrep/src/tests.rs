@@ -53,8 +53,6 @@ thread_local! {
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
-    /// The cause a watch started on this thread fails with.
-    pub static WATCH_FAILS: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
 /// This thread's watchman hooks, for a thread a load spawns.
