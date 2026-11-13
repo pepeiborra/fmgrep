@@ -233,13 +233,17 @@ server keeps its last token, or at its start the record's token, since
 the stat pass runs after it was taken. A daemon gone from its socket, a
 restart or a removed watch makes the server take a new token.
 
-The ask costs each served query 1.2 to 1.4 ms on Linux (measured on
-linux, chromium and aosp), plus the re-check of what watchman reports:
-3.1 to 3.4 ms on aosp when it reports nothing. On macOS each of its three
-synced calls (two clocks and the question) waits for FSEvents, and the
-ask takes about 40 ms (35 to 41 ms on a tree of 60,000 files); a loaded
-Mac can pass the 100 ms limit, and that query checks every file. Serve a
-tree that does not change with `--no-watch`, which asks watchman nothing.
+On Linux the ask makes each served query 1.1 to 3.2 ms slower (p50,
+measured on trees of 161 to 1.25 M files): a query that took 0.4 ms takes
+2.1 ms. On linux, chromium and aosp the question to watchman takes 1.1 to
+1.2 ms, and the re-check of what it reports 0.4 to 1.5 ms. In a git
+checkout watchman reports `.git` at every query, because its sync cookie
+changes that directory's mtime, so every query re-checks it. On macOS
+each of its three synced calls (two clocks and the question) waits for
+FSEvents, and the ask takes about 38 ms (35 to 41 ms on a tree of 60,000
+files); a loaded Mac can pass the 100 ms limit, and that query checks
+every file. Serve a tree that does not change with `--no-watch`, which
+asks watchman nothing.
 
 When watchman cannot answer, the search checks every file and prints one
 line on stderr per process that says why and what to do; stdout does not

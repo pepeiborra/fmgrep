@@ -44,9 +44,10 @@ answers. `fmgrep serve` needs it, unless given `--no-watch` or a
   files a search never contacts watchman: checking every file is faster.
   `fmgrep serve` checks before every query, not once, so it asks watchman
   at any tree size, unless given `--no-watch`: it starts the daemon and
-  asks it to watch even a small tree. On macOS that ask costs each served
-  query about 38 ms (on a tree of 60,000 files, where a query with
-  `--no-watch` took 0.17 ms), against 1.2 to 1.4 ms on Linux. Details:
+  asks it to watch even a small tree. On Linux that makes each served
+  query 1.1 to 3.2 ms slower: a query that took 0.4 ms takes 2.1 ms. On
+  macOS the ask costs each served query about 38 ms (on a tree of 60,000
+  files, where a query with `--no-watch` took 0.17 ms). Details:
   [docs/index-format.md](docs/index-format.md#watchman).
 * **Without watchman**, each search of such a tree checks every file
   itself and prints one warning line, `warning: watchman cannot say what
