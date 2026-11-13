@@ -1,0 +1,165 @@
+//! A search from a git checkout through a server of a `--store-docs`
+//! index of the served commit, on real repositories: the answer and the
+//! warnings.
+
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
+use crate::git::Sandbox;
+
+pub const FILES: [(&str, &str); 4] = [
+    ("a.c", "printk a\nother\n"),
+    ("dir/b.c", "printk b\n"),
+    ("dir/sub/c.h", "printk c\n"),
+    ("e.c", "printk e printk\n"),
+];
+
+/// A repository at the served commit, its `--store-docs` index served,
+/// and a clone of it: the client's checkout.
+pub struct Remote {
+    pub s: Sandbox,
+    pub origin: PathBuf,
+    pub commit: String,
+    pub _server: crate::Server,
+    pub addr: String,
+    pub client: PathBuf,
+}
+
+impl Remote {
+    pub fn new(files: &[(&str, &str)]) -> Self {
+        let s = Sandbox::new();
+        let origin = s.repo("origin", files);
+        let commit = s.head(&origin);
+        let (index, note) = s.index(&origin, "idx");
+        assert!(note.contains(&commit), "{note}");
+        let (server, addr) = s.serve(&index, &[]);
+        let client = s.path("client");
+        s.git(
+            s.tmp.path(),
+            &["clone", "-q", &origin.display().to_string(), "client"],
+        );
+        let client = std::fs::canonicalize(client).unwrap();
+        Self {
+            s,
+            origin,
+            commit,
+            _server: server,
+            addr,
+            client,
+        }
+    }
+
+    /// `args` through the server from `cwd`, with `FMGREP_SERVER`.
+    pub fn search(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.s
+            .fmgrep(cwd)
+            .env("FMGREP_SERVER", &self.addr)
+            .args(args)
+            .output()
+            .expect("spawn fmgrep")
+    }
+}
+
+pub fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+pub fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The one warning of a search whose local changes are ignored.
+pub fn ignored(why: &str) -> String {
+    format!("warning: local changes are ignored ({why}); these results are the server's alone\n")
+}
+
+/// Where the client cannot compare its checkout with the served commit,
+/// it prints the server's answer and one warning that says why.
+#[test]
+fn a_search_that_cannot_compare_its_checkout_warns_once() {
+    let r = Remote::new(&FILES);
+    let all = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+
+    // Outside any checkout.
+    let away = std::fs::canonicalize(r.s.path("home")).unwrap();
+    let out = r.search(&away, &["-l", "printk"]);
+    assert_eq!(stdout(&out), all);
+    let why = format!("{} is in no git checkout", away.display());
+    assert_eq!(stderr(&out), ignored(&why));
+
+    // Another repository, which lacks the served commit.
+    let other = r.s.repo("other", &[("x.c", "printk x\n")]);
+    let out = r.search(&other, &["-l", "printk"]);
+    assert_eq!(stdout(&out), all);
+    let short = &r.commit[..7];
+    let why = format!(
+        "this checkout does not have the served commit {short} (run git fetch origin {}, or \
+         this is another repository)",
+        r.commit
+    );
+    assert_eq!(stderr(&out), ignored(&why));
+
+    // A shallow clone of a later commit, which lacks it too.
+    r.s.write(&r.origin, &[("a.c", "printk a2\n")]);
+    r.s.commit(&r.origin, "second");
+    let url = format!("file://{}", r.origin.display());
+    r.s.git(
+        r.s.tmp.path(),
+        &["clone", "-q", "--depth", "1", &url, "shallow"],
+    );
+    let shallow = std::fs::canonicalize(r.s.path("shallow")).unwrap();
+    let out = r.search(&shallow, &["-l", "printk"]);
+    assert_eq!(stderr(&out), ignored(&why));
+
+    // No git to ask.
+    let out =
+        r.s.fmgrep(&r.client)
+            .env("FMGREP_SERVER", &r.addr)
+            .env("PATH", r.s.path("home"))
+            .args(["-l", "printk"])
+            .output()
+            .unwrap();
+    assert_eq!(stdout(&out), all);
+    assert!(
+        stderr(&out).starts_with("warning: local changes are ignored (cannot run git ("),
+        "{}",
+        stderr(&out)
+    );
+
+    // A clone that has the commit: nothing to say.
+    let out = r.search(&r.client, &["-l", "printk"]);
+    assert_eq!(
+        (stdout(&out), stderr(&out)),
+        (all.to_owned(), String::new())
+    );
+}
+
+/// A server that reports no served commit, searched from a checkout
+/// elsewhere: the warning; from its own tree or from no checkout: none.
+#[test]
+fn a_server_without_a_served_commit_warns_a_checkout_elsewhere() {
+    let s = Sandbox::new();
+    let origin = s.repo("origin", &FILES);
+    let output = s.path("idx").display().to_string();
+    assert!(
+        s.run(&origin, &["index", ".", "--output", &output])
+            .status
+            .success()
+    );
+    let (_server, addr) = s.serve(&s.path("idx"), &["--no-watch"]);
+    let client = s.repo("client", &FILES);
+    let search = |cwd: &Path| {
+        let out = s
+            .fmgrep(cwd)
+            .env("FMGREP_SERVER", &addr)
+            .args(["-l", "printk"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        stderr(&out)
+    };
+    let why = format!("the server at {addr} (FMGREP_SERVER) reports no served commit");
+    assert_eq!(search(&client), ignored(&why));
+    assert_eq!(search(&origin), "");
+    assert_eq!(search(&std::fs::canonicalize(s.path("home")).unwrap()), "");
+}

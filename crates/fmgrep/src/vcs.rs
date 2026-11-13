@@ -70,6 +70,17 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Whether `git -C dir <args>` succeeds, its output dropped; or why git
+/// cannot run.
+pub fn git_ok(dir: &Path, args: &[&str]) -> Result<bool, String> {
+    let status = command(dir, args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(spawn_failed)?;
+    Ok(status.success())
+}
+
 /// `out` as one line of UTF-8, its newline dropped.
 pub fn line(out: Vec<u8>) -> Result<String, String> {
     let text = String::from_utf8(out).map_err(|_| "git printed a path that is not UTF-8")?;

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 mod commit;
 mod git;
+mod remote;
 mod roundtrip;
 mod serve;
 /// The library tests' private watchman daemon.
@@ -23,7 +24,10 @@ fn fmgrep() -> Command {
             "XDG_CACHE_HOME",
             Path::new(env!("CARGO_TARGET_TMPDIR")).join("cache"),
         )
-        .env_remove("FMGREP_SERVER");
+        .env_remove("FMGREP_SERVER")
+        // Outside any git checkout, unless a test says where: a search
+        // through a server compares a checkout around its cwd.
+        .current_dir(std::env::temp_dir());
     cmd
 }
 

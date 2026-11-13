@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
+mod checkout;
 mod frames;
 mod locate;
 mod params;
@@ -224,6 +225,10 @@ fn client(
     };
     let status = serve::status_on(&mut conn)?;
     same_format(server, status.format)?;
+    let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
+    if let checkout::Plan::Degraded(why) = checkout::plan(server, &status, &cwd) {
+        checkout::degraded(&why);
+    }
     if !typed.is_empty() {
         let root = Path::new(&status.root);
         rebase(&mut p, typed, served_tree(root, status.store_docs))?;
