@@ -26,6 +26,9 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const QUERY_FAILED: i64 = -32000;
+/// A query pinned to another index format or served commit than this
+/// server's.
+pub const OTHER_INDEX: i64 = -32001;
 
 /// A rendering mode's result: the local stdout, as `text` when it is UTF-8
 /// and standard base64 `bytes` otherwise; neither when streamed.
@@ -147,7 +150,27 @@ struct Served<'m> {
 }
 
 impl Served<'_> {
+    /// Refuse a query pinned to another index format or served commit.
+    fn pinned(&self, p: &QueryParams) -> Result<(), RpcError> {
+        let ours = self.manifest.commit.as_ref().map(|c| c.id.as_str());
+        let format_ok = p.format.is_none_or(|f| f == self.manifest.format);
+        let commit_ok = p.commit.is_none() || p.commit.as_deref() == ours;
+        if format_ok && commit_ok {
+            return Ok(());
+        }
+        let format = self.manifest.format;
+        let message = match ours {
+            Some(id) => format!("this server serves commit {id} of index format {format}"),
+            None => format!("this server serves no commit, of index format {format}"),
+        };
+        Err(RpcError {
+            code: OTHER_INDEX,
+            message,
+        })
+    }
+
     fn query(&mut self, p: &mut QueryParams, out: &mut dyn Write) -> Result<Answer, RpcError> {
+        self.pinned(p)?;
         p.scope(super::served_tree(&self.root, self.manifest.store_docs));
         let req = p
             .request(self.index_dir, self.manifest, None)

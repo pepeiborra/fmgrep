@@ -65,6 +65,8 @@ response line each, after any [frames](#streamed-output).
 | `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 | `stream` | bool | false | send the output as [frames](#streamed-output) |
+| `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
+| `commit` | string | absent | the served commit (hex id) the client compared its checkout with; a server that serves another, or none, answers -32001 |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -180,6 +182,7 @@ Counting semantics:
 | -32601 | unknown method | `unknown method "nope"` |
 | -32602 | bad params | `` invalid params: missing field `terms` `` |
 | -32000 | the search failed | `` error: invalid regex pattern "(": regex parse error: ... `` |
+| -32001 | `format` or `commit` is not this server's | `this server serves commit 81b12d8... of index format 8` |
 
 The `id` is echoed, or null when the request has none that can be read.
 Serving continues after any error.
