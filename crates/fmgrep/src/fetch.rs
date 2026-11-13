@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{DOCS_SHARD, Manifest, shard_offsets};
-use crate::source::{Files, Index, Recorded, Stamps, Watch};
+use crate::source::{Files, Index, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -212,14 +212,6 @@ impl DocStore {
     pub fn checkpoint(&self, files: &[String]) {
         if let Source::Files(f) = &self.source {
             f.checkpoint(files);
-        }
-    }
-
-    /// `None` for a shard source.
-    pub fn watch(&self) -> Option<Result<Watch, String>> {
-        match &self.source {
-            Source::Shard { .. } => None,
-            Source::Files(f) => Some(f.watch()),
         }
     }
 

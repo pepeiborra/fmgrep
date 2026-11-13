@@ -1,6 +1,5 @@
 //! A server's re-check before each query, on one set of marks that lives
 //! across queries, against a private daemon; skipped without watchman.
-//! No file watcher runs here: watchman is the only source.
 
 use super::watched::{AB, TAKES, cannot, clock, indexed, notes, put, records};
 use super::*;

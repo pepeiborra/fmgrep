@@ -97,24 +97,23 @@ answer, a load stats every document against its `(size, mtime)` stamp
   those whose stamp moved, and walks new directories below them in full;
 - a file the walk skipped as non-text is sniffed again whenever its
   directory is listed: one rewritten in place as text is found once its
-  directory's stamp moves, or when watchman or `serve`'s watch names it;
+  directory's stamp moves, or when watchman reports it as changed;
 - when an ignore file in `ignores.stamps` changes, or one appears in a
   listed directory, the load walks the directory it governs in full (the
   root for those above it): an indexed file the rules now skip is excluded
   with no warning, and a file they now allow is added. This repeats at
-  every load until the next `index`. `serve`'s watch does the same when it
-  sees an ignore file change inside the tree. Such a load prints one line
-  on stderr per process, with the number of ignore files new, edited or
-  deleted since the index, for example `warning: 2 ignore files changed
-  since the index; each search reads their directories again (re-run
-  index to make searches fast again)`; a server that asks watchman
-  before each query says `each query` instead. Without `dirs.stamps`,
-  every load walks the whole tree, and prints no such line.
+  every load until the next `index`, and in a served query that watchman
+  tells of the change. Such a load prints one line on stderr per process,
+  with the number of ignore files new, edited or deleted since the index,
+  for example `warning: 2 ignore files changed since the index; each
+  search reads their directories again (re-run index to make searches
+  fast again)`; a server that asks watchman before each query says `each
+  query` instead. Without `dirs.stamps`, every load walks the whole tree,
+  and prints no such line.
 
-`serve` watches the tree, following new files and directories, and exits
-2 when the watch cannot start (on Linux, out of inotify watches: raise
-`fs.inotify.max_user_watches`). With `--no-watch` it misses files added
-after it is ready, and sees a changed file only when a query reads it.
+`serve` asks watchman before each query (see Watchman below). With
+`--no-watch` it misses files added after it is ready, and sees a changed
+file only when a query reads it.
 On a filesystem with 1-second mtimes, a same-size edit within that second
 goes unnoticed.
 The directory check relies on the filesystem updating a directory's mtime
@@ -128,7 +127,7 @@ asks watchman. `serve` asks it at any size, unless `--no-watch` is given.
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;
-`serve` neither stats nor watches the tree. Written with `--output`, it has
+`serve` neither stats the tree nor asks watchman. Written with `--output`, it has
 no tree: a PATH is refused and the cwd does not narrow the search.
 
 ## Watchman

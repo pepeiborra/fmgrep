@@ -97,7 +97,7 @@ pub struct ServeArgs {
     /// Requests on stdin, responses on stdout
     #[arg(long)]
     pub stdio: bool,
-    /// Do not watch the tree for changed or new files
+    /// Do not ask watchman what changed before each query
     #[arg(long)]
     pub no_watch: bool,
 }

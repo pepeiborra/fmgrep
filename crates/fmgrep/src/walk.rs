@@ -322,32 +322,6 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
     Ok((rels, notes))
 }
 
-/// Every dir at or under `top` that the index walk of `root` enters, plus each `.git/info` beside one.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn walk_dirs(root: &Path, top: &Path) -> Vec<PathBuf> {
-    let rel = relative_path(root, top);
-    if !rel.is_empty() && rules(root).matched(&rel, true).is_ignore() {
-        return Vec::new();
-    }
-    let found = Mutex::new(Vec::new());
-    builder(top).build_parallel().run(|| {
-        Box::new(|entry| {
-            if let Ok(entry) = entry
-                && is_dir(&entry)
-            {
-                let info = entry.path().join(".git/info");
-                let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
-                if info.is_dir() {
-                    found.push(info);
-                }
-                found.push(entry.into_path());
-            }
-            ignore::WalkState::Continue
-        })
-    });
-    found.into_inner().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// Paths relative to `root`, sorted, of every file under `under` the index
 /// walk lists before its text check. An unreadable directory is skipped.
 pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Vec<String> {
