@@ -254,12 +254,13 @@ query carries `commit`: the server's tree may be anywhere. The client
 then runs `git status` in the checkout, and `git diff-tree` between the
 commit and HEAD when HEAD moved: each path that differs from the commit
 (an untracked directory as `d/`, and for an ignore file that differs the
-whole directory it governs) goes on the query's `skip` list, the client
-searches those files itself as a local index of the checkout would hold
-them, and it prints its files between the server's in path order. Where
-the client cannot list the changes soundly (assume-unchanged or
-skip-worktree entries, a sparse checkout, a filter or line-ending
-conversion, a submodule, an ignore file that applies from outside the
+whole directory it governs; also each tracked file that the client's
+`info/exclude` or global excludes file ignores) goes on the query's
+`skip` list, the client searches those files itself as a local index of
+the checkout would hold them, and it prints its files between the
+server's in path order. Where the client cannot list the changes soundly
+(assume-unchanged or skip-worktree entries, a sparse checkout, a filter
+or line-ending conversion, a submodule, an ignore file above the
 checkout, more than 10,000 differing paths or files to search, as when a
 changed ignore file governs a large directory), it sends no skip list
 and warns that local changes are ignored, with the reason. When the

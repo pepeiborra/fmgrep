@@ -116,11 +116,14 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         .collect();
     skip.extend(governed);
     outer_ignores(top)?;
+    // Tracked files that the client's own excludes ignore are left out of
+    // its part when it resolves the list, as its index would leave them.
+    skip.extend(excluded(top)?);
+    skip.sort_unstable();
+    skip.dedup();
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
     }
-    skip.sort_unstable();
-    skip.dedup();
     Ok(skip)
 }
 
@@ -267,9 +270,8 @@ fn converts(top: &Path, changed: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a checkout that ignore rules from outside it apply to: the
-/// ignore files of its ancestors, the global excludes file and its
-/// `info/exclude`, when they hold a pattern.
+/// Refuse a checkout that the ignore files of its ancestors apply to,
+/// when they hold a pattern.
 fn outer_ignores(top: &Path) -> Result<(), String> {
     for dir in top.ancestors().skip(1) {
         for name in [".gitignore", ".ignore", ".rgignore"] {
@@ -282,17 +284,33 @@ fn outer_ignores(top: &Path) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
+
+/// The tracked files that rules the served commit does not carry ignore:
+/// the patterns of the checkout's `info/exclude` and of the global
+/// excludes file that the index's walk reads.
+fn excluded(top: &Path) -> Result<Vec<String>, String> {
     let exclude = vcs::line(vcs::git(top, &["rev-parse", "--git-path", "info/exclude"])?)?;
     let global = ignore::gitignore::gitconfig_excludes_path();
-    for path in std::iter::once(top.join(exclude)).chain(global) {
-        if vcs::served::has_pattern(&path) {
-            return Err(format!(
-                "ignore rules from outside the checkout apply ({})",
-                path.display()
-            ));
-        }
+    let from: Vec<String> = std::iter::once(top.join(exclude))
+        .chain(global)
+        .filter(|p| vcs::served::has_pattern(p))
+        .map(|p| format!("--exclude-from={}", p.display()))
+        .collect();
+    if from.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(())
+    let mut args = vec!["ls-files", "-z", "-c", "-i"];
+    args.extend(from.iter().map(String::as_str));
+    let out = vcs::git(top, &args)?;
+    vcs::records(&out)
+        .map(|r| {
+            std::str::from_utf8(r)
+                .map(str::to_owned)
+                .map_err(|_| "a changed path is not UTF-8".to_owned())
+        })
+        .collect()
 }
 
 /// The files of the checkout at `top` that the skip list `skip` holds and

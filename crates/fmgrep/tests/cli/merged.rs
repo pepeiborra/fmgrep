@@ -331,6 +331,51 @@ fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
     assert_eq!(stdout(&out), served);
 }
 
+/// Tracked files that the client's own excludes ignore (its global excludes
+/// file, its `info/exclude`, also from a linked worktree, a directory
+/// pattern) are left out, as its local index leaves them out.
+#[test]
+fn tracked_files_the_clients_excludes_ignore_are_left_out() {
+    let r = Remote::new(&FILES);
+    let global = r.s.path("config");
+    for (name, exclude) in [
+        ("global", global.join("git/ignore")),
+        ("info", r.client.join(".git/info/exclude")),
+    ] {
+        for pattern in ["*.h\n", "dir/sub/\n", "e.c\n"] {
+            reset(&r);
+            r.s.write(
+                exclude.parent().unwrap(),
+                &[(exclude.file_name().unwrap().to_str().unwrap(), pattern)],
+            );
+            r.s.write(&r.client, &[("a.c", "printk edited\n")]);
+            for args in [&["printk"][..], &["-l", "printk"]] {
+                r.same("", args);
+            }
+            std::fs::remove_file(&exclude).unwrap();
+            let _ = name;
+        }
+    }
+    reset(&r);
+    let tree = r.s.path("linked");
+    r.s.git(
+        &r.client,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &tree.display().to_string(),
+            &r.commit,
+        ],
+    );
+    r.s.write(&r.client, &[(".git/info/exclude", "*.h\n")]);
+    let tree = std::fs::canonicalize(tree).unwrap();
+    let out = r.search(&tree, &["-l", "printk"]);
+    assert_eq!(stderr(&out), "");
+    assert_eq!(stdout(&out), "a.c\ndir/b.c\ne.c\n");
+}
+
 /// One change set that interleaves the client's files with the server's,
 /// in every output mode.
 #[test]
@@ -411,7 +456,7 @@ type Unsound = (Change, &'static str);
 fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     let r = Remote::new(&FILES);
     let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
-    let cases: [Unsound; 8] = [
+    let cases: [Unsound; 7] = [
         (
             |r, c| {
                 r.s.git(c, &["update-index", "--assume-unchanged", "z.c"]);
@@ -455,10 +500,6 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
             |r, _| r.s.write(r.s.tmp.path(), &[(".ignore", "*.h\n")]),
             "an ignore file above the checkout applies ({tmp}/.ignore)",
         ),
-        (
-            |r, c| r.s.write(c, &[(".git/info/exclude", "*.h\n")]),
-            "ignore rules from outside the checkout apply ({client}/.git/info/exclude)",
-        ),
     ];
     let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
     for (change, why) in cases {
@@ -490,7 +531,8 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     }
     // A filter that applies to no file converts nothing.
     reset(&r);
-    std::fs::remove_file(r.client.join(".git/info/exclude")).unwrap();
+    let _ = std::fs::remove_file(r.client.join(".git/info/exclude"));
+    let _ = std::fs::remove_file(r.s.tmp.path().join(".ignore"));
     r.s.git(&r.client, &["config", "filter.up.smudge", "cat"]);
     r.same("", &["-l", "printk"]);
 }
