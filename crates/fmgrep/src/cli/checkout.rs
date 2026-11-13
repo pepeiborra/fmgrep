@@ -53,7 +53,13 @@ pub fn plan(server: Server<'_>, status: &ServeStatus, cwd: &Path) -> Plan {
         return Plan::Degraded(format!("{} is in no git checkout", cwd.display()));
     };
     let id = &commit.id;
-    match vcs::git_ok(&top, &["cat-file", "-e", &format!("{id}^{{commit}}")]) {
+    // A record of this checkout against the commit was saved after git
+    // compared them: the checkout has it.
+    let has = match crate::source::recorded(&top, &crate::source::Of::commit(id)) {
+        true => Ok(true),
+        false => vcs::git_ok(&top, &["cat-file", "-e", &format!("{id}^{{commit}}")]),
+    };
+    match has {
         Ok(true) => Plan::Checkout {
             top,
             commit: id.clone(),
@@ -109,12 +115,19 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     hidden(top)?;
     converts(top, &skip)?;
     // An ignore file that differs can change which files of its directory
-    // an index holds: the whole directory is searched here.
+    // an index holds: the whole directory is searched here. So is a path
+    // that is a directory now, as a tracked file replaced by one: git
+    // lists none of the files in it.
     let governed: Vec<String> = (skip.iter())
         .filter_map(|p| crate::walk::ignore_file_dir(p))
         .map(|dir| format!("{dir}/"))
         .collect();
+    let dirs: Vec<String> = (skip.iter())
+        .filter(|p| !p.ends_with('/') && lstat(top, p).is_some_and(|m| m.is_dir()))
+        .map(|p| format!("{p}/"))
+        .collect();
     skip.extend(governed);
+    skip.extend(dirs);
     outer_ignores(top)?;
     // Tracked files that the client's own excludes ignore are left out of
     // its part when it resolves the list, as its index would leave them.
@@ -326,7 +339,12 @@ pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, Strin
     // right after it, are in its walk.
     let mut walked: Vec<&str> = Vec::new();
     for entry in skip {
-        let rel = entry.trim_end_matches('/');
+        // `d/` is a subtree, and the server leaves out all of it; a path
+        // without the slash is that path alone, though it is a directory.
+        let (rel, tree) = match entry.strip_suffix('/') {
+            Some(rel) => (rel, true),
+            None => (entry.as_str(), false),
+        };
         let below = |d: &&str| {
             d.is_empty()
                 || rel
@@ -338,12 +356,12 @@ pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, Strin
         }
         let room = MAX_SKIP - listed.len();
         match lstat(top, rel) {
-            Some(m) if m.is_dir() => {
+            Some(m) if m.is_dir() && tree => {
                 walked.push(rel);
                 let found = crate::walk::walk_paths_within(top, &top.join(rel), room);
                 listed.extend(found.ok_or_else(|| too_many(skip, &walked, commit))?);
             }
-            Some(m) if m.is_file() && !rules.matched(rel, false).is_ignore() => {
+            Some(m) if m.is_file() && !tree && !rules.matched(rel, false).is_ignore() => {
                 if room == 0 {
                     return Err(too_many(skip, &walked, commit));
                 }

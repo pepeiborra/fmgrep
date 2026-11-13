@@ -258,7 +258,13 @@ whole directory it governs; also each tracked file that the client's
 `info/exclude` or global excludes file ignores) goes on the query's
 `skip` list, the client searches those files itself as a local index of
 the checkout would hold them, and it prints its files between the
-server's in path order. Where the client cannot list the changes soundly
+server's in path order. It asks git once and saves what git found with a
+watchman token in a record
+([index-format.md](index-format.md#watchman)); later searches ask
+watchman what changed since, and run no git. Without watchman every
+search asks git, and prints `warning: watchman cannot say what changed
+(<why>); asked git what differs from the served commit <id> (took
+<time>)`. Where the client cannot list the changes soundly
 (assume-unchanged or skip-worktree entries, a sparse checkout, a filter
 or line-ending conversion, a submodule, an ignore file above the
 checkout, more than 10,000 differing paths or files to search, as when a

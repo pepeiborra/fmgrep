@@ -151,9 +151,23 @@ index directory. The record is one line of JSON:
 |---|---|
 | `v` | `2`; a record of another version is not used |
 | `root` | the canonical tree |
-| `of` | what the baseline differs from: `index <canonical index directory>@<the manifest's index_started_ns>`, so a rebuilt index does not use it |
+| `of` | what the baseline differs from: `index <canonical index directory>@<the manifest's index_started_ns>`, so a rebuilt index does not use it; or `git <commit>` |
+| `extra` | a search through a server only: `git`, the paths in the checkout's git directory that decide what git status says and the config files that git reads (system, global, the repository's, those that `include.path` brings in, and the `core.excludesFile` they set), and `stamps`, the `[path, [size, mtime_ns]]` (or `null`) of those and of the global git config, ignore and attributes files and the ignore files above the checkout |
 | `token` | `sock`, `watch`, `relative`, `clock`: a watchman clock of the watch on the tree, and the daemon's socket |
 | `baseline` | the paths that may differ from the index, ascending; `null` when more than an eighth of the documents (at least 64) do |
+
+A search through a server from a git checkout keeps a record too, at any
+checkout size, one per checkout and served commit, so that searches
+through servers of two commits keep two. Its `baseline` is the skip list:
+what `git status` (and `git diff-tree`, when HEAD moved) found to differ
+from the served commit. A later search takes a new token, asks watchman
+what changed since the old one, adds those paths to the baseline, and
+runs no git. It asks git again, and writes a new baseline, when there is
+no record, when watchman cannot answer since the token (a restart,
+another daemon), when a stamped input moved (a commit, a checkout or a
+`git add` moves HEAD or the index), when a `.gitattributes` changed, or
+when more than 10,000 paths would be listed. Without watchman it asks git
+on every search, saves no record, and says so on stderr.
 
 A **token** is the second of two watchman clocks synced within 100 ms,
 kept only when it is a later tick than the first. A clock answered during

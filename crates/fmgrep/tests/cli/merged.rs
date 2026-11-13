@@ -321,13 +321,13 @@ fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
     let short = &r.commit[..7];
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = format!("more than 10000 files differ from the served commit {short}");
-    assert_eq!(stderr(&out), crate::remote::ignored(&why));
+    assert_eq!(r.warnings(&out), crate::remote::ignored(&why));
     assert_eq!(stdout(&out), served);
     r.s.write(&r.client, &[(".gitignore", "*.log\n*.tmp\n")]);
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = "the ignore file .gitignore differs from the served commit and governs more than \
                10000 files";
-    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(r.warnings(&out), crate::remote::ignored(why));
     assert_eq!(stdout(&out), served);
 }
 
@@ -372,7 +372,7 @@ fn tracked_files_the_clients_excludes_ignore_are_left_out() {
     r.s.write(&r.client, &[(".git/info/exclude", "*.h\n")]);
     let tree = std::fs::canonicalize(tree).unwrap();
     let out = r.search(&tree, &["-l", "printk"]);
-    assert_eq!(stderr(&out), "");
+    assert_eq!(r.warnings(&out), "");
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ne.c\n");
 }
 

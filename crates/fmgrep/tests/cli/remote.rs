@@ -23,7 +23,14 @@ pub struct Remote {
     pub _server: crate::Server,
     pub addr: String,
     pub client: PathBuf,
+    /// A private watchman daemon that watches the client, when one can
+    /// start; without it, every search asks git and says so.
+    pub daemon: Option<crate::watchman::Daemon>,
 }
+
+/// The start of the warning of a search that asks git because watchman
+/// cannot say what changed.
+pub const ASKED_GIT: &str = "warning: watchman cannot say what changed (";
 
 impl Remote {
     pub fn new(files: &[(&str, &str)]) -> Self {
@@ -63,6 +70,10 @@ impl Remote {
             &["clone", "-q", &origin.display().to_string(), "client"],
         );
         let client = std::fs::canonicalize(client).unwrap();
+        let daemon = crate::watchman::Daemon::start();
+        if let Some(daemon) = &daemon {
+            daemon.watch(&client);
+        }
         Self {
             s,
             origin,
@@ -70,17 +81,37 @@ impl Remote {
             _server: server,
             addr,
             client,
+            daemon,
         }
     }
 
-    /// `args` through the server from `cwd`, with `FMGREP_SERVER`.
+    /// `args` through the server from `cwd`, with `FMGREP_SERVER`, and the
+    /// private daemon's socket when there is one.
     pub fn search(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.s
-            .fmgrep(cwd)
-            .env("FMGREP_SERVER", &self.addr)
+        let mut cmd = self.s.fmgrep(cwd);
+        if let Some(daemon) = &self.daemon {
+            cmd.env("WATCHMAN_SOCK", &daemon.sock);
+        }
+        cmd.env("FMGREP_SERVER", &self.addr)
             .args(args)
             .output()
             .expect("spawn fmgrep")
+    }
+
+    /// The stderr of `out`, less the warning that git was asked because
+    /// watchman cannot say, when no daemon runs: each such search prints
+    /// it once. With a daemon, it stays, to fail the test.
+    pub fn warnings(&self, out: &Output) -> String {
+        let text = stderr(out);
+        if self.daemon.is_some() {
+            return text;
+        }
+        let asked = text.lines().filter(|l| l.starts_with(ASKED_GIT)).count();
+        assert!(asked <= 1, "{text}");
+        text.lines()
+            .filter(|l| !l.starts_with(ASKED_GIT))
+            .map(|l| format!("{l}\n"))
+            .collect()
     }
 
     /// What a local index of the client's checkout prints for `args` from
@@ -113,7 +144,7 @@ impl Remote {
             .filter(|l| !l.starts_with("warning:"))
             .map(|l| format!("{l}\n"))
             .collect();
-        assert_eq!(stderr(&got), errors.concat(), "{rel} {args:?}");
+        assert_eq!(self.warnings(&got), errors.concat(), "{rel} {args:?}");
         assert_eq!(
             (comparable(&stdout(&got)), got.status.code()),
             (comparable(&stdout(&want)), want.status.code()),
@@ -202,7 +233,7 @@ fn a_search_that_cannot_compare_its_checkout_warns_once() {
     // A clone that has the commit: nothing to say.
     let out = r.search(&r.client, &["-l", "printk"]);
     assert_eq!(
-        (stdout(&out), stderr(&out)),
+        (stdout(&out), r.warnings(&out)),
         (all.to_owned(), String::new())
     );
 }

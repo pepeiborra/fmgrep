@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
+mod baseline;
 mod checkout;
 mod frames;
 mod locate;
@@ -286,7 +287,7 @@ fn client(
 /// `commit`, and the files of it this client searches; else why the
 /// checkout cannot be compared.
 fn mine(top: &Path, commit: &str) -> Result<(Vec<String>, checkout::Local), String> {
-    let skip = checkout::changes(top, commit)?;
+    let skip = baseline::skip_list(top, commit)?;
     let local = checkout::resolve(top, &skip, commit)?;
     Ok((skip, local))
 }
