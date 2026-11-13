@@ -247,36 +247,70 @@ carries `format`; a server that answers it with -32001 (its index
 changed after the `status`) exits 2, as `error: the server at ADDR
 changed its index during this search; run the search again`.
 
+### From a checkout
+
 When the server reports a served commit and the cwd is in a git checkout
-that holds it, PATH arguments and the cwd resolve against the top of
-that checkout, as a local index of the checkout would read them, and the
-query carries `commit`: the server's tree may be anywhere. The client
-then runs `git status` in the checkout, and `git diff-tree` between the
-commit and HEAD when HEAD moved: each path that differs from the commit
-(an untracked directory as `d/`, and for an ignore file that differs the
-whole directory it governs; also each tracked file that the client's
-`info/exclude` or global excludes file ignores) goes on the query's
-`skip` list, the client searches those files itself as a local index of
-the checkout would hold them, and it prints its files between the
-server's in path order. It asks git once and saves what git found with a
-watchman token in a record
-([index-format.md](index-format.md#watchman)); later searches ask
+that holds it, PATH arguments and the cwd resolve against the top of that
+checkout, as a local index of the checkout would read them, and the query
+carries `commit`: the server's tree may be anywhere.
+
+The client then finds the skip list, with `git status` in the checkout,
+and `git diff-tree` between the commit and HEAD when HEAD moved: each
+path that differs from the commit (an untracked directory as `d/`, and
+a path that is a directory now also as `d/`), the whole directory of an
+ignore file that differs, and each tracked file that the client's
+`info/exclude` or global excludes file ignores. It searches the files
+of that list that a local index of the checkout would hold (a path
+below a symlinked directory is not one), sends the list as `skip`, and
+prints its files between the
+server's in path order.
+
+It asks git once and saves what git found with a watchman token in a
+record ([index-format.md](index-format.md#watchman)); later searches ask
 watchman what changed since, and run no git. A search that asks git for
 a new baseline says why, in one line: `warning: asked git what differs
 from the served commit <id> (<why>; took <time>); later searches ask
 watchman`. Without watchman every search asks git, and prints `warning:
 watchman cannot say what changed (<why>); asked git what differs from
-the served commit <id> (took <time>)`. Where the client cannot list the
-changes soundly (assume-unchanged or skip-worktree entries, a sparse
-checkout, a filter or line-ending conversion, a submodule, an ignore
-file above the checkout, more than 10,000 differing paths or files to
-search, as when a changed ignore file governs a large directory), it
-sends no skip list and warns that local changes are ignored, with the
-reason. When the client warns so because it cannot compare at all (a
-checkout that lacks the served commit), PATH arguments and the cwd still
-resolve against the top of the cwd's checkout, and the query carries the
-served commit. Otherwise (no checkout, a server that serves no commit,
-or the served tree itself) they resolve against the served tree.
+the served commit <id> (took <time>)`. Either line prints only when the
+client can search the files that git listed. `FMGREP_VERBOSE=1` adds
+one note: where the skip list came from, the sizes, the served commit
+and the record.
+
+Where the client cannot compute its local changes soundly, it sends no
+skip list, searches nothing itself, and prints one warning, `warning:
+local changes are ignored (<why>); these results are the server's
+alone`. That is the case for assume-unchanged or skip-worktree entries,
+a sparse checkout, a filter (a clean, smudge or process command) or a
+line-ending conversion that applies, a submodule, an ignore file above
+the checkout, and more than 10,000 differing paths or files to search
+(as when a changed ignore file governs a large directory). The record
+keeps that verdict until a stamped input moves or watchman reports any
+change in the tree. It is also the case for a checkout without the
+served commit: PATHs and the cwd still resolve against the top of the
+checkout, and the query carries the served commit. For a server that
+reports no served commit searched from a checkout elsewhere, and from a
+cwd in no checkout, they resolve against the served tree.
+
+Known limits of this first version:
+
+- git only.
+- Only a `--store-docs` index records a served commit.
+- An ignore file that differs from the commit puts its whole directory
+  on the skip list.
+- Files that git ignores but rg searches are not seen: git status runs
+  without `--ignored`.
+- When the server moves to a new commit during a search, the search
+  stops and asks to be run again.
+- `--json` alone and `--approx-counts` print the server's
+  `num_files_indexed` and `index_size_bytes`.
+- On a file system that ignores case (macOS by default), a rename that
+  changes only the case of a name, done with `mv` rather than `git mv`,
+  prints the old name.
+- A system git config file created after the baseline is not seen until
+  another stamped input moves.
+- fmgrep serve answers one connection at a time. A client that reads its
+  answer slowly delays the other clients.
 
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from

@@ -65,5 +65,8 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `note: N file(s) changed since indexing` | searches read them in full; re-index |
 | `warning: watchman cannot say what changed (...)` | answers are right but each search checks every file; do what the line says |
 | `error: cannot use watchman for DIR (...)` | `fmgrep serve` needs watchman; install it, or pass `--no-watch` for a tree that does not change |
+| `warning: Using local index DIR, not the server at ADDR (FMGREP_SERVER)` | an index above the cwd answers; the server is not asked |
+| `warning: local changes are ignored (...)` | through a shared server, the answer is for the served commit, not for this checkout; the reason says what to change |
+| `warning: asked git what differs from the served commit ...` | a search through a shared server took longer once; later ones ask watchman |
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md); design notes live in `docs/`.

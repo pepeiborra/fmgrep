@@ -49,7 +49,12 @@ answers. `fmgrep serve` needs it, unless given `--no-watch` or a
   daemon keeps running after fmgrep exits, with its watch: on AOSP
   (1.25 M files), about 710 MB of memory and 312,000 inotify watches. A
   search keeps a small record per tree in `~/.cache/fmgrep`. Below 50,000
-  files a search never contacts watchman: checking every file is faster.
+  files a search of a local index never contacts watchman: checking
+  every file is faster. A search through a server from a checkout asks
+  watchman at any checkout size, to learn what changed since git last
+  compared the checkout with the served commit: it starts the daemon
+  when none runs and asks it to watch the whole checkout, and keeps one
+  record per checkout and served commit.
   `fmgrep serve` checks before every query, not once, so it asks watchman
   at any tree size, unless given `--no-watch`: it starts the daemon and
   asks it to watch even a small tree. On Linux that makes each served
@@ -141,6 +146,62 @@ runs, watchman's client starts one. To serve a tree that does not change
 (a fixed commit), or without watchman, pass `--no-watch`. A
 `--store-docs` index never reads the tree, so serving it never needs
 watchman.
+
+### A shared server for a team's checkouts
+
+One machine can serve a huge git tree for everyone: it indexes a clean
+checkout of one commit with `--store-docs`, which records that commit
+(the served commit) when the stored files are exactly that commit's
+([conditions](docs/index-format.md#served-commit)), and serves it. Each
+developer sets
+`FMGREP_SERVER` and searches from their own checkout, with no index of
+their own:
+
+```console
+server$ git -C /srv/repo checkout -q origin/main
+server$ fmgrep index --store-docs /srv/repo
+note: the index holds commit 81b12d888b2bce896b8745567cfb620cfaf73e1b
+server$ fmgrep serve /srv/repo --listen 0.0.0.0:7777 &
+dev$ export FMGREP_SERVER=server:7777
+dev$ cd ~/src/repo/compiler && fmgrep -l initHscEnv
+```
+
+The client asks git once where the checkout differs from the served
+commit (edits, new and deleted files, commits on top, another branch),
+and watchman on later searches. It searches those files itself and the
+server the rest, so the output is what a local index of the checkout
+would print. When git cannot list the changes soundly, it prints the
+server's answer alone, with one line that says so and why:
+
+```console
+warning: local changes are ignored (git converts files (core.autocrlf=true)); these results are the server's alone
+```
+
+That happens for a checkout without the served commit (run `git fetch`),
+for assume-unchanged or skip-worktree entries, a sparse checkout, a git
+filter or line-ending conversion that applies, a submodule, an ignore
+file above the checkout, more than 10,000 differing files or files to
+search, and a server that reports no served commit. Limits, all for now:
+
+* git only; Sapling is not supported.
+* Only a `--store-docs` index records a served commit, so the server
+  holds a copy of the files.
+* An ignore file that differs from the commit makes the client search
+  its whole directory; at the top of a large tree, that passes the
+  limit.
+* Files that git ignores but rg searches (a `!` rule in `.ignore`) are
+  not seen: git status runs without `--ignored`.
+* When the server moves to a new commit during a search, the search
+  stops and asks to be run again.
+* The client and the server must be the same fmgrep version.
+* On a file system that ignores case (macOS by default), a rename that
+  changes only the case of a name, done with `mv` rather than `git mv`,
+  prints the old name.
+* fmgrep serve answers one connection at a time. A client that reads its
+  answer slowly delays the other clients.
+* `fmgrep serve` has no authentication ([SECURITY.md](SECURITY.md)).
+
+Details: [docs/protocol.md](docs/protocol.md#--server).
 
 ## Expressions
 
