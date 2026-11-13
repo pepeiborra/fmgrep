@@ -36,6 +36,14 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
                 return match resolve(top, &skip, commit) {
                     Ok(local) => {
                         remember(top, &of, token, skip.clone(), extra);
+                        note(
+                            top,
+                            Some(&of),
+                            commit,
+                            "watchman since the baseline",
+                            &skip,
+                            &local,
+                        );
                         Ok((skip, local))
                     }
                     Err(why) => Err(unsound(top, &of, token, extra, why)),
@@ -59,6 +67,14 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
                 short(commit),
                 crate::verbose::Us(took.as_secs_f64() * 1e6)
             ));
+            note(
+                top,
+                None,
+                commit,
+                "git, as watchman cannot say",
+                &skip,
+                &local,
+            );
             return Ok((skip, local));
         }
     };
@@ -83,7 +99,30 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
         short(commit),
         crate::verbose::Us(took.as_secs_f64() * 1e6)
     ));
+    note(top, Some(&of), commit, "git, a new baseline", &skip, &local);
     Ok((skip, local))
+}
+
+/// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
+/// checkout at `top` came from (`source`), its size, the files `local`
+/// that the client searches, the served commit `commit`, and the record of
+/// `of`, when one is saved.
+fn note(top: &Path, of: Option<&Of>, commit: &str, source: &str, skip: &[String], local: &Local) {
+    if !crate::verbose::verbose() {
+        return;
+    }
+    let record = of
+        .and_then(|of| crate::source::record_path(top, of))
+        .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+    let (s, n) = (skip.len(), local.files.len());
+    eprintln!(
+        "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
+         searched here; served commit {}; record {record}",
+        crate::verbose::plural(s),
+        crate::verbose::plural(n),
+        local.bytes,
+        short(commit)
+    );
 }
 
 /// The reason `why` that the checkout at `top` cannot be compared, after

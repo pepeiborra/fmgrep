@@ -17,7 +17,9 @@ mod added;
 mod journal;
 mod recorded;
 
-pub use journal::{Index, Of, Remembered, Token, recorded, remember, remembered, request_watch};
+pub use journal::{
+    Index, Of, Remembered, Token, record_path, recorded, remember, remembered, request_watch,
+};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
