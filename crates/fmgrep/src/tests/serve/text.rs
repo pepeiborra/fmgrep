@@ -299,20 +299,66 @@ fn streamed_output_splits_into_bounded_frames() {
     server.join().unwrap().unwrap();
 }
 
-/// A one-connection server that answers any request with `reply`.
-fn fake_server(reply: &[u8]) -> String {
-    let reply = reply.to_vec();
+/// A one-connection server that answers its `n`th request with
+/// `replies[n]`, then closes.
+fn fake_server(replies: &[&[u8]]) -> String {
+    let replies: Vec<Vec<u8>> = replies.iter().map(|r| r.to_vec()).collect();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        std::io::BufReader::new(&stream)
-            .read_line(&mut line)
-            .unwrap();
-        (&stream).write_all(&reply).unwrap();
+        let mut input = std::io::BufReader::new(&stream);
+        for reply in replies {
+            let mut line = String::new();
+            input.read_line(&mut line).unwrap();
+            (&stream).write_all(&reply).unwrap();
+        }
     });
     addr
+}
+
+/// A `status` response of index format `format`, or none.
+fn status_reply(format: Option<u32>) -> String {
+    let format = format
+        .map(|f| format!("\"format\":{f},"))
+        .unwrap_or_default();
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{{format}\"store_docs\":true,\"files\":1,\
+         \"num_bytes\":1,\"index_size_bytes\":1,\"load_us\":1,\"root\":\"/x\"}}}}\n"
+    )
+}
+
+/// A client refuses a server of another index format, or of none; a
+/// query refused with -32001 after the status means the server's index
+/// changed.
+#[test]
+fn a_client_refuses_a_server_of_another_index() {
+    let error = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"m\"}}\n";
+    let ours = status_reply(Some(crate::manifest::MANIFEST_FORMAT));
+    for (replies, want) in [
+        (
+            vec![status_reply(Some(7))],
+            "serves an index of format 7; this fmgrep reads format 8 (use one fmgrep version \
+             on both sides)",
+        ),
+        (
+            vec![status_reply(None)],
+            "reports no index format; it is older than this fmgrep (use one fmgrep version on \
+             both sides)",
+        ),
+        (
+            vec![ours, error.to_owned()],
+            "changed its index during this search; run the search again",
+        ),
+    ] {
+        let replies: Vec<&[u8]> = replies.iter().map(|r| r.as_bytes()).collect();
+        let addr = fake_server(&replies);
+        let words = argv(&["--server", &addr, "printk"]);
+        let got = dispatch_to(&words, &mut &b""[..], &mut Vec::new(), false)
+            .err()
+            .unwrap();
+        assert_eq!(got, format!("error: the server at {addr} {want}"));
+    }
 }
 
 /// `payload` as one frame.
@@ -335,7 +381,8 @@ fn a_server_error_after_output_keeps_the_output() {
         (sent.as_bytes(), &b"hello!"[..], "server: boom"),
         (cut.as_bytes(), b"", "{addr}: connection closed mid-frame"),
     ] {
-        let addr = fake_server(reply);
+        let status = status_reply(Some(crate::manifest::MANIFEST_FORMAT));
+        let addr = fake_server(&[status.as_bytes(), reply]);
         let mut out = Vec::new();
         let words = argv(&["--server", &addr, "printk"]);
         let got = dispatch_to(&words, &mut &b""[..], &mut out, false)

@@ -510,12 +510,9 @@ fn server_errors_surface_on_the_client() {
     assert!(client(&addr, &["--", "printk"]).is_ok());
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
-    assert!(
-        client(&addr, &["--status"])
-            .err()
-            .unwrap()
-            .starts_with(&format!("error: cannot reach the server at {addr}: "))
-    );
+    let gone = client(&addr, &["--status"]).err().unwrap();
+    let want = format!("error: cannot reach the server at {addr}: ");
+    assert!(gone.starts_with(&want), "{gone}");
 }
 
 fn serve_err(index: &Path) -> String {

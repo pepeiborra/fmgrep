@@ -240,6 +240,13 @@ answers, and stderr says `warning: Using local index <dir>: cannot reach
 the server at ADDR (<cause>)`; with none, the search exits 2, as `error:
 cannot reach the server at ADDR: <cause>`.
 
+The client first asks for `status`, on the connection that then carries
+the query, and refuses a server whose index format is not its own, or
+that reports none: use one fmgrep version on both sides. Its query
+carries `format`; a server that answers it with -32001 (its index
+changed after the `status`) exits 2, as `error: the server at ADDR
+changed its index during this search; run the search again`.
+
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
 the cwd. When it finds one, that index answers, and stderr says

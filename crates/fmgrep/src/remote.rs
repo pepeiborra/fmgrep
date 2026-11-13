@@ -25,6 +25,8 @@ pub struct RpcError {
 pub struct Conn {
     addr: String,
     stream: BufReader<TcpStream>,
+    /// The code of the last error response.
+    code: Option<i64>,
 }
 
 impl Conn {
@@ -35,7 +37,14 @@ impl Conn {
         Ok(Self {
             addr: addr.to_owned(),
             stream: BufReader::with_capacity(64 << 10, stream),
+            code: None,
         })
+    }
+
+    /// The JSON-RPC code of the error that the last call got back, if the
+    /// server answered it with one.
+    pub fn code(&self) -> Option<i64> {
+        self.code
     }
 
     /// [`Self::connect`], with a printable error.
@@ -51,6 +60,7 @@ impl Conn {
         params: Value,
         body: &mut dyn FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<Value, String> {
+        self.code = None;
         let addr = &self.addr;
         let io = |e: std::io::Error| format!("error: {addr}: {e}");
         let request = Request {
@@ -98,6 +108,7 @@ impl Conn {
         if let Some(err) = response.get_mut("error") {
             let e: RpcError = serde_json::from_value(err.take())
                 .map_err(|e| format!("error: {addr}: unparsable error: {e}"))?;
+            self.code = Some(e.code);
             let message = e.message.strip_prefix("error: ").unwrap_or(&e.message);
             return Err(format!("error: server: {message}"));
         }

@@ -14,7 +14,7 @@ mod serve;
 use crate::events::JsonSink;
 use crate::filter::SearchPath;
 use crate::index::{INDEX_DIR, IndexRequest, run_index};
-use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
+use crate::manifest::{BLOBS_SHARD, MANIFEST_FORMAT, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
 use crate::remote::Conn;
@@ -222,14 +222,43 @@ fn client(
             return Err(format!("error: cannot reach {server}: {e}"));
         }
     };
+    let status = serve::status_on(&mut conn)?;
+    same_format(server, status.format)?;
     if !typed.is_empty() {
-        let status = serve::status_on(&mut conn)?;
         let root = Path::new(&status.root);
         rebase(&mut p, typed, served_tree(root, status.store_docs))?;
     }
     p.stream = true;
     p.per_file = true;
-    run_client(&mut conn, &p, json, out)
+    p.format = Some(MANIFEST_FORMAT);
+    let answered = run_client(&mut conn, &p, json, out);
+    answered.map_err(|e| moved(server, conn.code(), e))
+}
+
+/// Refuse a server whose index format is not this fmgrep's, or that
+/// reports none.
+fn same_format(server: Server<'_>, format: Option<u32>) -> Result<(), String> {
+    match format {
+        Some(MANIFEST_FORMAT) => Ok(()),
+        Some(other) => Err(format!(
+            "error: {server} serves an index of format {other}; this fmgrep reads format \
+             {MANIFEST_FORMAT} (use one fmgrep version on both sides)"
+        )),
+        None => Err(format!(
+            "error: {server} reports no index format; it is older than this fmgrep (use one \
+             fmgrep version on both sides)"
+        )),
+    }
+}
+
+/// A query error `e` of code `code`, or the server's index change it means.
+fn moved(server: Server<'_>, code: Option<i64>, e: String) -> String {
+    match code {
+        Some(serve::OTHER_INDEX) => {
+            format!("error: {server} changed its index during this search; run the search again")
+        }
+        _ => e,
+    }
 }
 
 /// The tree a server's PATHs are relative to.
