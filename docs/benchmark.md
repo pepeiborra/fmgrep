@@ -43,9 +43,11 @@ test.
 
 fmgrep does not call git. `fmgrep index` asks watchman to watch a tree
 of 50,000 files or more, without waiting for the crawl, and takes no
-token; it starts the daemon when none runs, as a search does. On every query without a
-server and when a server starts, a load of 50,000 indexed files or more
-asks watchman. The first load of an index takes a token and stats every
+token; it starts the daemon when none runs, as a search does. On every
+query without a server, a load of 50,000 indexed files or more asks
+watchman. The served rows start `fmgrep serve --no-watch`, a server of a
+tree that does not change, as a shared server of one commit is: it stats
+every indexed file at its start and asks watchman nothing. The first load of an index takes a token and stats every
 indexed file; after it answers it keeps the token and the paths that
 differ from the index in a small record in the user's cache directory
 (`$XDG_CACHE_HOME/fmgrep`, else `~/.cache/fmgrep`), one per tree and
@@ -53,8 +55,8 @@ index. Each later load asks watchman what changed since that token. A smaller in
 watchman cannot answer, stats every indexed file
 ([Staleness](index-format.md#staleness)); while watchman crawls a big
 tree, every load of it stats every file. Each fmgrep row builds its own
-index, so its first load is the server's start or the warm-up query: no
-timed query takes the first token.
+index, so its first load is the warm-up query: no timed query takes the
+first token.
 
 Before the harness runs, `scripts/bench.sh` therefore passes the checkout
 to `scripts/fsmonitor.sh`, which has watchman watch it (`watchman
@@ -63,9 +65,8 @@ watchman has crawled it, so the crawl is over before any fmgrep row and
 no timed row runs during it. It
 prints how long the crawl took. Without watchman, or when the watch fails,
 it warns, and fmgrep stats every file. fmgrep runs with its defaults, so
-on linux, chromium and aosp the fmgrep rows other than `--store-docs`
-(whose index holds the documents and checks no tree) ask watchman at each
-load, and on ghc (about 27,000 files) they stat every file. The watch
+on linux, chromium and aosp the `fmgrep-direct` row asks watchman at each
+load, and on ghc (about 27,000 files) it stats every file. The watch
 covers an AOSP tree too.
 To do the same by hand, from the top of the checkout (the query below
 puts `$PWD` into a JSON string as it is, so a path holding `"` or `\`
@@ -203,8 +204,8 @@ servers start, which is cold:
 cargo build --release -p fmgrep
 FMGREP_SHARD_BYTES=100MB target/release/fmgrep index ~/chromium --output /tmp/chromium100
 FMGREP_SHARD_BYTES=250MB target/release/fmgrep index ~/chromium --output /tmp/chromium250
-target/release/fmgrep serve /tmp/chromium100 --listen 127.0.0.1:7100 &
-target/release/fmgrep serve /tmp/chromium250 --listen 127.0.0.1:7250 &
+target/release/fmgrep serve /tmp/chromium100 --no-watch --listen 127.0.0.1:7100 &
+target/release/fmgrep serve /tmp/chromium250 --no-watch --listen 127.0.0.1:7250 &
 scripts/bench.sh --corpus chromium --repo-path ~/chromium -- --rows rg \
     --server 100mb=127.0.0.1:7100 --server 250mb=127.0.0.1:7250
 ```

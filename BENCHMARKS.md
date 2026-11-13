@@ -14,8 +14,9 @@ Files only some rows searched (hidden, symlinked, gitignored, binary) are
 listed under the run's results, not failures.
 
 - **rg**: one `rg -n --no-heading` process per query.
-- **fmgrep**: an index (`index build`, `index size`), one `fmgrep serve`
-  (`ready`: spawn to its readiness line, the load and its
+- **fmgrep**: an index (`index build`, `index size`), one `fmgrep serve
+  --no-watch`, a server of a tree that does not change, as a shared server
+  of one commit is (`ready`: spawn to its readiness line, the load and its
   [check of the tree](docs/index-format.md#staleness) included), then one
   `fmgrep --server ADDR -n --no-heading` process per query.
 - **fmgrep, no server** (`--rows fmgrep-direct`): the same index, then one
