@@ -183,6 +183,15 @@ impl DocfmIndex {
         })
     }
 
+    /// The index of no document.
+    pub fn empty() -> Self {
+        Self {
+            metas: Vec::new(),
+            shards: Vec::new(),
+            total_docs: 0,
+        }
+    }
+
     /// Documents this index answers for.
     pub fn num_files_indexed(&self) -> usize {
         self.total_docs

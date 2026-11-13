@@ -44,7 +44,8 @@ pub fn write_stamps(output: &Path, mtimes: &[i64], file_lens: &[(u64, u64)]) -> 
 
 /// The mapped `docs.stamps`.
 pub struct Stamps {
-    map: memmap2::Mmap,
+    /// None: no indexed doc.
+    map: Option<memmap2::Mmap>,
     /// `(id, file length)` per doc decoded from UTF-16, ascending.
     utf16: Vec<(u64, u64)>,
 }
@@ -83,12 +84,24 @@ impl Stamps {
                 "lists UTF-16 docs out of order or range".to_string(),
             ));
         }
-        Ok(Self { map, utf16 })
+        Ok(Self {
+            map: Some(map),
+            utf16,
+        })
+    }
+
+    /// The stamps of no doc: the files of a search that no index describes.
+    pub fn none() -> Self {
+        Self {
+            map: None,
+            utf16: Vec::new(),
+        }
     }
 
     pub fn get(&self, doc: usize) -> i64 {
         let at = doc * 8;
-        i64::from_le_bytes(self.map[at..at + 8].try_into().expect("8-byte slot"))
+        let map = self.map.as_deref().unwrap_or_default();
+        i64::from_le_bytes(map[at..at + 8].try_into().expect("8-byte slot"))
     }
 
     /// Doc `doc`'s file length when it was decoded from UTF-16.
@@ -497,6 +510,16 @@ impl Files {
             said: Mutex::default(),
             refusal: Mutex::default(),
         })
+    }
+
+    /// The files source of `rels` under `root` (each a text file found
+    /// just now), and of no indexed doc: all of them are added files.
+    pub fn listed(root: PathBuf, rels: &[String]) -> Result<Self, String> {
+        let mut files = Self::open(root, Stamps::none(), 0)?;
+        let known = Arc::get_mut(&mut files.known).expect("listed precedes sharing");
+        known.add(rels);
+        known.complete.store(true, Ordering::Release);
+        Ok(files)
     }
 
     /// Let [`Self::replay`] ask watchman, for `index`; and

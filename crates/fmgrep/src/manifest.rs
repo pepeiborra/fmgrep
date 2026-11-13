@@ -74,6 +74,26 @@ pub struct Commit {
 }
 
 impl Manifest {
+    /// The manifest of no document, of the tree at `root`.
+    pub fn empty(root: &Path) -> Self {
+        Self {
+            format: MANIFEST_FORMAT,
+            store_docs: false,
+            num_docs: 0,
+            num_bytes: 0,
+            bom_bytes: 0,
+            index_size_bytes: 0,
+            build_time_us: 0,
+            index_started_ns: 0,
+            files: Vec::new(),
+            blobs: Vec::new(),
+            doc_lens: Vec::new(),
+            blob_lens: Vec::new(),
+            corpus_root: Some(root.display().to_string()),
+            commit: None,
+        }
+    }
+
     /// The files layout's tree: `corpus_root` if given, else the recorded one.
     pub fn tree(&self, corpus_root: Option<&Path>) -> PathBuf {
         corpus_root.map_or_else(

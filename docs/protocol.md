@@ -250,12 +250,20 @@ changed its index during this search; run the search again`.
 When the server reports a served commit and the cwd is in a git checkout
 that holds it, PATH arguments and the cwd resolve against the top of
 that checkout, as a local index of the checkout would read them, and the
-query carries `commit`: the server's tree may be anywhere. When the
-client warns that local changes are ignored (a checkout that lacks the
-served commit), they still resolve against the top of the cwd's
-checkout, and the query carries the served commit. Otherwise (no
-checkout, a server that serves no commit, or the served tree itself)
-they resolve against the served tree.
+query carries `commit`: the server's tree may be anywhere. The client
+then runs `git status` in the checkout: each path that differs from the
+commit (an untracked directory as `d/`) goes on the query's `skip` list,
+the client searches those files itself as a local index of the checkout
+would hold them, and it prints its files between the server's in path
+order. Where the client cannot list the changes soundly (HEAD is not the
+commit, an ignore file differs from it, more than 10,000 differing
+files), it sends no skip list and warns that local changes are ignored,
+with the reason. When the client warns that local changes are ignored
+because it cannot compare at all (a checkout that lacks the served
+commit), they still resolve against the top of the cwd's checkout, and
+the query carries the served commit. Otherwise (no checkout, a server
+that serves no commit, or the served tree itself) they resolve against
+the served tree.
 
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from

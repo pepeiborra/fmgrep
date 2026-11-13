@@ -8,6 +8,7 @@ mod args;
 mod checkout;
 mod frames;
 mod locate;
+mod merge;
 mod params;
 mod print;
 mod serve;
@@ -231,12 +232,17 @@ fn client(
     let status = serve::status_on(&mut conn)?;
     same_format(server, status.format)?;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
+    let mut ours = None;
     match checkout::plan(server, &status, &cwd) {
         // The checkout holds the served commit: PATHs and the cwd are
-        // resolved here, against its top.
+        // resolved here, against its top, and its changes searched here.
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
+            match mine(&top, &commit) {
+                Ok(changes) => ours = Some((top, changes)),
+                Err(why) => checkout::degraded(&why),
+            }
             p.commit = Some(commit);
         }
         plan => {
@@ -269,8 +275,50 @@ fn client(
     p.stream = true;
     p.per_file = true;
     p.format = Some(MANIFEST_FORMAT);
-    let answered = run_client(&mut conn, &p, json, out);
+    let answered = match ours {
+        None => run_client(&mut conn, &p, json, out),
+        Some((top, (skip, local))) => merged(&mut conn, p, &top, skip, &local, json, out),
+    };
     answered.map_err(|e| moved(server, conn.code(), e))
+}
+
+/// The skip list of the checkout at `top` against the served commit
+/// `commit`, and the files of it this client searches; else why the
+/// checkout cannot be compared.
+fn mine(top: &Path, commit: &str) -> Result<(Vec<String>, checkout::Local), String> {
+    let skip = checkout::changes(top, commit)?;
+    let local = checkout::resolve(top, &skip)?;
+    if local.files.len() > params::MAX_SKIP {
+        return Err(checkout::over(local.files.len(), commit));
+    }
+    Ok((skip, local))
+}
+
+/// `p` answered by the client for its files `local` under `top`, and by
+/// the server for every other file, the skip list `skip` left out; the
+/// files printed in path order.
+fn merged(
+    conn: &mut Conn,
+    mut p: QueryParams,
+    top: &Path,
+    skip: Vec<String>,
+    local: &checkout::Local,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<Outcome, String> {
+    let part = merge::part(&p, top, local)?;
+    p.skip = skip;
+    let report = render(&p, json, out, |sink| {
+        let mut both = merge::Merge::new(sink, &part);
+        let server = serve::remote(conn, &p, &mut both)?;
+        Ok(merge::report(server, &part.report))
+    })?;
+    if report.none_searched
+        && let Some(filter) = p.filter()?
+    {
+        return Err(crate::query::none_searched(&filter));
+    }
+    Ok(Outcome::Query(report))
 }
 
 /// Refuse a server whose index format is not this fmgrep's, or that

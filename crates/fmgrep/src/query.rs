@@ -170,6 +170,18 @@ fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
     loaded
 }
 
+/// The index of no file and the documents `files` under `root`, which no
+/// index describes: [`answer`] scans every one in full.
+pub fn listed(root: &Path, files: &[String]) -> Result<(DocfmIndex, Loaded), String> {
+    let loaded = Loaded {
+        docs: DocStore::listed(root.to_path_buf(), files)?,
+        load_wall: Duration::ZERO,
+        band: boolean::ReadBand::DEFAULT,
+        locate_us: read::locate_us(None),
+    };
+    Ok((DocfmIndex::empty(), loaded))
+}
+
 /// [`load`] then [`answer`].
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
     let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, Ask::Load)?;

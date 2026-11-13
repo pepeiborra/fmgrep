@@ -233,6 +233,13 @@ impl DocStore {
         Ok(Self::of(source, &manifest.doc_lens))
     }
 
+    /// The text files `rels` under `root`, which no index describes: each
+    /// is read whole by every term that scans it.
+    pub fn listed(root: PathBuf, rels: &[String]) -> Result<Self, String> {
+        let files = Files::listed(root, rels)?;
+        Ok(Self::of(Source::Files(Box::new(files)), &[]))
+    }
+
     fn of(source: Source, lens: &[u64]) -> Self {
         Self {
             source,
