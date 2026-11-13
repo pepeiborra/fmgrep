@@ -14,6 +14,9 @@ Bug reports, fixes and measurements are welcome.
   against rg, with and without `--store-docs`, and with `--corpus DIR` on a
   GHC checkout; `--serve` repeats every case through `--server`. It needs
   `rg` (and `jq` for `--corpus`), so it is not part of `scripts/check.sh`.
+- To run CI on a commit without a pull request, push it to a branch whose
+  name starts with `ci/`, or start the CI workflow from the Actions tab.
+  The run has every job of a pull request's CI run.
 
 ## Performance
 
