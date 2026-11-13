@@ -27,7 +27,9 @@ Bug reports, fixes and measurements are welcome.
 - A change to search output runs `scripts/rg-oracle.sh`, which diffs fmgrep
   against rg, with and without `--store-docs`, and with `--corpus DIR` on a
   GHC checkout; `--serve` repeats every case through `--server`, with a
-  private watchman daemon when it finds one as the tests do. It needs
+  private watchman daemon when it finds one as the tests do; `--remote`
+  runs every case from a clone of the tree through a server of its
+  `--store-docs` index, with the stale pass made in the clone. It needs
   `rg` (and `jq` for `--corpus`), so it is not part of `scripts/check.sh`.
 - To run CI on a commit without a pull request, push it to a branch whose
   name starts with `ci/`, or start the CI workflow from the Actions tab.
