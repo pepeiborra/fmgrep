@@ -21,7 +21,42 @@ cargo install fmgrep
 ```
 
 or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
-1.98 or later, nothing else.
+1.98 or later.
+
+## Dependencies
+
+To build fmgrep you need only Rust (above). To run it you need no other
+program: fmgrep does not call `rg`.
+
+[Watchman](https://facebook.github.io/watchman/), the file watcher, is a
+soft dependency: fmgrep works without it, with the same answers.
+
+* **What fmgrep uses it for.** A search must notice the files changed
+  since the index was built. On a tree of 50,000 files or more, it asks
+  watchman which files changed, instead of checking every file. `fmgrep
+  index` and a search of such a tree start the watchman daemon when none
+  runs, and ask it to watch the tree; the daemon keeps running after
+  fmgrep exits. A search keeps watchman's token (the clock value from
+  which the next search asks what changed) in a small record in
+  `~/.cache/fmgrep` (`$XDG_CACHE_HOME/fmgrep` when that is set). Below
+  50,000 files fmgrep never contacts watchman: checking every file is
+  faster. Details: [docs/index-format.md](docs/index-format.md#watchman).
+* **Without watchman**, each search of such a tree checks every file
+  itself and prints one warning line, `warning: watchman cannot say what
+  changed (cannot run watchman (...); install watchman); checked every
+  file`. The answers are the same; the search is slower. Whole search,
+  p50, on an AWS i4i.4xlarge (Ubuntu 24.04, watchman v2026.11.09,
+  November 2026):
+
+  | search | Linux kernel, 96k files | Chromium, 461k | AOSP, 1.25 M |
+  |---|--:|--:|--:|
+  | asks watchman | 41 ms | 141 ms | 574 ms |
+  | checks every file | 114 ms | 182 ms | 1.57 s |
+
+* To keep fmgrep away from watchman, set `WATCHMAN_SOCK` to a path where
+  no daemon listens: fmgrep then starts no daemon, and each search checks
+  every file and prints the same warning, which gives the socket
+  ([docs/tuning.md](docs/tuning.md#search)).
 
 ## Usage
 
