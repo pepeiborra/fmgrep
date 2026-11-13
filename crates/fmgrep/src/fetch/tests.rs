@@ -851,4 +851,7 @@ fn a_skip_list_holds_its_paths_and_subtrees() {
         assert_eq!(skip.holds_path(path), held, "{path}");
     }
     assert!(Skip::default().is_empty());
+    let all = Skip::new(["!x", "/"].map(String::from).to_vec(), &files);
+    assert_eq!(all.ids().count(), files.len());
+    assert!(all.holds_path("any/new"));
 }

@@ -110,7 +110,8 @@ pub struct DocStore {
 }
 
 /// The files a query leaves out, because its client searches them itself:
-/// each entry a root-relative path, or `d/` for every file below `d`.
+/// each entry a root-relative path, or `d/` for every file below `d`, and
+/// `/` for every file.
 #[derive(Default)]
 pub struct Skip {
     /// Ascending disjoint ranges of the manifest's ids.
@@ -126,6 +127,9 @@ impl Skip {
         let mut ranges: Vec<std::ops::Range<usize>> = entries
             .iter()
             .map(|e| {
+                if e == "/" {
+                    return 0..files.len();
+                }
                 let lo = files.partition_point(|f| f.as_str() < e.as_str());
                 let n = match e.ends_with('/') {
                     true => files[lo..].partition_point(|f| f.starts_with(e.as_str())),
@@ -161,6 +165,13 @@ impl Skip {
 
     /// Whether a file at `path`, not in the manifest, is left out.
     fn holds_path(&self, path: &str) -> bool {
+        if self
+            .entries
+            .binary_search_by(|e| e.as_str().cmp("/"))
+            .is_ok()
+        {
+            return true;
+        }
         let at = self.entries.partition_point(|e| e.as_str() <= path);
         // The greatest entry at or before `path`, then its parents' dirs.
         self.entries[..at]

@@ -108,14 +108,13 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     }
     hidden(top)?;
     converts(top, &skip)?;
-    if let Some(p) = skip
-        .iter()
-        .find(|p| crate::walk::ignore_file_dir(p).is_some())
-    {
-        return Err(format!(
-            "an ignore file differs from the served commit ({p})"
-        ));
-    }
+    // An ignore file that differs can change which files of its directory
+    // an index holds: the whole directory is searched here.
+    let governed: Vec<String> = (skip.iter())
+        .filter_map(|p| crate::walk::ignore_file_dir(p))
+        .map(|dir| format!("{dir}/"))
+        .collect();
+    skip.extend(governed);
     outer_ignores(top)?;
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
@@ -299,16 +298,37 @@ fn outer_ignores(top: &Path) -> Result<(), String> {
 /// The files of the checkout at `top` that the skip list `skip` holds and
 /// that a local index of the checkout would hold: what the walk lists
 /// (ignore rules, hidden names and symlinks apply), as text. Ascending,
-/// with their count and their bytes less leading UTF-8 BOMs.
-pub fn resolve(top: &Path, skip: &[String]) -> Result<Local, String> {
+/// with their count and their bytes less leading UTF-8 BOMs. Else, as
+/// soon as it lists more than [`MAX_SKIP`] files and before it reads any,
+/// why: the reason of the warning.
+pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, String> {
     let mut rules = crate::walk::rules(top);
     let mut listed = Vec::new();
+    // The directories walked; the entries below the last one, which sort
+    // right after it, are in its walk.
+    let mut walked: Vec<&str> = Vec::new();
     for entry in skip {
         let rel = entry.trim_end_matches('/');
-        let path = top.join(rel);
+        let below = |d: &&str| {
+            d.is_empty()
+                || rel
+                    .strip_prefix(*d)
+                    .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+        };
+        if walked.last().is_some_and(below) {
+            continue;
+        }
+        let room = MAX_SKIP - listed.len();
         match lstat(top, rel) {
-            Some(m) if m.is_dir() => listed.extend(crate::walk::walk_paths(top, &path, None)),
+            Some(m) if m.is_dir() => {
+                walked.push(rel);
+                let found = crate::walk::walk_paths_within(top, &top.join(rel), room);
+                listed.extend(found.ok_or_else(|| too_many(skip, &walked, commit))?);
+            }
             Some(m) if m.is_file() && !rules.matched(rel, false).is_ignore() => {
+                if room == 0 {
+                    return Err(too_many(skip, &walked, commit));
+                }
                 listed.push(rel.to_owned());
             }
             _ => {}
@@ -329,6 +349,24 @@ pub fn resolve(top: &Path, skip: &[String]) -> Result<Local, String> {
         local.files.push(rel);
     }
     Ok(local)
+}
+
+/// Why the files to search, listed from the skip list `skip`, passed
+/// [`MAX_SKIP`] once the client had walked the directories `walked`: an
+/// ignore file that differs and governs one of them, else the count.
+fn too_many(skip: &[String], walked: &[&str], commit: &str) -> String {
+    let governs =
+        |p: &&String| crate::walk::ignore_file_dir(p).is_some_and(|d| walked.contains(&d));
+    match skip.iter().find(governs) {
+        Some(file) => format!(
+            "the ignore file {file} differs from the served commit and governs more than \
+             {MAX_SKIP} files"
+        ),
+        None => format!(
+            "more than {MAX_SKIP} files differ from the served commit {}",
+            short(commit)
+        ),
+    }
 }
 
 /// The metadata of `rel` below `top`, of the path itself when it is a
