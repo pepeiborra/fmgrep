@@ -555,6 +555,109 @@ fn serve_no_watch_asks_watchman_nothing() {
     assert_eq!(record(tmp.path()), before);
 }
 
+/// A server that cannot use watchman at all refuses, before its readiness
+/// line, unless `--no-watch`; a stored-docs index never needs it.
+#[cfg(unix)]
+#[test]
+fn serve_refuses_without_watchman_unless_no_watch() {
+    let status = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"status\"}\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(stage_corpus(tmp.path(), &TWO_FILES)).unwrap();
+    let (files, docs) = (tmp.path().join("files"), tmp.path().join("docs"));
+    index_it(&root, &files, false);
+    index_it(&root, &docs, true);
+    let dead = tmp.path().join("no-daemon.sock");
+    let nfs = tmp.path().join("mountinfo-nfs4");
+    let text = format!(
+        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n40 22 0:35 / {} rw - nfs4 s:/x rw\n",
+        root.display()
+    );
+    std::fs::write(&nfs, text).unwrap();
+    let unreadable = tmp.path().join("no-mountinfo");
+    let causes = [
+        (None, None, "cannot run watchman (".to_owned()),
+        (
+            Some(dead.clone()),
+            None,
+            format!("no watchman daemon answers on {} (", dead.display()),
+        ),
+        (
+            None,
+            Some(nfs),
+            format!(
+                "{} is on nfs4, a network or shared filesystem",
+                root.display()
+            ),
+        ),
+        (
+            None,
+            Some(unreadable.clone()),
+            format!(
+                "cannot read {} to tell the tree's filesystem (",
+                unreadable.display()
+            ),
+        ),
+    ];
+    for (sock, mounts, cause) in causes {
+        WATCHMAN.set(sock);
+        MOUNTS.set(mounts);
+        let serve = |index: &Path, flags: &[&str]| {
+            let mut words = argv(&["serve", "--stdio", &index.display().to_string()]);
+            words.extend(argv(flags));
+            let mut out = Vec::new();
+            let got = dispatch_to(&words, &mut &status[..], &mut out, false);
+            (got, String::from_utf8(out).unwrap())
+        };
+        let (got, out) = serve(&files, &[]);
+        let e = got.err().unwrap();
+        let head = format!("error: cannot use watchman for {} ({cause}", root.display());
+        let tail = "; `fmgrep serve` asks it before each query (pass --no-watch to serve a \
+                    tree that does not change)";
+        assert!(e.starts_with(&head) && e.ends_with(tail), "{e}");
+        assert!(out.is_empty(), "{cause}: served nothing");
+        for (index, flags) in [(&files, FIXED), (&docs, &[][..])] {
+            let (got, out) = serve(index, flags);
+            assert!(matches!(got, Ok(Outcome::Done)), "{cause} {flags:?}");
+            assert_eq!(out.lines().count(), 1, "{cause} {flags:?}");
+        }
+    }
+    WATCHMAN.set(None);
+    MOUNTS.set(None);
+}
+
+/// A daemon that hangs at the start is late, not missing: the server
+/// starts, checks every file, and asks again before each query.
+#[cfg(unix)]
+#[test]
+fn serve_starts_while_watchman_hangs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), false);
+    let corpus = tmp.path().join("corpus");
+    let Some(daemon) = watching(tmp.path(), &corpus) else {
+        return;
+    };
+    daemon.hang();
+    let (addr, server) = spawn_server(&index, &[]);
+    std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [3]);
+    daemon.resume();
+    let late = "watchman cannot say what changed (watchman did not answer within 100 ms); \
+                checked every file";
+    assert_eq!(
+        super::watched::notes(),
+        [late],
+        "once: the start and the query"
+    );
+    std::fs::write(corpus.join("c.c"), b"printk\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [4]);
+    assert_eq!(daemon.sent().last().unwrap(), "clock");
+    std::fs::write(corpus.join("d.c"), b"printk\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [5]);
+    assert_eq!(daemon.sent().last().unwrap(), "query");
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
 #[test]
 fn serve_no_watch_finds_only_files_added_before_load() {
     let tmp = tempfile::tempdir().unwrap();

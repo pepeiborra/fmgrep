@@ -70,6 +70,11 @@ impl Loaded {
         }
     }
 
+    /// Why a server cannot use watchman at all, if it cannot.
+    pub fn refusal(&self) -> Option<String> {
+        self.docs.refusal()
+    }
+
     /// Before a served query, re-check what changed since the last one.
     pub fn recheck(&self, manifest: &Manifest) {
         self.docs.recheck(&manifest.files);
@@ -118,7 +123,8 @@ pub fn load(
         let fresh = scope.spawn(move || {
             #[cfg(test)]
             hooks.apply();
-            if docs_ref.replay(files) {
+            // A server that refuses to serve needs no stat pass.
+            if docs_ref.replay(files) || docs_ref.refusal().is_some() {
                 return;
             }
             scope.spawn(move || docs_ref.discover(files));

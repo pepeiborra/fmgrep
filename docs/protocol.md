@@ -26,7 +26,9 @@ response line each, after any [frames](#streamed-output).
   `--no-watch`, for a tree that does not change, it contacts no watchman
   and checks the tree once, at its start. When watchman cannot answer, that
   query checks every file, and the server says why on its stderr; the
-  response does not.
+  response does not. Without `--no-watch`, a server that cannot use
+  watchman at all exits 2 before the readiness line, with the cause. A
+  `--store-docs` index never reads the tree and never needs watchman.
 - `serve` needs its documents: `docs.shard`, or the tree with
   `docs.stamps` and at most half the indexed files. Otherwise it exits 2
   before the readiness line.

@@ -80,7 +80,7 @@ struct FetchWorker {
 
 enum Source {
     Shard { path: PathBuf, offsets: Vec<u64> },
-    Files(Files),
+    Files(Box<Files>),
 }
 
 /// The query's one read path for document bytes, from `docs.shard` or the
@@ -158,7 +158,7 @@ impl DocStore {
                 if ask != Ask::Never {
                     files.ask(index, ask == Ask::EachQuery);
                 }
-                Source::Files(files)
+                Source::Files(Box::new(files))
             }
         };
         Ok(Self::of(source, &manifest.doc_lens))
@@ -191,7 +191,7 @@ impl DocStore {
 
     #[cfg(test)]
     fn files(files: Files, doc_lens: &[u64]) -> Self {
-        Self::of(Source::Files(files), doc_lens)
+        Self::of(Source::Files(Box::new(files)), doc_lens)
     }
 
     /// Joined before it returns: the stale set is known on return.
@@ -208,6 +208,14 @@ impl DocStore {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
             Source::Shard { .. } => false,
+        }
+    }
+
+    /// Why a server cannot use watchman at all; never for stored docs.
+    pub fn refusal(&self) -> Option<String> {
+        match &self.source {
+            Source::Files(f) => f.refusal(),
+            Source::Shard { .. } => None,
         }
     }
 

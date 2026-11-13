@@ -200,6 +200,10 @@ pub struct Asked {
     pub paths: Option<Vec<String>>,
     /// Why watchman could not answer, as stderr says it.
     pub why: Option<String>,
+    /// Why watchman cannot be used at all, when a later ask would fail as
+    /// well (not installed, no daemon on `WATCHMAN_SOCK`, a network
+    /// filesystem); set instead of `why` when the caller refuses on it.
+    pub lasting: Option<String>,
 }
 
 /// What a server learned before one query.
@@ -301,16 +305,23 @@ impl Record {
 
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
 /// a token for the record; why watchman cannot say goes to stderr, worded
-/// for a server's queries if `served`. On a network filesystem, or when
-/// the mount table cannot be read, there is no token, so no record either.
+/// for a server's queries if `served`, unless `served` and the cause
+/// lasts: then it is returned, for the server to refuse. On a network
+/// filesystem, or when the mount table cannot be read, there is no token,
+/// so no record either.
 pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
+    let fail = |why: String, lasting: bool| match lasting && served {
+        true => Asked {
+            lasting: Some(why),
+            ..Asked::default()
+        },
+        false => Asked {
+            why: Some(cannot_answer(&why)),
+            ..Asked::default()
+        },
+    };
     let root_str = match unaskable(root) {
-        Err(why) => {
-            return Asked {
-                why: Some(cannot_answer(&why)),
-                ..Asked::default()
-            };
-        }
+        Err(why) => return fail(why, true),
         Ok(root_str) => root_str,
     };
     #[cfg(unix)]
@@ -325,8 +336,8 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
                         let kept = served.then(|| record.token.clone());
                         return Asked {
                             token: token.or(kept),
-                            paths: None,
                             why: Some(cannot_answer(&why)),
+                            ..Asked::default()
                         };
                     }
                     Err(not_used) => not_used,
@@ -334,7 +345,16 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
             }
             Err(why) => (why, None),
         };
-        first(root, taken, &why, served)
+        match first(root, taken, served) {
+            Ok(token) => {
+                checked_once(&why, served);
+                Asked {
+                    token: Some(token),
+                    ..Asked::default()
+                }
+            }
+            Err((why, late)) => fail(why, !late),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -454,30 +474,27 @@ fn later(
     Ok(Asked {
         token: Some(token),
         paths: Some(paths),
-        why: None,
+        ..Asked::default()
     })
 }
 
-/// A search that cannot use a record, for reason `why`: find the daemon
-/// and take a token, unless one was `taken` just now; every file is
-/// checked. Worded for a server's queries if `served`.
+/// For a search that cannot use a record: find the daemon and take a
+/// token, unless one was `taken` just now; every file is checked. Else
+/// why not, worded for a server's queries if `served`, and whether
+/// watchman may answer later.
 #[cfg(unix)]
-fn first(root: &Path, taken: Option<Token>, why: &str, served: bool) -> Asked {
-    let taken = match taken {
-        Some(token) => Ok(token),
-        None => watchman::Watchman::find(ASK_WAIT).and_then(|w| w.served(served).mark(root)),
-    };
+fn first(root: &Path, taken: Option<Token>, served: bool) -> Result<Token, (String, bool)> {
     match taken {
-        Ok(token) => {
-            checked_once(why, served);
-            Asked {
-                token: Some(token),
-                ..Asked::default()
+        Some(token) => Ok(token),
+        None => match watchman::Watchman::find(ASK_WAIT) {
+            Ok(w) => {
+                let w = w.served(served);
+                w.mark(root).map_err(|why| (why, w.late()))
             }
-        }
-        Err(why) => Asked {
-            why: Some(cannot_answer(&why)),
-            ..Asked::default()
+            Err(why) => {
+                let late = watchman::late_find(&why);
+                Err((why, late))
+            }
         },
     }
 }

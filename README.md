@@ -25,11 +25,13 @@ or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
 
 ## Dependencies
 
-To build fmgrep you need only Rust (above). To run it you need no other
-program: fmgrep does not call `rg`.
+To build fmgrep you need only Rust (above). To run a search you need no
+other program: fmgrep does not call `rg`.
 
 [Watchman](https://facebook.github.io/watchman/), the file watcher, is a
-soft dependency: fmgrep works without it, with the same answers.
+soft dependency of a search: a search works without it, with the same
+answers. `fmgrep serve` needs it, unless given `--no-watch` or a
+`--store-docs` index ([Usage](#usage)).
 
 * **What fmgrep uses it for.** A search must notice the files changed
   since the index was built. On a tree of 50,000 files or more, it asks
@@ -61,13 +63,16 @@ soft dependency: fmgrep works without it, with the same answers.
 
   The second row is the first search after an index: it asks watchman
   for its clock, a few milliseconds, then checks every file. A search
-  without watchman checks every file the same way.
+  without watchman checks every file the same way. `fmgrep serve`
+  without watchman exits 2 at its start, and says why, unless given
+  `--no-watch` or a `--store-docs` index.
 * To keep fmgrep away from watchman, set `WATCHMAN_SOCK` to a path where
   no daemon listens: fmgrep then starts no daemon, and each search checks
   every file and prints a warning that gives the socket
   ([docs/tuning.md](docs/tuning.md#search)). fmgrep no longer reads
   `FMGREP_JOURNAL`, which fmgrep 0.1.0 used for this. `fmgrep serve
-  --no-watch` contacts no watchman at any tree size.
+  --no-watch` contacts no watchman at any tree size; without `--no-watch`,
+  a server refuses to start with such a socket.
 
 ## Usage
 
@@ -117,6 +122,12 @@ $ fmgrep --server 127.0.0.1:7777 --shutdown
 
 `--server` takes every search flag but `--index` and prints what the local
 search would; the server answers ([details](docs/protocol.md#--server)).
+Before each query the server asks [watchman](https://facebook.github.io/watchman/)
+what changed in the tree, so it needs watchman installed; when no daemon
+runs, watchman's client starts one. To serve a tree that does not change
+(a fixed commit), or without watchman, pass `--no-watch`. A
+`--store-docs` index never reads the tree, so serving it never needs
+watchman.
 
 ## Expressions
 
