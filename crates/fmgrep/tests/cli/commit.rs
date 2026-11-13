@@ -165,6 +165,63 @@ fn a_converted_file_records_no_commit() {
     }
 }
 
+/// An ignore rule that a checkout of the commit would not have: an
+/// untracked ignore file in the tree, or a pattern above it, in the global
+/// excludes file, or in `info/exclude` (of a linked worktree too). Comments
+/// alone are no rule.
+#[test]
+fn an_ignore_rule_from_outside_records_no_commit() {
+    let s = Sandbox::new();
+    let no = |repo: &std::path::Path, name: &str, why: String| {
+        let (index, stderr) = s.index(repo, &format!("idx-{name}"));
+        let want = format!("note: the index records no served commit ({why})");
+        assert_eq!(note(&stderr), want, "{name}");
+        assert_eq!(commit_of(&index), None, "{name}");
+    };
+    let outside = |path: &std::path::Path| {
+        format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        )
+    };
+
+    let repo = s.repo("untracked", &FILES);
+    s.write(&repo, &[("dir/.ignore", "*.h\n")]);
+    no(
+        &repo,
+        "untracked",
+        "the ignore file dir/.ignore is not tracked by git".into(),
+    );
+
+    let repo = s.repo("parent/repo", &FILES);
+    let parent = std::fs::canonicalize(s.path("parent")).unwrap();
+    s.write(&parent, &[(".ignore", "# a comment\n\n")]);
+    let (index, _) = s.index(&repo, "idx-comment");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&parent, &[(".ignore", "*.h\n")]);
+    no(&repo, "parent", outside(&repo.join("../.ignore")));
+
+    let repo = s.repo("exclude", &FILES);
+    s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
+    no(&repo, "exclude", outside(&repo.join(".git/info/exclude")));
+
+    let repo = s.repo("main", &FILES);
+    let tree = s.path("linked");
+    s.git(
+        &repo,
+        &["worktree", "add", "-q", &tree.display().to_string()],
+    );
+    let tree = std::fs::canonicalize(tree).unwrap();
+    let (index, _) = s.index(&tree, "idx-linked-clean");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
+    no(&tree, "linked", outside(&repo.join(".git/info/exclude")));
+
+    let repo = s.repo("global", &FILES);
+    s.write(&s.path("config"), &[("git/ignore", "*.h\n")]);
+    no(&repo, "global", outside(&s.path("config/git/ignore")));
+}
+
 /// The build time that `index` reports counts the check of the served
 /// commit: with a git that waits a second before it reads the blobs, it
 /// is a second or more.
@@ -353,5 +410,73 @@ fn an_unreadable_blob_says_why_git_failed() {
         "{note}"
     );
     assert!(!note.contains("has no blob"), "{note}");
+    assert_eq!(commit_of(&index), None);
+}
+
+/// A tracked ignore file that a filter changes on checkout holds rules
+/// that a checkout of HEAD without the filter does not have, while git
+/// status shows no change: here it leaves `dir/c.h` out.
+#[test]
+fn an_ignore_file_converted_on_checkout_records_no_commit() {
+    let s = Sandbox::new();
+    let extra = [
+        ("dir/.ignore", "*.x\n"),
+        (".gitattributes", ".ignore filter=up\n"),
+    ];
+    let repo = s.repo("repo", &[&FILES[..], &extra].concat());
+    s.git(&repo, &["config", "filter.up.smudge", "tr x h"]);
+    s.git(&repo, &["config", "filter.up.clean", "tr h x"]);
+    std::fs::remove_file(repo.join("dir/.ignore")).unwrap();
+    s.git(&repo, &["checkout", "--", "dir/.ignore"]);
+    let text = std::fs::read_to_string(repo.join("dir/.ignore")).unwrap();
+    assert_eq!(text, "*.h\n");
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let (index, stderr) = s.index(&repo, "idx");
+    let why = "the ignore file dir/.ignore differs from its blob in HEAD";
+    assert_eq!(
+        note(&stderr),
+        format!("note: the index records no served commit ({why})")
+    );
+    assert_eq!(commit_of(&index), None);
+}
+
+/// An ignore file edited for the walk and restored for git status gave the
+/// walk other rules than HEAD's.
+#[test]
+fn an_ignore_file_edited_during_the_build_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &[&FILES[..], &[("dir/.ignore", "*.x\n")]].concat());
+    let body = format!(
+        "if [ \"$3\" = status ]; then\n\
+           [ -e '{seen}' ] && printf '*.x\\n' > \"$2/dir/.ignore\" && exec \"$real\" \"$@\"\n\
+           \"$real\" \"$@\"; code=$?; touch '{seen}'; printf '*.h\\n' > \"$2/dir/.ignore\"; exit $code\n\
+         fi\n",
+        seen = s.path("seen").display()
+    );
+    let stderr = index_with(&s, &repo, &wrapped_git(&s, &body));
+    let why = "the ignore file dir/.ignore changed during the build";
+    assert_eq!(
+        note(&stderr),
+        format!("note: the index records no served commit ({why})")
+    );
+    assert_eq!(commit_of(&s.path("idx")), None);
+}
+
+/// Leading blanks belong to a gitignore pattern: ` #v.c` is a rule for the
+/// file ` #v.c`, not a comment.
+#[test]
+fn a_pattern_after_blanks_outside_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &[&FILES[..], &[(" #v.c", "printk v\n")]].concat());
+    s.write(&s.path("config"), &[("git/ignore", " #v.c\n")]);
+    let (index, stderr) = s.index(&repo, "idx");
+    let why = format!(
+        "the ignore file {} outside the checkout has a pattern",
+        s.path("config/git/ignore").display()
+    );
+    assert_eq!(
+        note(&stderr),
+        format!("note: the index records no served commit ({why})")
+    );
     assert_eq!(commit_of(&index), None);
 }

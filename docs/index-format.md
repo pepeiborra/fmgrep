@@ -518,7 +518,14 @@ replace refs and no fetch) and records HEAD only when all of these hold:
 4. every indexed file is a regular file (mode 100644 or 100755) of
    HEAD's tree, `git ls-tree -r HEAD`, and no entry is a submodule (mode
    160000);
-5. each stored document equals the text of its blob in that tree, read
+5. every ignore file that the walk read below the top is a file of that
+   tree, with its blob's bytes, unchanged since the walk read it, and
+   those outside the tree hold no pattern (a line that is neither blank
+   nor a comment): the ignore files of the ancestors, the global excludes
+   file, and the checkout's `info/exclude`, where `git rev-parse
+   --git-path` puts it (a linked worktree shares its repository's). A
+   checkout of the commit elsewhere would not have them;
+6. each stored document equals the text of its blob in that tree, read
    with one `git cat-file --batch` and decoded as the index decodes a
    file, and each file of the tree that the walk left out as binary or
    too large would be left out as its blob too. A file that git converts

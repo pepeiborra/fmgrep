@@ -66,8 +66,9 @@ fn clean_head(folder: &Path) -> Result<String, String> {
 /// `files` (ascending) is a regular file of HEAD whose text is the stored
 /// one, every file of HEAD that the walk left out as binary or too large
 /// is one the index would leave out as HEAD has it, no entry is a
-/// submodule, and no ignore rule from outside the checkout applies. Else
-/// why not.
+/// submodule, every ignore file the walk read is one of HEAD, as HEAD has
+/// it, and no ignore rule from outside the checkout applies. Else why
+/// not.
 pub fn after(
     before: Before,
     folder: &Path,
@@ -126,6 +127,7 @@ pub fn after(
     if let Some(file) = want.next() {
         return Err(format!("{file} is not tracked by git"));
     }
+    ignores_are_tracked(&folder, &listed, walk)?;
     same_text(&folder, output, &oids, files, lens)?;
     left_out_too(&folder, &left_oids, &left_out)?;
     Ok(Commit {
@@ -151,6 +153,75 @@ fn hides_none(folder: &Path) -> Result<(), String> {
             crate::verbose::plural(n)
         )),
     }
+}
+
+/// Whether every ignore input of the walk is one that a checkout of HEAD
+/// has too: each ignore file below the top is a file of HEAD (`listed` is
+/// `git ls-tree -r -z HEAD`) with its blob's bytes, unchanged since the
+/// walk read it, and those outside the tree (the ancestors', the global
+/// excludes file and the checkout's `info/exclude`, wherever git keeps it)
+/// hold no pattern.
+fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result<(), String> {
+    let mut tracked = std::collections::HashMap::new();
+    for entry in entries(listed) {
+        let entry = entry?;
+        tracked.insert(entry.path, entry.oid);
+    }
+    let exclude = super::line(git(folder, &["rev-parse", "--git-path", "info/exclude"])?)?;
+    let mut outside = vec![folder.join(exclude)];
+    let (mut read, mut oids) = (Vec::new(), Vec::new());
+    for (rel, stamp) in &walk.ignores {
+        let inside =
+            !(rel.starts_with('/') || rel.starts_with("../") || rel.ends_with(GIT_EXCLUDE));
+        match (inside, stamp) {
+            (true, Some(stamp)) => {
+                let Some(&oid) = tracked.get(rel.as_bytes()) else {
+                    return Err(format!("the ignore file {rel} is not tracked by git"));
+                };
+                read.push((rel, *stamp));
+                oids.push(oid);
+            }
+            (true, None) => {}
+            (false, _) => outside.push(folder.join(rel)),
+        }
+    }
+    if let Some(path) = outside.into_iter().find(|p| has_pattern(p)) {
+        return Err(format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        ));
+    }
+    // A filter can change an ignore file on checkout while git status
+    // shows no change.
+    super::blobs(folder, &oids, |i, blob| {
+        let (rel, stamp) = read[i];
+        let path = folder.join(rel);
+        let now = std::fs::read(&path).ok();
+        if crate::walk::stamp(&path) != Some(stamp) {
+            return Err(format!("the ignore file {rel} changed during the build"));
+        }
+        match now == Some(blob) {
+            true => Ok(()),
+            false => Err(format!(
+                "the ignore file {rel} differs from its blob in HEAD"
+            )),
+        }
+    })
+}
+
+/// `.git/info/exclude`, as the walk lists it.
+const GIT_EXCLUDE: &str = ".git/info/exclude";
+
+/// Whether the ignore file at `path` exists and holds a line that is
+/// neither blank nor a comment. Leading blanks belong to a pattern: ` #a`
+/// is one.
+pub fn has_pattern(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|text| {
+        text.split(|&b| b == b'\n').any(|l| {
+            let l = l.trim_ascii_end();
+            !l.is_empty() && !l.starts_with(b"#")
+        })
+    })
 }
 
 /// Whether each stored document is the text of its blob, as the index
