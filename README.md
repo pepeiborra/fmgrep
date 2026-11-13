@@ -108,6 +108,29 @@ compiler/GHC/Driver/Main/Hsc.hs
   tree the whole tree is searched, relative to its root. PATH arguments are
   rg's: relative to the cwd, and their files print as rg prints them.
 * Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, PATH arguments); `fmgrep --help` lists them.
+* `index`, `serve` and `status` are commands when they are the first word.
+  To search for one of these words, put `--` or any flag first:
+  `fmgrep -- status`, `fmgrep -n status`.
+
+To see what an index holds:
+
+```console
+$ fmgrep status
+index: /home/me/ghc/.fmgrep
+format: 7
+store_docs: false
+num_docs: 26787
+num_bytes: 88781005
+bom_bytes: 6
+index_size_bytes: 76771936
+build_time_us: 1997204
+index_started_ns: 1763061773123456789
+shards: 1
+corpus_root: /home/me/ghc
+```
+
+`fmgrep status --json` prints the manifest as one JSON line, with the file
+list ([fields](docs/index-format.md#manifestjson)).
 
 For many searches in a row, keep the index loaded in a server:
 

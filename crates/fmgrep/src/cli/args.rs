@@ -13,10 +13,10 @@ use crate::regex_pattern;
 
 const SEARCH_NOTE: &str = "\
 A search reads the .fmgrep of the nearest enclosing directory. Put -- first
-to search for a TERM named index or serve. Trailing TERMs naming files or
-directories are PATHs, as in rg; with --expr every argument is one. Without
-a PATH only the cwd's subtree is searched, as in rg; from outside the indexed
-tree, all of it.";
+to search for a TERM named index, serve or status. Trailing TERMs naming
+files or directories are PATHs, as in rg; with --expr every argument is one.
+Without a PATH only the cwd's subtree is searched, as in rg; from outside the
+indexed tree, all of it.";
 
 const ENV: &str = "\
 Environment:
@@ -61,6 +61,9 @@ pub enum Command {
     /// Answer searches over JSON-RPC
     #[command(display_name = "fmgrep")]
     Serve(ServeArgs),
+    /// Report on the index at or above PATH
+    #[command(display_name = "fmgrep")]
+    Status(StatusArgs),
 }
 
 #[derive(Args)]
@@ -101,6 +104,15 @@ pub struct ServeArgs {
     /// watchman nothing
     #[arg(long)]
     pub no_watch: bool,
+}
+
+#[derive(Args)]
+pub struct StatusArgs {
+    /// Report on the index at or above PATH
+    pub path: Option<PathBuf>,
+    /// Print the manifest as JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]

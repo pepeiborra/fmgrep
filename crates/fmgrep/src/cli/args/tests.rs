@@ -226,9 +226,24 @@ fn only_the_first_word_selects_a_subcommand() {
         cli(&["index", "--store-docs"]).command,
         Some(Command::Index(_))
     ));
+    assert!(matches!(
+        cli(&["status"]).command,
+        Some(Command::Status(StatusArgs {
+            path: None,
+            json: false
+        }))
+    ));
+    match cli(&["status", "idx", "--json"]).command {
+        Some(Command::Status(a)) => assert_eq!((a.path, a.json), (Some("idx".into()), true)),
+        _ => panic!("status idx --json is the command"),
+    }
     for (words, terms) in [
         (&["--", "index"][..], &["index"][..]),
         (&["--", "serve", "x"], &["serve", "x"]),
+        (&["--", "status"], &["status"]),
+        (&["-i", "status"], &["status"]),
+        (&["x", "status"], &["x", "status"]),
+        (&["Status", "x"], &["Status", "x"]),
         (&["indexes", "x"], &["indexes", "x"]),
         (&["Serve", "x"], &["Serve", "x"]),
         (&["x", "index"], &["x", "index"]),

@@ -204,6 +204,88 @@ fn index_defaults_to_a_dotdir_found_from_subdirectories() {
     }
 }
 
+/// `status --json` prints the manifest a search reads, byte for byte; plain
+/// `status` prints its scalars; `-- status` searches for the word.
+#[test]
+fn status_prints_the_manifest_of_the_index() {
+    for store_docs in [false, true] {
+        let (_tmp, root) = stage();
+        std::fs::write(root.join("s.txt"), "status\n").unwrap();
+        let index: &[&str] = match store_docs {
+            true => &["index", "--store-docs"],
+            false => &["index"],
+        };
+        assert!(run_in(&root, index).status.success());
+        let dotdir = std::fs::canonicalize(root.join(".fmgrep")).unwrap();
+        let manifest = std::fs::read(dotdir.join("manifest.json")).unwrap();
+        let json = run_in(&root, &["status", "--json"]);
+        assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+        assert_eq!(
+            String::from_utf8_lossy(&json.stdout),
+            String::from_utf8_lossy(&manifest),
+            "{store_docs}"
+        );
+        let given = run(&["status", &dotdir.display().to_string(), "--json"]);
+        assert_eq!(given.stdout, manifest, "{store_docs}: PATH names the index");
+
+        let m: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let out = run_in(&root, &["status"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut want = vec![format!("index: {}", dotdir.display())];
+        for key in [
+            "format",
+            "store_docs",
+            "num_docs",
+            "num_bytes",
+            "bom_bytes",
+            "index_size_bytes",
+            "build_time_us",
+            "index_started_ns",
+        ] {
+            want.push(format!("{key}: {}", m[key]));
+        }
+        want.push(format!("shards: {}", m["blobs"].as_array().unwrap().len()));
+        if !store_docs {
+            want.push(format!(
+                "corpus_root: {}",
+                m["corpus_root"].as_str().unwrap()
+            ));
+        }
+        assert_eq!(text.lines().collect::<Vec<_>>(), want, "{store_docs}");
+
+        for args in [&["--", "status"][..], &["-l", "status"]] {
+            let out = run_in(&root, args);
+            assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("s.txt"),
+                "{args:?} searches"
+            );
+        }
+    }
+}
+
+/// `status` refuses what a search refuses, with the same words.
+#[test]
+fn status_of_a_refused_index_fails_as_a_search() {
+    let (_tmp, docs) = stage();
+    let index_dir = do_index(&docs, true);
+    let path = index_dir.join("manifest.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replacen("\"format\":7", "\"format\":12", 1)).unwrap();
+    let index = index_dir.display().to_string();
+    let search = run(&["--index", &index, "printk"]);
+    let status = run(&["status", &index]);
+    assert_eq!(status.status.code(), Some(2));
+    assert!(status.stdout.is_empty());
+    assert!(
+        stderr(&status).contains("unsupported manifest format 12"),
+        "{}",
+        stderr(&status)
+    );
+    assert_eq!(stderr(&status), stderr(&search));
+}
+
 /// With no index at or above the cwd a search is refused, even for the word
 /// `index` after `--`.
 #[test]
@@ -213,7 +295,12 @@ fn no_index_above_the_cwd_is_refused() {
     if canon.ancestors().any(|a| a.join(".fmgrep").is_dir()) {
         return;
     }
-    for args in [&["printk"][..], &["--", "index"]] {
+    for args in [
+        &["printk"][..],
+        &["--", "index"],
+        &["status"],
+        &["--", "status"],
+    ] {
         let out = run_in(dir.path(), args);
         let stderr = stderr(&out);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");

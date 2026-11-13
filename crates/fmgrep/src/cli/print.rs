@@ -1,7 +1,10 @@
-//! The non-match output: `--help`, the index summary, the `--json` reports.
+//! The non-match output: `--help`, the index summary, `status`, the
+//! `--json` reports.
 
 use std::io::Write;
+use std::path::Path;
 
+use crate::manifest::Manifest;
 use crate::output::WRITE_FAILED;
 use crate::wire::{IndexSummary, OutputReport};
 
@@ -33,6 +36,29 @@ pub fn index_summary(out: &mut dyn Write, json: bool, s: &IndexSummary) -> Resul
             ms = s.build_time_us / 1000,
         ),
     )
+}
+
+/// `status`: under `--json` the manifest as one JSON line, else one
+/// `name: value` line per scalar, by the manifest's names, without the
+/// tables.
+pub fn status(out: &mut dyn Write, json: bool, dir: &Path, m: &Manifest) -> Result<(), String> {
+    if json {
+        return line(out, &encoded("manifest", m)?);
+    }
+    let mut lines = vec![
+        format!("index: {}", dir.display()),
+        format!("format: {}", m.format),
+        format!("store_docs: {}", m.store_docs),
+        format!("num_docs: {}", m.num_docs),
+        format!("num_bytes: {}", m.num_bytes),
+        format!("bom_bytes: {}", m.bom_bytes),
+        format!("index_size_bytes: {}", m.index_size_bytes),
+        format!("build_time_us: {}", m.build_time_us),
+        format!("index_started_ns: {}", m.index_started_ns),
+        format!("shards: {}", m.blobs.len()),
+    ];
+    lines.extend(m.corpus_root.as_ref().map(|r| format!("corpus_root: {r}")));
+    lines.iter().try_for_each(|l| line(out, l))
 }
 
 /// The wire report; the human query path prints matches instead.

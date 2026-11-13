@@ -18,7 +18,7 @@ use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
-use args::{Cli, Command, Search, ServeArgs};
+use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
 use serve::{ServeRequest, run_client, run_serve};
@@ -27,8 +27,8 @@ use serve::{ServeRequest, run_client, run_serve};
 pub enum Outcome {
     Index(#[cfg_attr(not(test), allow(dead_code))] IndexSummary),
     Query(OutputReport),
-    /// `serve` ended, help or the version printed, or `--status|--shutdown`
-    /// answered.
+    /// `serve` ended, help or the version printed, `status` printed, or
+    /// `--status|--shutdown` answered.
     Done,
 }
 
@@ -43,6 +43,15 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
         watch: !a.no_watch,
     };
     run_serve(&req, input, out)?;
+    Ok(Outcome::Done)
+}
+
+/// `status`: the manifest of the index at or above PATH, as a search
+/// reads it.
+fn status(a: &StatusArgs, out: &mut dyn Write) -> Result<Outcome, String> {
+    let (found, manifest) = open_index(a.path.as_deref())?;
+    let dir = std::fs::canonicalize(&found.index_dir).unwrap_or(found.index_dir);
+    print::status(out, a.json, &dir, &manifest)?;
     Ok(Outcome::Done)
 }
 
@@ -216,6 +225,7 @@ fn dispatch_in(
             Ok(Outcome::Index(summary))
         }
         Some(Command::Serve(a)) => serve(a, input, out),
+        Some(Command::Status(a)) => status(a, out),
         None => search(&cli.search, input, out, tty, printing),
     }
 }
