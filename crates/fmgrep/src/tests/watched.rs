@@ -528,10 +528,15 @@ fn searches_at_once_leave_one_whole_record() {
     );
 }
 
-/// Mountinfo text that puts canonical `root` on a filesystem of type `fs`.
-fn mounted(root: &Path, fs: &str) -> String {
+/// A mountinfo file in `tmp` that puts canonical `root` on a filesystem of
+/// type `fs`.
+fn mounted(tmp: &Path, root: &Path, fs: &str) -> PathBuf {
+    let file = tmp.join(format!("mountinfo-{fs}"));
     let root = root.display();
-    format!("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n40 22 0:35 / {root} rw - {fs} srv:/x rw\n")
+    let text =
+        format!("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n40 22 0:35 / {root} rw - {fs} srv:/x rw\n");
+    std::fs::write(&file, text).unwrap();
+    file
 }
 
 #[test]
@@ -541,7 +546,7 @@ fn a_tree_on_a_network_filesystem_takes_no_token_and_checks_every_file() {
         return;
     };
     let root = std::fs::canonicalize(&folder).unwrap();
-    MOUNTS.set(Some(mounted(&root, "nfs4")));
+    MOUNTS.set(Some(mounted(tmp.path(), &root, "nfs4")));
     index_it(&folder, &tmp.path().join("idx2"), false);
     assert!(daemon.sent().is_empty(), "index asks for no watch");
     let why = format!(
@@ -557,11 +562,35 @@ fn a_tree_on_a_network_filesystem_takes_no_token_and_checks_every_file() {
         assert!(records(tmp.path()).is_empty(), "{i}: no record");
     }
     // FUSE (bindfs, EdenFS) passes events on: a token.
-    MOUNTS.set(Some(mounted(&root, "fuse.bindfs")));
+    MOUNTS.set(Some(mounted(tmp.path(), &root, "fuse.bindfs")));
     assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
     assert_eq!(notes(), [ONCE]);
     assert_eq!(daemon.sent(), TAKES);
     assert_eq!(baseline(tmp.path()), serde_json::json!(["b.c"]));
+}
+
+#[test]
+fn unreadable_mountinfo_takes_no_token_and_checks_every_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
+        return;
+    };
+    let file = tmp.path().join("no-mountinfo");
+    MOUNTS.set(Some(file.clone()));
+    index_it(&folder, &tmp.path().join("idx2"), false);
+    assert!(daemon.sent().is_empty(), "index asks for no watch");
+    let err = std::fs::read_to_string(&file).unwrap_err();
+    let why = format!(
+        "cannot read {} to tell the tree's filesystem ({err})",
+        file.display()
+    );
+    for (i, text) in ["printk now\n", "printk again\n"].iter().enumerate() {
+        std::fs::write(folder.join("b.c"), text).unwrap();
+        assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n", "{i}");
+        assert_eq!(notes(), [cannot(&why)], "{i}");
+        assert!(daemon.sent().is_empty(), "{i}: no token");
+        assert!(records(tmp.path()).is_empty(), "{i}: no record");
+    }
 }
 
 #[test]
