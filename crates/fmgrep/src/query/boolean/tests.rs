@@ -642,7 +642,8 @@ fn a_measured_band_keeps_the_default_shape_within_2_to_200_us() {
 fn measured_band(index: &std::path::Path, expr: &Expr) -> ReadBand {
     let manifest = crate::manifest::read_manifest(index).unwrap();
     let answers = |measure: bool| {
-        let (fm, mut loaded) = super::super::load(index, &manifest, None, false).unwrap();
+        let (fm, mut loaded) =
+            super::super::load(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
         if measure {
             loaded.measure_band(&manifest);
         }

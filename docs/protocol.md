@@ -22,8 +22,9 @@ response line each, after any [frames](#streamed-output).
 - A load that fails (no index, an old format, a damaged index) exits 2
   before the readiness line, with the message a search would print.
 - Before each query, `serve` asks watchman what changed in the tree since
-  the query before, unless `--no-watch` is given
-  ([Watchman](index-format.md#watchman)). When watchman cannot answer, that
+  the query before ([Watchman](index-format.md#watchman)). With
+  `--no-watch`, for a tree that does not change, it contacts no watchman
+  and checks the tree once, at its start. When watchman cannot answer, that
   query checks every file, and the server says why on its stderr; the
   response does not.
 - `serve` needs its documents: `docs.shard`, or the tree with

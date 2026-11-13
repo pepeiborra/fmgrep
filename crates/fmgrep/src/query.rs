@@ -8,7 +8,7 @@ use crate::regex_pattern;
 
 use crate::blobs::BlobSlots;
 use crate::expr::Expr;
-use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::fetch::{Ask, DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
 use crate::manifest::Manifest;
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
@@ -99,16 +99,16 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout re-checks what watchman names, else
-/// stats every doc and discovers added files; under `each_query`,
-/// [`Loaded::recheck`] asks watchman again.
+/// stats every doc and discovers added files; `ask` says when watchman is
+/// asked, at load and in [`Loaded::recheck`].
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
     corpus_root: Option<&Path>,
-    each_query: bool,
+    ask: Ask,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
-    let docs = DocStore::open(index_dir, manifest, corpus_root, each_query)?;
+    let docs = DocStore::open(index_dir, manifest, corpus_root, ask)?;
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
     let (files, docs_ref) = (&manifest.files, &docs);
     #[cfg(test)]
@@ -157,7 +157,7 @@ fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
 
 /// [`load`] then [`answer`].
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
-    let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, false)?;
+    let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, Ask::Load)?;
     answer(&index, &mut loaded, req, sink)
 }
 

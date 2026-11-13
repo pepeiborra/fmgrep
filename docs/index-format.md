@@ -112,8 +112,10 @@ answer, a load stats every document against its `(size, mtime)` stamp
   and prints no such line.
 
 `serve` asks watchman before each query (see Watchman below). With
-`--no-watch` it misses files added after it is ready, and sees a changed
-file only when a query reads it.
+`--no-watch`, for a tree that does not change, it contacts no watchman:
+it runs the stat pass at its start, reads and saves no record, misses
+files added after it is ready, and sees a changed file only when a query
+reads it.
 On a filesystem with 1-second mtimes, a same-size edit within that second
 goes unnoticed.
 The directory check relies on the filesystem updating a directory's mtime
@@ -202,9 +204,9 @@ record, so that later searches walk its directory again and print the
 warning above. The write is a rename, so two searches at once leave one
 whole record.
 
-`serve` reads the record once, at its start, as a search does, whatever
-the size of the tree. Unless `--no-watch` is given, before each query it
-takes a newer token and asks
+Without `--no-watch`, `serve` reads the record once, at its start, as a
+search does, whatever the size of the tree. Before each query it takes
+a newer token and asks
 watchman what changed since the token of the query before, and
 re-checks the paths that watchman reports as changed. It keeps its
 tokens in memory and saves the record once, after its first query with
@@ -225,8 +227,7 @@ linux, chromium and aosp), plus the re-check of what watchman reports:
 synced calls (two clocks and the question) waits for FSEvents, and the
 ask takes about 40 ms (35 to 41 ms on a tree of 60,000 files); a loaded
 Mac can pass the 100 ms limit, and that query checks every file. Serve a
-tree that does not change with `--no-watch`, which asks watchman nothing
-before a query.
+tree that does not change with `--no-watch`, which asks watchman nothing.
 
 When watchman cannot answer, the search checks every file and prints one
 line on stderr per process that says why and what to do; stdout does not

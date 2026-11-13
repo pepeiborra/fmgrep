@@ -10,6 +10,7 @@ use serde_json::Value;
 use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
+use crate::fetch::Ask;
 use crate::manifest::{DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::output::writer::Pipe;
@@ -125,7 +126,8 @@ pub struct ServeRequest<'a> {
     pub corpus_root: Option<&'a Path>,
     /// None: requests on the input, responses on the output.
     pub listen: Option<SocketAddr>,
-    /// Ask watchman what changed before each query, for a files layout.
+    /// Ask watchman what changed, at start and before each query, for a
+    /// files layout; else never.
     pub watch: bool,
 }
 
@@ -387,7 +389,11 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     let root = docs_root(req)?;
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("error: cannot resolve {}: {e}", root.display()))?;
-    let (index, mut docs) = load(req.index_dir, req.manifest, req.corpus_root, req.watch)?;
+    let ask = match req.watch {
+        true => Ask::EachQuery,
+        false => Ask::Never,
+    };
+    let (index, mut docs) = load(req.index_dir, req.manifest, req.corpus_root, ask)?;
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }

@@ -22,7 +22,7 @@ struct Served {
 
 fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
-    let docs = DocStore::open(index, &manifest, None, true).unwrap();
+    let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
     if !docs.replay(&manifest.files) {
         docs.discover(&manifest.files);
         docs.stat_all(&manifest.files);

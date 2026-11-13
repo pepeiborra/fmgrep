@@ -97,7 +97,8 @@ pub struct ServeArgs {
     /// Requests on stdin, responses on stdout
     #[arg(long)]
     pub stdio: bool,
-    /// Do not ask watchman what changed before each query
+    /// Serve a tree that does not change: check it once at start, ask
+    /// watchman nothing
     #[arg(long)]
     pub no_watch: bool,
 }
