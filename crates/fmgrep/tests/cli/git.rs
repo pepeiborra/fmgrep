@@ -140,6 +140,25 @@ impl Sandbox {
     }
 }
 
+impl Sandbox {
+    /// `fmgrep serve <index> <flags>` over TCP: the server and its address.
+    pub fn serve(&self, index: &Path, flags: &[&str]) -> (crate::Server, String) {
+        let mut cmd = self.fmgrep(self.tmp.path());
+        cmd.arg("serve").arg(index).args(flags);
+        let mut server = crate::Server::spawn_cmd(&mut cmd);
+        let addr = server.addr();
+        assert!(!addr.is_empty(), "serve {} did not start", index.display());
+        (server, addr)
+    }
+
+    /// `--status` of the server at `addr`.
+    pub fn status(&self, addr: &str) -> serde_json::Value {
+        let out = self.run(self.tmp.path(), &["--server", addr, "--status"]);
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+}
+
 /// The `commit` a manifest records.
 pub fn commit_of(index: &Path) -> Option<String> {
     let manifest: serde_json::Value =

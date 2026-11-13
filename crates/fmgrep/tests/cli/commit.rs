@@ -209,3 +209,21 @@ fn a_plain_index_records_no_commit() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("note:"));
     assert_eq!(commit_of(&s.path("idx")), None);
 }
+
+/// `status` reports the served commit of a `--store-docs` index, and none
+/// for an index that reads the tree.
+#[test]
+fn status_reports_the_served_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (index, _) = s.index(&repo, "idx");
+    let (_server, addr) = s.serve(&index, &[]);
+    let status = s.status(&addr);
+    assert_eq!(status["commit"]["vcs"], "git");
+    assert_eq!(status["commit"]["id"], s.head(&repo));
+    let plain = s.path("plain").display().to_string();
+    let out = s.run(&repo, &["index", ".", "--output", &plain]);
+    assert!(out.status.success());
+    let (_server, addr) = s.serve(&s.path("plain"), &["--no-watch"]);
+    assert!(s.status(&addr).get("commit").is_none());
+}

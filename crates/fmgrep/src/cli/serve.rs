@@ -11,7 +11,7 @@ use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::Ask;
-use crate::manifest::{DOCS_SHARD, Manifest};
+use crate::manifest::{Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
@@ -121,6 +121,9 @@ pub struct ServeStatus {
     load_us: u64,
     /// The documents' directory: the tree, or the index directory holding `docs.shard`.
     pub root: String,
+    /// The served commit: the commit whose files a `store_docs` index holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
 }
 
 /// What `serve` serves.
@@ -191,6 +194,7 @@ impl Served<'_> {
             index_size_bytes: self.manifest.index_size_bytes,
             load_us: self.docs.load_wall.as_micros() as u64,
             root: self.root.display().to_string(),
+            commit: self.manifest.commit.clone(),
         }
     }
 }

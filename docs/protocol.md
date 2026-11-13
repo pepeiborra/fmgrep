@@ -40,7 +40,7 @@ response line each, after any [frames](#streamed-output).
 | method | params | result |
 |---|---|---|
 | `query` | below | an `OutputReport`, `{text, report}`, or frames then `{report}` |
-| `status` | none | `{format, store_docs, files, num_bytes, index_size_bytes, load_us, root}` |
+| `status` | none | `{format, store_docs, files, num_bytes, index_size_bytes, load_us, root, commit}` |
 | `shutdown` | none | `{"status":"shutting down"}`, then the server exits 0 |
 
 `query` params; unknown fields are refused:
@@ -91,7 +91,11 @@ output is not UTF-8, `bytes` (standard base64) replaces `text`.
 `root` is where the server reads the documents: the tree, or the index
 directory holding `docs.shard`. `format` is the manifest format of the
 served index ([index-format.md](index-format.md#manifestjson)); a server
-older than this field leaves it out.
+older than this field leaves it out. `commit`, as `{"vcs":"git","id":"<40
+hex>"}`, is the served commit: the commit whose files a `--store-docs`
+index holds ([index-format.md](index-format.md#served-commit)). It is
+absent when the index records none, and from every index that reads the
+tree.
 
 ### Streamed output
 
