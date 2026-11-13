@@ -44,7 +44,9 @@ fmgrep --server 127.0.0.1:7777 --shutdown
 - `--and`, `--or` and `--expr` are **document-level**: `A AND B` picks files
   holding both, and then prints the lines of either. `AND` and `OR` must be
   capitals.
-- Put `--` first to search for a term named `index` or `serve`.
+- Put `--` first to search for a term named `index`, `serve` or `status`.
+  `fmgrep status` reports on the local index; `--json` prints its manifest.
+  `fmgrep --status` reports on a server.
 
 ## Freshness
 

@@ -49,6 +49,14 @@ are refused.
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
 
+`fmgrep status [PATH]` reads the manifest of the index at or above PATH
+(default: the current directory) as a search does, and refuses what a
+search refuses. It prints one `name: value` line per scalar field, plus
+`index` (the index directory) and `shards` (the number of blobs).
+`fmgrep status --json` prints the manifest itself: the fields above, in
+that order, on one line. A script reads the paths with
+`fmgrep status --json | jq -r '.files[]'`.
+
 A load refuses, with exit 2:
 
 - a `format` other than 7, naming the remedy: re-run `fmgrep index`. Old

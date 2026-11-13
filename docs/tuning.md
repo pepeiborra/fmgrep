@@ -29,7 +29,7 @@ empty is the default, and any other value that does not parse is an error.
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_SERVER` | unset | `HOST:PORT` of a `fmgrep serve`. A search with no `--server` and no `--index` goes there when no `.fmgrep` is found by walking up from the cwd. An index found wins, with a warning that starts `Using local index`. `--status` reads it; `--shutdown` needs `--server`. Empty is unset. |
+| `FMGREP_SERVER` | unset | `HOST:PORT` of a `fmgrep serve`. A search with no `--server` and no `--index` goes there when no `.fmgrep` is found by walking up from the cwd. An index found wins, with a warning that starts `Using local index`. `--status` reads it; `--shutdown` needs `--server`; `fmgrep status` (the local index) does not read it. Empty is unset. |
 
 A search asks watchman what changed when the tree holds
 50,000 files or more, starting the daemon and adding the watch when they
@@ -103,6 +103,6 @@ with `--store-docs`, `check` holds no `watchman`, `stat` or `discovery`.
 `total` is the time from the start of the program to the tree. The
 process start and exit are outside it: the wall time of the process
 minus `total` is their cost. A search that fails prints the spans it
-opened, before the error. A search that a server answers, `serve` and
-`index` print no spans. Without the variable no span is recorded, and
+opened, before the error. A search that a server answers, `serve`,
+`index` and `status` print no spans. Without the variable no span is recorded, and
 stdout, stderr and the exit status do not change.
