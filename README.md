@@ -35,17 +35,18 @@ soft dependency: fmgrep works without it, with the same answers.
   since the index was built. On a tree of 50,000 files or more, it asks
   watchman which files changed, instead of checking every file. `fmgrep
   index` and a search of such a tree start the watchman daemon when none
-  runs, and ask it to watch the tree; the daemon keeps running after
-  fmgrep exits. A search keeps watchman's token (the clock value from
-  which the next search asks what changed) in a small record in
-  `~/.cache/fmgrep` (`$XDG_CACHE_HOME/fmgrep` when that is set). Below
-  50,000 files fmgrep never contacts watchman: checking every file is
-  faster. Details: [docs/index-format.md](docs/index-format.md#watchman).
+  runs, in CI and in containers too, and ask it to watch the tree. The
+  daemon keeps running after fmgrep exits, with its watch: on AOSP
+  (1.25 M files), about 710 MB of memory and 312,000 inotify watches. A
+  search keeps a small record per tree in `~/.cache/fmgrep`. Below 50,000
+  files fmgrep never contacts watchman: checking every file is faster.
+  Details: [docs/index-format.md](docs/index-format.md#watchman).
 * **Without watchman**, each search of such a tree checks every file
   itself and prints one warning line, `warning: watchman cannot say what
   changed (cannot run watchman (...); install watchman); checked every
-  file`. The answers are the same; the search is slower. Whole search,
-  p50, on an AWS i4i.4xlarge (Ubuntu 24.04, watchman v2026.11.09,
+  file`. The answers are the same; the search is slower. Whole search for
+  an identifier found in 8 to 19 files, p50 of 15, files in the page
+  cache, on an AWS i4i.4xlarge (Ubuntu 24.04, watchman v2026.11.09,
   November 2026):
 
   | search | Linux kernel, 96k files | Chromium, 461k | AOSP, 1.25 M |
@@ -53,10 +54,14 @@ soft dependency: fmgrep works without it, with the same answers.
   | asks watchman | 41 ms | 141 ms | 574 ms |
   | checks every file | 114 ms | 182 ms | 1.57 s |
 
+  The second row is the first search after an index: it asks watchman
+  for its clock, a few milliseconds, then checks every file. A search
+  without watchman checks every file the same way.
 * To keep fmgrep away from watchman, set `WATCHMAN_SOCK` to a path where
   no daemon listens: fmgrep then starts no daemon, and each search checks
-  every file and prints the same warning, which gives the socket
-  ([docs/tuning.md](docs/tuning.md#search)).
+  every file and prints a warning that gives the socket
+  ([docs/tuning.md](docs/tuning.md#search)). fmgrep no longer reads
+  `FMGREP_JOURNAL`, which fmgrep 0.1.0 used for this.
 
 ## Usage
 
