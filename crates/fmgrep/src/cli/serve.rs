@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::frames::{FileFrames, Frame};
-use super::params::{Mode, QueryParams};
+use super::params::{MAX_SKIP, Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
-use crate::fetch::Ask;
+use crate::fetch::{Ask, Skip};
 use crate::manifest::{Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::query::{Loaded, answer, load};
@@ -176,6 +176,7 @@ impl Served<'_> {
         if p.commit.is_none() {
             p.scope(super::served_tree(&self.root, self.manifest.store_docs));
         }
+        let skip = Skip::new(std::mem::take(&mut p.skip), &self.manifest.files);
         let req = p
             .request(self.index_dir, self.manifest, None)
             .map_err(|message| RpcError {
@@ -183,6 +184,8 @@ impl Served<'_> {
                 message,
             })?;
         self.docs.recheck(self.manifest);
+        // Until the next query sets its own.
+        self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
         let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
         let answered = match p.mode {
@@ -334,6 +337,13 @@ fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String
             };
             let refusal = match &p.expr {
                 _ if p.per_file && !p.stream => Some("per_file needs stream".to_owned()),
+                _ if !p.skip.is_empty() && (p.commit.is_none() || !p.per_file) => {
+                    Some("skip needs commit and per_file".to_owned())
+                }
+                _ if p.skip.len() > MAX_SKIP => Some(format!(
+                    "skip lists {} files; the limit is {MAX_SKIP}",
+                    p.skip.len()
+                )),
                 None if !has_terms => Some("missing field `terms`".to_owned()),
                 None => None,
                 Some(_) if !p.terms.is_empty() => Some(TERMS_REFUSAL.to_owned()),

@@ -150,6 +150,93 @@ fn a_pinned_query_is_scoped_by_its_paths_alone() {
     assert_eq!(text(2), "c.c\n");
 }
 
+/// A query's skip list leaves files out of every mode: of the matches, of
+/// the counts and of rg's corpus summary, whose bytes lose the skipped
+/// files' less their BOM. The list needs `commit` and `per_file`.
+#[test]
+fn a_skip_list_leaves_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: [(&str, &[u8]); 4] = [
+        ("a.c", b"printk a\n"),
+        ("d/b.c", b"\xEF\xBB\xBFprintk b\n"),
+        ("d/c.c", b"printk c\n"),
+        ("e.c", b"printk e printk\n"),
+    ];
+    let folder = stage_corpus(tmp.path(), &files[..1]);
+    for (rel, bytes) in &files[1..] {
+        std::fs::create_dir_all(folder.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(folder.join(rel), bytes).unwrap();
+    }
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let ask = |mode: &str, skip: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"{mode}","commit":"{id}","stream":true,"per_file":true,"skip":{skip}}}}}"#
+        )
+    };
+    let skip = r#"["d/","e.c"]"#;
+    let mut input = String::new();
+    for mode in ["counts", "files", "json_matches"] {
+        input.push_str(&ask(mode, skip));
+        input.push('\n');
+    }
+    let mut out = Vec::new();
+    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let counts: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let q = &counts["result"]["queries"][0];
+    assert_eq!(
+        (&q["total_matches"], &q["docs_matched"]),
+        (&1.into(), &1.into())
+    );
+    let docs: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix(r#"{"doc":""#))
+        .map(|l| l.split('"').next().unwrap())
+        .collect();
+    assert_eq!(docs, ["a.c", "a.c"], "{text}");
+    // One doc of 9 bytes is left of 4 docs of 9, 12 (a BOM), 9 and 16;
+    // only rg's JSON summary prints the bytes, so only it reads the BOMs.
+    let corpus: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with(r#"{"corpus""#))
+        .collect();
+    assert_eq!(corpus.last(), Some(&r#"{"corpus":[1,9]}"#), "{text}");
+
+    for (params, why) in [
+        (
+            r#""skip":["a.c"],"commit":"x","stream":true"#,
+            "skip needs commit and per_file",
+        ),
+        (
+            r#""skip":["a.c"],"stream":true,"per_file":true"#,
+            "skip needs commit and per_file",
+        ),
+        (r#""per_file":true"#, "per_file needs stream"),
+    ] {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],{params}}}}}"#
+        );
+        let got = serve_stdio(&index, &[&line]);
+        assert_eq!(got[0]["error"]["code"], -32602, "{params}");
+        assert_eq!(
+            got[0]["error"]["message"],
+            format!("invalid params: {why}"),
+            "{params}"
+        );
+    }
+    let many: Vec<String> = (0..10_001).map(|i| format!("f{i}")).collect();
+    let line = ask("files", &serde_json::to_string(&many).unwrap());
+    let got = serve_stdio(&index, &[&line]);
+    assert_eq!(
+        got[0]["error"]["message"],
+        "invalid params: skip lists 10001 files; the limit is 10000"
+    );
+}
+
 /// A query pinned to another format or served commit is refused with
 /// -32001; one pinned to this server's is answered.
 #[test]

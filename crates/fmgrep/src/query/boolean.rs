@@ -398,7 +398,8 @@ pub fn answer_expr(
         leaves: Vec::new(),
     };
     if emit {
-        sink.corpus(num_docs, manifest.num_bytes - manifest.bom_bytes)?;
+        let (n, bytes) = docs.corpus(manifest, req.output.json());
+        sink.corpus(n, bytes)?;
         sink.term_start(&report.term)?;
     }
     let filter = req.filter.as_ref();

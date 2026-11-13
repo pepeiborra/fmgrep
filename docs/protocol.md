@@ -68,6 +68,7 @@ response line each, after any [frames](#streamed-output).
 | `per_file` | bool | false | with `stream`: one frame per [output event](#one-frame-per-file); without `stream`, -32602 |
 | `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
 | `commit` | string | absent | the served commit (hex id) the client compared its checkout with; a server that serves another, or none, answers -32001 |
+| `skip` | [string] | [] | the skip list: files the server leaves out, because the client searches them itself; each a path from the root, or `d/` for every file below `d`; at most 10,000; needs `commit` and `per_file`, else -32602 |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -131,7 +132,7 @@ for a file, its printed bytes:
 
 | event | payload |
 |---|---|
-| the corpus, once | `{"corpus":[docs,bytes]}`: what rg's `--json` summary counts as searched |
+| the corpus, once | `{"corpus":[docs,bytes]}`: what rg's `--json` summary counts as searched, less the skip list's files (their bytes less their BOMs in `json_matches`, the one mode that prints them) |
 | a term starts | `{"term":"<term>"}` |
 | a matching file | `{"doc":"<path from the root>","path":"<path as printed>","stats":[matches,matched_lines,bytes_printed]}`, a newline, then the file's printed bytes |
 | a term ends | `{"end":<QueryReport>}` |

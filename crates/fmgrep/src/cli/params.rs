@@ -71,7 +71,15 @@ pub struct QueryParams {
     /// that serves another, or none, refuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// The skip list: the files the server leaves out because the client
+    /// searches them itself; root-relative paths, `d/` for a subtree. It
+    /// needs `commit` and `per_file`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skip: Vec<String>,
 }
+
+/// The longest skip list a query may carry.
+pub const MAX_SKIP: usize = 10_000;
 
 /// What a request produces: the report (`counts`) or the
 /// local stdout of lines, `-l`, `-c`, `--count-matches`, `-o` and
@@ -153,6 +161,7 @@ impl Default for QueryParams {
             per_file: false,
             format: None,
             commit: None,
+            skip: Vec::new(),
         }
     }
 }

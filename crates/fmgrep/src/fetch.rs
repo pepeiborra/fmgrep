@@ -96,14 +96,83 @@ pub struct DocStore {
     stale_bytes: u64,
     /// As of `epoch`: [`Self::stale`], [`Self::changed`], and every added
     /// slot's path.
-    stale: Vec<usize>,
+    unscreened: Vec<usize>,
     changed: Vec<usize>,
     added: Arc<[String]>,
     epoch: usize,
+    /// What this query leaves out, and [`Self::stale`] less it.
+    skip: Skip,
+    scanned: Vec<usize>,
     #[cfg(test)]
     fetches: u64,
     #[cfg(test)]
     hits: u64,
+}
+
+/// The files a query leaves out, because its client searches them itself:
+/// each entry a root-relative path, or `d/` for every file below `d`.
+#[derive(Default)]
+pub struct Skip {
+    /// Ascending disjoint ranges of the manifest's ids.
+    ranges: Vec<std::ops::Range<usize>>,
+    entries: Vec<String>,
+}
+
+impl Skip {
+    /// `entries` over ascending `files`.
+    pub fn new(mut entries: Vec<String>, files: &[String]) -> Self {
+        entries.sort_unstable();
+        entries.dedup();
+        let mut ranges: Vec<std::ops::Range<usize>> = entries
+            .iter()
+            .map(|e| {
+                let lo = files.partition_point(|f| f.as_str() < e.as_str());
+                let n = match e.ends_with('/') {
+                    true => files[lo..].partition_point(|f| f.starts_with(e.as_str())),
+                    false => usize::from(files.get(lo) == Some(e)),
+                };
+                lo..lo + n
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        ranges.sort_unstable_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        Self {
+            ranges: merged,
+            entries,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether manifest doc `id` is left out.
+    fn holds_id(&self, id: usize) -> bool {
+        let at = self.ranges.partition_point(|r| r.end <= id);
+        self.ranges.get(at).is_some_and(|r| r.contains(&id))
+    }
+
+    /// Whether a file at `path`, not in the manifest, is left out.
+    fn holds_path(&self, path: &str) -> bool {
+        let at = self.entries.partition_point(|e| e.as_str() <= path);
+        // The greatest entry at or before `path`, then its parents' dirs.
+        self.entries[..at]
+            .iter()
+            .rev()
+            .any(|e| e == path || (e.ends_with('/') && path.starts_with(e.as_str())))
+    }
+
+    /// The manifest ids left out.
+    fn ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ranges.iter().flat_map(|r| r.clone())
+    }
 }
 
 /// Ceiling on bytes pinned by the cross-term cache: small overlaps (the usual
@@ -172,10 +241,12 @@ impl DocStore {
             cached_bytes: 0,
             max_cached_bytes: MAX_CACHED_BYTES,
             stale_bytes: 0,
-            stale: Vec::new(),
+            unscreened: Vec::new(),
             changed: Vec::new(),
             added: Arc::new([]),
             epoch: 0,
+            skip: Skip::default(),
+            scanned: Vec::new(),
             #[cfg(test)]
             fetches: 0,
             #[cfg(test)]
@@ -277,16 +348,78 @@ impl DocStore {
             self.changed = snap.gone;
             self.changed.extend_from_slice(&snap.stale);
             self.changed.sort_unstable();
-            self.stale = snap.stale;
-            self.stale.extend_from_slice(&snap.added);
+            self.unscreened = snap.stale;
+            self.unscreened.extend_from_slice(&snap.added);
             self.added = snap.names;
+            self.scanned = self.unskipped();
+        }
+    }
+
+    /// Leave out the files of `skip` until the next call; an empty one
+    /// leaves out none.
+    pub fn set_skip(&mut self, skip: Skip) {
+        self.skip = skip;
+        self.scanned = self.unskipped();
+    }
+
+    /// [`Self::stale`] less what the query leaves out.
+    fn unskipped(&self) -> Vec<usize> {
+        let mut scanned = self.unscreened.clone();
+        if !self.skip.is_empty() {
+            scanned.retain(|&id| !self.skipped(id));
+        }
+        scanned
+    }
+
+    /// Whether the query leaves out doc `id`, indexed or added.
+    fn skipped(&self, id: usize) -> bool {
+        match id.checked_sub(self.lens.len()) {
+            None => self.skip.holds_id(id),
+            Some(slot) => self
+                .added
+                .get(slot)
+                .is_some_and(|p| self.skip.holds_path(p)),
         }
     }
 
     /// The stale docs then the added ones, ascending, as of the last
-    /// [`Self::begin`] or [`Self::screen`]: every term scans them in full.
+    /// [`Self::begin`] or [`Self::screen`], less what the query leaves
+    /// out: every term scans them in full.
     pub fn stale(&self) -> &[usize] {
-        &self.stale
+        &self.scanned
+    }
+
+    /// The shape of a full scan of the manifest's docs, less what the query
+    /// leaves out: their count and their bytes, less leading UTF-8 BOMs, as
+    /// rg's searcher strips them. The BOMs of the docs left out are read
+    /// only when `boms` asks.
+    pub fn corpus(&self, manifest: &Manifest, boms: bool) -> (usize, u64) {
+        let (mut docs, mut bytes) = (
+            manifest.files.len(),
+            manifest.num_bytes - manifest.bom_bytes,
+        );
+        for id in self.skip.ids() {
+            docs -= 1;
+            bytes -= self.lens[id];
+            if boms && self.has_bom(id) {
+                bytes += 3;
+            }
+        }
+        (docs, bytes)
+    }
+
+    /// Whether indexed doc `id` starts with a UTF-8 BOM, as stored.
+    fn has_bom(&self, id: usize) -> bool {
+        let mut head = [0u8; 3];
+        let read = match &self.source {
+            Source::Shard { path, offsets } => std::fs::File::open(path)
+                .and_then(|f| pread_exact(&f, &mut head, offsets[id]))
+                .is_ok(),
+            // A query that leaves files out needs a served commit, which
+            // only stored docs have.
+            Source::Files(_) => false,
+        };
+        read && self.lens[id] >= 3 && head == [0xEF, 0xBB, 0xBF]
     }
 
     /// The stale and gone docs, ascending, as of the last [`Self::begin`] or
@@ -297,29 +430,30 @@ impl DocStore {
 
     /// Indexed docs gone as of the last [`Self::begin`] or [`Self::screen`].
     pub fn gone(&self) -> usize {
-        self.changed.len() - self.stale.partition_point(|&id| id < self.lens.len())
+        self.changed.len() - self.unscreened.partition_point(|&id| id < self.lens.len())
     }
 
-    /// Drop the stale and gone docs from one term's answer, first catching
-    /// up with changes seen since the last call.
+    /// Drop the stale and gone docs, and those the query leaves out, from
+    /// one term's answer, first catching up with changes seen since the
+    /// last call.
     pub fn screen(&mut self, exact: &mut Vec<(usize, u64)>, candidates: &mut Vec<usize>) {
         self.refresh(false);
-        if self.changed.is_empty() {
+        if self.changed.is_empty() && self.skip.is_empty() {
             return;
         }
-        let keep = |id: usize| self.changed.binary_search(&id).is_err();
+        let keep = |id: usize| self.changed.binary_search(&id).is_err() && !self.skip.holds_id(id);
         exact.retain(|&(id, _)| keep(id));
         candidates.retain(|&id| keep(id));
     }
 
     /// Whether indexed doc `id` was gone as of the last [`Self::begin`] or
-    /// [`Self::screen`].
+    /// [`Self::screen`], or is one the query leaves out.
     pub fn is_gone(&self, id: usize) -> bool {
-        self.changed.binary_search(&id).is_ok() && !self.is_stale(id)
+        self.changed.binary_search(&id).is_ok() && !self.is_stale(id) || self.skipped(id)
     }
 
     fn is_stale(&self, id: usize) -> bool {
-        self.stale.binary_search(&id).is_ok()
+        self.unscreened.binary_search(&id).is_ok()
     }
 
     /// Physical reads performed and cache hits served without a read.

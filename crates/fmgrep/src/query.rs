@@ -8,7 +8,7 @@ use crate::regex_pattern;
 
 use crate::blobs::BlobSlots;
 use crate::expr::Expr;
-use crate::fetch::{Ask, DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::fetch::{Ask, DocStore, Paths, Skip, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
 use crate::manifest::Manifest;
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
@@ -78,6 +78,11 @@ impl Loaded {
     /// Before a served query, re-check what changed since the last one.
     pub fn recheck(&self, manifest: &Manifest) {
         self.docs.recheck(&manifest.files);
+    }
+
+    /// Leave out `skip`'s files until the next call.
+    pub fn skip(&mut self, skip: Skip) {
+        self.docs.set_skip(skip);
     }
 
     /// Indexed files missing at load.
@@ -365,10 +370,8 @@ fn answer_terms(
 
     if emit {
         // rg's bytes_searched excludes the BOMs its searcher strips.
-        sink.corpus(
-            manifest.files.len(),
-            manifest.num_bytes - manifest.bom_bytes,
-        )?;
+        let (n, bytes) = docs.corpus(manifest, req.output.json());
+        sink.corpus(n, bytes)?;
     }
     let mut queries = Vec::with_capacity(terms.len());
     let filter = req.filter.as_ref();

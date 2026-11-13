@@ -831,3 +831,24 @@ fn paths_cmp_orders_added_ids_among_manifest_ids() {
     paths.sort(&mut manifest_only);
     assert_eq!(manifest_only, [0, 1]);
 }
+
+#[test]
+fn a_skip_list_holds_its_paths_and_subtrees() {
+    let files: Vec<String> = ["a.c", "b.c", "d/x", "d/y/z", "dz", "e.c"]
+        .map(String::from)
+        .to_vec();
+    let entries = ["d/", "b.c", "missing", "e.c"].map(String::from).to_vec();
+    let skip = Skip::new(entries, &files);
+    let held: Vec<usize> = (0..files.len()).filter(|&id| skip.holds_id(id)).collect();
+    assert_eq!(held, [1, 2, 3, 5]);
+    assert_eq!(skip.ids().collect::<Vec<_>>(), [1, 2, 3, 5]);
+    for (path, held) in [
+        ("d/new", true),
+        ("dz2", false),
+        ("missing", true),
+        ("c", false),
+    ] {
+        assert_eq!(skip.holds_path(path), held, "{path}");
+    }
+    assert!(Skip::default().is_empty());
+}

@@ -59,6 +59,11 @@ impl QueryOutput {
     pub fn names_lines(self) -> bool {
         matches!(self, Self::Matches(p) if p.path || p.json)
     }
+
+    /// Whether the output is rg's JSON events, whose summary counts bytes.
+    pub fn json(self) -> bool {
+        matches!(self, Self::Matches(p) if p.json)
+    }
 }
 
 /// How matched lines print.
