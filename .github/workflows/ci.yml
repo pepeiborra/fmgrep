@@ -2,15 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # A push to ci/<topic> runs every job on a commit without a pull request.
+    branches: [main, "ci/**"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# One group per branch or pull request. A newer commit cancels the run of
+# a pull request or a ci/ branch; every push to main runs to the end.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/ci/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,3 +33,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
       - run: scripts/check.sh
+
+  # The check job has no watchman, so it skips the tests that need a
+  # daemon. This job installs one on Linux and runs them, then the race.
+  watchman:
+    name: Watchman (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+      - name: Install watchman
+        # The prebuilt release that scripts/ec2-bench.sh pins. Its daemon
+        # does not start without its state directory.
+        run: |
+          z=watchman-v2026.11.09.00-linux
+          curl -fsSL -o "$RUNNER_TEMP/$z.zip" "https://github.com/facebook/watchman/releases/download/v2026.11.09.00/$z.zip"
+          echo "8833355ecd4a5004ceffeecf7fc27624c1644f4790e4c631c5fcc1fcaf0baba6  $RUNNER_TEMP/$z.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/$z.zip" -d "$RUNNER_TEMP"
+          sudo install -d -m 2777 /usr/local/var/run/watchman
+          sudo install -m 755 "$RUNNER_TEMP/$z"/bin/* /usr/local/bin/
+      - name: Test against a daemon started for the run
+        run: |
+          d="$RUNNER_TEMP/watchman"
+          mkdir -p "$d"
+          echo '{"root_files": []}' > "$d/config.json"
+          WATCHMAN_CONFIG_FILE="$d/config.json" watchman --foreground --sockname="$d/sock" \
+            --statefile="$d/state" --logfile="$d/log" --pidfile="$d/pid" </dev/null >"$d/out" 2>&1 &
+          for _ in $(seq 1 100); do [ -S "$d/sock" ] && break; sleep 0.1; done
+          WATCHMAN_SOCK="$d/sock" cargo test --workspace --locked
+      - name: Changes while watchman reads the tree
+        run: |
+          cargo build --release --locked -p fmgrep
+          scripts/watchman-race.sh target/release/fmgrep /usr/local/bin/watchman
