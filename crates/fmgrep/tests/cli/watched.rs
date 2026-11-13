@@ -71,6 +71,7 @@ fn later_searches_ask_watchman_not_git() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
     assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
+    asked_again(&r, &out, "no record of an earlier search");
     let c = &r.client;
     let changes: [fn(&Remote, &Path); 7] = [
         |r, c| {
@@ -107,6 +108,25 @@ fn later_searches_ask_watchman_not_git() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert!(runs.iter().any(|r| r.contains("diff-tree")), "{runs:?}");
     assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
+    let head = std::fs::canonicalize(c.join(".git/HEAD")).unwrap();
+    let index = std::fs::canonicalize(c.join(".git/index")).unwrap();
+    let text = stderr(&out);
+    let moved = [&head, &index].map(|p| format!("({} changed;", p.display()));
+    assert!(moved.iter().any(|m| text.contains(m)), "{text}");
+}
+
+/// The one line of a search that asked git for a new baseline, `why`.
+fn asked_again(r: &Remote, out: &Output, why: &str) {
+    let text = stderr(out);
+    let want = format!(
+        "warning: asked git what differs from the served commit {} ({why}; took ",
+        &r.commit[..7]
+    );
+    assert!(
+        text.starts_with(&want) && text.ends_with("); later searches ask watchman\n"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
 }
 
 /// A restarted daemon, or another one, cannot say what changed since the
@@ -126,6 +146,9 @@ fn a_restarted_or_another_daemon_asks_git_again() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\n");
+    let why = "watchman restarted, added the watch again or pruned deleted files since the last \
+               search";
+    asked_again(&r, &out, why);
     let mut other = r.s.fmgrep(&r.client);
     let out = other
         .env("WATCHMAN_SOCK", r.s.path("no-daemon"))

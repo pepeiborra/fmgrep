@@ -308,7 +308,9 @@ fn a_changed_ignore_file_searches_its_whole_directory() {
 
 /// More files to search than a query may list, from a new directory and
 /// then from a changed ignore file at the top that governs the whole
-/// checkout: the server's answer alone, and the true reason.
+/// checkout: the server's answer alone, and the true reason. Nothing
+/// else on stderr: the line that says git was asked would promise what
+/// the reason takes back.
 #[test]
 fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
     let r = Remote::new(&FILES);
@@ -321,13 +323,13 @@ fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
     let short = &r.commit[..7];
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = format!("more than 10000 files differ from the served commit {short}");
-    assert_eq!(r.warnings(&out), crate::remote::ignored(&why));
+    assert_eq!(stderr(&out), crate::remote::ignored(&why));
     assert_eq!(stdout(&out), served);
     r.s.write(&r.client, &[(".gitignore", "*.log\n*.tmp\n")]);
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = "the ignore file .gitignore differs from the served commit and governs more than \
                10000 files";
-    assert_eq!(r.warnings(&out), crate::remote::ignored(why));
+    assert_eq!(stderr(&out), crate::remote::ignored(why));
     assert_eq!(stdout(&out), served);
 }
 

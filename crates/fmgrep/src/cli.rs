@@ -240,7 +240,7 @@ fn client(
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
-            match mine(&top, &commit) {
+            match baseline::skip_list(&top, &commit) {
                 Ok(changes) => ours = Some((top, changes)),
                 Err(why) => checkout::degraded(&why),
             }
@@ -281,15 +281,6 @@ fn client(
         Some((top, (skip, local))) => merged(&mut conn, p, &top, skip, &local, json, out),
     };
     answered.map_err(|e| moved(server, conn.code(), e))
-}
-
-/// The skip list of the checkout at `top` against the served commit
-/// `commit`, and the files of it this client searches; else why the
-/// checkout cannot be compared.
-fn mine(top: &Path, commit: &str) -> Result<(Vec<String>, checkout::Local), String> {
-    let skip = baseline::skip_list(top, commit)?;
-    let local = checkout::resolve(top, &skip, commit)?;
-    Ok((skip, local))
 }
 
 /// `p` answered by the client for its files `local` under `top`, and by

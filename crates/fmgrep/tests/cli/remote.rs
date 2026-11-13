@@ -32,6 +32,9 @@ pub struct Remote {
 /// cannot say what changed.
 pub const ASKED_GIT: &str = "warning: watchman cannot say what changed (";
 
+/// The start of the warning of a search that asks git for a new baseline.
+pub const ASKED_AGAIN: &str = "warning: asked git what differs from the served commit ";
+
 impl Remote {
     pub fn new(files: &[(&str, &str)]) -> Self {
         Self::after(&[], files)
@@ -98,18 +101,19 @@ impl Remote {
             .expect("spawn fmgrep")
     }
 
-    /// The stderr of `out`, less the warning that git was asked because
-    /// watchman cannot say, when no daemon runs: each such search prints
-    /// it once. With a daemon, it stays, to fail the test.
+    /// The stderr of `out`, less the one line that says git was asked:
+    /// without a daemon, because watchman cannot say; with one, for a new
+    /// baseline. The other line stays, to fail the test.
     pub fn warnings(&self, out: &Output) -> String {
         let text = stderr(out);
-        if self.daemon.is_some() {
-            return text;
-        }
-        let asked = text.lines().filter(|l| l.starts_with(ASKED_GIT)).count();
-        assert!(asked <= 1, "{text}");
+        let asked = match self.daemon {
+            Some(_) => ASKED_AGAIN,
+            None => ASKED_GIT,
+        };
+        let n = text.lines().filter(|l| l.starts_with(asked)).count();
+        assert!(n <= 1, "{text}");
         text.lines()
-            .filter(|l| !l.starts_with(ASKED_GIT))
+            .filter(|l| !l.starts_with(asked))
             .map(|l| format!("{l}\n"))
             .collect()
     }

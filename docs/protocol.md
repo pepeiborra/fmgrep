@@ -261,20 +261,22 @@ the checkout would hold them, and it prints its files between the
 server's in path order. It asks git once and saves what git found with a
 watchman token in a record
 ([index-format.md](index-format.md#watchman)); later searches ask
-watchman what changed since, and run no git. Without watchman every
-search asks git, and prints `warning: watchman cannot say what changed
-(<why>); asked git what differs from the served commit <id> (took
-<time>)`. Where the client cannot list the changes soundly
-(assume-unchanged or skip-worktree entries, a sparse checkout, a filter
-or line-ending conversion, a submodule, an ignore file above the
-checkout, more than 10,000 differing paths or files to search, as when a
-changed ignore file governs a large directory), it sends no skip list
-and warns that local changes are ignored, with the reason. When the
-client warns so because it cannot compare at all (a checkout that lacks
-the served commit), PATH arguments and the cwd still resolve against the
-top of the cwd's checkout, and the query carries the served commit.
-Otherwise (no checkout, a server that serves no commit, or the served
-tree itself) they resolve against the served tree.
+watchman what changed since, and run no git. A search that asks git for
+a new baseline says why, in one line: `warning: asked git what differs
+from the served commit <id> (<why>; took <time>); later searches ask
+watchman`. Without watchman every search asks git, and prints `warning:
+watchman cannot say what changed (<why>); asked git what differs from
+the served commit <id> (took <time>)`. Where the client cannot list the
+changes soundly (assume-unchanged or skip-worktree entries, a sparse
+checkout, a filter or line-ending conversion, a submodule, an ignore
+file above the checkout, more than 10,000 differing paths or files to
+search, as when a changed ignore file governs a large directory), it
+sends no skip list and warns that local changes are ignored, with the
+reason. When the client warns so because it cannot compare at all (a
+checkout that lacks the served commit), PATH arguments and the cwd still
+resolve against the top of the cwd's checkout, and the query carries the
+served commit. Otherwise (no checkout, a server that serves no commit,
+or the served tree itself) they resolve against the served tree.
 
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
