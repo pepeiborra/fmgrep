@@ -163,3 +163,45 @@ C_Check` (40 lines missed in 1 file). The second file is indexed; eg 1.0.0
 anchors the index at the common parent of its search paths under
 `--index-dir` (here `external/`) and drops every candidate, while a scan
 finds it, so the miss is intermittent.
+
+## A served query with default flags
+
+The served rows above run `fmgrep serve --no-watch`. With default flags
+the server asks [watchman](docs/index-format.md#watchman) what changed
+before each query, which costs time and makes each answer current.
+
+Measured on an AWS i4i.4xlarge (Ubuntu 24.04, ext4 on NVMe, watchman
+v2026.11.09) on 2026-11-13, files in the page cache. "Before" is the
+server that ran its own file watcher and "after" the one that asks
+watchman; both served the same index at once, in alternating blocks, 120
+queries per class each, each timed as the client's wall time over a new
+connection with nothing changing in the tree. `serve --no-watch` took
+the same time before and after, within noise, on every tree and class,
+so the tables above stand.
+
+p50 in ms, before → after, first run. The last column covers both runs
+and every class.
+
+| tree | rare identifier (`-l`) | no match | AND of two terms | regex | common word (`-c`) | after minus before |
+|---|---|---|---|---|---|---|
+| linux | 0.42 → 2.10 | 0.51 → 2.52 | 1.27 → 3.11 | 42.7 → 45.0 | 20.9 → 22.9 | +1.7 to +2.3 ms |
+| chromium | 0.45 → 2.11 | 0.50 → 2.41 | 1.48 → 3.42 | 85.5 → 87.5 | 39.2 → 41.3 | +1.7 to +2.1 ms (one regex run +0.2) |
+| aosp | 0.52 → 2.78 | 0.55 → 3.33 | 3.29 → 5.68 | 6.84 → 9.28 | 152 → 154 | +2.2 to +3.2 ms (one `-c` run +0.4) |
+| fmgrep | 0.22 → 1.30 | 0.22 → 1.32 | 0.58 → 1.66 | 1.04 → 2.13 | 0.77 → 1.87 | +1.1 ms |
+
+Where the time goes, from the server's `--verbose` line:
+
+| tree | the ask (p50 / p95) | the re-check (p50 / p95) | paths watchman reports per query |
+|---|---|---|---|
+| linux | 1.1 / 1.3-1.4 ms | 0.54-0.57 / 0.67-0.75 ms | 1 |
+| chromium | 1.1-1.2 / 1.4 ms | 0.42-0.43 / 0.49-0.52 ms | 1 |
+| aosp | 1.2 / 1.4-1.5 ms | 1.5 / 2.2-2.7 ms | 0 |
+| fmgrep | 0.97 / 1.1 ms | 0.03 / 0.04 ms | 0 |
+
+An edit, then a query sent at once:
+
+| tree | before misses the edit | after misses it | before shows it after (p50 / p95 / max) |
+|---|---|---|---|
+| linux | 290 of 300 | 0 of 300 | 50 / 74 / 76 ms |
+| chromium | 196 of 200 | 0 of 200 | 51 / 75 / 78 ms |
+| aosp | 200 of 200 | 0 of 200 | 63 / 71 / 72 ms |
