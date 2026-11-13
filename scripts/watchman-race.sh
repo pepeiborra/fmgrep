@@ -4,13 +4,15 @@
 # not make fmgrep give wrong answers. Starts a private watchman daemon (its
 # own socket, state, log and pid files under a temporary directory; never
 # the user's daemon), generates a tree of FILES small files (200,000 by
-# default) and indexes it with WATCHMAN_SOCK set to that daemon. Four
-# searches are compared with rg, three times each (a check). Then watchman
-# reads the whole tree twice: after a restart of the daemon, and after its
-# watch is removed, when the first search asks for a new one. During each
-# read the script deletes, edits and adds 1,800 files and three loops
-# search the tree; a check follows once both are done. A last round of
-# changes, after a token, has its check too.
+# default) and indexes it with WATCHMAN_SOCK set to that daemon, then
+# starts `fmgrep serve` on it, which asks that daemon before each query.
+# Four searches are compared with rg, three times each, with and without
+# the server (a check). Then watchman reads the whole tree twice: after a
+# restart of the daemon, and after its watch is removed, when the first
+# search asks for a new one. During each read the script deletes, edits
+# and adds 1,800 files, three loops search the tree and one loop asks the
+# server; a check follows once all are done. A last round of changes,
+# after a token, has its check too. Records go to a temporary cache.
 #
 # Some changes must fall within the read after the restart: the script
 # fails when none does (raise FILES). Needs python3 and rg. Ends with
@@ -32,6 +34,8 @@ TREE="$WORK/tree"
 IDX="$WORK/idx"
 SOCK="$WORK/w/sock"
 DAEMON=""
+SERVER=""
+export XDG_CACHE_HOME="$WORK/cache"
 stop() {
     if [[ -n "$DAEMON" ]]; then
         kill "$DAEMON" 2>/dev/null || true
@@ -39,7 +43,7 @@ stop() {
     fi
     DAEMON=""
 }
-trap 'stop; rm -rf "$WORK"' EXIT
+trap '[[ -n "$SERVER" ]] && kill "$SERVER" 2>/dev/null; stop; rm -rf "$WORK"' EXIT
 
 # min_acceptable_nice_value: watchman refuses to start at a raised nice
 # value, which CI runners and background shells can have. root_files []:
@@ -99,6 +103,14 @@ WATCHMAN_SOCK="$SOCK" "$BIN" index --output "$IDX" "$TREE" >&2
 echo "indexed in ${SECONDS} s" >&2
 call "[\"watch-project\", \"$TREE\"]" >/dev/null
 crawled
+WATCHMAN_SOCK="$SOCK" "$BIN" serve "$IDX" >"$WORK/ready" 2>>"$WORK/serve.err" </dev/null &
+SERVER=$!
+for _ in $(seq 1 600); do
+    [[ -s "$WORK/ready" ]] && break
+    sleep 0.1
+done
+ADDR="$(head -n1 "$WORK/ready")"
+[[ -n "$ADDR" ]] || { echo "fmgrep serve did not become ready:" >&2; cat "$WORK/serve.err" >&2; exit 2; }
 
 # Deletes, edits and adds 1,800 files, in batches of 30 with 20 ms between
 # them; the round names the added files. Prints the time of each change.
@@ -126,20 +138,24 @@ for k, i in enumerate(rand.sample(range(n), 1800)):
 EOF
 }
 
-# Each answer against rg's, sorted.
+# Each answer, of a search and of the server, against rg's, sorted.
 PASS=0 FAIL=0
 compare() {
-    local flags=$1 term=$2 ours theirs
+    local flags=$1 term=$2 ours served theirs how got
     ours="$(cd "$TREE" && WATCHMAN_SOCK="$SOCK" "$BIN" --index "$IDX" $flags -- "$term" </dev/null 2>"$WORK/err" | LC_ALL=C sort)" || true
+    served="$(cd "$TREE" && "$BIN" --server "$ADDR" $flags -- "$term" </dev/null 2>>"$WORK/err" | LC_ALL=C sort)" || true
     theirs="$(cd "$TREE" && rg $flags -- "$term" </dev/null | LC_ALL=C sort)" || true
-    if [[ "$ours" == "$theirs" ]]; then
-        PASS=$((PASS + 1))
-    else
-        FAIL=$((FAIL + 1))
-        echo "FAIL: fmgrep $flags $term differs from rg (< rg, > fmgrep):" >&2
-        diff <(echo "$theirs") <(echo "$ours") | head -20 >&2 || true
-        grep -v '^warning: excluding ' "$WORK/err" | sed 's/^/  stderr: /' >&2 || true
-    fi
+    for how in search server; do
+        [[ $how == search ]] && got=$ours || got=$served
+        if [[ "$got" == "$theirs" ]]; then
+            PASS=$((PASS + 1))
+        else
+            FAIL=$((FAIL + 1))
+            echo "FAIL: fmgrep ($how) $flags $term differs from rg (< rg, > fmgrep):" >&2
+            diff <(echo "$theirs") <(echo "$got") | head -20 >&2 || true
+            grep -v '^warning: excluding ' "$WORK/err" | sed 's/^/  stderr: /' >&2 || true
+        fi
+    done
 }
 checks() {
     for _ in 1 2 3; do
@@ -158,6 +174,15 @@ searching() {
         n=$((n + 1))
     done
     echo "$n" >>"$WORK/searches"
+}
+# Queries to the server until the changes are done and the read is over.
+serving() {
+    local n=0
+    while kill -0 "$changer" 2>/dev/null || kill -0 "$reader" 2>/dev/null; do
+        (cd "$TREE" && "$BIN" --server "$ADDR" -c needle </dev/null >/dev/null 2>>"$WORK/race.err.served") || true
+        n=$((n + 1))
+    done
+    echo "$n" >"$WORK/queries"
 }
 
 # Round $2 of changes while watchman reads the tree, with three loops of
@@ -181,6 +206,8 @@ race() {
         searching "$i" &
         searchers+=($!)
     done
+    serving &
+    searchers+=($!)
     wait "$changer"
     wait "$reader"
     wait "${searchers[@]}"
@@ -188,10 +215,16 @@ race() {
     DURING=$(awk -v end="$end" '$1 < end' "$WORK/changes" | wc -l | tr -d ' ')
     echo "$why: watchman read the tree in $(awk -v a="$t0" -v b="$end" 'BEGIN {printf "%.1f", b - a}') s;" \
         "$DURING of $(wc -l <"$WORK/changes" | tr -d ' ') changes were made meanwhile;" \
-        "$(awk '{n += $1} END {print n}' "$WORK/searches") searches ran during the changes" >&2
+        "$(awk '{n += $1} END {print n}' "$WORK/searches") searches and $(cat "$WORK/queries") served queries ran during the changes" >&2
     cat "$WORK"/race.err.* | grep '^warning: ' | grep -v '^warning: excluding ' | sed -E 's/[0-9]+ ms/N ms/g' |
         sort | uniq -c | sort -rn >&2 || true
     checks
+}
+# What the server said since the last call, on its stderr.
+said() {
+    echo "the server's stderr:" >&2
+    grep -v '^warning: excluding ' "$WORK/serve.err" | sed 's/^/  /' >&2 || true
+    : >"$WORK/serve.err"
 }
 
 # Searches before any change, which leave a record of a token.
@@ -200,10 +233,12 @@ checks
 stop
 start
 race "after a restart" r1
+said
 [[ $DURING -gt 0 ]] || { echo "no change was made while watchman read the tree: raise FILES" >&2; exit 1; }
 # No watch: the first search asks for one, and watchman reads the tree.
 call "[\"watch-del\", \"$TREE\"]" >/dev/null
 race "after the watch was removed" r2
+said
 # Changes after a token: no read.
 change r3 >/dev/null
 checks
