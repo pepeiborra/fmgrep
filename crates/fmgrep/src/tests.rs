@@ -9,6 +9,10 @@ mod matches;
 mod output;
 mod serve;
 pub(crate) mod support;
+#[cfg(unix)]
+mod watched;
+#[cfg(unix)]
+pub(crate) mod watchman;
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,9 @@ thread_local! {
     pub static SHARD_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
     /// `FMGREP_JOURNAL` for indexes and loads on this thread, over the env.
     pub static JOURNAL: Cell<Option<&'static str>> = const { Cell::new(Some("off")) };
+    /// The watchman socket found on this thread; none when `None`, so tests
+    /// reach only a daemon they started.
+    pub static WATCHMAN: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The cause a watch started on this thread fails with.
     pub static WATCH_FAILS: Cell<Option<&'static str>> = const { Cell::new(None) };
 }

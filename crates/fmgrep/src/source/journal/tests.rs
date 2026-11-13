@@ -79,6 +79,7 @@ mod watchman_tests {
 
     use super::*;
     use crate::source::journal::watchman::Watchman;
+    use crate::tests::watchman::Daemon;
 
     const NORMAL: u8 = 0;
     const FRESH: u8 = 1;
@@ -268,27 +269,23 @@ mod watchman_tests {
         );
     }
 
-    /// Live tests add watches, so they run only against an explicit `WATCHMAN_SOCK`.
-    fn live() -> Option<Watchman> {
-        let w =
-            std::env::var_os("WATCHMAN_SOCK").and_then(|_| Watchman::find(Duration::from_secs(5)));
-        if w.is_none() {
-            eprintln!("skipped: WATCHMAN_SOCK is unset");
-        }
-        w
+    /// A private daemon of this test, which this thread finds; `None`
+    /// without watchman.
+    fn live() -> Option<(Daemon, Watchman)> {
+        let daemon = Daemon::start()?;
+        crate::tests::WATCHMAN.set(Some(daemon.sock.clone()));
+        let w = Watchman::find(Duration::from_secs(5)).expect("the test's daemon");
+        Some((daemon, w))
     }
 
     #[test]
     fn watchman_live_round_trip() {
-        let Some(w) = live() else {
+        let Some((_daemon, w)) = live() else {
             return;
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let Some(token) = w.mark(&root) else {
-            eprintln!("skipped: watchman does not cover {}", root.display());
-            return;
-        };
+        let token = w.mark(&root).expect("a token of the tree, watched");
         std::fs::write(root.join("new.c"), b"new").unwrap();
         let w = Watchman::of(&token, Duration::from_secs(5)).unwrap();
         let named = |token: &Value| match w.since(&Ask { root: &root, token }) {
@@ -308,13 +305,10 @@ mod watchman_tests {
     fn watchman_alone_is_marked_unless_off() {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path());
-        let Some(w) = live() else {
+        let Some((_daemon, w)) = live() else {
             return;
         };
-        if w.mark(&root).is_none() {
-            eprintln!("skipped: watchman does not cover {}", root.display());
-            return;
-        }
+        assert!(w.mark(&root).is_some(), "the tree, watched");
         let kinds =
             |knob| -> Vec<String> { marks(&root, knob).into_iter().map(|t| t.kind).collect() };
         assert_eq!(kinds(Knob::Auto), ["watchman"]);

@@ -53,15 +53,11 @@ jobs:
           unzip -q "$RUNNER_TEMP/$z.zip" -d "$RUNNER_TEMP"
           sudo install -d -m 2777 /usr/local/var/run/watchman
           sudo install -m 755 "$RUNNER_TEMP/$z"/bin/* /usr/local/bin/
-      - name: Test against a daemon started for the run
-        run: |
-          d="$RUNNER_TEMP/watchman"
-          mkdir -p "$d"
-          echo '{"root_files": []}' > "$d/config.json"
-          WATCHMAN_CONFIG_FILE="$d/config.json" watchman --foreground --sockname="$d/sock" \
-            --statefile="$d/state" --logfile="$d/log" --pidfile="$d/pid" </dev/null >"$d/out" 2>&1 &
-          for _ in $(seq 1 100); do [ -S "$d/sock" ] && break; sleep 0.1; done
-          WATCHMAN_SOCK="$d/sock" cargo test --workspace --locked
+      - name: Test, each test with a daemon of its own
+        # A path, so that the tests fail, not skip, without it.
+        env:
+          FMGREP_TEST_WATCHMAN: /usr/local/bin/watchman
+        run: cargo test --workspace --locked
       - name: Changes while watchman reads the tree
         run: |
           cargo build --release --locked -p fmgrep
