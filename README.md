@@ -144,12 +144,12 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 
 | fmgrep / rg | linux | chromium | aosp |
 |---|--:|--:|--:|
-| index size | 1.11 GB / - | 2.23 GB / - | 12.13 GB / - |
-| files read per literal (mean) | 798 / all 95553 | 14219 / all 461027 | 1241 / all 1264964 |
-| literal p50 | 3.89 / 121 ms | 24.4 / 569 ms | 10.6 / 2380 ms |
-| regex p50 | 9.79 / 123 ms | 32.1 / 560 ms | 12.1 / 2360 ms |
+| index size | 1.11 GB / - | 2.22 GB / - | 12.00 GB / - |
+| files read per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
+| literal p50 | 4.09 / 114 ms | 24.0 / 510 ms | 9.89 / 1560 ms |
+| regex p50 | 9.06 / 116 ms | 30.2 / 496 ms | 15.0 / 1580 ms |
 
-aosp is Android's platform source: 17.6 GB of text in 1.26 M files from
+aosp is Android's platform source: 17.4 GB of text in 1.25 M files from
 about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
 tables in [BENCHMARKS.md](BENCHMARKS.md).
 [scripts/ec2-bench.sh](scripts/ec2-bench.sh) runs the benchmark on such an
