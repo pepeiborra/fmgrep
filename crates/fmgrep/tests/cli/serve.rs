@@ -372,6 +372,31 @@ fn fmgrep_server_gives_the_server() {
     assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
 }
 
+/// `--server` that cannot be reached: an index found by walking up answers,
+/// with one warning; with none, the search fails.
+#[test]
+fn an_unreachable_server_falls_back_to_a_local_index() {
+    let (tmp, docs) = stage();
+    ok(&["index", &docs.display().to_string()]);
+    let closed = closed_port();
+    let words = ["--server", &closed, "-l", "printk"];
+    let out = run_in(&docs, &words);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.bin\nb.bin\n");
+    let lines: Vec<String> = stderr(&out).lines().map(str::to_owned).collect();
+    let dotdir = std::fs::canonicalize(&docs).unwrap().join(".fmgrep");
+    let want = format!(
+        "warning: Using local index {}: cannot reach the server at {closed} (",
+        dotdir.display()
+    );
+    assert!(lines.len() == 1 && lines[0].starts_with(&want), "{lines:?}");
+    let out = run_in(tmp.path(), &words);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let want = format!("error: cannot reach the server at {closed}: ");
+    assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
+}
+
 /// The server scopes a search to the client's cwd.
 #[test]
 fn a_client_below_the_served_tree_searches_its_subtree() {

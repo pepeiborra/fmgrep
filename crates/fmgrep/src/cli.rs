@@ -196,7 +196,8 @@ impl std::fmt::Display for Server<'_> {
 }
 
 /// A search through `server`: one connection; PATHs resolve against the
-/// served tree.
+/// served tree. When `--server` gives a server that cannot be reached, an
+/// index found by walking up answers, with a warning.
 fn client(
     server: Server<'_>,
     mut p: QueryParams,
@@ -204,8 +205,22 @@ fn client(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
-    let mut conn =
-        Conn::connect(server.addr).map_err(|e| format!("error: cannot reach {server}: {e}"))?;
+    let mut conn = match Conn::connect(server.addr) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // With `FMGREP_SERVER`, such an index has already won.
+            if !server.env
+                && let Ok(found) = locate(Path::new("."))
+            {
+                warn(&format!(
+                    "Using local index {}: cannot reach {server} ({e})",
+                    found.index_dir.display()
+                ));
+                return local(None, p, typed, json, out);
+            }
+            return Err(format!("error: cannot reach {server}: {e}"));
+        }
+    };
     if !typed.is_empty() {
         let status = serve::status_on(&mut conn)?;
         let root = Path::new(&status.root);

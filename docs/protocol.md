@@ -186,9 +186,11 @@ Serving continues after any error.
 `--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
 headings follow the client's stdout, as in rg. `--status` prints the
 status object and `--shutdown` stops the server. An error response exits
-2, as `error: server: <message>`, after any output already received. A
-server that cannot be reached exits 2, as `error: cannot reach the server
-at ADDR: <cause>`.
+2, as `error: server: <message>`, after any output already received. When
+the server cannot be reached, a `.fmgrep` found by walking up from the cwd
+answers, and stderr says `warning: Using local index <dir>: cannot reach
+the server at ADDR (<cause>)`; with none, the search exits 2, as `error:
+cannot reach the server at ADDR: <cause>`.
 
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
