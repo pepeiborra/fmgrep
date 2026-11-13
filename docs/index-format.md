@@ -215,7 +215,9 @@ change:
   (<error>)` (the socket in `WATCHMAN_SOCK`),
   `watchman did not answer within 100 ms`, `watchman's ignore_dirs hide
   part of /src`, `/src is on nfs4, a network or shared filesystem:
-  watchman does not see changes made there from other machines`, `the
+  watchman does not see changes made there from other machines`,
+  `cannot read /proc/self/mountinfo to tell the tree's filesystem
+  (<error>)`, `the
   index has no dirs.stamps; re-run index`, `the manifest lists files out
   of order; re-run index`, `cannot resolve /src (<error>)`, or
   `watchman: <its own error>`. A late answer is never used; the record is
@@ -235,8 +237,11 @@ or virtiofs, as `/proc/self/mountinfo` says) watchman sees only the changes
 made from this machine, so a token would miss a file changed from
 another one. There `index` asks for no watch, and a search takes no
 token and saves no record: every search checks every file and prints
-the `watchman cannot say what changed` line. This check is made on Linux
-only; elsewhere the type of the filesystem is not read.
+the `watchman cannot say what changed` line. The same holds when
+`/proc/self/mountinfo` cannot be read (no `/proc` in a container or a
+sandbox, for example): the type is then unknown, and fmgrep takes it as
+a network filesystem. This check is made on Linux only; elsewhere the
+type of the filesystem is not read.
 
 ## Shards
 

@@ -44,10 +44,10 @@ thread_local! {
     /// path where none is, unless a test puts a stand-in there.
     pub static WATCHMAN_PROGRAM: std::cell::RefCell<PathBuf> =
         std::cell::RefCell::new(PathBuf::from("/nonexistent/watchman"));
-    /// The cache directory of searches on this thread; none when `None`.
-    /// The mountinfo text searches on this thread read; none when `None`,
+    /// The mountinfo file searches on this thread read; none when `None`,
     /// so no mount check is made.
-    pub static MOUNTS: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    pub static MOUNTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    /// The cache directory of searches on this thread; none when `None`.
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
@@ -60,7 +60,7 @@ pub struct Hooks {
     ask_from: Option<usize>,
     watchman: Option<PathBuf>,
     program: PathBuf,
-    mounts: Option<String>,
+    mounts: Option<PathBuf>,
     cache: Option<PathBuf>,
     notes: Arc<Mutex<Vec<String>>>,
 }
