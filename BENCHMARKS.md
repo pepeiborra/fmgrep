@@ -23,7 +23,11 @@ listed under the run's results, not failures.
   `fmgrep --index DIR -n --no-heading` process per query from the corpus
   root, as an agent without a server runs it; each process loads the index
   and checks the tree itself, so there is no `ready`, and the footprint
-  and RSS are the largest query's.
+  and RSS are the largest query's. On these three trees the check asks
+  watchman what changed since the token in the record that the first
+  search left in the cache directory. The warm-up query is that first
+  search: it checks every file and takes the token, so the row times
+  only later searches.
 - **fmgrep `--store-docs`**: the same over `index --store-docs`, which keeps
   a copy of every file: a printed line is read from the copy, and `serve`
   does not check the tree.
@@ -55,6 +59,10 @@ Before its timed queries every row runs the set's first query once as a
 warm-up, after `ready` where the row has one: its output is checked, but
 it is neither timed nor kept, nor counted in the query footprint or
 RSS, so no row times the first query a client sends.
+Before the rows, `scripts/bench.sh` has watchman watch the checkout and
+waits until watchman has crawled it
+([File monitor](docs/benchmark.md#file-monitor)); fmgrep runs with its
+defaults.
 Latency is spawn to exit, process start-up and printing included. `p50` is
 the lower median over the literal, the regex or the intersection queries,
 beside their mean; `all` is over every query. `query footprint` is the
@@ -67,9 +75,9 @@ bytes.
 
 | corpus | commit | files | text | queries (literal / regex / intersection) |
 |---|---|--:|--:|--:|
-| linux | `5878583` | 95553 | 1.53 GB | 113 (92 / 13 / 8) |
-| chromium | `e2c5a77` | 461027 | 2.84 GB | 46 (30 / 8 / 8) |
-| aosp | `android-17.0.0_r1` | 1264964 | 17.57 GB | 46 (30 / 8 / 8) |
+| linux | `5878583` | 95926 | 1.53 GB | 113 (92 / 13 / 8) |
+| chromium | `e2c5a77` | 460698 | 2.84 GB | 46 (30 / 8 / 8) |
+| aosp | `android-17.0.0_r1` | 1253798 | 17.37 GB | 46 (30 / 8 / 8) |
 
 aosp is the Android Open Source Project's platform source at release tag
 `android-17.0.0_r1`, assembled by the repo tool from the platform
@@ -101,10 +109,11 @@ hold both.
 
 AWS i4i.4xlarge spot instance (16 vCPUs, Intel Xeon Platinum 8375C at 2.90
 GHz, 123 GiB, local NVMe formatted ext4), Ubuntu 24.04, kernel 7.0. fmgrep
-0.1.0 (release build), ripgrep 15.2.0, tgrep 1.0.8, elgrep 1.0.0. One run per corpus,
-measured 2026-11-09 (UTC), searching the checkout in place. The fmgrep
-rows come from a later run on an instance of the same type (rg, tgrep and
-elgrep do not use fmgrep's index).
+0.1.0 (release build, commit `c58fb4b`), ripgrep 15.2.0, tgrep 1.0.8,
+elgrep 1.0.0, watchman v2026.11.09.00 (the prebuilt release). One run of
+every row on one instance with
+[scripts/ec2-bench.sh](scripts/ec2-bench.sh), measured 2026-11-13 (UTC),
+searching the checkout in place.
 
 ### Results
 
@@ -112,53 +121,60 @@ elgrep do not use fmgrep's index).
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 121 ms | 121 ms | 123 ms | 125 ms | 127 ms | 244 ms | 121 ms | 130 ms | 14.72 MB | 18.42 MB | - | 7.70->8.66! |
-| fmgrep | 22.33 s | 1.11 GB | 115 ms | 3.89 ms | 4.72 ms | 9.79 ms | 18.4 ms | 8.91 ms | 12.9 ms | 4.05 ms | 6.87 ms | 207.56 MB | 1.28 GB | 6.57 GB | 9.97->11.56! |
-| fmgrep `--store-docs` | 21.31 s | 2.64 GB | 42.3 ms | 3.26 ms | 3.96 ms | 7.70 ms | 13.2 ms | 8.44 ms | 17.4 ms | 3.72 ms | 5.97 ms | 207.99 MB | 1.28 GB | 6.70 GB | 11.56->12.33! |
-| fmgrep, no server | 21.25 s | 1.11 GB | - | 51.2 ms | 51.7 ms | 57.8 ms | 66.6 ms | 57.1 ms | 61.2 ms | 51.5 ms | 54.1 ms | 202.47 MB | 936.52 MB | 6.23 GB | 12.33->11.94! |
-| tgrep | 14.12 s | 1.02 GB | 1.84 s | 20.5 ms | 30.0 ms | 41.5 ms | 59.4 ms | 120 ms | 610 ms | 23.0 ms | 74.4 ms | 2.22 GB | 2.28 GB | 282.62 MB | 10.15->8.40! |
-| elgrep | 27.61 s | 1.39 GB | 27.62 s | 9.79 ms | 11.0 ms | 23.7 ms | 23.0 ms | 38.5 ms | 1.27 s | 10.8 ms | 101 ms | 10.45 MB | 394.08 MB | 7.06 GB | 8.40->8.85! |
+| rg | - | - | - | 114 ms | 115 ms | 116 ms | 118 ms | 125 ms | 239 ms | 115 ms | 124 ms | 10.15 MB | 16.07 MB | - | 6.16->7.45! |
+| fmgrep | 22.04 s | 1.11 GB | 160 ms | 4.09 ms | 4.95 ms | 9.06 ms | 17.0 ms | 8.61 ms | 13.0 ms | 4.51 ms | 6.90 ms | 196.45 MB | 1.27 GB | 6.15 GB | 7.45->9.70! |
+| fmgrep `--store-docs` | 20.28 s | 2.64 GB | 42.9 ms | 3.68 ms | 4.22 ms | 6.98 ms | 13.4 ms | 6.16 ms | 11.2 ms | 3.93 ms | 5.77 ms | 206.75 MB | 1.28 GB | 7.19 GB | 9.70->10.78! |
+| fmgrep, no server | 18.20 s | 1.11 GB | - | 47.3 ms | 47.9 ms | 51.6 ms | 60.3 ms | 51.4 ms | 55.9 ms | 48.2 ms | 49.9 ms | 197.52 MB | 936.34 MB | 6.17 GB | 10.78->9.78! |
+| tgrep | 14.67 s | 1.02 GB | 2.13 s | 23.1 ms | 30.8 ms | 44.8 ms | 66.1 ms | 130 ms | 634 ms | 25.9 ms | 77.5 ms | 2.21 GB | 2.27 GB | 284.12 MB | 9.78->7.97! |
+| elgrep | 31.42 s | 1.39 GB | 31.43 s | 9.88 ms | 11.3 ms | 23.8 ms | 23.2 ms | 40.8 ms | 1.23 s | 11.0 ms | 99.0 ms | 10.14 MB | 391.46 MB | 7.19 GB | 7.97->8.49! |
 
 elgrep answered 4 of the 113 queries by scanning: its index refuses a pattern that selects over 30% of the files.
 
-elgrep differed from rg on 2 intersections: `static AND
-devm_platform_ioremap_resource` (14700 lines missed in 429 files) and
-`MARGINING AND PERFCOUNTER` (197 lines missed in 1 file).
+elgrep differed from rg on 1 intersection: `MARGINING AND PERFCOUNTER`
+(197 lines missed in 1 file).
 
 ### chromium
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 569 ms | 592 ms | 560 ms | 587 ms | 558 ms | 603 ms | 569 ms | 593 ms | 112.61 MB | 116.37 MB | - | 12.14->11.96! |
-| fmgrep | 38.73 s | 2.23 GB | 629 ms | 24.4 ms | 51.3 ms | 32.1 ms | 69.8 ms | 4.24 ms | 4.79 ms | 16.0 ms | 46.4 ms | 164.37 MB | 2.33 GB | 8.80 GB | 10.98->15.99! |
-| fmgrep `--store-docs` | 36.08 s | 5.06 GB | 135 ms | 17.1 ms | 37.2 ms | 27.3 ms | 47.3 ms | 5.10 ms | 5.64 ms | 11.3 ms | 33.4 ms | 208.33 MB | 2.37 GB | 9.34 GB | 15.99->16.12! |
-| fmgrep, no server | 47.23 s | 2.23 GB | - | 212 ms | 240 ms | 220 ms | 257 ms | 190 ms | 193 ms | 206 ms | 235 ms | 170.49 MB | 2.22 GB | 8.79 GB | 16.12->12.83! |
-| tgrep | 38.90 s | 2.77 GB | 12.28 s | 207 ms | 454 ms | 514 ms | 890 ms | 157 ms | 407 ms | 220 ms | 522 ms | 6.55 GB | 6.57 GB | 1.08 GB | 12.96->4.42! |
-| elgrep | 60.83 s | 3.23 GB | 60.84 s | 47.3 ms | 89.0 ms | 52.5 ms | 134 ms | 193 ms | 1.45 s | 53.6 ms | 333 ms | 67.44 MB | 608.20 MB | 16.58 GB | 4.42->8.01! |
+| rg | - | - | - | 510 ms | 519 ms | 496 ms | 509 ms | 483 ms | 513 ms | 501 ms | 516 ms | 96.39 MB | 102.01 MB | - | 1.63->4.72! |
+| fmgrep | 46.06 s | 2.22 GB | 442 ms | 24.0 ms | 48.9 ms | 30.2 ms | 64.6 ms | 4.52 ms | 5.18 ms | 15.7 ms | 44.0 ms | 181.54 MB | 2.35 GB | 8.99 GB | 4.72->11.08! |
+| fmgrep `--store-docs` | 41.97 s | 5.06 GB | 138 ms | 16.3 ms | 32.8 ms | 22.2 ms | 43.1 ms | 5.20 ms | 5.95 ms | 11.8 ms | 29.9 ms | 209.09 MB | 2.37 GB | 8.83 GB | 11.08->13.16! |
+| fmgrep, no server | 38.63 s | 2.22 GB | - | 169 ms | 200 ms | 177 ms | 216 ms | 150 ms | 150 ms | 162 ms | 194 ms | 168.14 MB | 2.20 GB | 8.89 GB | 13.16->12.98! |
+| tgrep | 40.62 s | 2.77 GB | 13.24 s | 210 ms | 462 ms | 523 ms | 906 ms | 164 ms | 420 ms | 219 ms | 532 ms | 6.53 GB | 6.55 GB | 1.07 GB | 12.98->4.37! |
+| elgrep | 70.69 s | 3.24 GB | 70.70 s | 47.5 ms | 89.2 ms | 52.8 ms | 134 ms | 195 ms | 1.37 s | 54.8 ms | 320 ms | 67.56 MB | 604.49 MB | 16.46 GB | 4.37->7.16! |
 
 elgrep answered every query from its index. It differed from rg on 5
-intersections, missing 2 to 1020 lines each: `std::unique_ptr AND
-blink::LocalFrame` (1020 lines in 69 files), `TODO AND blink::LocalFrame`
-(228 in 36), `std::vector AND net::URLRequest` (170 in 24), `DCHECK AND
-net::URLRequest` (35 in 8) and `CurrencyExtendedData AND
+intersections, missing 2 to 995 lines each: `std::unique_ptr AND
+blink::LocalFrame` (995 lines in 63 files), `TODO AND blink::LocalFrame`
+(290 in 44), `std::vector AND net::URLRequest` (257 in 30), `DCHECK AND
+net::URLRequest` (64 in 10) and `CurrencyExtendedData AND
 UnitsDisplayNames` (2 in 1).
 
 ### aosp
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 2.38 s | 2.38 s | 2.36 s | 2.40 s | 2.31 s | 2.31 s | 2.36 s | 2.37 s | 368.68 MB | 372.44 MB | - | 4.01->8.04! |
-| fmgrep | 201.21 s | 12.13 GB | 3.83 s | 10.6 ms | 35.5 ms | 12.1 ms | 97.0 ms | 14.2 ms | 19.8 ms | 11.6 ms | 43.5 ms | 1.03 GB | 10.78 GB | 12.05 GB | 9.68->12.55! |
-| fmgrep `--store-docs` | 204.48 s | 29.71 GB | 542 ms | 9.25 ms | 29.5 ms | 9.57 ms | 89.8 ms | 14.3 ms | 19.7 ms | 9.57 ms | 38.3 ms | 979.47 MB | 10.72 GB | 10.51 GB | 12.55->11.35! |
-| fmgrep, no server | 203.31 s | 12.13 GB | - | 1.66 s | 1.67 s | 1.64 s | 1.72 s | 1.66 s | 1.65 s | 1.66 s | 1.68 s | 884.64 MB | 8.41 GB | 11.15 GB | 11.35->14.83! |
-| tgrep | 159.16 s | 9.87 GB | 34.59 s | 137 ms | 249 ms | 488 ms | 822 ms | 566 ms | 673 ms | 187 ms | 423 ms | 28.12 GB | 28.18 GB | 2.63 GB | 11.01->2.73! |
-| elgrep | 294.54 s | 12.23 GB | 294.55 s | 52.6 ms | 1.07 s | 47.4 ms | 65.8 ms | 162 ms | 307 ms | 59.9 ms | 761 ms | 310.67 MB | 1020.09 MB | 59.55 GB | 2.73->8.71! |
+| rg | - | - | - | 1.56 s | 1.56 s | 1.58 s | 1.61 s | 1.51 s | 1.51 s | 1.56 s | 1.56 s | 309.01 MB | 314.70 MB | - | 5.39->9.88! |
+| fmgrep | 196.80 s | 12.00 GB | 2.82 s | 9.89 ms | 34.0 ms | 15.0 ms | 76.3 ms | 14.2 ms | 21.0 ms | 11.1 ms | 39.1 ms | 986.38 MB | 10.50 GB | 11.98 GB | 9.88->13.78! |
+| fmgrep `--store-docs` | 201.04 s | 29.38 GB | 553 ms | 9.16 ms | 31.9 ms | 12.5 ms | 75.9 ms | 18.1 ms | 59.9 ms | 11.0 ms | 44.4 ms | 882.16 MB | 10.45 GB | 10.37 GB | 13.78->11.98! |
+| fmgrep, no server | 212.90 s | 12.00 GB | - | 590 ms | 614 ms | 593 ms | 658 ms | 599 ms | 604 ms | 590 ms | 620 ms | 836.33 MB | 8.28 GB | 11.71 GB | 11.98->8.03! |
+| tgrep | 168.62 s | 9.87 GB | 37.63 s | 167 ms | 265 ms | 518 ms | 792 ms | 578 ms | 717 ms | 206 ms | 436 ms | 28.14 GB | 28.20 GB | 2.58 GB | 8.03->3.02! |
+| elgrep | - | 12.23 GB | - | 43.1 ms | 130 ms | 55.0 ms | 70.9 ms | 163 ms | 309 ms | 47.5 ms | 151 ms | 259.75 MB | 1019.23 MB | 60.95 GB | 3.02->9.52! |
 
-elgrep answered 12 of the 46 queries by scanning, before its daemon
-vouched that the tree had not changed since the index was published.
+elgrep's `index build` and `ready` on aosp are not given (`-`). The
+aosp root holds no `.git` directory, so watchman, which watches the tree
+for fmgrep, writes its short-lived cookie files (`.watchman-cookie-*`)
+in the root. eg-indexd counted them as changes and restarted its index
+build, again and again, until the watch was removed by hand after 28
+minutes. On 2026-11-09, before the harness had watchman watch the tree,
+they were 294.54 s and 294.55 s.
+
+elgrep answered 1 of the 46 queries by scanning: its daemon reported
+that the tree had changed since the index was published.
 
 elgrep differed from rg on 2 queries: `ndk::ScopedAStatus AND
-android::base::unique_fd` (227 lines missed in 3 files) and `MCK_ AND
+android::base::unique_fd` (9 lines missed in 1 file) and `MCK_ AND
 C_Check` (40 lines missed in 1 file). The second file is indexed; eg 1.0.0
 anchors the index at the common parent of its search paths under
 `--index-dir` (here `external/`) and drops every candidate, while a scan
