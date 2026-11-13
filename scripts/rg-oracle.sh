@@ -445,9 +445,11 @@ expr_cases() {
     check_expr "expr-context   [$label]" "--heading -n -C 1" "--heading -n -C 1" "$@"
 }
 
-# Exits 2 unless the manifest in index dir $1 records STORE_DOCS.
+# The manifest of index dir $1 into $WORK/manifest; exits 2 unless it
+# records STORE_DOCS.
 manifest_ok() {
-    grep -q "\"store_docs\": *$STORE_DOCS[,}]" "$1/manifest.json" ||
+    "$BIN" status --json "$1" > "$WORK/manifest" || exit 2
+    grep -q "\"store_docs\": *$STORE_DOCS[,}]" "$WORK/manifest" ||
         { echo "the index manifest does not record store_docs=$STORE_DOCS" >&2; exit 2; }
 }
 
@@ -610,8 +612,8 @@ if [[ -n "$CORPUS_DIR" ]]; then
     IDX="$WORK/index"
     "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} --output "$IDX" "$CORPUS" >&2
     manifest_ok "$IDX"
-    jq -r '.files[]' "$IDX/manifest.json" | tr '\n' '\0' > "$WORK/all0"
-    echo "corpus=$CORPUS store_docs=$STORE_DOCS files=$(jq '.files | length' "$IDX/manifest.json")"
+    jq -r '.files[]' "$WORK/manifest" | tr '\n' '\0' > "$WORK/all0"
+    echo "corpus=$CORPUS store_docs=$STORE_DOCS files=$(jq '.files | length' "$WORK/manifest")"
     spawn_serve "$IDX" serve SERVER ADDR
 
     pair and t:HscEnv t:DynFlags
