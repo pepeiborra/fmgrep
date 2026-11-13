@@ -58,6 +58,38 @@ impl Remote {
             .output()
             .expect("spawn fmgrep")
     }
+
+    /// What a local index of the client's checkout prints for `args` from
+    /// `rel` below its top: a copy of the checkout, `.git` included, is
+    /// indexed, as an index inside the checkout would win over the server.
+    pub fn oracle(&self, rel: &str, args: &[&str]) -> Output {
+        let copy = self.s.path("oracle");
+        let _ = std::fs::remove_dir_all(&copy);
+        let status = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(&self.client)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let index = self.s.run(&copy, &["index", "."]);
+        assert!(index.status.success(), "{}", stderr(&index));
+        self.s.run(&copy.join(rel), args)
+    }
+
+    /// `args` from `rel` below the client's top, through the server and
+    /// as the oracle: the same stdout and exit status, and no stderr.
+    pub fn same(&self, rel: &str, args: &[&str]) {
+        let want = self.oracle(rel, args);
+        let got = self.search(&self.client.join(rel), args);
+        assert_eq!(stderr(&got), "", "{rel} {args:?}");
+        assert_eq!(
+            (stdout(&got), got.status.code()),
+            (stdout(&want), want.status.code()),
+            "{rel} {args:?}: {}",
+            stderr(&want)
+        );
+    }
 }
 
 pub fn stderr(out: &Output) -> String {
@@ -162,4 +194,61 @@ fn a_server_without_a_served_commit_warns_a_checkout_elsewhere() {
     assert_eq!(search(&client), ignored(&why));
     assert_eq!(search(&origin), "");
     assert_eq!(search(&std::fs::canonicalize(s.path("home")).unwrap()), "");
+}
+
+/// A checkout at another path than the served tree: PATH arguments and
+/// the cwd resolve against its top, and print as a local search does.
+#[test]
+fn paths_and_the_cwd_resolve_against_the_checkout() {
+    let r = Remote::new(&FILES);
+    for (rel, args) in [
+        ("", &["printk"][..]),
+        ("dir", &["-l", "printk"]),
+        ("dir/sub", &["printk"]),
+        ("dir", &["-l", "printk", "../a.c"]),
+        ("dir", &["-c", "printk", "sub", "../e.c"]),
+        ("", &["printk", "dir/b.c"]),
+        ("dir", &["-l", "-g", "*.h", "printk"]),
+        ("dir", &["-l", "printk", ".."]),
+    ] {
+        r.same(rel, args);
+    }
+    let out = r.search(&r.client.join("dir"), &["-l", "printk", "../../home"]);
+    assert_eq!(out.status.code(), Some(2));
+    let want = format!(
+        "error: ../../home is outside the checkout at {}\n",
+        r.client.display()
+    );
+    assert_eq!(stderr(&out), want);
+}
+
+/// A checkout that lacks the served commit is still where the developer
+/// is: its cwd scopes the server's answer, and its PATHs resolve against
+/// its top, as a local search of the checkout reads them.
+#[test]
+fn a_checkout_that_lacks_the_commit_keeps_its_cwd_and_paths() {
+    let r = Remote::new(&FILES);
+    r.s.write(&r.origin, &[("a.c", "printk a2\n")]);
+    r.s.commit(&r.origin, "second");
+    let url = format!("file://{}", r.origin.display());
+    r.s.git(
+        r.s.tmp.path(),
+        &["clone", "-q", "--depth", "1", &url, "shallow"],
+    );
+    let dir = std::fs::canonicalize(r.s.path("shallow/dir")).unwrap();
+    let short = &r.commit[..7];
+    let why = format!(
+        "this checkout does not have the served commit {short} (run git fetch origin {}, or \
+         this is another repository)",
+        r.commit
+    );
+    for (args, want) in [
+        (&["-l", "printk"][..], "b.c\nsub/c.h\n"),
+        (&["-l", "printk", "sub"], "sub/c.h\n"),
+        (&["-l", "printk", "../a.c", "sub"], "../a.c\nsub/c.h\n"),
+    ] {
+        let out = r.search(&dir, args);
+        assert_eq!(stderr(&out), ignored(&why), "{args:?}");
+        assert_eq!((stdout(&out).as_str(), out.status.code()), (want, Some(0)));
+    }
 }

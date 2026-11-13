@@ -247,6 +247,16 @@ carries `format`; a server that answers it with -32001 (its index
 changed after the `status`) exits 2, as `error: the server at ADDR
 changed its index during this search; run the search again`.
 
+When the server reports a served commit and the cwd is in a git checkout
+that holds it, PATH arguments and the cwd resolve against the top of
+that checkout, as a local index of the checkout would read them, and the
+query carries `commit`: the server's tree may be anywhere. When the
+client warns that local changes are ignored (a checkout that lacks the
+served commit), they still resolve against the top of the cwd's
+checkout, and the query carries the served commit. Otherwise (no
+checkout, a server that serves no commit, or the served tree itself)
+they resolve against the served tree.
+
 `FMGREP_SERVER=ADDR` stands for `--server ADDR` in a search that has
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
 the cwd. When it finds one, that index answers, and stderr says

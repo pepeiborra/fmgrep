@@ -17,8 +17,8 @@ pub enum Plan {
     /// The server's answer alone, and a warning: local changes are ignored,
     /// for this reason.
     Degraded(String),
-    /// The checkout holds the served commit.
-    Checkout,
+    /// The checkout at `top` holds the served commit `commit`.
+    Checkout { top: PathBuf, commit: String },
 }
 
 /// The top of the work tree that holds `dir`: the nearest directory at or
@@ -53,7 +53,10 @@ pub fn plan(server: Server<'_>, status: &ServeStatus, cwd: &Path) -> Plan {
     };
     let id = &commit.id;
     match vcs::git_ok(&top, &["cat-file", "-e", &format!("{id}^{{commit}}")]) {
-        Ok(true) => Plan::Checkout,
+        Ok(true) => Plan::Checkout {
+            top,
+            commit: id.clone(),
+        },
         Ok(false) => Plan::Degraded(format!(
             "this checkout does not have the served commit {} (run git fetch origin {id}, or \
              this is another repository)",
