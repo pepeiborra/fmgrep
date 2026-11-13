@@ -12,13 +12,17 @@ Bug reports, fixes and measurements are welcome.
   runs these tests on Linux, then `scripts/watchman-race.sh`, then
   `scripts/watchman-spawn.sh`, which starts the runner's own daemon and so
   runs only where `CI=true`.
+- `fmgrep serve` asks watchman before each query. A test that starts a
+  server of a tree it does not change passes `--no-watch`; a test of what a
+  server sees change asks a private daemon.
 - Update the docs with the code. `crates/bench/tests/docs.rs` fails when an
   `FMGREP_*` variable is missing from [docs/tuning.md](docs/tuning.md), a
   manifest field from [docs/index-format.md](docs/index-format.md), or a
   relative link points nowhere.
 - A change to search output runs `scripts/rg-oracle.sh`, which diffs fmgrep
   against rg, with and without `--store-docs`, and with `--corpus DIR` on a
-  GHC checkout; `--serve` repeats every case through `--server`. It needs
+  GHC checkout; `--serve` repeats every case through `--server`, with a
+  private watchman daemon when it finds one as the tests do. It needs
   `rg` (and `jq` for `--corpus`), so it is not part of `scripts/check.sh`.
 - To run CI on a commit without a pull request, push it to a branch whose
   name starts with `ci/`, or start the CI workflow from the Actions tab.

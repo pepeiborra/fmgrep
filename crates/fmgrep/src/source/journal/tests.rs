@@ -492,7 +492,7 @@ mod watchman_tests {
         let sock = fake(tmp.path(), Arc::new(AtomicU8::new(SYNC_FAILED)));
         let (root, idx) = (Path::new("/w/sub"), index("/i", 1));
         save(root, &idx, faked(&sock), vec!["b.c".into()], 64);
-        let asked = ask(root, &idx, 1000);
+        let asked = ask(root, &idx, 1000, false);
         let token = asked.token.expect("the new token");
         assert_ne!(token.clock, faked(&sock).clock);
         assert!(asked.paths.is_none(), "every file is checked");

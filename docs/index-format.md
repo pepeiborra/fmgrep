@@ -107,8 +107,9 @@ answer, a load stats every document against its `(size, mtime)` stamp
   on stderr per process, with the number of ignore files new, edited or
   deleted since the index, for example `warning: 2 ignore files changed
   since the index; each search reads their directories again (re-run
-  index to make searches fast again)`. Without `dirs.stamps`, every load
-  walks the whole tree, and prints no such line.
+  index to make searches fast again)`; a server that asks watchman
+  before each query says `each query` instead. Without `dirs.stamps`,
+  every load walks the whole tree, and prints no such line.
 
 `serve` watches the tree, following new files and directories, and exits
 2 when the watch cannot start (on Linux, out of inotify watches: raise
@@ -122,8 +123,8 @@ that does not, delete `dirs.stamps` to make every load walk the tree.
 Re-index after many edits.
 
 On a tree of 50,000 files or more, a search asks watchman instead (see
-Watchman below). Below that, the stat pass is cheaper and watchman is
-never asked.
+Watchman below). Below that, the stat pass is cheaper and a search never
+asks watchman. `serve` asks it at any size, unless `--no-watch` is given.
 
 A `--store-docs` index never reads the tree: it answers as of index time,
 and edits, new files and deletions show up only after the next `index`;
@@ -199,9 +200,34 @@ After it answers, a search saves its token and what differs now as the new
 baseline: the stale and gone files, each added file, or its topmost
 directory the index did not record, and each ignore file the index did not
 record, so that later searches walk its directory again and print the
-warning above. The write is a
-rename, so two searches at once leave one whole record. `serve` saves at
-its first query.
+warning above. The write is a rename, so two searches at once leave one
+whole record.
+
+`serve` reads the record once, at its start, as a search does, whatever
+the size of the tree. Unless `--no-watch` is given, before each query it
+takes a newer token and asks
+watchman what changed since the token of the query before, and
+re-checks the paths that watchman reports as changed. It keeps its
+tokens in memory and saves the record once, after its first query with
+a token. When watchman cannot answer for a query, that query checks
+every file, as a new load would, and the server says why on stderr each
+time the reason changes; `note: each query re-checks only what watchman
+reports again` follows once watchman answers. The server's lines speak
+of its next query, not of later searches: `warning: checked every file
+once (no record of an earlier search); the next query asks watchman`. A
+late daemon (one that hangs, or reads the tree) keeps the server's last
+token, or at its start the record's token, since the stat pass runs
+after it was taken; a daemon gone from its socket, a restart or a
+removed watch makes the server take a new one.
+
+The ask costs each served query 1.2 to 1.4 ms on Linux (measured on
+linux, chromium and aosp), plus the re-check of what watchman reports:
+3.1 to 3.4 ms on aosp when it reports nothing. On macOS each of its three
+synced calls (two clocks and the question) waits for FSEvents, and the
+ask takes about 40 ms (35 to 41 ms on a tree of 60,000 files); a loaded
+Mac can pass the 100 ms limit, and that query checks every file. Serve a
+tree that does not change with `--no-watch`, which asks watchman nothing
+before a query.
 
 When watchman cannot answer, the search checks every file and prints one
 line on stderr per process that says why and what to do; stdout does not
@@ -228,6 +254,8 @@ change:
   against 1 us a file). The record then holds no baseline, and each
   search checks every file, until no more than that many differ again
   (then the record holds a baseline again) or the next `index`.
+- `warning: more than <n> paths changed since the last query; checked
+  every file`: the same limit, for one served query.
 - `warning: cannot save <record> (<error>); the next search checks again`.
 
 An edit made while a directory above the root is renamed away and back,

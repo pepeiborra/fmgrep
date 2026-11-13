@@ -81,7 +81,7 @@ fn served_text_equals_local_stdout_in_every_mode() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = stage(tmp.path(), store_docs);
-        let (addr, server) = spawn_server(&index, &[]);
+        let (addr, server) = spawn_server(&index, FIXED);
         for (flags, terms) in CASES {
             let (here, served) = both(&index, &addr, flags, terms);
             assert!(!here.is_empty(), "store_docs={store_docs} {flags:?}");
@@ -101,7 +101,7 @@ fn served_text_equals_local_stdout_in_every_mode() {
 fn client_color_auto_follows_its_own_tty() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage(tmp.path(), true);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let search = local(&index, &[], &["printk"]);
     let served = argv(&["--server", &addr, "printk"]);
     for tty in [false, true] {
@@ -163,26 +163,29 @@ fn served_stale_file_equals_local() {
     let index = stage(tmp.path(), false);
     let corpus = tmp.path().join("corpus");
     std::fs::write(corpus.join("a.c"), b"printk changed\nprintk\n").unwrap();
-    let (addr, server) = spawn_server(&index, &[]);
-    let modes: [&[&str]; 5] = [&[], &["-l"], &["-c"], &["-C1"], &["--json", "--matches"]];
-    for flags in modes {
+    let (addr, server) = spawn_server(&index, FIXED);
+    for flags in MODES {
         let (here, served) = both(&index, &addr, flags, &["printk"]);
         assert_eq!(served, here, "stale at load {flags:?}");
     }
-    // Rewritten each poll, as FSEvents can miss a change made just after the
-    // watch starts.
-    let change = || std::fs::write(corpus.join("b.c"), b"printk printk\nnew\n").unwrap();
-    let start = std::time::Instant::now();
-    change();
-    let converged = || {
-        let (here, served) = both(&index, &addr, &["-c"], &["printk"]);
-        here == served
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+const MODES: [&[&str]; 5] = [&[], &["-l"], &["-c"], &["-C1"], &["--json", "--matches"]];
+
+#[cfg(unix)]
+#[test]
+fn a_file_changed_while_serving_equals_local() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage(tmp.path(), false);
+    let corpus = tmp.path().join("corpus");
+    let Some(_daemon) = watching(tmp.path(), &corpus) else {
+        return;
     };
-    while !converged() && start.elapsed() < std::time::Duration::from_secs(60) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        change();
-    }
-    for flags in modes {
+    let (addr, server) = spawn_server(&index, &[]);
+    std::fs::write(corpus.join("b.c"), b"printk printk\nnew\n").unwrap();
+    for flags in MODES {
         let (here, served) = both(&index, &addr, flags, &["printk"]);
         assert_eq!(served, here, "changed while serving {flags:?}");
     }
@@ -194,7 +197,12 @@ fn served_stale_file_equals_local() {
 fn serve_frames(index: &Path, requests: &[&str]) -> Vec<(Vec<Vec<u8>>, serde_json::Value)> {
     let input: String = requests.iter().map(|r| format!("{r}\n")).collect();
     let mut out = Vec::new();
-    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    let words = argv(&[
+        "serve",
+        "--stdio",
+        "--no-watch",
+        &index.display().to_string(),
+    ]);
     dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
     let (mut rest, mut got, mut frames) = (&out[..], Vec::new(), Vec::new());
     while let Some(eol) = rest.iter().position(|&b| b == b'\n') {
@@ -281,7 +289,7 @@ fn streamed_output_splits_into_bounded_frames() {
     assert!(frames.len() > 10, "{}", frames.len());
     assert!(frames.iter().all(|f| f.len() <= 64 << 10));
     assert_eq!(frames.concat(), here);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let served = output(&words(&["--server", &addr], &[], &["printk"]), false).unwrap();
     assert_eq!(
         served,
@@ -330,7 +338,7 @@ fn a_server_error_after_output_keeps_the_output() {
 fn a_client_leaving_mid_stream_leaves_the_server_serving() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage_big(tmp.path(), 16_000);
-    let (addr, server) = spawn_server(&index, &[]);
+    let (addr, server) = spawn_server(&index, FIXED);
     let stream = std::net::TcpStream::connect(&addr).unwrap();
     let request = streamed(r#""terms":["printk"],"mode":"lines""#);
     (&stream)

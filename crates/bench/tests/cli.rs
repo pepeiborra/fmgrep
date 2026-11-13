@@ -344,7 +344,7 @@ fn served_tree(fmgrep: &Path, dir: &Path, name: &str) -> (std::path::PathBuf, Se
         index.as_ref(),
     ]);
     assert!(built.output().unwrap().status.success());
-    let mut serve = fmgrep(&["serve".as_ref(), index.as_ref()]);
+    let mut serve = fmgrep(&["serve".as_ref(), index.as_ref(), "--no-watch".as_ref()]);
     serve.stdin(std::process::Stdio::null());
     let mut child = serve.stdout(std::process::Stdio::piped()).spawn().unwrap();
     let mut out = std::io::BufReader::new(child.stdout.take().unwrap());

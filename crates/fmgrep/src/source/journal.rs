@@ -192,10 +192,27 @@ struct Record {
 /// What a load learned before it re-checks anything.
 #[derive(Debug, Default)]
 pub struct Asked {
-    /// Taken now, for the record written once the search answered.
+    /// Taken now, for the record written once the search answered. For a
+    /// server whose daemon is late, the record's: every file is checked
+    /// after it was taken, so the next query can ask since it.
     pub token: Option<Token>,
     /// What may differ, unsorted; `None`: check every file.
     pub paths: Option<Vec<String>>,
+    /// Why watchman could not answer, as stderr says it.
+    pub why: Option<String>,
+}
+
+/// What a server learned before one query.
+#[derive(Debug, Default)]
+pub struct Again {
+    /// Taken now: the next query asks since it.
+    pub token: Option<Token>,
+    /// Without a new token: whether the last one may answer later.
+    pub keep: bool,
+    /// What changed since the last token, unsorted; `None`: check every file.
+    pub paths: Option<Vec<String>>,
+    /// Why every file is checked, as stderr says it.
+    pub why: Option<String>,
 }
 
 /// `$XDG_CACHE_HOME/fmgrep`, else `$HOME/.cache/fmgrep`; tests use only
@@ -283,41 +300,118 @@ impl Record {
 }
 
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
-/// a token for the record; why watchman cannot say goes to stderr. On a
-/// network filesystem, or when the mount table cannot be read, there is
-/// no token, so no record either.
-pub fn ask(root: &Path, index: &Index, docs: usize) -> Asked {
+/// a token for the record; why watchman cannot say goes to stderr, worded
+/// for a server's queries if `served`. On a network filesystem, or when
+/// the mount table cannot be read, there is no token, so no record either.
+pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
+    let root_str = match unaskable(root) {
+        Err(why) => {
+            return Asked {
+                why: Some(cannot_answer(&why)),
+                ..Asked::default()
+            };
+        }
+        Ok(root_str) => root_str,
+    };
     #[cfg(unix)]
     {
-        let Some(root_str) = root.to_str() else {
-            cannot_answer("the tree's path is not UTF-8");
-            return Asked::default();
-        };
-        if let Err(why) = local(root) {
-            cannot_answer(&why);
-            return Asked::default();
-        }
         let (why, taken) = match Record::read(root_str, index).and_then(same_socket) {
             Ok(record) => {
-                let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
+                let sock = record.token.sock.clone().into();
+                let w = watchman::Watchman::at(sock, ASK_WAIT).served(served);
                 match later(&w, &record, root, docs) {
                     Ok(asked) => return asked,
                     Err((why, token)) if w.late() => {
-                        cannot_answer(&why);
-                        return Asked { token, paths: None };
+                        let kept = served.then(|| record.token.clone());
+                        return Asked {
+                            token: token.or(kept),
+                            paths: None,
+                            why: Some(cannot_answer(&why)),
+                        };
                     }
                     Err(not_used) => not_used,
                 }
             }
             Err(why) => (why, None),
         };
-        first(root, taken, &why)
+        first(root, taken, &why, served)
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, index, docs);
-        cannot_answer("watchman is not supported on this platform");
-        Asked::default()
+        let _ = (root_str, index, docs);
+        unreachable!("unaskable refuses every root here")
+    }
+}
+
+/// Canonical `root` as UTF-8, or why watchman cannot answer for it at all.
+fn unaskable(root: &Path) -> Result<&str, String> {
+    if !cfg!(unix) {
+        return Err("watchman is not supported on this platform".to_owned());
+    }
+    let root_str = root.to_str().ok_or("the tree's path is not UTF-8")?;
+    local(root)?;
+    Ok(root_str)
+}
+
+/// Before a served query on canonical `root`: a new token, then what
+/// changed since `last`, the token taken for the query before. Without
+/// `last`, or when its daemon is gone, the daemon is found again and a
+/// first token taken; every file is checked then. A late daemon keeps
+/// `last`. Nothing is printed.
+pub fn again(root: &Path, last: Option<&Token>) -> Again {
+    if let Err(why) = unaskable(root) {
+        return Again {
+            why: Some(cannot(&why)),
+            ..Again::default()
+        };
+    }
+    #[cfg(unix)]
+    {
+        let Some(last) = last else {
+            return renew(root, "no token from an earlier query");
+        };
+        let w = watchman::Watchman::at(last.sock.clone().into(), ASK_WAIT).served(true);
+        let token = match w.mark(root) {
+            Ok(token) => token,
+            Err(why) if w.late() => {
+                return Again {
+                    keep: true,
+                    why: Some(cannot(&why)),
+                    ..Again::default()
+                };
+            }
+            Err(why) => return renew(root, &why),
+        };
+        let (paths, why) = match w.since(last, root) {
+            Ok(paths) => (Some(paths), None),
+            Err(why) if w.late() => (None, Some(cannot(&why))),
+            Err(why) => (None, Some(once(&why, true))),
+        };
+        Again {
+            token: Some(token),
+            keep: false,
+            paths,
+            why,
+        }
+    }
+    #[cfg(not(unix))]
+    unreachable!("unaskable refuses every root here: {last:?}")
+}
+
+/// A server's first token, or one from the daemon found again because
+/// the last token cannot answer, for reason `why`.
+#[cfg(unix)]
+fn renew(root: &Path, why: &str) -> Again {
+    match watchman::Watchman::find(ASK_WAIT).and_then(|w| w.served(true).mark(root)) {
+        Ok(token) => Again {
+            token: Some(token),
+            why: Some(once(why, true)),
+            ..Again::default()
+        },
+        Err(why) => Again {
+            why: Some(cannot(&why)),
+            ..Again::default()
+        },
     }
 }
 
@@ -349,7 +443,7 @@ fn later(
         over(named_cap(docs));
         return Ok(Asked {
             token: Some(token),
-            paths: None,
+            ..Asked::default()
         });
     };
     let mut paths = match w.since(&record.token, root) {
@@ -360,30 +454,31 @@ fn later(
     Ok(Asked {
         token: Some(token),
         paths: Some(paths),
+        why: None,
     })
 }
 
 /// A search that cannot use a record, for reason `why`: find the daemon
 /// and take a token, unless one was `taken` just now; every file is
-/// checked.
+/// checked. Worded for a server's queries if `served`.
 #[cfg(unix)]
-fn first(root: &Path, taken: Option<Token>, why: &str) -> Asked {
+fn first(root: &Path, taken: Option<Token>, why: &str, served: bool) -> Asked {
     let taken = match taken {
         Some(token) => Ok(token),
-        None => watchman::Watchman::find(ASK_WAIT).and_then(|w| w.mark(root)),
+        None => watchman::Watchman::find(ASK_WAIT).and_then(|w| w.served(served).mark(root)),
     };
     match taken {
         Ok(token) => {
-            checked_once(why);
+            checked_once(why, served);
             Asked {
                 token: Some(token),
-                paths: None,
+                ..Asked::default()
             }
         }
-        Err(why) => {
-            cannot_answer(&why);
-            Asked::default()
-        }
+        Err(why) => Asked {
+            why: Some(cannot_answer(&why)),
+            ..Asked::default()
+        },
     }
 }
 
@@ -405,30 +500,58 @@ pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap
 }
 
 /// `line` on stderr, once per process for each `seen`.
-pub(super) fn warn(seen: &AtomicBool, line: std::fmt::Arguments<'_>) {
+pub(super) fn warn(seen: &AtomicBool, line: &str) {
     #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_string()));
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
     if !seen.swap(true, Ordering::Relaxed) {
         eprintln!("warning: {line}");
     }
 }
 
-/// No usable answer from watchman on a tree worth asking about.
-pub fn cannot_answer(why: &str) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        format_args!("watchman cannot say what changed ({why}); checked every file"),
-    );
+/// `line` on stderr, as a warning, every time: a server's.
+pub fn say(line: &str) {
+    #[cfg(test)]
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
+    eprintln!("warning: {line}");
 }
 
-/// This search took a token, but checked every file for its baseline.
-fn checked_once(why: &str) {
+/// What a server prints once watchman answers after a warning.
+pub const ANSWERS_AGAIN: &str = "each query re-checks only what watchman reports again";
+
+/// [`ANSWERS_AGAIN`] on stderr, as a note.
+pub fn answers_again() {
+    #[cfg(test)]
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(ANSWERS_AGAIN.to_owned()));
+    eprintln!("note: {ANSWERS_AGAIN}");
+}
+
+pub fn cannot(why: &str) -> String {
+    format!("watchman cannot say what changed ({why}); checked every file")
+}
+
+/// Every file was checked once, for reason `why`, and a token taken: later
+/// searches ask watchman, or a server's next query if `served`.
+fn once(why: &str, served: bool) -> String {
+    let next = match served {
+        true => "the next query asks watchman",
+        false => "later searches ask watchman",
+    };
+    format!("checked every file once ({why}); {next}")
+}
+
+/// No usable answer from watchman on a tree worth asking about: the line.
+pub fn cannot_answer(why: &str) -> String {
     static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        format_args!("checked every file once ({why}); later searches ask watchman"),
-    );
+    let line = cannot(why);
+    warn(&SEEN, &line);
+    line
+}
+
+/// This search, or server start if `served`, took a token, but checked
+/// every file for its baseline.
+fn checked_once(why: &str, served: bool) {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    warn(&SEEN, &once(why, served));
 }
 
 /// The record could not be written.
@@ -436,7 +559,7 @@ fn cannot_save(what: std::fmt::Arguments<'_>) {
     static SEEN: AtomicBool = AtomicBool::new(false);
     warn(
         &SEEN,
-        format_args!("cannot save {what}; the next search checks again"),
+        &format!("cannot save {what}; the next search checks again"),
     );
 }
 
@@ -445,10 +568,15 @@ pub fn over(cap: usize) {
     static SEEN: AtomicBool = AtomicBool::new(false);
     warn(
         &SEEN,
-        format_args!(
+        &format!(
             "more than {cap} paths may differ from the index; checked every file (re-run index)"
         ),
     );
+}
+
+/// A server's query after more than `cap` paths changed: the line.
+pub fn over_since(cap: usize) -> String {
+    format!("more than {cap} paths changed since the last query; checked every file")
 }
 
 #[cfg(test)]

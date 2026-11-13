@@ -117,11 +117,14 @@ impl DocStore {
     /// The manifest's layout. Stored docs ignore `corpus_root`; a missing
     /// `docs.shard` surfaces only on the first non-empty fetch. The files
     /// layout maps `docs.stamps` and reads the walk record, and
-    /// checks `corpus_root` (else the manifest's) is a directory.
+    /// checks `corpus_root` (else the manifest's) is a directory. A load
+    /// asks watchman as a search does; `each_query` asks again before each
+    /// query, for a server.
     pub fn open(
         index_dir: &Path,
         manifest: &Manifest,
         corpus_root: Option<&Path>,
+        each_query: bool,
     ) -> Result<Self, String> {
         let source = match (manifest.store_docs, corpus_root) {
             (true, _) => Source::Shard {
@@ -138,10 +141,11 @@ impl DocStore {
                 }
                 // As given if it does not resolve: the record's name only.
                 let dir = index_dir.canonicalize();
-                files.ask(Index {
+                let index = Index {
                     dir: dir.unwrap_or_else(|_| index_dir.to_path_buf()),
                     started_ns: manifest.index_started_ns,
-                });
+                };
+                files.ask(index, each_query);
                 Source::Files(files)
             }
         };
@@ -195,10 +199,18 @@ impl DocStore {
         }
     }
 
+    /// Before a served query, re-check what watchman reports as changed
+    /// since the last query; nothing for stored docs, or unless asked to.
+    pub fn recheck(&self, files: &[String]) {
+        if let Source::Files(f) = &self.source {
+            f.recheck(files, &self.lens);
+        }
+    }
+
     /// Once the stat pass and discovery, or the replay, are done: save the
     /// watchman token and what differs, once, in the user's cache.
-    pub fn checkpoint(&mut self, files: &[String]) {
-        if let Source::Files(f) = &mut self.source {
+    pub fn checkpoint(&self, files: &[String]) {
+        if let Source::Files(f) = &self.source {
             f.checkpoint(files);
         }
     }

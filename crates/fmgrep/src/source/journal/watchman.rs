@@ -29,6 +29,8 @@ pub struct Watchman {
     /// A call failed for want of time, or during a crawl: later it may
     /// answer.
     late: Cell<bool>,
+    /// A server's: each reason speaks of its queries, not of searches.
+    served: bool,
 }
 
 /// Reads that fail once the deadline passes.
@@ -54,7 +56,13 @@ impl Watchman {
             deadline: Instant::now() + budget,
             budget,
             late: Cell::new(false),
+            served: false,
         }
+    }
+
+    /// The same, for a server if `served`.
+    pub fn served(self, served: bool) -> Self {
+        Self { served, ..self }
     }
 
     /// Whether a call failed for want of time or during a crawl.
@@ -153,7 +161,7 @@ impl Watchman {
             return Ok((watch.to_owned(), relative.to_owned()));
         }
         let project = match self.call(&json!(["watch-project", root]), root) {
-            Err(_) if self.late() => return Err(asked(root)),
+            Err(_) if self.late() => return Err(asked(root, self.served)),
             project => project?,
         };
         let watch = project.get("watch").and_then(Value::as_str);
@@ -235,7 +243,13 @@ impl Watchman {
         }
         let reply = self.call(&json!(["query", token.watch, query]), root)?;
         if reply.get("is_fresh_instance").and_then(Value::as_bool) != Some(false) {
-            return Err("watchman restarted, added the watch again or pruned deleted files since the last search".to_owned());
+            let last = match self.served {
+                true => "the server last asked it",
+                false => "the last search",
+            };
+            return Err(format!(
+                "watchman restarted, added the watch again or pruned deleted files since {last}"
+            ));
         }
         let files = reply.get("files").and_then(Value::as_array);
         files
@@ -325,12 +339,14 @@ fn not_watching(root: &Path) -> String {
     format!("watchman is not watching {}", root.display())
 }
 
-/// Why a search that asked watchman to watch `root` just now cannot use it.
-fn asked(root: &Path) -> String {
-    format!(
-        "fmgrep asked watchman to watch {}; later searches ask it once its crawl ends",
-        root.display()
-    )
+/// Why a search, or a server if `served`, that asked watchman to watch
+/// `root` just now cannot use it.
+fn asked(root: &Path, served: bool) -> String {
+    let next = match served {
+        true => "the next query asks it again",
+        false => "later searches ask it once its crawl ends",
+    };
+    format!("fmgrep asked watchman to watch {}; {next}", root.display())
 }
 
 /// Whether clock `b` is of `a`'s instance with a later tick; a clock is

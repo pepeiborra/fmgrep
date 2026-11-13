@@ -58,7 +58,7 @@ fn tcp_server_flag_equals_local_search() {
     for store_docs in [false, true] {
         let (_tmp, docs) = stage();
         let index = do_index(&docs, store_docs).display().to_string();
-        let mut server = Server::spawn(&["serve", &index]);
+        let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
         let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
         let mut addr = String::new();
         stdout.read_line(&mut addr).unwrap();
@@ -100,39 +100,41 @@ fn served_printk(addr: &str) -> u64 {
 }
 
 /// Files source: an added file and an indexed one, each deleted and then
-/// recreated under the server, come back; only the indexed one warns.
+/// recreated under a server that asks a private watchman daemon, come
+/// back at the next query; only the indexed one warns.
+#[cfg(unix)]
 #[test]
-fn serve_watch_handles_delete_then_recreate() {
+fn serve_sees_a_delete_then_recreate() {
     let (_tmp, docs) = stage();
     let index = do_index(&docs, false).display().to_string();
     std::fs::write(docs.join("d.bin"), b"zebra printk\n").unwrap();
-    let mut server = Server::spawn(&["serve", &index]);
+    let Some(daemon) = crate::watchman::Daemon::start() else {
+        return;
+    };
+    daemon.watch(&docs);
+    let mut cmd = fmgrep();
+    let mut server = Server::spawn_cmd(
+        cmd.args(["serve", &index])
+            .env("WATCHMAN_SOCK", &daemon.sock),
+    );
     let addr = server.addr();
-    // `change` repeats each poll, as FSEvents can miss a change.
-    let poll = |change: &dyn Fn(), want: u64| {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        change();
-        while served_printk(&addr) != want && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-            change();
-        }
-        assert_eq!(served_printk(&addr), want);
-    };
-    poll(&|| {}, 4);
-    let delete = || {
-        let _ = std::fs::remove_file(docs.join("d.bin"));
-        let _ = std::fs::remove_file(docs.join("a.bin"));
-    };
-    poll(&delete, 1);
-    let recreate = || {
-        std::fs::write(docs.join("d.bin"), b"zebra printk\n").unwrap();
-        std::fs::write(docs.join("a.bin"), b"printk back\n").unwrap();
-    };
-    poll(&recreate, 3);
+    assert_eq!(served_printk(&addr), 4);
+    std::fs::remove_file(docs.join("d.bin")).unwrap();
+    std::fs::remove_file(docs.join("a.bin")).unwrap();
+    assert_eq!(served_printk(&addr), 1);
+    std::fs::write(docs.join("d.bin"), b"zebra printk\n").unwrap();
+    std::fs::write(docs.join("a.bin"), b"printk back\n").unwrap();
+    assert_eq!(served_printk(&addr), 3);
     shutdown(&mut server, &addr);
     let stderr = served_stderr(&mut server);
-    assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
-    assert!(stderr.contains("a.bin"), "{stderr}");
+    let excluding: Vec<&str> = stderr.lines().filter(|l| l.contains("excluding")).collect();
+    assert!(
+        excluding.len() == 1 && excluding[0].contains("a.bin"),
+        "{stderr}"
+    );
+    let first = "warning: checked every file once (no record of an earlier search)";
+    assert!(stderr.starts_with(first), "{stderr}");
+    assert_eq!(stderr.matches("warning:").count(), 2, "{stderr}");
 }
 
 #[test]
@@ -140,14 +142,26 @@ fn serve_is_ready_only_once_added_files_are_found() {
     let (tmp, docs) = stage();
     let index = do_index(&docs, false).display().to_string();
     std::fs::write(docs.join("d.bin"), b"printk added\n").unwrap();
-    for flags in [&[][..], &["--no-watch"]] {
+    // A server that asks watchman, when a private daemon can start.
+    #[cfg(unix)]
+    let daemon = crate::watchman::Daemon::start();
+    let mut cases: Vec<(&[&str], Option<&Path>)> = vec![(&["--no-watch"], None)];
+    #[cfg(unix)]
+    if let Some(daemon) = &daemon {
+        daemon.watch(&docs);
+        cases.push((&[], Some(&daemon.sock)));
+    }
+    for (flags, sock) in cases {
         // One file for both streams keeps their writes in order.
         let log = tmp.path().join("serve.log");
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
+        let mut cmd = fmgrep();
+        if let Some(sock) = sock {
+            cmd.env("WATCHMAN_SOCK", sock);
+        }
         let mut server = Server(
-            fmgrep()
-                .args([&["serve", &index][..], flags].concat())
+            cmd.args([&["serve", &index][..], flags].concat())
                 .env("FMGREP_VERBOSE", "1")
                 .stdout(out)
                 .stderr(err)
@@ -221,7 +235,7 @@ fn serve_without_its_documents_is_refused() {
         let f = f.unwrap();
         std::fs::copy(f.path(), copy.join(".fmgrep").join(f.file_name())).unwrap();
     }
-    let out = run_in(&copy, &["serve", "--stdio"]);
+    let out = run_in(&copy, &["serve", "--stdio", "--no-watch"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     let copy = std::fs::canonicalize(&copy).unwrap();

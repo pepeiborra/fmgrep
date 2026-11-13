@@ -147,6 +147,7 @@ impl Served<'_> {
                 code: QUERY_FAILED,
                 message,
             })?;
+        self.docs.recheck(self.manifest);
         let (index, loaded) = (&self.index, &mut self.docs);
         let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
         let answered = match p.mode {

@@ -141,10 +141,14 @@ struct Known {
     /// The walk's rule, loaded on first use.
     rules: Mutex<Option<ignore::IncrementalIgnore>>,
     /// Ignore files the index did not record, seen by this load: the
-    /// baseline keeps them, so later loads walk their dirs again.
-    new_ignores: Mutex<Vec<String>>,
+    /// baseline keeps them, so later loads walk their dirs again. A set: a
+    /// server finds the same ones again at each query that walks there.
+    new_ignores: Mutex<std::collections::BTreeSet<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
+    /// Whether a server asks watchman again before each query: its
+    /// warnings then speak of queries, not searches.
+    each_query: bool,
 }
 
 impl Known {
@@ -229,10 +233,10 @@ impl Known {
         *self.rules.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
-    /// Stat `ids` (ascending), then warn about the gone ones in order, or
-    /// once when over half the docs are.
-    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64]) {
-        let gone = parallel(ids, |&id| self.stat(id, files, lens, false));
+    /// Stat `ids` (ascending), ignored ones only if `force`, then warn about
+    /// the gone ones in order, or once when over half the docs are.
+    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64], force: bool) {
+        let gone = parallel(ids, |&id| self.stat(id, files, lens, force));
         let n = gone.iter().flatten().count();
         if n * 2 > self.state.len() {
             eprintln!(
@@ -252,9 +256,9 @@ impl Known {
         }
     }
 
-    fn stat_all(&self, files: &[String], lens: &[u64]) {
+    fn stat_all(&self, files: &[String], lens: &[u64], force: bool) {
         let ids: Vec<usize> = (0..self.state.len()).collect();
-        self.stat_ids(&ids, files, lens);
+        self.stat_ids(&ids, files, lens, force);
     }
 
     /// Take root-relative `paths` (any order) as all that may differ in
@@ -339,7 +343,7 @@ impl Known {
         }
         ids.sort_unstable();
         ids.dedup();
-        self.stat_ids(&ids, files, lens);
+        self.stat_ids(&ids, files, lens, false);
         let prune = Arc::clone(recorded);
         let walked = crate::walk::walk_changed(root, listed.clone(), self.exclude.as_deref(), {
             move |rel| prune.is_dir(rel)
@@ -365,15 +369,14 @@ impl Known {
     /// since the index: every load walks the dirs they govern again.
     fn apply_ignores(&self, changes: recorded::IgnoreScopes) -> Vec<String> {
         self.keep_ignores(changes.found);
-        let mut new = self
+        let new = self
             .new_ignores
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        new.sort_unstable();
-        new.dedup();
-        let n = changes.moved + new.len();
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        let n = changes.moved + new;
         if n > 0 {
-            ignores_changed(n);
+            ignores_changed(n, self.each_query);
         }
         changes.scopes
     }
@@ -388,17 +391,19 @@ impl Known {
 }
 
 /// `n` ignore files moved or are new since the index, which every load
-/// applies by walking the dirs they govern again.
-fn ignores_changed(n: usize) {
+/// applies by walking the dirs they govern again; worded for a server's
+/// queries if `served`.
+fn ignores_changed(n: usize, served: bool) {
     static SEEN: AtomicBool = AtomicBool::new(false);
     let (files, dirs) = match n {
         1 => ("file", "its directory"),
         _ => ("files", "their directories"),
     };
+    let each = if served { "query" } else { "search" };
     journal::warn(
         &SEEN,
-        format_args!(
-            "{n} ignore {files} changed since the index; each search reads {dirs} again \
+        &format!(
+            "{n} ignore {files} changed since the index; each {each} reads {dirs} again \
              (re-run index to make searches fast again)"
         ),
     );
@@ -411,6 +416,15 @@ fn unrecorded<'a>(recorded: Option<&Recorded>, rel: &'a str) -> &'a str {
     match rel.match_indices('/').map(|(i, _)| i).find(new) {
         Some(i) => &rel[..i],
         None => rel,
+    }
+}
+
+/// Under `--verbose`: what a re-check took from watchman, and its cost,
+/// the ask from `asked` to `applied` and the re-check since.
+fn timed(what: std::fmt::Arguments<'_>, asked: std::time::Instant, applied: std::time::Instant) {
+    if crate::verbose::verbose() {
+        let (ask, apply) = (applied - asked, applied.elapsed());
+        eprintln!("note: {what} (ask {ask:.1?}, apply {apply:.1?})");
     }
 }
 
@@ -443,8 +457,15 @@ pub struct Files {
     known: Arc<Known>,
     /// The index a load asks watchman about, and keeps a record of.
     index: Option<journal::Index>,
-    /// Taken by [`Self::replay`] before re-checking, for [`Self::checkpoint`].
-    token: OnceLock<journal::Token>,
+    /// The last token taken, before its re-check: the next ask is since
+    /// it, and [`Self::checkpoint`] saves it.
+    last: Mutex<Option<journal::Token>>,
+    /// Whether the record was saved: once per process.
+    saved: AtomicBool,
+    /// Whether `files` ascend, checked once.
+    sorted: OnceLock<bool>,
+    /// The warning a server printed last, until watchman answers again.
+    said: Mutex<Option<String>>,
 }
 
 impl Files {
@@ -469,48 +490,64 @@ impl Files {
                 rules: Mutex::default(),
                 new_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
+                each_query: false,
             }),
             index: None,
-            token: OnceLock::new(),
+            last: Mutex::default(),
+            saved: AtomicBool::new(false),
+            sorted: OnceLock::new(),
+            said: Mutex::default(),
         })
     }
 
-    /// Let [`Self::replay`] ask watchman, for `index`.
-    pub fn ask(&mut self, index: journal::Index) {
+    /// Let [`Self::replay`] ask watchman, for `index`; and
+    /// [`Self::recheck`] too, before each query, if `each_query`. Before
+    /// any watch or discovery.
+    pub fn ask(&mut self, index: journal::Index, each_query: bool) {
+        let known = Arc::get_mut(&mut self.known).expect("ask precedes sharing");
+        known.each_query = each_query;
         self.index = Some(index);
+    }
+
+    /// The canonical root and the walk's record to ask with, or why not.
+    fn askable(&self, files: &[String]) -> Result<(PathBuf, &Arc<Recorded>), String> {
+        if !*self.sorted.get_or_init(|| files.is_sorted()) {
+            return Err("the manifest lists files out of order; re-run index".to_owned());
+        }
+        let root = &self.known.root;
+        let canonical = root
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {} ({e})", root.display()))?;
+        match &self.known.recorded {
+            Some(recorded) => Ok((canonical, recorded)),
+            None => Err("the index has no dirs.stamps; re-run index".to_owned()),
+        }
     }
 
     /// Re-check what may differ (what watchman names, plus the saved
     /// baseline) instead of [`Self::stat_all`] and discovery: false when no
-    /// ask is due, or, saying why on stderr, when watchman cannot say.
+    /// ask is due (a server's always is), or, saying why on stderr, when
+    /// watchman cannot say.
     pub fn replay(&self, files: &[String], lens: &[u64]) -> bool {
         let Some(index) = &self.index else {
             return false;
         };
-        if !journal::due(files.len()) {
+        if !self.known.each_query && !journal::due(files.len()) {
             return false;
         }
-        if !files.is_sorted() {
-            journal::cannot_answer("the manifest lists files out of order; re-run index");
-            return false;
-        }
-        let root = match self.known.root.canonicalize() {
-            Ok(root) => root,
-            Err(e) => {
-                let root = self.known.root.display();
-                journal::cannot_answer(&format!("cannot resolve {root} ({e})"));
+        let (root, recorded) = match self.askable(files) {
+            Ok(askable) => askable,
+            Err(why) => {
+                self.degraded(journal::cannot_answer(&why));
                 return false;
             }
         };
-        let Some(recorded) = &self.known.recorded else {
-            journal::cannot_answer("the index has no dirs.stamps; re-run index");
-            return false;
-        };
         let asked = std::time::Instant::now();
-        let answer = journal::ask(&root, index, files.len());
-        if let Some(token) = answer.token {
-            let _ = self.token.set(token);
+        let answer = journal::ask(&root, index, files.len(), self.known.each_query);
+        if let Some(why) = answer.why {
+            self.degraded(why);
         }
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = answer.token;
         let Some(paths) = answer.paths else {
             return false;
         };
@@ -522,12 +559,13 @@ impl Files {
                 return false;
             }
         };
+        let n = paths.len();
+        timed(
+            format_args!("watchman and the baseline named {n} path(s), {kept} kept"),
+            asked,
+            applied,
+        );
         if crate::verbose::verbose() {
-            let (n, ask, apply) = (paths.len(), applied - asked, applied.elapsed());
-            eprintln!(
-                "note: watchman and the baseline named {n} path(s), {kept} kept (ask \
-                 {ask:.1?}, apply {apply:.1?})"
-            );
             let n = self.known.added().live().count();
             if n > 0 {
                 eprintln!(
@@ -538,18 +576,99 @@ impl Files {
         true
     }
 
-    /// Once every doc is known, save [`Self::replay`]'s token and what
-    /// differs now (the baseline) in the user's cache.
-    pub fn checkpoint(&mut self, files: &[String]) {
-        let (Some(token), Some(index)) = (self.token.take(), &self.index) else {
-            return;
-        };
-        if !self.known.complete.load(Ordering::Acquire) {
+    /// A server's start that took no token says why: its first query
+    /// prints a warning only when the reason differs.
+    fn degraded(&self, why: String) {
+        if self.known.each_query {
+            *self.said.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+    }
+
+    /// Before a served query: ask watchman what changed since the last
+    /// token, then re-check those paths; when watchman cannot say, check
+    /// every file as a new load would. On stderr, why every file was
+    /// checked, each time the reason changes, and a note once watchman
+    /// answers again.
+    pub fn recheck(&self, files: &[String], lens: &[u64]) {
+        if self.index.is_none() || !self.known.each_query {
             return;
         }
-        let Ok(root) = self.known.root.canonicalize() else {
+        self.known.reload_rules();
+        let why = match self.askable(files) {
+            Ok((root, recorded)) => self.ask_again(&root, recorded, files, lens),
+            Err(why) => Some(journal::cannot(&why)),
+        };
+        if why.is_some() {
+            self.check_all(files, lens);
+        }
+        let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
+        match (&why, said.is_some()) {
+            (Some(line), _) if said.as_ref() != Some(line) => journal::say(line),
+            (None, true) => journal::answers_again(),
+            _ => {}
+        }
+        *said = why;
+    }
+
+    /// The ask and re-check of [`Self::recheck`]: why every file must be
+    /// checked, if it must. The last token stays when watchman is only
+    /// late; it goes when its daemon is gone.
+    fn ask_again(
+        &self,
+        root: &Path,
+        recorded: &Arc<Recorded>,
+        files: &[String],
+        lens: &[u64],
+    ) -> Option<String> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let asked = std::time::Instant::now();
+        let again = journal::again(root, last.as_ref());
+        if again.token.is_some() || !again.keep {
+            *last = again.token;
+        }
+        drop(last);
+        let Some(paths) = again.paths else {
+            return again.why;
+        };
+        let applied = std::time::Instant::now();
+        let Ok(kept) = self.known.replay(recorded, &paths, files, lens) else {
+            return Some(journal::over_since(journal::named_cap(files.len())));
+        };
+        let n = paths.len();
+        timed(
+            format_args!("watchman reported {n} path(s) changed, {kept} kept"),
+            asked,
+            applied,
+        );
+        again.why
+    }
+
+    /// What a new load finds: every doc statted, ignored ones too, then
+    /// discovery, which marks again what the rules skip.
+    fn check_all(&self, files: &[String], lens: &[u64]) {
+        self.known.stat_all(files, lens, true);
+        self.discover(files, lens);
+    }
+
+    /// Once every doc is known, save the last token and what differs now
+    /// (the baseline) in the user's cache: once per process, so a server
+    /// saves after its first query that has a token.
+    pub fn checkpoint(&self, files: &[String]) {
+        let Some(index) = &self.index else {
             return;
         };
+        if self.saved.load(Ordering::Acquire) || !self.known.complete.load(Ordering::Acquire) {
+            return;
+        }
+        let token = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let (Some(token), Ok(root)) = (token, self.known.root.canonicalize()) else {
+            return;
+        };
+        self.saved.store(true, Ordering::Release);
         let snap = self.snapshot();
         let mut baseline: Vec<String> = snap
             .stale
@@ -592,7 +711,7 @@ impl Files {
 
     /// Stat every doc; each newly gone one warns, in doc order.
     pub fn stat_all(&self, files: &[String], lens: &[u64]) {
-        self.known.stat_all(files, lens);
+        self.known.stat_all(files, lens, false);
     }
 
     /// Whether any doc is stale or gone.
@@ -733,12 +852,12 @@ impl Watch {
             }
             self.known.reload_rules();
             if all {
-                self.known.stat_all(files, lens);
+                self.known.stat_all(files, lens, false);
                 self.known.discover(&self.root, &self.root, files, lens);
             } else {
                 ids.sort_unstable();
                 ids.dedup();
-                self.known.stat_ids(&ids, files, lens);
+                self.known.stat_ids(&ids, files, lens, false);
                 named.sort_unstable();
                 named.dedup();
                 let mut scopes = Vec::new();
@@ -1095,6 +1214,25 @@ mod tests {
         std::fs::remove_file(fix.path.join("e/.ignore")).unwrap();
         assert_eq!(replay(&["e"]), Ok(1), "a new dir itself");
         assert_eq!(added_paths(&files, &fix), ["e/sub/y.c", "e/x.c"]);
+    }
+
+    /// A server's stat pass on marks it keeps finds what a new load finds:
+    /// a doc that a new ignore file hid comes back once the file goes.
+    #[cfg(unix)]
+    #[test]
+    fn checking_every_file_again_brings_back_a_doc_no_longer_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_named(tmp.path(), &["a.c", "sub/b.c"]);
+        let (files, _) = replayed(&fix, &[]);
+        files.check_all(&fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [FRESH, FRESH]);
+        std::fs::write(fix.path.join("sub/.ignore"), b"b.c\n").unwrap();
+        files.check_all(&fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [FRESH, IGNORED]);
+        std::fs::remove_file(fix.path.join("sub/.ignore")).unwrap();
+        files.check_all(&fix.files, &fix.lens);
+        assert_eq!(files.kinds(), [FRESH, FRESH], "as a new load finds it");
+        assert!(!files.warned(1));
     }
 
     /// The live added paths, by slot.

@@ -39,8 +39,13 @@ soft dependency: fmgrep works without it, with the same answers.
   daemon keeps running after fmgrep exits, with its watch: on AOSP
   (1.25 M files), about 710 MB of memory and 312,000 inotify watches. A
   search keeps a small record per tree in `~/.cache/fmgrep`. Below 50,000
-  files fmgrep never contacts watchman: checking every file is faster.
-  Details: [docs/index-format.md](docs/index-format.md#watchman).
+  files a search never contacts watchman: checking every file is faster.
+  `fmgrep serve` checks before every query, not once, so it asks watchman
+  at any tree size, unless given `--no-watch`: it starts the daemon and
+  asks it to watch even a small tree. On macOS that ask costs each served
+  query about 38 ms (on a tree of 60,000 files, where a query with
+  `--no-watch` took 0.17 ms), against 1.2 to 1.4 ms on Linux. Details:
+  [docs/index-format.md](docs/index-format.md#watchman).
 * **Without watchman**, each search of such a tree checks every file
   itself and prints one warning line, `warning: watchman cannot say what
   changed (cannot run watchman (...); install watchman); checked every

@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 
 mod roundtrip;
 mod serve;
+/// The library tests' private watchman daemon.
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "../../src/tests/watchman.rs"]
+mod watchman;
 
 fn fmgrep() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fmgrep"));
@@ -120,10 +125,12 @@ impl Drop for Server {
 
 impl Server {
     fn spawn(args: &[&str]) -> Self {
+        Self::spawn_cmd(fmgrep().args(args))
+    }
+
+    fn spawn_cmd(cmd: &mut Command) -> Self {
         Server(
-            fmgrep()
-                .args(args)
-                .stdin(Stdio::piped())
+            cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()

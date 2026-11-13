@@ -8,6 +8,8 @@ mod json;
 mod matches;
 mod output;
 mod serve;
+#[cfg(unix)]
+mod served;
 pub(crate) mod support;
 #[cfg(unix)]
 mod watched;

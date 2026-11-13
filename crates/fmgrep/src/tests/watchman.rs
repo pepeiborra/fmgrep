@@ -283,38 +283,3 @@ impl Drop for Daemon {
         self.stop();
     }
 }
-
-#[test]
-fn a_private_daemon_watches_logs_restarts_and_hangs() {
-    let Some(mut daemon) = Daemon::start() else {
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(tmp.path()).unwrap();
-    std::fs::write(root.join("a.c"), b"a").unwrap();
-    daemon.watch(&root);
-    assert_eq!(daemon.roots(), [root.to_str().unwrap()]);
-    let clock = json!(["clock", root, {"sync_timeout": 10_000}]);
-    let first = daemon.call(&clock).unwrap()["clock"].clone();
-    assert_eq!(daemon.sent(), ["clock"]);
-    daemon.restart();
-    assert_eq!(daemon.roots(), [root.to_str().unwrap()], "watched again");
-    let again = daemon.call(&clock).unwrap()["clock"].clone();
-    assert_ne!(first, again, "another instance");
-    daemon.hang();
-    let start = Instant::now();
-    let mut conn = UnixStream::connect(&daemon.sock).unwrap();
-    conn.set_read_timeout(Some(Duration::from_millis(300)))
-        .unwrap();
-    let command = format!("{}\n", json!(["watch-list"]));
-    conn.write_all(command.as_bytes()).unwrap();
-    let mut line = String::new();
-    assert!(
-        BufReader::new(&conn).read_line(&mut line).is_err(),
-        "no reply while it hangs: {line}"
-    );
-    assert!(start.elapsed() >= Duration::from_millis(300));
-    daemon.resume();
-    daemon.unwatch(&root);
-    assert!(daemon.roots().is_empty());
-}
