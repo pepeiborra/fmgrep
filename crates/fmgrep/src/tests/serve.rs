@@ -518,6 +518,43 @@ fn serve_no_watch_sees_a_change_only_when_read() {
     server.join().unwrap().unwrap();
 }
 
+/// Where a search asks watchman (here at any size), a `--no-watch` server
+/// sends it nothing, at its start or before a query, and leaves the record
+/// as the search wrote it.
+#[cfg(unix)]
+#[test]
+fn serve_no_watch_asks_watchman_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), false);
+    let corpus = tmp.path().join("corpus");
+    let Some(daemon) = watching(tmp.path(), &corpus) else {
+        return;
+    };
+    ASK_FROM.set(Some(0));
+    assert_eq!(printed(&index, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert!(!daemon.sent().is_empty(), "a search asks");
+    let record = |dir: &Path| {
+        let files = std::fs::read_dir(dir.join("cache")).unwrap();
+        files
+            .map(|f| std::fs::read(f.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let before = record(tmp.path());
+    std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
+    let (addr, server) = spawn_server(&index, FIXED);
+    assert_eq!(
+        served_totals(&addr, &["printk"]),
+        [3],
+        "the stat pass at start"
+    );
+    std::fs::write(corpus.join("c.c"), b"printk\n").unwrap();
+    assert_eq!(served_totals(&addr, &["printk"]), [3]);
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+    assert!(daemon.sent().is_empty(), "the server sent nothing");
+    assert_eq!(record(tmp.path()), before);
+}
+
 #[test]
 fn serve_no_watch_finds_only_files_added_before_load() {
     let tmp = tempfile::tempdir().unwrap();

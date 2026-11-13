@@ -66,7 +66,8 @@ soft dependency: fmgrep works without it, with the same answers.
   no daemon listens: fmgrep then starts no daemon, and each search checks
   every file and prints a warning that gives the socket
   ([docs/tuning.md](docs/tuning.md#search)). fmgrep no longer reads
-  `FMGREP_JOURNAL`, which fmgrep 0.1.0 used for this.
+  `FMGREP_JOURNAL`, which fmgrep 0.1.0 used for this. `fmgrep serve
+  --no-watch` contacts no watchman at any tree size.
 
 ## Usage
 

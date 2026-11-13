@@ -10,7 +10,8 @@ use super::*;
 /// baseline name.
 fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
-    let docs = crate::fetch::DocStore::open(index, &manifest, None, false).unwrap();
+    let docs =
+        crate::fetch::DocStore::open(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
     docs.replay(&manifest.files)
 }
 
@@ -915,7 +916,8 @@ fn watchman_skips_the_stat_pass() {
     stamps[0] ^= 1;
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
     let manifest = read_manifest(&output).unwrap();
-    let mut docs = crate::fetch::DocStore::open(&output, &manifest, None, false).unwrap();
+    let mut docs =
+        crate::fetch::DocStore::open(&output, &manifest, None, crate::fetch::Ask::Load).unwrap();
     assert!(docs.replay(&manifest.files), "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");

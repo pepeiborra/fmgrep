@@ -113,18 +113,28 @@ const MAX_CACHED_BYTES: u64 = 1 << 20;
 /// Ceiling on stale docs' bytes pinned for every term of a query.
 const STALE_CACHE_BYTES: u64 = 64 << 20;
 
+/// When a files-layout load asks watchman what changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// A search's: at load, on a tree of 50,000 files or more.
+    Load,
+    /// A server's: at load and before each query, at any size.
+    EachQuery,
+    /// A server's of a tree that does not change: never.
+    Never,
+}
+
 impl DocStore {
     /// The manifest's layout. Stored docs ignore `corpus_root`; a missing
     /// `docs.shard` surfaces only on the first non-empty fetch. The files
     /// layout maps `docs.stamps` and reads the walk record, and
-    /// checks `corpus_root` (else the manifest's) is a directory. A load
-    /// asks watchman as a search does; `each_query` asks again before each
-    /// query, for a server.
+    /// checks `corpus_root` (else the manifest's) is a directory; it asks
+    /// watchman as `ask` says.
     pub fn open(
         index_dir: &Path,
         manifest: &Manifest,
         corpus_root: Option<&Path>,
-        each_query: bool,
+        ask: Ask,
     ) -> Result<Self, String> {
         let source = match (manifest.store_docs, corpus_root) {
             (true, _) => Source::Shard {
@@ -145,7 +155,9 @@ impl DocStore {
                     dir: dir.unwrap_or_else(|_| index_dir.to_path_buf()),
                     started_ns: manifest.index_started_ns,
                 };
-                files.ask(index, each_query);
+                if ask != Ask::Never {
+                    files.ask(index, ask == Ask::EachQuery);
+                }
                 Source::Files(files)
             }
         };
