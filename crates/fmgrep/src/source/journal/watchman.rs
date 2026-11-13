@@ -335,6 +335,11 @@ impl Watchman {
     }
 }
 
+/// Whether [`Watchman::find`] failed with `why` for want of time only.
+pub fn late_find(why: &str) -> bool {
+    why.starts_with("watchman get-sockname did not answer within")
+}
+
 fn not_watching(root: &Path) -> String {
     format!("watchman is not watching {}", root.display())
 }

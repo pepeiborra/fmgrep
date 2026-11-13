@@ -32,4 +32,5 @@ are missing, and says on stderr when watchman cannot answer; watchman's
 own `WATCHMAN_SOCK` names its socket. To keep fmgrep from watchman, set
 `WATCHMAN_SOCK` to a path where no daemon listens: fmgrep then starts no
 daemon, asks for no watch, uses no record of an earlier search and checks
-every file. See [index-format.md](index-format.md#watchman).
+every file. `fmgrep serve` then refuses to start, unless given
+`--no-watch`. See [index-format.md](index-format.md#watchman).

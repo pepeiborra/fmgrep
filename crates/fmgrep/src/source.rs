@@ -462,6 +462,8 @@ pub struct Files {
     sorted: OnceLock<bool>,
     /// The warning a server printed last, until watchman answers again.
     said: Mutex<Option<String>>,
+    /// Why a server cannot use watchman at all, found at its start.
+    refusal: Mutex<Option<String>>,
 }
 
 impl Files {
@@ -493,6 +495,7 @@ impl Files {
             saved: AtomicBool::new(false),
             sorted: OnceLock::new(),
             said: Mutex::default(),
+            refusal: Mutex::default(),
         })
     }
 
@@ -533,8 +536,12 @@ impl Files {
         }
         let (root, recorded) = match self.askable(files) {
             Ok(askable) => askable,
+            Err(why) if self.known.each_query => {
+                *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+                return false;
+            }
             Err(why) => {
-                self.degraded(journal::cannot_answer(&why));
+                journal::cannot_answer(&why);
                 return false;
             }
         };
@@ -542,6 +549,9 @@ impl Files {
         let answer = journal::ask(&root, index, files.len(), self.known.each_query);
         if let Some(why) = answer.why {
             self.degraded(why);
+        }
+        if let Some(why) = answer.lasting {
+            *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
         }
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = answer.token;
         let Some(paths) = answer.paths else {
@@ -570,6 +580,17 @@ impl Files {
             }
         }
         true
+    }
+
+    /// Why a server cannot use watchman at all, as its start found: not
+    /// installed, no daemon on `WATCHMAN_SOCK`, a network filesystem, an
+    /// index without `dirs.stamps`, and the like. Watchman reading the
+    /// tree, or late, is no such cause.
+    pub fn refusal(&self) -> Option<String> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// A server's start that took no token says why: its first query

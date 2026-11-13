@@ -394,6 +394,13 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         false => Ask::Never,
     };
     let (index, mut docs) = load(req.index_dir, req.manifest, req.corpus_root, ask)?;
+    if let Some(cause) = docs.refusal() {
+        return Err(format!(
+            "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \
+             query (pass --no-watch to serve a tree that does not change)",
+            root.display()
+        ));
+    }
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }

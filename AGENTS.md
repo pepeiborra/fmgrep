@@ -20,7 +20,7 @@ fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)' -l
 For many searches in a row, keep the index loaded:
 
 ```sh
-fmgrep serve --listen 127.0.0.1:7777 &     # prints the address once ready
+fmgrep serve --listen 127.0.0.1:7777 &     # prints the address once ready; needs watchman
 fmgrep --server 127.0.0.1:7777 HscEnv      # the lines a local search prints
 fmgrep --server 127.0.0.1:7777 -l HscEnv   # any search flag
 fmgrep --server 127.0.0.1:7777 --shutdown
@@ -64,5 +64,6 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `warning: skipping PATH: over 2147483646 bytes` | too large to index; search it with rg |
 | `note: N file(s) changed since indexing` | searches read them in full; re-index |
 | `warning: watchman cannot say what changed (...)` | answers are right but each search checks every file; do what the line says |
+| `error: cannot use watchman for DIR (...)` | `fmgrep serve` needs watchman; install it, or pass `--no-watch` for a tree that does not change |
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md); design notes live in `docs/`.

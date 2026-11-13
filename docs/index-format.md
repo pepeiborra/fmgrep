@@ -215,11 +215,23 @@ every file, as a new load would, and the server says why on stderr each
 time the reason changes; `note: each query re-checks only what watchman
 reports again` follows once watchman answers. The server's lines speak
 of its next query, not of later searches: `warning: checked every file
-once (no record of an earlier search); the next query asks watchman`. A
-late daemon (one that hangs, or reads the tree) keeps the server's last
-token, or at its start the record's token, since the stat pass runs
-after it was taken; a daemon gone from its socket, a restart or a
-removed watch makes the server take a new one.
+once (no record of an earlier search); the next query asks watchman`.
+
+A server that cannot use watchman at all exits 2 before its readiness
+line, unless `--no-watch` is given: when watchman is not installed, when
+`WATCHMAN_SOCK` names a socket where no daemon answers, when the tree is
+on a network filesystem or `/proc/self/mountinfo` cannot be read, when
+watchman's `ignore_dirs` hide part of the tree or watchman refuses to
+watch it, or when the index has no `dirs.stamps`:
+
+    error: cannot use watchman for /src (cannot run watchman (No such file or directory (os error 2)); install watchman); `fmgrep serve` asks it before each query (pass --no-watch to serve a tree that does not change)
+
+A `--store-docs` index never needs watchman. A late daemon (one that
+hangs, or reads the tree) does not stop the server, at its start or
+later: the queries check every file until watchman answers, and the
+server keeps its last token, or at its start the record's token, since
+the stat pass runs after it was taken. A daemon gone from its socket, a
+restart or a removed watch makes the server take a new token.
 
 The ask costs each served query 1.2 to 1.4 ms on Linux (measured on
 linux, chromium and aosp), plus the re-check of what watchman reports:
