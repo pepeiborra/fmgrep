@@ -321,7 +321,12 @@ fn server_errors_surface_on_the_client() {
     // Tests run at once: another one's server can take the freed port, and
     // answer, or close while this client talks to it.
     if let Err(gone) = client(&addr, &["--status"]) {
-        assert!(gone.starts_with(&format!("error: {addr}: ")), "{gone}");
+        let refused = format!("error: cannot reach the server at {addr}: ");
+        let reset = format!("error: {addr}: ");
+        assert!(
+            gone.starts_with(&refused) || gone.starts_with(&reset),
+            "{gone}"
+        );
     }
 }
 
