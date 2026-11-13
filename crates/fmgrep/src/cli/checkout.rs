@@ -94,7 +94,11 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         if r.starts_with("# ") {
             continue;
         }
+        // An ordinary change's third field says whether it is a submodule.
         let path = vcs::status_path(r).ok_or_else(|| format!("git status printed {r:?}"))?;
+        if r.starts_with('1') && r.split(' ').nth(2).is_some_and(|s| s.starts_with('S')) {
+            return Err(format!("the checkout holds a submodule ({path})"));
+        }
         skip.push(path.to_owned());
     }
     match head.as_deref() {
@@ -104,6 +108,8 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         }
         Some(_) => {}
     }
+    hidden(top)?;
+    converts(top, &skip)?;
     if let Some(p) = skip
         .iter()
         .find(|p| crate::walk::ignore_file_dir(p).is_some())
@@ -112,6 +118,7 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
             "an ignore file differs from the served commit ({p})"
         ));
     }
+    outer_ignores(top)?;
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
     }
@@ -126,6 +133,135 @@ pub fn over(n: usize, commit: &str) -> String {
         "{n} files differ from the served commit {}; the limit is {MAX_SKIP}",
         short(commit)
     )
+}
+
+/// Refuse a checkout whose index hides changes from git status
+/// (assume-unchanged or skip-worktree entries), or that holds a submodule.
+fn hidden(top: &Path) -> Result<(), String> {
+    let listed = vcs::git(top, &["ls-files", "-z", "-s", "-v"])?;
+    let mut hidden = 0;
+    for r in vcs::records(&listed) {
+        // `<tag> <mode> <oid> <stage>\t<path>`: `S` is skip-worktree, a
+        // lowercase tag assume-unchanged.
+        let (tag, rest) = r.split_at(r.iter().position(|&b| b == b' ').unwrap_or(0));
+        if tag == b"S" || tag.first().is_some_and(u8::is_ascii_lowercase) {
+            hidden += 1;
+        }
+        let entry = vcs::entry(rest.get(1..).unwrap_or_default())?;
+        if entry.mode == "160000" {
+            let path = String::from_utf8_lossy(entry.path);
+            return Err(format!("the checkout holds a submodule ({path})"));
+        }
+    }
+    match hidden {
+        0 => Ok(()),
+        n => Err(format!(
+            "git hides changes to {n} file{} (assume-unchanged or skip-worktree)",
+            crate::verbose::plural(n)
+        )),
+    }
+}
+
+/// Refuse a checkout whose files git converts between the work tree and
+/// the index (line endings, a filter that cleans or smudges), so that they
+/// can differ from their blobs when git status says they do not; or a
+/// sparse one. `changed` are the paths that differ.
+fn converts(top: &Path, changed: &[String]) -> Result<(), String> {
+    let config = vcs::git(
+        top,
+        &[
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^(core\.(sparsecheckout|autocrlf|eol|attributesfile)|filter\..*\.(clean|smudge|process))$",
+        ],
+    );
+    // `git config --get-regexp` fails when nothing matches.
+    let config = config.unwrap_or_default();
+    let converts = |what: String| Err(format!("git converts files ({what})"));
+    for r in vcs::records(&config) {
+        let r = String::from_utf8_lossy(r);
+        let (key, value) = r.split_once('\n').unwrap_or((&r, ""));
+        let on = matches!(
+            value.to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        );
+        match key {
+            "core.sparsecheckout" if on => {
+                return Err("the checkout is sparse (core.sparseCheckout)".to_owned());
+            }
+            "core.autocrlf" if on => return converts("core.autocrlf=true".to_owned()),
+            "core.eol" if value.eq_ignore_ascii_case("crlf") => {
+                return converts("core.eol=crlf".to_owned());
+            }
+            "core.attributesfile" => return converts("core.attributesFile".to_owned()),
+            _ => {}
+        }
+        if let Some(name) = key
+            .strip_prefix("filter.")
+            .and_then(|k| k.rsplit_once('.'))
+            .map(|(name, _)| name)
+        {
+            let spec = format!(":(attr:filter={name})");
+            let files = vcs::git(top, &["ls-files", "-z", "--", &spec])?;
+            let n = vcs::records(&files).count();
+            if n > 0 {
+                return converts(format!(
+                    "the filter {name} applies to {n} file{}",
+                    crate::verbose::plural(n)
+                ));
+            }
+        }
+    }
+    if changed
+        .iter()
+        .any(|p| p.rsplit('/').next() == Some(".gitattributes"))
+    {
+        return converts(".gitattributes differs from the served commit".to_owned());
+    }
+    let info = vcs::line(vcs::git(
+        top,
+        &["rev-parse", "--git-path", "info/attributes"],
+    )?)?;
+    let global = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("git/attributes"));
+    for path in std::iter::once(top.join(info)).chain(global) {
+        if vcs::served::has_pattern(&path) {
+            return converts(path.display().to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a checkout that ignore rules from outside it apply to: the
+/// ignore files of its ancestors, the global excludes file and its
+/// `info/exclude`, when they hold a pattern.
+fn outer_ignores(top: &Path) -> Result<(), String> {
+    for dir in top.ancestors().skip(1) {
+        for name in [".gitignore", ".ignore", ".rgignore"] {
+            let path = dir.join(name);
+            if vcs::served::has_pattern(&path) {
+                return Err(format!(
+                    "an ignore file above the checkout applies ({})",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let exclude = vcs::line(vcs::git(top, &["rev-parse", "--git-path", "info/exclude"])?)?;
+    let global = ignore::gitignore::gitconfig_excludes_path();
+    for path in std::iter::once(top.join(exclude)).chain(global) {
+        if vcs::served::has_pattern(&path) {
+            return Err(format!(
+                "ignore rules from outside the checkout apply ({})",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The files of the checkout at `top` that the skip list `skip` holds and

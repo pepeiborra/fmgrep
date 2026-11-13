@@ -202,7 +202,7 @@ type Unsound = (Change, &'static str);
 fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     let r = Remote::new(&FILES);
     let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
-    let cases: [Unsound; 2] = [
+    let cases: [Unsound; 10] = [
         (
             |r, c| {
                 r.s.write(c, &[("a.c", "printk top\n")]);
@@ -212,17 +212,110 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
             "HEAD is not the served commit {short}",
         ),
         (
+            |r, c| {
+                r.s.git(c, &["update-index", "--assume-unchanged", "z.c"]);
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["update-index", "--skip-worktree", "z.c"]);
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "core.sparseCheckout", "true"]);
+            },
+            "the checkout is sparse (core.sparseCheckout)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "core.autocrlf", "true"]);
+            },
+            "git converts files (core.autocrlf=true)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "filter.up.smudge", "cat"]);
+                r.s.write(c, &[(".git/info/attributes", "*.c filter=up\n")]);
+            },
+            "git converts files (the filter up applies to 5 files)",
+        ),
+        (
+            |r, c| {
+                let info = format!("160000,{},sub", r.commit);
+                r.s.git(c, &["update-index", "--add", "--cacheinfo", &info]);
+                std::fs::create_dir(c.join("sub")).unwrap();
+            },
+            "the checkout holds a submodule (sub)",
+        ),
+        (
+            |r, _| r.s.write(r.s.tmp.path(), &[(".ignore", "*.h\n")]),
+            "an ignore file above the checkout applies ({tmp}/.ignore)",
+        ),
+        (
             |r, c| r.s.write(c, &[(".gitignore", "*.log\n*.h\n")]),
             "an ignore file differs from the served commit (.gitignore)",
         ),
+        (
+            |r, c| r.s.write(c, &[(".git/info/exclude", "*.h\n")]),
+            "ignore rules from outside the checkout apply ({client}/.git/info/exclude)",
+        ),
     ];
+    let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
     for (change, why) in cases {
         reset(&r);
+        let _ = std::fs::remove_file(r.s.tmp.path().join(".ignore"));
+        for args in [
+            &["config", "--unset", "core.sparseCheckout"][..],
+            &["config", "--unset", "core.autocrlf"],
+            &["config", "--remove-section", "filter.up"],
+            &[
+                "update-index",
+                "--no-skip-worktree",
+                "--no-assume-unchanged",
+                "z.c",
+            ],
+        ] {
+            let _ = r.s.git_output(&r.client, args);
+        }
+        let _ = std::fs::remove_file(r.client.join(".git/info/attributes"));
+        let _ = std::fs::remove_file(r.client.join(".git/info/exclude"));
         r.s.write(&r.client, &[("a.c", "none\n")]);
         change(&r, &r.client);
         let out = r.search(&r.client, &["-l", "printk"]);
-        let why = why.replace("{short}", &r.commit[..7]);
+        let why = why
+            .replace("{tmp}", &tmp.display().to_string())
+            .replace("{client}", &r.client.display().to_string())
+            .replace("{short}", &r.commit[..7]);
         assert_eq!(stderr(&out), crate::remote::ignored(&why));
         assert_eq!(stdout(&out), served, "{why}");
     }
+    // A filter that applies to no file converts nothing.
+    reset(&r);
+    std::fs::remove_file(r.client.join(".git/info/exclude")).unwrap();
+    r.s.git(&r.client, &["config", "filter.up.smudge", "cat"]);
+    r.same("", &["-l", "printk"]);
+}
+
+/// A filter with a clean command alone: git status compares the cleaned
+/// file with its blob, so an edit that the filter drops is not listed.
+/// The client ignores local changes and says why.
+#[test]
+fn a_clean_only_filter_ignores_local_changes() {
+    let files = [
+        (".gitattributes", "*.txt filter=strip\n"),
+        ("a.c", "printk a\n"),
+        ("notes.txt", "printk notes\n"),
+    ];
+    let r = Remote::new(&files);
+    let c = &r.client;
+    r.s.git(c, &["config", "filter.strip.clean", "grep -v SECRET"]);
+    r.s.write(c, &[("notes.txt", "printk notes\nSECRET printk\n")]);
+    r.s.git(c, &["add", "notes.txt"]);
+    let out = r.search(c, &["printk"]);
+    let why = "git converts files (the filter strip applies to 1 file)";
+    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(stdout(&out), "a.c:printk a\nnotes.txt:printk notes\n");
 }
