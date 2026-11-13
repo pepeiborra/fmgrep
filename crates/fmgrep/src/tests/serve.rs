@@ -122,6 +122,34 @@ pub(crate) fn pin(index: &Path, id: &str) {
     std::fs::write(&path, serde_json::to_string(&m).unwrap()).unwrap();
 }
 
+/// A cwd below the served tree scopes a query, unless the query is pinned
+/// to the served commit: then only its `paths` scope it.
+#[test]
+fn a_pinned_query_is_scoped_by_its_paths_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &TWO_FILES);
+    std::fs::create_dir(folder.join("sub")).unwrap();
+    std::fs::write(folder.join("sub/c.c"), "printk sub\n").unwrap();
+    let index = folder.join(".fmgrep");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let cwd = std::fs::canonicalize(folder.join("sub")).unwrap();
+    let ask = |extra: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"files","cwd":{:?}{extra}}}}}"#,
+            cwd.display().to_string()
+        )
+    };
+    let pinned = format!(r#","commit":"{id}""#);
+    let sub = format!(r#"{pinned},"paths":[{{"path":"sub","name":""}}]"#);
+    let got = serve_stdio(&index, &[&ask(""), &ask(&pinned), &ask(&sub)]);
+    let text = |i: usize| got[i]["result"]["text"].as_str().unwrap().to_owned();
+    assert_eq!(text(0), "c.c\n");
+    assert_eq!(text(1), "a.c\nb.c\nsub/c.c\n");
+    assert_eq!(text(2), "c.c\n");
+}
+
 /// A query pinned to another format or served commit is refused with
 /// -32001; one pinned to this server's is answered.
 #[test]

@@ -171,7 +171,11 @@ impl Served<'_> {
 
     fn query(&mut self, p: &mut QueryParams, out: &mut dyn Write) -> Result<Answer, RpcError> {
         self.pinned(p)?;
-        p.scope(super::served_tree(&self.root, self.manifest.store_docs));
+        // A pinned query's cwd is in the client's checkout, not in the
+        // served tree: its `paths` already say what to search.
+        if p.commit.is_none() {
+            p.scope(super::served_tree(&self.root, self.manifest.store_docs));
+        }
         let req = p
             .request(self.index_dir, self.manifest, None)
             .map_err(|message| RpcError {
