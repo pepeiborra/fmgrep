@@ -167,7 +167,12 @@ no record, when watchman cannot answer since the token (a restart,
 another daemon), when a stamped input moved (a commit, a checkout or a
 `git add` moves HEAD or the index), when a `.gitattributes` changed, or
 when more than 10,000 paths would be listed. Without watchman it asks git
-on every search, saves no record, and says so on stderr.
+on every search, saves no record, and says so on stderr. When the client
+cannot list the checkout's changes soundly (a sparse checkout, more than
+10,000 differing files or files to search, and the like), the record
+keeps the reason as `extra.why`, with an empty baseline: later searches
+print the same warning with no git run, until a stamped input moves or
+watchman reports any change outside `.git`.
 
 A **token** is the second of two watchman clocks synced within 100 ms,
 kept only when it is a later tick than the first. A clock answered during

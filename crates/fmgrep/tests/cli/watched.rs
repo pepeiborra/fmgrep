@@ -160,6 +160,77 @@ fn a_restarted_or_another_daemon_asks_git_again() {
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\n");
 }
 
+/// 10,001 new files, as `many/`.
+fn many(r: &Remote) {
+    let many: Vec<(String, String)> = (0..10_001)
+        .map(|i| (format!("many/{i:05}.c"), "printk\n".to_owned()))
+        .collect();
+    let many: Vec<(&str, &str)> = many.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    r.s.write(&r.client, &many);
+}
+
+/// A checkout that the client cannot compare stays so while nothing moves:
+/// the next search prints the same warning and runs no git. An input that
+/// moves (a reset), or any change that watchman reports (the new files
+/// deleted by hand, an ignore file deleted), asks git again, and the
+/// answer is the merged one.
+#[test]
+fn an_unsound_checkout_is_remembered_until_something_changes() {
+    let r = Remote::new(&FILES);
+    if r.daemon.is_none() {
+        return;
+    }
+    let (log, path) = logging_git(&r);
+    let short = &r.commit[..7];
+    let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let remembered = |why: &str| {
+        for asks in [true, false] {
+            let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
+            assert_eq!(stderr(&out), crate::remote::ignored(why));
+            assert_eq!(stdout(&out), served);
+            assert_eq!(runs.iter().any(|r| r.contains("status")), asks, "{runs:?}");
+        }
+    };
+    let merged = |want: &str| {
+        let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
+        assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
+        assert_eq!(stdout(&out), want);
+        assert_eq!(r.warnings(&out), "");
+    };
+
+    // Staged: git lists 10,001 paths. A reset moves the index.
+    many(&r);
+    r.s.git(&r.client, &["add", "many"]);
+    remembered(&format!(
+        "10001 files differ from the served commit {short}; the limit is 10000"
+    ));
+    r.s.git(&r.client, &["reset", "-q", "--hard"]);
+    r.s.git(&r.client, &["clean", "-q", "-f", "-d"]);
+    r.s.write(&r.client, &[("e.c", "none\n")]);
+    merged("a.c\ndir/b.c\ndir/sub/c.h\n");
+
+    // Untracked: git lists `many/`, the client's walk passes the limit.
+    // Deleted by hand: nothing that the record stamps moves.
+    many(&r);
+    remembered(&format!(
+        "more than 10000 files differ from the served commit {short}"
+    ));
+    std::fs::remove_dir_all(r.client.join("many")).unwrap();
+    r.s.write(&r.client, &[("a.c", "none\n")]);
+    merged("dir/b.c\ndir/sub/c.h\n");
+
+    // A new ignore file at the top governs every file.
+    many(&r);
+    r.s.write(&r.client, &[(".gitignore", "*.log\n")]);
+    remembered(
+        "the ignore file .gitignore differs from the served commit and governs more than 10000 \
+         files",
+    );
+    std::fs::remove_dir_all(r.client.join("many")).unwrap();
+    std::fs::remove_file(r.client.join(".gitignore")).unwrap();
+    merged("dir/b.c\ndir/sub/c.h\n");
+}
+
 /// Without watchman, each search asks git, and says so in one line.
 #[test]
 fn without_watchman_every_search_asks_git_and_says_so() {

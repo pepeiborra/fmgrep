@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::checkout::{Local, changes, resolve, short};
 use super::params::MAX_SKIP;
-use crate::source::{Of, Remembered, remember, remembered};
+use crate::source::{Of, Remembered, Token, remember, remembered};
 use crate::vcs;
 
 /// The skip list of the checkout at `top` against the served commit
@@ -32,10 +32,18 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
             extra,
             changed,
         } => match since(top, baseline, &extra, changed) {
-            Ok(skip) => {
-                remember(top, &of, token, skip.clone(), extra);
-                let local = resolve(top, &skip, commit)?;
-                return Ok((skip, local));
+            Ok(Again::Skip(skip)) => {
+                return match resolve(top, &skip, commit) {
+                    Ok(local) => {
+                        remember(top, &of, token, skip.clone(), extra);
+                        Ok((skip, local))
+                    }
+                    Err(why) => Err(unsound(top, &of, token, extra, why)),
+                };
+            }
+            Ok(Again::Unsound(why)) => {
+                remember(top, &of, token, Vec::new(), extra);
+                return Err(why);
             }
             Err(why) => (token, why),
         },
@@ -58,17 +66,17 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
     // makes the next search ask git again.
     let asked = Instant::now();
     let git = git_inputs(top)?;
-    let stamps = stamps(&inputs(top, &git));
-    let skip = changes(top, commit)?;
+    let extra = json!({"git": git, "stamps": stamps(&inputs(top, &git))});
+    let skip = match changes(top, commit) {
+        Ok(skip) => skip,
+        Err(why) => return Err(unsound(top, &of, token, extra, why)),
+    };
     let took = asked.elapsed();
-    remember(
-        top,
-        &of,
-        token,
-        skip.clone(),
-        json!({"git": git, "stamps": stamps}),
-    );
-    let local = resolve(top, &skip, commit)?;
+    let local = match resolve(top, &skip, commit) {
+        Ok(local) => local,
+        Err(why) => return Err(unsound(top, &of, token, extra, why)),
+    };
+    remember(top, &of, token, skip.clone(), extra);
     super::warn(&format!(
         "asked git what differs from the served commit {} ({why}; took {}); later searches ask \
          watchman",
@@ -78,14 +86,37 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
     Ok((skip, local))
 }
 
-/// The baseline plus what watchman says `changed`, when the inputs that
-/// `extra` stamped are as they were; else why git must be asked again.
+/// The reason `why` that the checkout at `top` cannot be compared, after
+/// saving it in the record of `of` with an empty baseline, the token and
+/// the stamps of `extra`: it stays so until an input moves or watchman
+/// reports a change. A git that failed, or that cannot run, is not saved:
+/// it may not fail next time.
+fn unsound(top: &Path, of: &Of, token: Token, mut extra: Value, why: String) -> String {
+    if !why.starts_with("git failed") && !why.starts_with("cannot run git") {
+        extra["why"] = Value::String(why.clone());
+        remember(top, of, token, Vec::new(), extra);
+    }
+    why
+}
+
+/// What a record tells a search whose inputs are as they were.
+enum Again {
+    /// The skip list: the baseline plus what watchman says changed.
+    Skip(Vec<String>),
+    /// Why git could not list the checkout's changes soundly, as it said
+    /// at the baseline.
+    Unsound(String),
+}
+
+/// The baseline plus what watchman says `changed`, or the reason the
+/// record keeps for an unsound checkout, when the inputs that `extra`
+/// stamped are as they were; else why git must be asked again.
 fn since(
     top: &Path,
     mut skip: Vec<String>,
     extra: &Value,
     changed: Vec<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Again, String> {
     let git: Vec<String> = serde_json::from_value(extra["git"].clone())
         .map_err(|_| "the record is malformed".to_owned())?;
     let was: Vec<(String, Option<(u64, i64)>)> = serde_json::from_value(extra["stamps"].clone())
@@ -97,11 +128,21 @@ fn since(
     if let Some((path, _)) = was.iter().find(|s| !now.contains(s)) {
         return Err(format!("{path} changed"));
     }
+    let git_dir = |p: &String| p == ".git" || p.starts_with(".git/");
+    // A reason can stop holding when the work tree changes (files deleted
+    // below the limit, a `.gitattributes` edited): any change asks git.
+    if let Some(why) = extra["why"].as_str() {
+        return match changed.iter().find(|p| !git_dir(p)) {
+            Some(p) => Err(format!("{p} changed")),
+            None => Ok(Again::Unsound(why.to_owned())),
+        };
+    }
+    let attributes = |p: &String| p.rsplit('/').next() == Some(".gitattributes");
     for p in changed {
-        if p == ".git" || p.starts_with(".git/") {
+        if git_dir(&p) {
             continue;
         }
-        if p.rsplit('/').next() == Some(".gitattributes") {
+        if attributes(&p) {
             return Err(format!("{p} changed"));
         }
         if let Some(dir) = crate::walk::ignore_file_dir(&p) {
@@ -119,7 +160,7 @@ fn since(
     if skip.len() > MAX_SKIP {
         return Err(format!("more than {MAX_SKIP} paths changed"));
     }
-    Ok(skip)
+    Ok(Again::Skip(skip))
 }
 
 /// The files in the git directory of the checkout at `top` that decide
