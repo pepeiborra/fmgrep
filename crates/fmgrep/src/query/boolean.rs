@@ -607,6 +607,7 @@ pub fn answer_expr(
         index_size_bytes: manifest.index_size_bytes,
         num_files_indexed: manifest.num_docs,
         queries: vec![report],
+        none_searched: false,
     })
 }
 

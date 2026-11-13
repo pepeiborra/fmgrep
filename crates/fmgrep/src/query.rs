@@ -36,6 +36,10 @@ pub struct QueryRequest<'a> {
     pub output: QueryOutput,
     /// The files searched, of those indexed or added.
     pub filter: Option<PathFilter>,
+    /// A search that `filter` keeps from every file reports it in
+    /// [`OutputReport::none_searched`] instead of failing: its client
+    /// searches other files too.
+    pub report_none: bool,
 }
 
 mod boolean;
@@ -180,7 +184,7 @@ pub fn answer(
     req: &QueryRequest<'_>,
     sink: &mut dyn MatchSink,
 ) -> Result<OutputReport, String> {
-    let report = match req.expr {
+    let mut report = match req.expr {
         Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink)?,
         None => {
             let terms: Vec<Term<'_>> = req
@@ -203,13 +207,22 @@ pub fn answer(
             loaded.docs.is_gone(id)
         })
     {
-        let why = match f.globs() {
-            true => "the globs exclude every file",
-            false => "no indexed file is below the cwd",
-        };
-        return Err(format!("error: no files were searched: {why}"));
+        if req.report_none {
+            report.none_searched = true;
+            return Ok(report);
+        }
+        return Err(none_searched(f));
     }
     Ok(report)
+}
+
+/// The error of a search that `f` keeps from every file.
+pub fn none_searched(f: &PathFilter) -> String {
+    let why = match f.globs() {
+        true => "the globs exclude every file",
+        false => "no indexed file is below the cwd",
+    };
+    format!("error: no files were searched: {why}")
 }
 
 /// One per-term query: the name it reports under, its literal bytes, and
@@ -487,6 +500,7 @@ fn answer_terms(
         index_size_bytes: manifest.index_size_bytes,
         num_files_indexed: manifest.num_docs,
         queries,
+        none_searched: false,
     })
 }
 

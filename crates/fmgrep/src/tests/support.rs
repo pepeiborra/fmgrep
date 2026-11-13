@@ -122,6 +122,7 @@ pub(crate) fn request<'a>(
         expr: None,
         output,
         filter: None,
+        report_none: false,
     }
 }
 

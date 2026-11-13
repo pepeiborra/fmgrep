@@ -184,6 +184,7 @@ caps nesting at 60.
 | `index_size_bytes` | as in the manifest |
 | `num_files_indexed` | documents in the index |
 | `queries` | one `QueryReport` per term, in order, or one for the expression |
+| `none_searched` | present, as `true`, only when a query with `commit` found that its PATHs, cwd and globs keep it from every file it answers for; such a query does not fail, as its client searches other files too |
 
 `QueryReport`:
 

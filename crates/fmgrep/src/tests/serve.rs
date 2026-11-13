@@ -237,6 +237,37 @@ fn a_skip_list_leaves_files_out() {
     );
 }
 
+/// A pinned query whose globs keep it from every file left after its skip
+/// list reports so; an unpinned one still fails.
+#[test]
+fn a_pinned_query_that_searched_no_file_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let ask = |params: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"files","stream":true,"per_file":true{params}}}}}"#
+        )
+    };
+    let responses = |requests: &[&str]| -> Vec<serde_json::Value> {
+        let got = serve_stdio(&index, requests);
+        got.into_iter().filter(|v| v.get("id").is_some()).collect()
+    };
+    let pinned = format!(r#","globs":["a.c"],"commit":"{id}","skip":["a.c"]"#);
+    let got = responses(&[&ask(&pinned), &ask(r#","globs":["x"]"#)]);
+    assert_eq!(got[0]["result"]["report"]["none_searched"], true, "{got:?}");
+    assert_eq!(
+        got[1]["error"]["message"],
+        "error: no files were searched: the globs exclude every file"
+    );
+    let got = responses(&[&ask(&format!(r#","globs":["a.c"],"commit":"{id}""#))]);
+    assert!(
+        got[0]["result"]["report"].get("none_searched").is_none(),
+        "{got:?}"
+    );
+}
+
 /// A query pinned to another format or served commit is refused with
 /// -32001; one pinned to this server's is answered.
 #[test]
