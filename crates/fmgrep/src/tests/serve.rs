@@ -322,7 +322,7 @@ fn server_errors_surface_on_the_client() {
         client(&addr, &["--status"])
             .err()
             .unwrap()
-            .starts_with(&format!("error: {addr}: "))
+            .starts_with(&format!("error: cannot reach the server at {addr}: "))
     );
 }
 

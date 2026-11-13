@@ -16,6 +16,7 @@ use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
+use crate::remote::Conn;
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
 use args::{Cli, Command, Search, ServeArgs};
@@ -108,17 +109,29 @@ fn tree_of(found: &Located, manifest: &Manifest) -> Option<PathBuf> {
         .or_else(|| manifest.corpus_root.as_ref().map(PathBuf::from))
 }
 
+/// A search: through `--server`; else of `--index`; else of the index found
+/// by walking up from the cwd, or through the server that `env`
+/// (`FMGREP_SERVER`) gives when none is found.
 fn search(
     s: &Search,
+    env: Option<&str>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
     printing: bool,
 ) -> Result<Outcome, String> {
-    if let Some(addr) = &s.server
-        && (s.status || s.shutdown)
-    {
-        return serve::manage(addr, s.shutdown, out);
+    if s.shutdown {
+        let addr = s
+            .server
+            .as_deref()
+            .ok_or("error: --shutdown needs --server ADDR; FMGREP_SERVER does not stop a server")?;
+        return serve::manage(addr, true, out);
+    }
+    if s.status {
+        let addr = (s.server.as_deref())
+            .or(env)
+            .ok_or("error: --status needs --server ADDR or FMGREP_SERVER")?;
+        return serve::manage(addr, false, out);
     }
     let mut p = s.params(input, printing, tty)?;
     let typed = s.paths()?;
@@ -126,36 +139,80 @@ fn search(
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
     if let Some(addr) = &s.server {
-        return client(addr, p, &typed, s.json, out);
+        return client(Server { addr, env: false }, p, &typed, s.json, out);
     }
-    let (found, manifest) = open_index(s.index.as_deref())?;
+    if let (None, Some(addr)) = (&s.index, env) {
+        match locate(Path::new(".")) {
+            Ok(found) => warn(&format!(
+                "Using local index {}, not the server at {addr} (FMGREP_SERVER)",
+                found.index_dir.display()
+            )),
+            Err(_) => return client(Server { addr, env: true }, p, &typed, s.json, out),
+        }
+    }
+    local(s.index.as_deref(), p, &typed, s.json, out)
+}
+
+/// A search of the index at or above `index`, else above the cwd.
+fn local(
+    index: Option<&Path>,
+    mut p: QueryParams,
+    typed: &[String],
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<Outcome, String> {
+    let (found, manifest) = open_index(index)?;
     let tree = tree_of(&found, &manifest);
-    rebase(&mut p, &typed, tree.as_deref())?;
+    rebase(&mut p, typed, tree.as_deref())?;
     p.scope(tree.as_deref());
     let root = found.root.filter(|_| !manifest.store_docs);
     let req = p.request(&found.index_dir, &manifest, root.as_deref())?;
-    let report = render(&p, s.json, out, |sink| run_query(&req, sink));
+    let report = render(&p, json, out, |sink| run_query(&req, sink));
     drop(req);
     // Off the exit path: dropping a large tree's paths costs milliseconds.
     let _ = std::thread::Builder::new().spawn(move || drop(manifest));
     report.map(Outcome::Query)
 }
 
-/// `--server`: one `query`; PATHs resolve against the served tree.
+/// `line` on stderr, as a warning.
+fn warn(line: &str) {
+    eprintln!("warning: {line}");
+}
+
+/// A server's address, and whether `FMGREP_SERVER` gave it.
+#[derive(Clone, Copy)]
+struct Server<'a> {
+    addr: &'a str,
+    env: bool,
+}
+
+impl std::fmt::Display for Server<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.env {
+            true => write!(f, "the server at {} (FMGREP_SERVER)", self.addr),
+            false => write!(f, "the server at {}", self.addr),
+        }
+    }
+}
+
+/// A search through `server`: one connection; PATHs resolve against the
+/// served tree.
 fn client(
-    addr: &str,
+    server: Server<'_>,
     mut p: QueryParams,
     typed: &[String],
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
+    let mut conn =
+        Conn::connect(server.addr).map_err(|e| format!("error: cannot reach {server}: {e}"))?;
     if !typed.is_empty() {
-        let status = serve::status(addr)?;
+        let status = serve::status_on(&mut conn)?;
         let root = Path::new(&status.root);
         rebase(&mut p, typed, served_tree(root, status.store_docs))?;
     }
     p.stream = true;
-    run_client(addr, &p, json, out)
+    run_client(&mut conn, &p, json, out)
 }
 
 /// The tree a server's PATHs are relative to.
@@ -168,14 +225,16 @@ fn served_tree(root: &Path, store_docs: bool) -> Option<&Path> {
 
 /// Parse and run `args` (argv without the binary name), writing output to
 /// `out`. `serve --stdio` and `--expr-json -` read `input`; `tty` resolves
-/// `--color auto`.
+/// `--color auto`. `FMGREP_SERVER` is not read: a developer's value never
+/// reaches the tests.
+#[cfg(test)]
 pub fn dispatch_to(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
 ) -> Result<Outcome, String> {
-    dispatch_in(args, input, out, tty, true)
+    dispatch_in(args, input, out, tty, true, None)
 }
 
 /// [`dispatch_to`] with empty input, discarded output, and a search with no
@@ -185,15 +244,28 @@ pub fn dispatch(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
 ) -> Result<Outcome, String> {
     let (mut input, mut out) = (std::io::empty(), std::io::sink());
-    dispatch_in(args, &mut input, &mut out, false, false)
+    dispatch_in(args, &mut input, &mut out, false, false, None)
 }
 
+/// `FMGREP_SERVER`: unset when empty.
+fn server_env() -> Result<Option<String>, String> {
+    match std::env::var_os("FMGREP_SERVER") {
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) => (v.into_string())
+            .map(Some)
+            .map_err(|v| format!("error: FMGREP_SERVER={v:?} is not UTF-8")),
+        None => Ok(None),
+    }
+}
+
+/// [`dispatch_to`], with `env` the value of `FMGREP_SERVER`.
 fn dispatch_in(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
     printing: bool,
+    env: Option<&str>,
 ) -> Result<Outcome, String> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -216,7 +288,7 @@ fn dispatch_in(
             Ok(Outcome::Index(summary))
         }
         Some(Command::Serve(a)) => serve(a, input, out),
-        None => search(&cli.search, input, out, tty, printing),
+        None => search(&cli.search, env, input, out, tty, printing),
     }
 }
 
@@ -264,7 +336,9 @@ pub fn run() {
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut input = std::io::stdin().lock();
     let args = std::env::args_os().skip(1);
-    let mut result = dispatch_to(args, &mut input, &mut out, tty).map(|o| match o {
+    let dispatched = server_env()
+        .and_then(|env| dispatch_in(args, &mut input, &mut out, tty, true, env.as_deref()));
+    let mut result = dispatched.map(|o| match o {
         Outcome::Query(r) => r
             .queries
             .iter()
