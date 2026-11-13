@@ -77,8 +77,14 @@ impl Watchman {
         })
     }
 
-    /// `$WATCHMAN_SOCK`, else the socket of a daemon already running.
+    /// `$WATCHMAN_SOCK`, else the socket of a daemon already running; tests
+    /// look only at the socket their thread gives.
     pub fn find(budget: Duration) -> Option<Self> {
+        #[cfg(test)]
+        return crate::tests::WATCHMAN
+            .with_borrow(Clone::clone)
+            .map(|sock| Self::at(sock, budget));
+        #[cfg(not(test))]
         match std::env::var_os("WATCHMAN_SOCK") {
             Some(sock) => Some(Self::at(sock.into(), budget)),
             None => Self::detect(Path::new("watchman"), budget),
