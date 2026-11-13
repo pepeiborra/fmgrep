@@ -3,9 +3,9 @@
 # target/ec2-bench/<run>/ and deletes what it created. See docs/benchmark.md#ec2.
 #
 # Usage: scripts/ec2-bench.sh [--dry-run] [down]
-#   Environment: INSTANCE_TYPE=i4i.4xlarge CORPORA=linux TTL=3 (hours) SPOT=1,
-#   and AWS_PROFILE, AWS_REGION for the aws CLI. down deletes every run's
-#   resources in the region.
+#   Environment: INSTANCE_TYPE=i4i.4xlarge CORPORA=linux TTL=3 (hours) SPOT=1
+#   TAG=fmgrep-bench (the Project tag), and AWS_PROFILE, AWS_REGION for the
+#   aws CLI. down deletes every run's resources in the region.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -14,7 +14,7 @@ INSTANCE_TYPE=${INSTANCE_TYPE:-i4i.4xlarge}
 CORPORA=${CORPORA:-linux}
 TTL=${TTL:-3}
 SPOT=${SPOT:-1}
-TAG=fmgrep-bench
+TAG=${TAG:-fmgrep-bench}
 RUN=$TAG-$(date -u +%Y%m%dT%H%M%SZ)
 DRY=0 CMD=run
 export AWS_PAGER="" AWS_DEFAULT_OUTPUT=text
@@ -29,6 +29,7 @@ for a in "$@"; do
     esac
 done
 [[ $TTL =~ ^[1-9][0-9]*$ ]] || die "TTL takes whole hours"
+[[ $TAG =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "TAG takes letters, digits, _, . and -"
 for c in $CORPORA; do
     case $c in linux | chromium | ghc | aosp) ;; *) die "CORPORA: $c is not linux, chromium, ghc or aosp" ;; esac
 done
@@ -130,8 +131,9 @@ set -euxo pipefail
     [[ -n $dev ]] || { echo "$type has no instance storage: pick another INSTANCE_TYPE" >&2; exit 2; }
     sudo mkfs.ext4 -q -F -E nodiscard "$dev"
     sudo mkdir -p $W && sudo mount "$dev" $W && sudo chown "$(id -u):$(id -g)" $W
-    export RUSTUP_HOME=$W/rustup CARGO_HOME=$W/cargo TMPDIR=$W/tmp PATH=$W/cargo/bin:$PATH
-    mkdir -p $TMPDIR $W/fmgrep $W/results
+    # fmgrep keeps its watchman records under XDG_CACHE_HOME: on the instance storage too.
+    export RUSTUP_HOME=$W/rustup CARGO_HOME=$W/cargo TMPDIR=$W/tmp XDG_CACHE_HOME=$W/cache PATH=$W/cargo/bin:$PATH
+    mkdir -p $TMPDIR $XDG_CACHE_HOME $W/fmgrep $W/results
     tar xzf ~/src.tar.gz -C $W/fmgrep
     sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 update
     sudo DEBIAN_FRONTEND=noninteractive apt-get -yqq -o DPkg::Lock::Timeout=600 install build-essential pkg-config unzip
@@ -150,7 +152,10 @@ set -euxo pipefail
     if [[ " $* " == *" aosp "* ]]; then
         git -c advice.detachedHead=false clone -q --depth 1 --branch v2.72 https://gerrit.googlesource.com/git-repo $W/git-repo
         [[ $(git -C $W/git-repo rev-parse HEAD) == 365629015667e04739f59070e745548a728549c8 ]]
-        export PATH=$W/git-repo:$PATH FMGREP_CORPUS_AOSP=$W/aosp
+        # Run from its own checkout, the launcher would take the repo tool from that shallow
+        # clone, where --repo-rev=v2.72 does not resolve; a copy fetches it from gerrit.
+        install -D -m 755 $W/git-repo/repo $W/bin/repo
+        export PATH=$W/bin:$PATH FMGREP_CORPUS_AOSP=$W/aosp
         ulimit -n 65536 || ulimit -n "$(ulimit -Hn)"
         EXCLUDE='(^|/)prebuilts?(/|$)|[-_]prebuilts?$|Prebuilt$|-kernel$|^external/chromium-webview$|^device/google/cuttlefish_vmm$'
         mkdir $W/aosp && cd $W/aosp
@@ -162,12 +167,13 @@ set -euxo pipefail
     cargo install -q --locked ripgrep --version 15.2.0
     cargo install -q --locked elgrep --version 1.0.0
     cargo install -q --locked --git https://github.com/microsoft/tgrep --rev b1d0fc2f6245cc78f1943e5864ceeab812452404 tgrep-cli
-    { echo "fmgrep $rev $type"; lscpu | grep 'Model name'; nproc; free -g; uname -r; rustc -V; rg -V; } | tee $W/results/box.txt
+    { echo "fmgrep $rev $type"; lscpu | grep 'Model name'; nproc; free -g; uname -r; rustc -V; rg -V
+        echo "watchman $(watchman --version || echo absent)"; } | tee $W/results/box.txt
     cd $W/fmgrep
     rc=0
     for c in "$@"; do
         scripts/bench.sh --corpus "$c" --bench-dir $W/bench --results $W/results/results-$c.md \
-            -- --rows rg,fmgrep,fmgrep-store-docs,tgrep,elgrep ||
+            -- --rows rg,fmgrep,fmgrep-store-docs,fmgrep-direct,tgrep,elgrep ||
             { s=$?; [[ $rc != 0 ]] || rc=$s; }
         cp $W/bench/trace-$c.jsonl $W/results/ || true
     done

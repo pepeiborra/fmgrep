@@ -102,10 +102,11 @@ watchman (a pinned prebuilt release on x86_64, else the Ubuntu package),
 ripgrep, tgrep and elgrep at the versions in
 [BENCHMARKS.md](../BENCHMARKS.md), for `aosp` syncs the tree as under
 [AOSP](#aosp) with the repo launcher at v2.72 (about 11 GB to download),
-runs `scripts/bench.sh` with every row for each corpus and copies
-`results-<corpus>.md`, `trace-<corpus>.jsonl` and `box.txt` (the commit and
-the machine) to `target/ec2-bench/<run>/`. On any exit it terminates the
-instance and deletes the key pair and security group, found by their `Run`
+runs `scripts/bench.sh` with every row for each corpus, with
+`XDG_CACHE_HOME` on the instance storage, and copies
+`results-<corpus>.md`, `trace-<corpus>.jsonl` and `box.txt` (the commit,
+the machine and the watchman version) to `target/ec2-bench/<run>/`. On
+any exit it terminates the instance and deletes the key pair and security group, found by their `Run`
 tag, and exits with the first failing `scripts/bench.sh` status. The run is
 one SSH session: if it drops, the instance still terminates after `TTL`
 hours, and `down` deletes the rest.
@@ -116,6 +117,7 @@ hours, and `down` deletes the rest.
 | `CORPORA` | `linux` | any of `linux chromium ghc aosp` |
 | `TTL` | `3` | hours until the instance terminates itself |
 | `SPOT` | `1` | `0` launches on demand, when spot capacity is short |
+| `TAG` | `fmgrep-bench` | the `Project` tag on everything the run creates, for a policy that names another |
 
 `AWS_PROFILE` and `AWS_REGION` pick the account and region, as for any
 `aws` command. It needs the AWS CLI v2, `ssh`, `git`, `curl` and a default
@@ -128,12 +130,12 @@ VPC in the region. The caller needs `ec2:DescribeInstances`,
 `arn:aws:ssm:*::parameter/aws/service/canonical/*`; the creating actions can
 be limited with `aws:RequestTag/Project` on the instance, volume, key-pair
 and security-group resources, and the others with
-`aws:ResourceTag/Project`, both `fmgrep-bench`. A first spot launch in an
+`aws:ResourceTag/Project`, both the `TAG` value. A first spot launch in an
 account may also need `iam:CreateServiceLinkedRole` for the EC2 Spot role.
 On an i4i.4xlarge, linux and chromium together took under 0.6
 instance-hours, tool builds and the sync included: about
 $1 or less at on-demand prices, less on spot. `down` deletes every instance,
-security group and key pair tagged `Project=fmgrep-bench` in the region,
+security group and key pair tagged `Project=$TAG` in the region,
 another run's included.
 
 ## AOSP
