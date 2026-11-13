@@ -60,6 +60,10 @@ pub struct QueryParams {
     /// Rendering modes: send the output as byte frames before the response.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
+    /// With `stream`: one frame per output event (a matching file, a term's
+    /// start and end, the corpus), for the client to print.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub per_file: bool,
     /// The manifest format the client reads: a server of another refuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<u32>,
@@ -146,6 +150,7 @@ impl Default for QueryParams {
             cwd: String::new(),
             filename: true,
             stream: false,
+            per_file: false,
             format: None,
             commit: None,
         }

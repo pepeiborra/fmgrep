@@ -14,7 +14,7 @@ use std::time::Instant;
 use grep_printer::Stats;
 use grep_regex::RegexMatcher;
 
-use super::{Loaded, QueryRequest, in_index, prepare, printed, searched};
+use super::{Loaded, QueryRequest, in_index, path_of, prepare, printed, searched};
 use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
@@ -558,7 +558,7 @@ pub fn answer_expr(
                 &fetch,
                 fetch_threads(),
                 &map,
-                &mut |_, _, scanned| {
+                &mut |doc, _, scanned| {
                     let Some(((path, f), counts)) = scanned? else {
                         return Ok(());
                     };
@@ -569,6 +569,7 @@ pub fn answer_expr(
                         .zip(counts)
                         .for_each(|(t, c)| *t += c);
                     sink.doc(DocMatches {
+                        rel: path_of(&paths, doc)?,
                         path: &path,
                         printed: &f.printed,
                         stats: &f.stats,
@@ -701,6 +702,7 @@ fn listed(
     doc: usize,
 ) -> Result<(), String> {
     sink.doc(DocMatches {
+        rel: path_of(paths, doc)?,
         path: &printed(paths, filter, doc)?,
         printed: &[],
         stats: &Stats::new(),

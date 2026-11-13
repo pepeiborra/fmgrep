@@ -281,6 +281,50 @@ fn served_paths_print_as_the_local_search() {
     shutdown(&mut server, &addr);
 }
 
+/// The client prints each file the server sends in a frame of its own:
+/// the same bytes as a local search, for a file whose output passes
+/// 64 KiB, in colour, with several terms and as rg's JSON events.
+#[test]
+fn served_files_print_as_the_local_search_in_every_mode() {
+    let big: String = (0..6000).map(|i| format!("printk line {i}\n")).collect();
+    let (_tmp, docs) = stage_files(&[
+        ("a.c", b"printk a\nother\nprintk aa\n"),
+        ("big.c", big.as_bytes()),
+        ("c.h", b"aa only\n"),
+    ]);
+    for store_docs in [false, true] {
+        let index = do_index(&docs, store_docs).display().to_string();
+        let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+        let addr = server.addr();
+        for args in [
+            &["printk"][..],
+            &["--heading", "-n", "printk"],
+            &["--color", "always", "--heading", "printk"],
+            &["-C1", "aa"],
+            &["printk", "aa"],
+            &["-c", "printk", "aa"],
+            &["--count-matches", "printk"],
+            &["-l", "aa"],
+            &["-o", "a+"],
+            &["--and", "printk", "aa"],
+            &["--json", "--matches", "printk", "aa"],
+            &["--json", "-l", "printk"],
+        ] {
+            let local = run(&[&["--index", &index][..], args].concat());
+            let served = run(&[&["--server", &addr][..], args].concat());
+            assert_eq!(served.status.code(), local.status.code(), "{args:?}");
+            assert_eq!(stderr(&served), "", "{args:?}");
+            assert_eq!(
+                timeless(&served.stdout),
+                timeless(&local.stdout),
+                "{store_docs} {args:?}"
+            );
+        }
+        shutdown(&mut server, &addr);
+        std::fs::remove_dir_all(&index).unwrap();
+    }
+}
+
 /// `argv` from `cwd` with `FMGREP_SERVER` set to `server`.
 fn run_env(cwd: &Path, server: &str, argv: &[&str]) -> Output {
     fmgrep()

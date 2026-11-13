@@ -61,6 +61,7 @@ fn render_in(
             if let Some(f) = s.doc(path, strip_bom(raw)).unwrap() {
                 let (printed, stats) = (&f.printed, &f.stats);
                 w.doc(DocMatches {
+                    rel: "",
                     path,
                     printed,
                     stats,
@@ -347,6 +348,7 @@ fn broken_pipe_is_not_an_error() {
         let f = s.doc(FIXTURE[0].0, FIXTURE[0].1)?.unwrap();
         w.term_start("alpha")?;
         w.doc(DocMatches {
+            rel: "",
             path: FIXTURE[0].0,
             printed: &f.printed,
             stats: &f.stats,

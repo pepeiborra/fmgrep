@@ -53,6 +53,7 @@ fn render(docs: &[(&str, &[u8])], terms: &[&str]) -> String {
             if let Some(f) = s.doc(path, strip_bom(raw)).unwrap() {
                 let (printed, stats) = (&f.printed, &f.stats);
                 sink.doc(DocMatches {
+                    rel: "",
                     path,
                     printed,
                     stats,
@@ -197,6 +198,7 @@ fn broken_pipe_is_not_an_error() {
     let f = search("alpha", MATCHES, MatchMode::default());
     let f = f.doc(A.0, A.1).unwrap().unwrap();
     sink.doc(DocMatches {
+        rel: "",
         path: A.0,
         printed: &f.printed,
         stats: &f.stats,

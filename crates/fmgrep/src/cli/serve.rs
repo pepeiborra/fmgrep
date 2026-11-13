@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::frames::{FileFrames, Frame};
 use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::Ask;
 use crate::manifest::{Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
-use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
 use crate::remote::{Conn, RpcError};
 use crate::sharded::DocfmIndex;
@@ -188,6 +188,19 @@ impl Served<'_> {
         let answered = match p.mode {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
             // Output so far precedes an error, as in a local search.
+            _ if p.per_file => {
+                let mut frames = FileFrames::new(out);
+                let report = run(&mut frames);
+                let sent = frames.flush();
+                report.and_then(|report| {
+                    sent?;
+                    Ok(Answer::Rendered(Rendered {
+                        text: None,
+                        bytes: None,
+                        report,
+                    }))
+                })
+            }
             _ if p.stream => {
                 let mut frames = Frames::new(out);
                 let rendered = render(p, false, &mut frames, run);
@@ -320,6 +333,7 @@ fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String
                 }
             };
             let refusal = match &p.expr {
+                _ if p.per_file && !p.stream => Some("per_file needs stream".to_owned()),
                 None if !has_terms => Some("missing field `terms`".to_owned()),
                 None => None,
                 Some(_) if !p.terms.is_empty() => Some(TERMS_REFUSAL.to_owned()),
@@ -510,28 +524,31 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
     ask_on(conn, "status")
 }
 
-/// Send one request to a server and print its result as a search would.
+/// Send one request to a server and print its result as a search would:
+/// each file's frame through this search's own writer.
 pub fn run_client(
     conn: &mut Conn,
     p: &QueryParams,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
+    render(p, json, out, |sink| remote(conn, p, sink)).map(Outcome::Query)
+}
+
+/// `p` (with `per_file`) answered by the server: each event to `sink`, then
+/// the report.
+pub fn remote(
+    conn: &mut Conn,
+    p: &QueryParams,
+    sink: &mut dyn MatchSink,
+) -> Result<OutputReport, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
-    let mut pipe = Pipe::new(&mut *out);
-    let result = conn.call("query", sent, &mut |b| match printed {
-        true => pipe.raw(b),
-        false => Ok(()),
+    let result = conn.call("query", sent, &mut |frame| {
+        Frame::decode(frame)?.replay(sink)
     })?;
-    pipe.finish()?;
-    let report = match p.mode {
-        Mode::Counts => conn.decode(result)?,
-        _ => conn.decode::<Rendered>(result)?.report,
-    };
-    if printed {
-        return Ok(Outcome::Query(report));
+    match p.mode {
+        Mode::Counts => conn.decode(result),
+        _ => Ok(conn.decode::<Rendered>(result)?.report),
     }
-    render(p, json, out, |_| Ok(report)).map(Outcome::Query)
 }

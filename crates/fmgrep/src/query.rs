@@ -452,6 +452,7 @@ fn answer_terms(
                 };
                 counts.add(f.stats.matches().max(1));
                 sink.doc(DocMatches {
+                    rel: path_of(&paths, doc)?,
                     path: &path,
                     printed: &f.printed,
                     stats: &f.stats,
@@ -584,6 +585,7 @@ fn emit_probe_exact(
         stats.add_matches(count);
     }
     sink.doc(DocMatches {
+        rel: path_of(paths, doc)?,
         path: &printed(paths, filter, doc)?,
         printed: printed_count.as_bytes(),
         stats: &stats,

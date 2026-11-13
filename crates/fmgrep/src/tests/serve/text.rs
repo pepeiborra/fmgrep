@@ -315,20 +315,32 @@ fn fake_server(reply: &[u8]) -> String {
     addr
 }
 
+/// `payload` as one frame.
+fn frame(payload: &str) -> String {
+    format!("{}\n{payload}", payload.len())
+}
+
 #[test]
 fn a_server_error_after_output_keeps_the_output() {
+    let error =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n";
+    let sent = [
+        frame("{\"term\":\"printk\"}\n"),
+        frame("{\"doc\":\"a\",\"path\":\"a\",\"stats\":[1,1,6]}\nhello!"),
+        error.to_owned(),
+    ]
+    .concat();
+    let cut = [frame("{\"term\":\"printk\"}\n"), "60\n{\"doc\"".to_owned()].concat();
     for (reply, printed, error) in [
-        (
-            &b"5\nhello1\n!{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n"[..],
-            &b"hello!"[..],
-            "server: boom",
-        ),
-        (b"10\nabc", b"abc", "{addr}: connection closed mid-frame"),
+        (sent.as_bytes(), &b"hello!"[..], "server: boom"),
+        (cut.as_bytes(), b"", "{addr}: connection closed mid-frame"),
     ] {
         let addr = fake_server(reply);
         let mut out = Vec::new();
         let words = argv(&["--server", &addr, "printk"]);
-        let got = dispatch_to(&words, &mut &b""[..], &mut out, false).err().unwrap();
+        let got = dispatch_to(&words, &mut &b""[..], &mut out, false)
+            .err()
+            .unwrap();
         assert_eq!(got, format!("error: {}", error.replace("{addr}", &addr)));
         assert_eq!(out, printed);
     }

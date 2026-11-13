@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
+mod frames;
 mod locate;
 mod params;
 mod print;
@@ -227,6 +228,7 @@ fn client(
         rebase(&mut p, typed, served_tree(root, status.store_docs))?;
     }
     p.stream = true;
+    p.per_file = true;
     run_client(&mut conn, &p, json, out)
 }
 

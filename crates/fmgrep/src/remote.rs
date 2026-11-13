@@ -1,6 +1,6 @@
 //! The JSON-RPC client connection.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,8 @@ impl Conn {
         Self::connect(addr).map_err(|e| format!("error: cannot reach the server at {addr}: {e}"))
     }
 
-    /// Frames go to `body` until the response line, whose `result` this is.
+    /// Each frame goes whole to `body` until the response line, whose
+    /// `result` this is.
     pub fn call(
         &mut self,
         method: &str,
@@ -64,27 +65,28 @@ impl Conn {
         stream
             .write_all(format!("{request}\n").as_bytes())
             .map_err(io)?;
-        let mut line = String::new();
+        let (mut line, mut frame) = (String::new(), Vec::new());
         loop {
             line.clear();
             self.stream.read_line(&mut line).map_err(io)?;
             if !line.starts_with(|c: char| c.is_ascii_digit()) {
                 break;
             }
-            let mut left: usize = line
+            let len: usize = line
                 .trim_end()
                 .parse()
                 .map_err(|e| format!("error: {addr}: bad frame header: {e}"))?;
-            while left > 0 {
-                let chunk = self.stream.fill_buf().map_err(io)?;
-                if chunk.is_empty() {
-                    return Err(format!("error: {addr}: connection closed mid-frame"));
-                }
-                let n = chunk.len().min(left);
-                body(&chunk[..n])?;
-                self.stream.consume(n);
-                left -= n;
-            }
+            frame.clear();
+            frame.resize(len, 0);
+            self.stream
+                .read_exact(&mut frame)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => {
+                        format!("error: {addr}: connection closed mid-frame")
+                    }
+                    _ => io(e),
+                })?;
+            body(&frame)?;
         }
         if line.is_empty() {
             return Err(format!(

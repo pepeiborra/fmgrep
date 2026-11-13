@@ -4,9 +4,10 @@ use grep_printer::Stats;
 
 use crate::wire::QueryReport;
 
-/// One matching document, valid only for the call: its path as printed, its
-/// printed bytes and rg's stats for it.
+/// One matching document, valid only for the call: its root-relative path,
+/// its path as printed, its printed bytes and rg's stats for it.
 pub struct DocMatches<'a> {
+    pub rel: &'a str,
     pub path: &'a str,
     pub printed: &'a [u8],
     pub stats: &'a Stats,
