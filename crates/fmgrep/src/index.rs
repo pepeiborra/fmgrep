@@ -71,7 +71,8 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             write_walk(output, &docs.walk, started)?;
         }
         let build_time_us = start.elapsed().as_micros() as u64;
-        let commit = before.map(|b| served::after(b, req.folder, output, &docs.paths, &docs.lens));
+        let commit = before
+            .map(|b| served::after(b, req.folder, output, &docs.paths, &docs.lens, &docs.walk));
         if let Some(commit) = &commit {
             served::note(commit);
         }

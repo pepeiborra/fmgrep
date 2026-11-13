@@ -397,7 +397,13 @@ no fetch) and records HEAD only when all of these hold:
    the build, with the same HEAD;
 3. every indexed file is a stage-0 regular file (mode 100644 or 100755)
    of `git ls-files -s`, and no entry is a submodule (mode 160000);
-4. each stored document equals the text of its blob, read with one `git
+4. every ignore file that the walk read below the top is tracked, and
+   those outside the tree hold no pattern (a line that is neither blank
+   nor a comment): the ignore files of the ancestors, the global excludes
+   file, and the checkout's `info/exclude`, where `git rev-parse
+   --git-path` puts it (a linked worktree shares its repository's). A
+   checkout of the commit elsewhere would not have them;
+5. each stored document equals the text of its blob, read with one `git
    cat-file --batch` and decoded as the index decodes a file. A file that
    git converts on checkout (line endings, a filter) differs here, though
    git status shows no change.

@@ -141,6 +141,63 @@ fn a_converted_file_records_no_commit() {
     }
 }
 
+/// An ignore rule that a checkout of the commit would not have: an
+/// untracked ignore file in the tree, or a pattern above it, in the global
+/// excludes file, or in `info/exclude` (of a linked worktree too). Comments
+/// alone are no rule.
+#[test]
+fn an_ignore_rule_from_outside_records_no_commit() {
+    let s = Sandbox::new();
+    let no = |repo: &std::path::Path, name: &str, why: String| {
+        let (index, stderr) = s.index(repo, &format!("idx-{name}"));
+        let want = format!("note: the index records no served commit ({why})");
+        assert_eq!(note(&stderr), want, "{name}");
+        assert_eq!(commit_of(&index), None, "{name}");
+    };
+    let outside = |path: &std::path::Path| {
+        format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        )
+    };
+
+    let repo = s.repo("untracked", &FILES);
+    s.write(&repo, &[("dir/.ignore", "*.h\n")]);
+    no(
+        &repo,
+        "untracked",
+        "the ignore file dir/.ignore is not tracked by git".into(),
+    );
+
+    let repo = s.repo("parent/repo", &FILES);
+    let parent = std::fs::canonicalize(s.path("parent")).unwrap();
+    s.write(&parent, &[(".ignore", "# a comment\n\n")]);
+    let (index, _) = s.index(&repo, "idx-comment");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&parent, &[(".ignore", "*.h\n")]);
+    no(&repo, "parent", outside(&repo.join("../.ignore")));
+
+    let repo = s.repo("exclude", &FILES);
+    s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
+    no(&repo, "exclude", outside(&repo.join(".git/info/exclude")));
+
+    let repo = s.repo("main", &FILES);
+    let tree = s.path("linked");
+    s.git(
+        &repo,
+        &["worktree", "add", "-q", &tree.display().to_string()],
+    );
+    let tree = std::fs::canonicalize(tree).unwrap();
+    let (index, _) = s.index(&tree, "idx-linked-clean");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
+    no(&tree, "linked", outside(&repo.join(".git/info/exclude")));
+
+    let repo = s.repo("global", &FILES);
+    s.write(&s.path("config"), &[("git/ignore", "*.h\n")]);
+    no(&repo, "global", outside(&s.path("config/git/ignore")));
+}
+
 /// An index that reads the tree records no commit and says nothing of one.
 #[test]
 fn a_plain_index_records_no_commit() {

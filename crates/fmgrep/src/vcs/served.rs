@@ -6,6 +6,7 @@ use std::path::Path;
 
 use super::{entries, git, records};
 use crate::manifest::{Commit, DOCS_SHARD};
+use crate::walk::WalkNotes;
 
 /// What `git status` says of a checkout before the index walks it.
 pub type Before = Result<String, String>;
@@ -62,14 +63,15 @@ fn clean_head(folder: &Path) -> Result<String, String> {
 /// The served commit of the index just built from `folder` into `output`:
 /// HEAD, unchanged since [`before`], when every indexed file in `files`
 /// (ascending) is a regular file of HEAD whose text is the stored one, no
-/// entry is a submodule, and no ignore rule from outside the checkout
-/// applies. Else why not.
+/// entry is a submodule, every ignore file the walk read is one of HEAD,
+/// and no ignore rule from outside the checkout applies. Else why not.
 pub fn after(
     before: Before,
     folder: &Path,
     output: &Path,
     files: &[String],
     lens: &[u64],
+    walk: &WalkNotes,
 ) -> Result<Commit, String> {
     let head = before?;
     let folder = std::fs::canonicalize(folder)
@@ -101,10 +103,57 @@ pub fn after(
     if let Some(file) = want.next() {
         return Err(format!("{file} is not tracked by git"));
     }
+    ignores_are_tracked(&folder, &listed, walk)?;
     same_text(&folder, output, &oids, files, lens)?;
     Ok(Commit {
         vcs: "git".to_owned(),
         id: head,
+    })
+}
+
+/// Whether every ignore input of the walk is one that a checkout of HEAD
+/// has too: each ignore file below the top is tracked (`listed` is `git
+/// ls-files -s -z`), and those outside the tree (the ancestors', the
+/// global excludes file and the checkout's `info/exclude`, wherever git
+/// keeps it) hold no pattern.
+fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result<(), String> {
+    let mut tracked = std::collections::HashSet::new();
+    for entry in entries(listed) {
+        tracked.insert(entry?.path);
+    }
+    let exclude = super::line(git(folder, &["rev-parse", "--git-path", "info/exclude"])?)?;
+    let mut outside = vec![folder.join(exclude)];
+    for (rel, stamp) in &walk.ignores {
+        let inside =
+            !(rel.starts_with('/') || rel.starts_with("../") || rel.ends_with(GIT_EXCLUDE));
+        match inside {
+            true if stamp.is_some() && !tracked.contains(rel.as_bytes()) => {
+                return Err(format!("the ignore file {rel} is not tracked by git"));
+            }
+            true => {}
+            false => outside.push(folder.join(rel)),
+        }
+    }
+    match outside.into_iter().find(|p| has_pattern(p)) {
+        Some(path) => Err(format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// `.git/info/exclude`, as the walk lists it.
+const GIT_EXCLUDE: &str = ".git/info/exclude";
+
+/// Whether the ignore file at `path` exists and holds a line that is
+/// neither blank nor a comment.
+pub fn has_pattern(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|text| {
+        text.split(|&b| b == b'\n').any(|l| {
+            let l = l.trim_ascii();
+            !l.is_empty() && !l.starts_with(b"#")
+        })
     })
 }
 
