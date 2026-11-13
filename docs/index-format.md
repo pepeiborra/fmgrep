@@ -190,9 +190,10 @@ re-checks the paths that watchman reports as changed plus the baseline,
 and skips the stat pass and the directory check: a reported file is
 statted, and a reported directory and the parent of any other reported
 path are listed again one level (a recorded subdirectory whose stamp
-moved is listed in turn, a new one is walked). A path under a directory the index did not record is found
-through that directory. The ignore files are checked as the stat pass
-checks them.
+moved is listed in turn, a new one is walked). A reported directory that
+the index did not record, or a path under one, makes the search walk the
+topmost such directory in full, with the ignore files in it. The ignore
+files are checked as the stat pass checks them.
 
 After it answers, a search saves its token and what differs now as the new
 baseline: the stale and gone files, each added file, or its topmost

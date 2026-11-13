@@ -262,13 +262,14 @@ impl Known {
     /// kept, or Err when they cost more than the stat pass (nothing is
     /// touched then: past [`journal::named_cap`]).
     ///
-    /// A path under a dir the index did not record is dropped: under an
-    /// ignored or hidden dir, or under a new dir that its listed parent
-    /// finds. A named doc is statted. A named dir, and the parent of any
-    /// other named path that is not hidden, are listed again, one level:
-    /// the docs in each are statted, a recorded subdir that moved is listed
-    /// in turn, one that went has its docs statted, a new one is walked.
-    /// Then the ignore inputs, as discovery does.
+    /// A dir the index did not record, or a path under one, counts once, as
+    /// the topmost such dir, which discovery walks: its added files become
+    /// those the walk finds now. A hidden one is skipped. A named doc is
+    /// statted. A named recorded dir, and the parent of any other named path
+    /// that is not hidden, are listed again, one level: the docs in each are
+    /// statted, a recorded subdir that moved is listed in turn, one that
+    /// went has its docs statted, a new one is walked. Then the ignore
+    /// inputs, as discovery does.
     fn replay(
         &self,
         recorded: &Arc<Recorded>,
@@ -278,20 +279,31 @@ impl Known {
     ) -> Result<usize, ()> {
         let root = &self.root;
         let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
-        let mut named_ignores = Vec::new();
+        let (mut named_ignores, mut new_dirs) = (Vec::new(), std::collections::HashSet::new());
         for rel in paths {
             let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
-            if rel.is_empty() || !recorded.is_dir(parent) || self.excluded(root, rel) {
+            if rel.is_empty() || self.excluded(root, rel) {
                 continue;
             }
-            kept += 1;
+            if !recorded.is_dir(parent) {
+                let top = unrecorded(Some(recorded), rel);
+                if !top.rsplit('/').next().is_some_and(|n| n.starts_with('.')) {
+                    new_dirs.insert(top);
+                }
+                continue;
+            }
             if let Ok(id) = files.binary_search_by(|f| f.as_str().cmp(rel)) {
                 ids.push(id);
             } else if recorded.is_dir(rel) {
                 dirs.push(rel.clone());
             } else if !name.starts_with('.') {
+                if std::fs::symlink_metadata(root.join(rel)).is_ok_and(|m| m.is_dir()) {
+                    new_dirs.insert(rel.as_str());
+                    continue;
+                }
                 dirs.push(parent.to_owned());
             }
+            kept += 1;
             if let Some(dir) = crate::walk::ignore_file_dir(rel) {
                 scopes.push(dir.to_owned());
                 if !recorded.is_ignore(rel) && root.join(rel).exists() {
@@ -300,9 +312,11 @@ impl Known {
             }
         }
         self.keep_ignores(named_ignores);
+        let kept = kept + new_dirs.len();
         if kept > journal::named_cap(files.len()) {
             return Err(());
         }
+        scopes.extend(new_dirs.into_iter().map(str::to_owned));
         let seek = |key: &str| files.partition_point(|f| f.as_str() < key);
         let (mut listed, mut seen) = (Vec::new(), std::collections::HashSet::new());
         while let Some(dir) = dirs.pop() {
@@ -391,8 +405,7 @@ fn ignores_changed(n: usize) {
 }
 
 /// Added file `rel`, or its topmost ancestor the walk did not record: a
-/// replay drops a path under an unrecorded dir, but lists that dir's
-/// parent for the dir itself, and walks it.
+/// replay walks that dir for any path under it.
 fn unrecorded<'a>(recorded: Option<&Recorded>, rel: &'a str) -> &'a str {
     let new = |i: &usize| recorded.is_some_and(|r| !r.is_dir(&rel[..*i]));
     match rel.match_indices('/').map(|(i, _)| i).find(new) {
@@ -1027,7 +1040,11 @@ mod tests {
         std::fs::remove_file(at("keep/k.c")).unwrap();
         let named = ["a.c", "z.c", "d", "kb/k.bin", "gone/dir/x.c", ".hidden"];
         let (files, kept) = replayed(&fix, &named);
-        assert_eq!(kept, Ok(5), "a path under an unrecorded dir is dropped");
+        assert_eq!(
+            kept,
+            Ok(6),
+            "a path under an unrecorded dir counts as that dir"
+        );
         let want = [STALE, GONE, FRESH, GONE, FRESH, FRESH];
         assert_eq!(files.kinds(), want, "keep/k.c is not named, nor its dir");
         assert_eq!(added(&files), ["d/out/i.c", "kb/k.bin"]);
@@ -1043,6 +1060,48 @@ mod tests {
         let (files, kept) = replayed(&fix, &many);
         assert_eq!(kept, Err(()), "past 64, the cap of a small tree");
         assert!(!files.changed(), "past the cap nothing is touched");
+    }
+
+    /// One set of marks across replays, as a server keeps: a path deep in
+    /// a new dir walks that dir, and an ignore file made in it later drops
+    /// the files it hides.
+    #[cfg(unix)]
+    #[test]
+    fn replay_walks_a_new_dir_and_drops_what_its_ignore_file_hides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_named(tmp.path(), &["a.c"]);
+        let (files, _) = replayed(&fix, &[]);
+        let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
+        let replay = |named: &[&str]| {
+            let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
+            files.known.replay(&recorded, &named, &fix.files, &fix.lens)
+        };
+        let put = |rel: &str| {
+            std::fs::create_dir_all(fix.path.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(fix.path.join(rel), b"x\n").unwrap();
+        };
+        put("e/x.c");
+        put("e/sub/y.c");
+        put(".h/z.c");
+        assert_eq!(replay(&["e/sub/y.c", "e/sub", ".h/z.c"]), Ok(1), "e, once");
+        assert_eq!(added_paths(&files, &fix), ["e/sub/y.c", "e/x.c"]);
+        std::fs::write(fix.path.join("e/.ignore"), b"x.c\n").unwrap();
+        assert_eq!(replay(&["e/.ignore"]), Ok(1));
+        assert_eq!(
+            added_paths(&files, &fix),
+            ["e/sub/y.c"],
+            "e/x.c is ignored now"
+        );
+        std::fs::remove_file(fix.path.join("e/.ignore")).unwrap();
+        assert_eq!(replay(&["e"]), Ok(1), "a new dir itself");
+        assert_eq!(added_paths(&files, &fix), ["e/sub/y.c", "e/x.c"]);
+    }
+
+    /// The live added paths, by slot.
+    fn added_paths(files: &Files, fix: &Fix) -> Vec<String> {
+        let s = files.snapshot();
+        let n = fix.files.len();
+        s.added.iter().map(|&d| s.names[d - n].clone()).collect()
     }
 
     #[test]
