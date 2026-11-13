@@ -8,6 +8,7 @@ use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manife
 use crate::plan::shard_bytes;
 use crate::sharded::DocfmIndex;
 use crate::source::{request_watch, write_stamps, write_walk};
+use crate::vcs::served;
 use crate::wire::IndexSummary;
 
 /// The default index directory, under the indexed folder.
@@ -45,6 +46,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     let persist = |output: &Path| -> Result<Manifest, String> {
         let start = Instant::now();
         let started = SystemTime::now();
+        let before = req.store_docs.then(|| served::before(req.folder));
         let mut sink = create_sink(output)?;
         let cap = shard_bytes()?;
         #[cfg(test)]
@@ -69,6 +71,10 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             write_walk(output, &docs.walk, started)?;
         }
         let build_time_us = start.elapsed().as_micros() as u64;
+        let commit = before.map(|b| served::after(b, req.folder, output, &docs.paths, &docs.lens));
+        if let Some(commit) = &commit {
+            served::note(commit);
+        }
         let since_epoch = started.duration_since(UNIX_EPOCH).unwrap_or_default();
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
@@ -84,7 +90,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             doc_lens: docs.lens,
             blob_lens,
             corpus_root: docs.root,
-            commit: None,
+            commit: commit.and_then(Result::ok),
         };
         write_manifest(output, &manifest)?;
         Ok(manifest)

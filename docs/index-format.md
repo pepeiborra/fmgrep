@@ -380,6 +380,32 @@ sentinel and the 2 s rule are those of `dirs.stamps`.
 The documents concatenated, by id, with no separators; `doc_lens` slices
 them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
 
+## Served commit
+
+A `--store-docs` index records `commit` when its stored documents are,
+byte for byte, the files of one git commit, as a checkout of that commit
+would index them. That commit is the served commit: a client in another
+checkout of the repository can find, with git, the files where it
+differs, and search those itself. The index runs git (with the
+repository variables of its environment removed, no optional locks and
+no fetch) and records HEAD only when all of these hold:
+
+1. the indexed folder is the top of its work tree (`git rev-parse
+   --show-toplevel`);
+2. `git status --porcelain=v2 --untracked-files=no
+   --ignore-submodules=none` shows no change, before the walk and after
+   the build, with the same HEAD;
+3. every indexed file is a stage-0 regular file (mode 100644 or 100755)
+   of `git ls-files -s`, and no entry is a submodule (mode 160000);
+4. each stored document equals the text of its blob, read with one `git
+   cat-file --batch` and decoded as the index decodes a file. A file that
+   git converts on checkout (line endings, a filter) differs here, though
+   git status shows no change.
+
+The build then prints `note: the index holds commit <id>`; otherwise
+`note: the index records no served commit (<why>)`, and the manifest has
+no `commit`. An index without `--store-docs` never runs git.
+
 ## Determinism
 
 The same tree, the same ignore files outside it (see Documents) and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and

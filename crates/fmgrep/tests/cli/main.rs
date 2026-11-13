@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+mod commit;
+mod git;
 mod roundtrip;
 mod serve;
 /// The library tests' private watchman daemon.
