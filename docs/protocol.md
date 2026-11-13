@@ -62,7 +62,7 @@ response line each, after any [frames](#streamed-output).
 | `iglobs` | [string] | [] | `--iglob`, after `globs` |
 | `glob_case_insensitive` | bool | false | `--glob-case-insensitive` |
 | `paths` | [{path, name}] | [] | PATH arguments: `path` relative to the indexed root (`""` the root), `name` as typed (`""`: the cwd of a search without PATH), which its files print under |
-| `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
+| `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths` and `commit`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 | `stream` | bool | false | send the output as [frames](#streamed-output) |
 | `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
