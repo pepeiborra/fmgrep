@@ -40,7 +40,7 @@ response line each, after any [frames](#streamed-output).
 | method | params | result |
 |---|---|---|
 | `query` | below | an `OutputReport`, `{text, report}`, or frames then `{report}` |
-| `status` | none | `{store_docs, files, num_bytes, index_size_bytes, load_us, root}` |
+| `status` | none | `{format, store_docs, files, num_bytes, index_size_bytes, load_us, root}` |
 | `shutdown` | none | `{"status":"shutting down"}`, then the server exits 0 |
 
 `query` params; unknown fields are refused:
@@ -85,11 +85,13 @@ output is not UTF-8, `bytes` (standard base64) replaces `text`.
 > {"jsonrpc":"2.0","id":4,"method":"query","params":{"terms":["greet"],"mode":"files"}}
 < {"jsonrpc":"2.0","id":4,"result":{"text":"README.md\napp/Main.hs\nsrc/Lib.hs\n","report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":26,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}}
 > {"jsonrpc":"2.0","id":5,"method":"status"}
-< {"jsonrpc":"2.0","id":5,"result":{"store_docs":false,"files":3,"num_bytes":197,"index_size_bytes":34456,"load_us":4305,"root":"/src/demo"}}
+< {"jsonrpc":"2.0","id":5,"result":{"format":8,"store_docs":false,"files":3,"num_bytes":197,"index_size_bytes":34456,"load_us":4305,"root":"/src/demo"}}
 ```
 
 `root` is where the server reads the documents: the tree, or the index
-directory holding `docs.shard`.
+directory holding `docs.shard`. `format` is the manifest format of the
+served index ([index-format.md](index-format.md#manifestjson)); a server
+older than this field leaves it out.
 
 ### Streamed output
 

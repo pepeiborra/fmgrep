@@ -82,6 +82,7 @@ fn tcp_server_flag_equals_local_search() {
         assert_eq!(status["files"], DOCS.len(), "{store_docs}");
         assert_eq!(status["num_bytes"], bytes, "{store_docs}");
         assert_eq!(status["store_docs"], store_docs, "{store_docs}");
+        assert_eq!(status["format"], 8, "{store_docs}");
         shutdown(&mut server, addr);
         let mut rest = String::new();
         stdout.read_to_string(&mut rest).unwrap();

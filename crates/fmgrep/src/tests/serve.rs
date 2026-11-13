@@ -81,6 +81,7 @@ fn serve_stdio_matches_query() {
         keys.sort_unstable();
         let want = [
             "files",
+            "format",
             "index_size_bytes",
             "load_us",
             "num_bytes",

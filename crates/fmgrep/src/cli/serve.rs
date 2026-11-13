@@ -110,6 +110,10 @@ enum Answer {
 /// `status` result.
 #[derive(Serialize, Deserialize)]
 pub struct ServeStatus {
+    /// The manifest format of the served index; absent from a server older
+    /// than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
     pub store_docs: bool,
     files: usize,
     num_bytes: u64,
@@ -180,6 +184,7 @@ impl Served<'_> {
 
     fn status(&self) -> ServeStatus {
         ServeStatus {
+            format: Some(self.manifest.format),
             store_docs: self.manifest.store_docs,
             files: self.manifest.num_docs,
             num_bytes: self.manifest.num_bytes,
