@@ -462,6 +462,47 @@ fn a_view_error_names_the_slot() {
     );
 }
 
+/// Shards are checked at once, but of two tampered slots the error names the
+/// lower, every time.
+#[test]
+fn of_two_bad_slots_the_error_names_the_lower() {
+    let docs = docs_of(&[b"first", b"second", b"third", b"fourth", b"fifth"]);
+    let dir = tempfile::tempdir().unwrap();
+    let (labels, lens) = persist(&DocfmIndex::build_with_cap(&docs, 5), dir.path());
+    assert!(labels.len() >= 4, "{labels:?}");
+    let shard_path = dir.path().join(BLOBS_SHARD);
+    let mut bytes = std::fs::read(&shard_path).unwrap();
+    let start = |slot: usize| lens[..slot].iter().sum::<u64>() as usize;
+    // Slot 1 fails the last check of a view, its count of marked rows, and
+    // the last slot the first, its magic: the higher slot fails first.
+    let slot = start(1)..start(2);
+    let flipped = |bit: usize| {
+        let mut blob = bytes[slot.clone()].to_vec();
+        blob[bit / 8] ^= 1 << (bit % 8);
+        blob
+    };
+    let bit = (0..8 * slot.len())
+        .find(|&bit| {
+            ::docfm::FmIndex::view(flipped(bit))
+                .err()
+                .is_some_and(|e| e.to_string().contains("marked rows"))
+        })
+        .expect("a bit of slot 1's marks");
+    bytes[slot.start + bit / 8] ^= 1 << (bit % 8);
+    let last = start(labels.len() - 1);
+    bytes[last..last + 8].copy_from_slice(b"XXXXXXXX");
+    std::fs::write(&shard_path, &bytes).unwrap();
+    for _ in 0..20 {
+        let err = load_from(dir.path(), &labels, &lens, &doc_lens(&docs))
+            .err()
+            .expect("must refuse");
+        assert!(
+            err.starts_with("shard slot 1: ") && err.contains("marked rows"),
+            "got: {err}"
+        );
+    }
+}
+
 /// Honest count and locate over `docs`' shard text, in docfm's units: the
 /// located value is the hit's document ordinal.
 struct Scan {
