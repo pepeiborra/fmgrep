@@ -76,6 +76,30 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Whether the repository at `dir` has the commit `id`, as `git cat-file
+/// --batch-check` says; or why git cannot tell, in git's words. Git
+/// prints `missing` for an object it lacks, and fails for a repository it
+/// cannot read.
+pub fn has_commit(dir: &Path, id: &str) -> Result<bool, String> {
+    let mut child = command(dir, &["cat-file", "--batch-check=%(objecttype)"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(spawn_failed)?;
+    let mut stdin = child.stdin.take().expect("piped");
+    // A git that fails reads nothing; its stderr says why.
+    let _ = writeln!(stdin, "{id}^{{commit}}");
+    drop(stdin);
+    let out = child.wait_with_output().map_err(spawn_failed)?;
+    if !out.status.success() {
+        return Err(failed(&out.stderr, out.status));
+    }
+    match String::from_utf8_lossy(&out.stdout).trim_end() {
+        "commit" => Ok(true),
+        line if line.ends_with(" missing") => Ok(false),
+        line => Err(format!("git cat-file printed {line:?}")),
+    }
+}
+
 /// `out` as one line of UTF-8, its newline dropped.
 pub fn line(out: Vec<u8>) -> Result<String, String> {
     let text = String::from_utf8(out).map_err(|_| "git printed a path that is not UTF-8")?;

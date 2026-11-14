@@ -17,7 +17,9 @@
 # changed ignore file.
 #
 # --serve repeats every case through `--server` (lines `srv`): same stdout and
-# exit status, empty stderr. The server asks a private watchman daemon (its
+# exit status, and no stderr. With --store-docs the index records no commit,
+# so the client warns that local changes are ignored: that one warning is
+# allowed. The server asks a private watchman daemon (its
 # own socket, state and log under a temporary directory; never the user's
 # daemon), from $FMGREP_TEST_WATCHMAN or else `watchman` on PATH, before
 # each query, so it serves the stale pass without a restart. Without
@@ -156,6 +158,13 @@ served() {
     local name="$1" rc=0
     shift
     ( cd "$CORPUS$AT" && "$BIN" --server "$ADDR" "$@" ) > "$WORK/srv" 2> "$WORK/srv.err" || rc=$?
+    # The tree holds .git, and stored docs that record no commit ignore its
+    # edits: the client says so.
+    if [[ "$STORE_DOCS" == true ]]; then
+        grep -vF "warning: local changes are ignored (the server at $ADDR reports no served commit)" \
+            "$WORK/srv.err" > "$WORK/srv.rest" || true
+        mv "$WORK/srv.rest" "$WORK/srv.err"
+    fi
     if [[ "$rc" != "$RC" || ("$RC" != 2 && -s "$WORK/srv.err") ]]; then
         echo "FAIL srv $PASS$name  (exit $rc, want exit $RC and no stderr)"
         cat "$WORK/srv.err"
