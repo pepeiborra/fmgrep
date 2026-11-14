@@ -72,6 +72,20 @@ pub struct Manifest {
     /// Absolute UTF-8 path; present iff not `store_docs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corpus_root: Option<String>,
+    /// The served commit: the commit whose files the documents are, byte
+    /// for byte. Only a `store_docs` index records one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
+}
+
+/// A version-control commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Commit {
+    /// `git`.
+    pub vcs: String,
+    /// The full hex id.
+    pub id: String,
 }
 
 impl Manifest {
@@ -210,7 +224,8 @@ fn foreign(path: &Path, format: Option<u32>) -> String {
 }
 
 /// The checks of a manifest's values that its encoding does not hold:
-/// `corpus_root` present iff not `store_docs`, and absolute; `bom_bytes`
+/// `corpus_root` present iff not `store_docs`, and absolute; a `commit`
+/// only with `store_docs`; `bom_bytes`
 /// within `num_bytes`; each table as long as the list it describes.
 fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
     match (manifest.store_docs, &manifest.corpus_root) {
@@ -228,6 +243,12 @@ fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
             ));
         }
         (true, None) => {}
+    }
+    if manifest.commit.is_some() && !manifest.store_docs {
+        return Err(format!(
+            "error: {} reads documents from files but records a commit; refusing a tampered index",
+            manifest_path.display()
+        ));
     }
     if manifest.bom_bytes > manifest.num_bytes {
         return Err(format!(
@@ -351,6 +372,7 @@ mod tests {
             doc_lens: docs.iter().map(|d| d.len() as u64).collect(),
             blob_lens: blobs.iter().map(|b| b.len() as u64).collect(),
             corpus_root: None,
+            commit: None,
         }
     }
 
@@ -388,6 +410,7 @@ mod tests {
             doc_lens: vec![6, 4].into(),
             blob_lens: vec![11],
             corpus_root: Some("/corpus".into()),
+            commit: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         // The order of the JSON that an older fmgrep wrote as manifest.json;
@@ -428,6 +451,57 @@ mod tests {
         };
         let json = serde_json::to_string(&stored).unwrap();
         assert!(json.ends_with("\"blob_lens\":[11]}"), "{json}");
+        let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+        let served = Manifest {
+            commit: Some(Commit {
+                vcs: "git".into(),
+                id: id.into(),
+            }),
+            ..stored
+        };
+        let json = serde_json::to_string(&served).unwrap();
+        let tail = format!("\"blob_lens\":[11],\"commit\":{{\"vcs\":\"git\",\"id\":\"{id}\"}}}}");
+        assert!(json.ends_with(&tail), "the commit is the last key: {json}");
+    }
+
+    #[test]
+    fn a_commit_reads_back_and_needs_stored_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        stage(&dir, &[b"hello"], &[b"blob"]);
+        let commit = Commit {
+            vcs: "git".into(),
+            id: "1a2b".into(),
+        };
+        rewrite(&dir, |m| m.commit = Some(commit.clone()));
+        assert_eq!(read_manifest(&dir).unwrap().commit, Some(commit.clone()));
+        // The open checks the served commit it maps: one damaged byte, not
+        // a hex digit or not UTF-8, is refused before any use.
+        let raw = std::fs::read(dir.join(MANIFEST_BIN)).unwrap();
+        let at = raw.windows(8).position(|w| w == b"git 1a2b").unwrap() + 5;
+        for (byte, why) in [
+            (b'z', "not a VCS, a space and a hex id"),
+            (0xFF, "not UTF-8"),
+        ] {
+            patch(&dir, at, &[byte]);
+            let err = read_manifest(&dir).unwrap_err();
+            assert!(
+                err.contains(&format!("holds a served commit that is {why}")),
+                "{err}"
+            );
+            assert!(err.ends_with("; re-run `index`"), "{err}");
+        }
+        patch(&dir, at, b"a");
+        assert_eq!(read_manifest(&dir).unwrap().commit, Some(commit));
+        rewrite(&dir, |m| {
+            m.store_docs = false;
+            m.corpus_root = Some("/corpus".into());
+        });
+        let err = read_manifest(&dir).unwrap_err();
+        assert!(
+            err.contains("records a commit") && err.contains("tampered"),
+            "{err}"
+        );
     }
 
     #[test]

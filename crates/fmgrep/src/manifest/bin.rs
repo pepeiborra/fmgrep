@@ -19,7 +19,7 @@
 //! | 56 | 8 | `index_started_ns`, i64 |
 //! | 64 | 8 | shards: the number of blobs, u64 |
 //! | 72 | 8 | bytes of `corpus_root`, u64; 0 when absent |
-//! | 80 | 8 | bytes of the served commit, u64; 0 |
+//! | 80 | 8 | bytes of the served commit, u64; 0 when absent |
 //!
 //! Then the sections, in this order, each right after the one before:
 //!
@@ -29,8 +29,8 @@
 //! 3. `blob_lens`: one u64 per shard;
 //! 4. label ends: one u64 per shard, the same rule over the label text;
 //! 5. `corpus_root`, UTF-8;
-//! 6. the served commit, UTF-8: kept for a later fmgrep, which fills it;
-//!    this one writes none and reads past it;
+//! 6. the served commit, UTF-8: the VCS, one space, then the commit id in
+//!    lowercase hex (`git 1a2b...`);
 //! 7. the label text: the `blobs` labels, joined;
 //! 8. the path text: the `files` paths, joined, by id.
 //!
@@ -47,7 +47,7 @@ use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::files::{Bytes, Lens, Store};
-use super::{FileTable, Manifest, refuse_foreign};
+use super::{Commit, FileTable, Manifest, refuse_foreign};
 
 const MAGIC: [u8; 8] = *b"fmmanif\0";
 
@@ -81,8 +81,19 @@ struct OnDisk {
 
 const _: () = assert!(size_of::<OnDisk>() == 88);
 
+/// Whether `vcs` and `id` make a served commit this layout holds: a VCS
+/// name of lowercase ASCII letters and digits, and an id of lowercase hex
+/// digits. Nothing else is safe to hand to the VCS as a commit, nor to
+/// print or cut as one.
+pub fn commit_ok(vcs: &str, id: &str) -> bool {
+    let name = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+    !vcs.is_empty() && vcs.bytes().all(name) && !id.is_empty() && id.bytes().all(hex)
+}
+
 /// Write `m` as `manifest.bin`. Refuses a manifest that this layout cannot
-/// hold: tables of different lengths, or an empty `corpus_root`.
+/// hold: tables of different lengths, an empty `corpus_root`, or a served
+/// commit that [`commit_ok`] refuses.
 pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
     let n = m.files.len();
     if m.num_docs != n || m.doc_lens.len() != n || m.blob_lens.len() != m.blobs.len() {
@@ -103,6 +114,16 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
             "an empty corpus_root",
         ));
     }
+    let commit = match &m.commit {
+        None => String::new(),
+        Some(c) if !commit_ok(&c.vcs, &c.id) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a served commit of vcs {:?} and id {:?}", c.vcs, c.id),
+            ));
+        }
+        Some(c) => format!("{} {}", c.vcs, c.id),
+    };
     let root = m.corpus_root.as_deref().unwrap_or_default();
     let head = OnDisk {
         prefix: Prefix {
@@ -118,7 +139,7 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
         index_started_ns: I64::new(m.index_started_ns),
         num_shards: U64::new(m.blobs.len() as u64),
         root_len: U64::new(root.len() as u64),
-        commit_len: U64::ZERO,
+        commit_len: U64::new(commit.len() as u64),
     };
     out.write_all(head.as_bytes())?;
     write_words(out, m.doc_lens.iter().copied())?;
@@ -126,6 +147,7 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
     write_words(out, m.blob_lens.iter().copied())?;
     write_words(out, ends_of(m.blobs.iter()))?;
     out.write_all(root.as_bytes())?;
+    out.write_all(commit.as_bytes())?;
     for label in &m.blobs {
         out.write_all(label.as_bytes())?;
     }
@@ -247,7 +269,20 @@ pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, Stri
         std::str::from_utf8(b).map_err(|_| bad(format!("holds {what} that is not UTF-8")))
     };
     let root = utf8(root, "a corpus_root")?;
-    utf8(commit, "a served commit")?;
+    let commit = match utf8(commit, "a served commit")? {
+        "" => None,
+        text => match text.split_once(' ') {
+            Some((vcs, id)) if commit_ok(vcs, id) => Some(Commit {
+                vcs: vcs.to_owned(),
+                id: id.to_owned(),
+            }),
+            _ => {
+                return Err(bad(
+                    "holds a served commit that is not a VCS, a space and a hex id".into(),
+                ));
+            }
+        },
+    };
     let labels = utf8(labels, "a shard label")?;
     let label_ends = with_zero(label_ends);
     cuts(labels, &label_ends, "shard label").map_err(&bad)?;
@@ -273,6 +308,7 @@ pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, Stri
         blob_lens: blob_lens.iter().map(|w| w.get()).collect(),
         corpus_root: (!root.is_empty()).then(|| root.to_owned()),
         files,
+        commit,
     })
 }
 

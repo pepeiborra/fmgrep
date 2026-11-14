@@ -30,6 +30,18 @@ fn sample(paths: &[&str], shards: usize, root: Option<&str>) -> Manifest {
         doc_lens: doc_lens.into(),
         blob_lens: (0..shards as u64).map(|s| 100 + s).collect(),
         corpus_root: root.map(str::to_owned),
+        commit: None,
+    }
+}
+
+/// [`sample`] in the documents layout, serving commit `id`.
+fn served(paths: &[&str], id: &str) -> Manifest {
+    Manifest {
+        commit: Some(Commit {
+            vcs: "git".into(),
+            id: id.into(),
+        }),
+        ..sample(paths, 1, None)
     }
 }
 
@@ -80,6 +92,7 @@ struct Offsets {
     path_ends: usize,
     label_ends: usize,
     root: usize,
+    commit: usize,
     labels: usize,
     paths: usize,
 }
@@ -89,12 +102,18 @@ fn offsets(m: &Manifest) -> Offsets {
     let path_ends = 88 + 8 * n;
     let label_ends = path_ends + 8 * n + 8 * s;
     let root = label_ends + 8 * s;
-    let labels = root + m.corpus_root.as_deref().map_or(0, str::len);
+    let commit = root + m.corpus_root.as_deref().map_or(0, str::len);
+    let commit_len = m
+        .commit
+        .as_ref()
+        .map_or(0, |c| c.vcs.len() + 1 + c.id.len());
+    let labels = commit + commit_len;
     let paths = labels + m.blobs.iter().map(String::len).sum::<usize>();
     Offsets {
         path_ends,
         label_ends,
         root,
+        commit,
         labels,
         paths,
     }
@@ -140,6 +159,8 @@ fn a_manifest_reads_back_equal() {
         mid(),
         max,
         before_epoch,
+        served(&["a.c"], "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"),
+        served(&[], "0"),
     ] {
         let b = bytes(&m);
         assert_eq!(read(&b).as_ref(), Ok(&m));
@@ -177,11 +198,37 @@ fn the_layout_is_fixed() {
     ];
     let hex: String = bytes(&m).iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, want.concat());
+    // A served commit fills its length and its section, and moves nothing
+    // else but the sections after it.
+    let m = served(&["a"], "1a2b");
+    let want = [
+        "666d6d616e696600",                                       // magic
+        "08000000",                                               // format
+        "01000000",                                               // flags: store_docs
+        "0100000000000000",                                       // num_docs
+        "0100000000000000",                                       // num_bytes
+        "0100000000000000",                                       // bom_bytes
+        "3930000000000000",                                       // index_size_bytes
+        "a602000000000000",                                       // build_time_us
+        "150f187057a77718",                                       // index_started_ns
+        "0100000000000000",                                       // shards
+        "0000000000000000",                                       // bytes of corpus_root
+        "0800000000000000",                                       // bytes of the served commit
+        "0100000000000000",                                       // doc_lens
+        "0100000000000000",                                       // path ends
+        "6400000000000000",                                       // blob_lens
+        "1b00000000000000",                                       // label ends
+        "6769742031613262",                                       // the served commit: "git 1a2b"
+        "73686172642d30303030303030302d30303030303030312e62696e", // labels
+        "61",                                                     // paths
+    ];
+    let hex: String = bytes(&m).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, want.concat());
 }
 
 #[test]
 fn every_truncation_is_refused() {
-    for m in [small(), mid()] {
+    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
         let b = bytes(&m);
         for cut in 0..b.len() {
             refused(&b[..cut], "is truncated");
@@ -252,7 +299,7 @@ fn refusal(why: &str) -> String {
 /// or of the path text opens and is refused when read.
 #[test]
 fn every_byte_change_is_refused_or_reads_back_whole() {
-    for m in [small(), mid()] {
+    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
         let b = bytes(&m);
         let off = offsets(&m);
         let ends = off.path_ends..off.path_ends + 8 * m.files.len();
@@ -279,7 +326,7 @@ fn every_byte_change_is_refused_or_reads_back_whole() {
 /// whole. A count of 2^60 sizes no buffer.
 #[test]
 fn edge_values_in_every_word_are_refused_or_read_back() {
-    for m in [small(), mid()] {
+    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
         let b = bytes(&m);
         let len = b.len() as u64;
         for at in (16..offsets(&m).root).step_by(8) {
@@ -418,12 +465,15 @@ fn a_damaged_path_is_refused_when_read() {
     assert_eq!(fate(&c, "an end inside é"), Fate::Read);
 }
 
-/// A later fmgrep fills the served commit: this one checks it and reads
-/// past it.
+/// The served commit is read from the section that format 8 has always
+/// had: a file without one, as every fmgrep of format 8 wrote before, reads
+/// as one without a commit.
 #[test]
-fn a_served_commit_is_read_past() {
-    let m = small();
+fn a_served_commit_is_its_vcs_a_space_and_its_id() {
+    let m = sample(&["a.c", "b"], 1, None);
     let (b, at) = (bytes(&m), offsets(&m));
+    assert_eq!(at.commit, at.labels);
+    assert_eq!(get(&b, 80), 0);
     let with = |commit: &[u8]| {
         let mut c = b[..at.labels].to_vec();
         put(&mut c, 80, commit.len() as u64);
@@ -431,11 +481,42 @@ fn a_served_commit_is_read_past() {
         c.extend_from_slice(&b[at.labels..]);
         c
     };
-    assert_eq!(read(&with(b"git 0123456789abcdef")), Ok(m));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let pinned = read(&with(format!("git {id}").as_bytes())).unwrap();
+    assert_eq!(pinned, served(&["a.c", "b"], id));
+    assert_eq!(bytes(&pinned), with(format!("git {id}").as_bytes()));
+    // A VCS that a later fmgrep names reads back as it is.
+    let sl = read(&with(b"sl 1a2b")).unwrap().commit.unwrap();
+    assert_eq!((sl.vcs.as_str(), sl.id.as_str()), ("sl", "1a2b"));
     refused(
         &with(b"git \xFF"),
         "holds a served commit that is not UTF-8",
     );
+    // Only a VCS name and a hex id: a ref, a revision, a second word or a
+    // letter outside ASCII is not a commit to hand to the VCS.
+    for bad in [
+        &b"git"[..],
+        b"git ",
+        b" 1a2b",
+        b" ",
+        b"git zzzz",
+        b"git HEAD",
+        b"git main",
+        b"git HEAD~0",
+        b"git -oops",
+        b"git  1a2b",
+        b"git 1a2b c",
+        b"git \n1",
+        b"git 1A2B",
+        "git \u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}".as_bytes(),
+        b"Git 1a2b",
+        b"g-t 1a2b",
+    ] {
+        refused(
+            &with(bad),
+            "holds a served commit that is not a VCS, a space and a hex id",
+        );
+    }
 }
 
 #[test]
@@ -452,6 +533,19 @@ fn a_manifest_the_layout_cannot_hold_is_not_written() {
     let mut m = small();
     m.corpus_root = Some(String::new());
     assert!(encode(&m, &mut Vec::new()).is_err());
+    for (vcs, id) in [
+        ("", "1a2b"),
+        ("g it", "1a2b"),
+        ("git", ""),
+        ("git", "HEAD"),
+        ("git", " 1a2b"),
+        ("git", "1a2b\n"),
+        ("Git", "1a2b"),
+    ] {
+        let mut m = served(&["a"], id);
+        m.commit.as_mut().unwrap().vcs = vcs.into();
+        assert!(encode(&m, &mut Vec::new()).is_err(), "{vcs:?} {id:?}");
+    }
 }
 
 /// The checks of the values run as on the JSON, with the same words.
@@ -483,6 +577,11 @@ fn values_are_checked_as_before() {
     check(
         &|m| m.blob_lens.truncate(1),
         "blob tables skew (blobs=2 blob_lens=1)",
+    );
+    assert_eq!(validate(&served(&["a"], "1a2b"), at), Ok(()));
+    check(
+        &|m| m.commit = served(&[], "1a2b").commit,
+        "reads documents from files but records a commit",
     );
 }
 
