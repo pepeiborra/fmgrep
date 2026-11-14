@@ -2,6 +2,7 @@
 //! index of the served commit, on real repositories: the answer and the
 //! warnings.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -23,6 +24,48 @@ pub struct Remote {
     pub _server: crate::Server,
     pub addr: String,
     pub client: PathBuf,
+    /// A private watchman daemon that watches the client, when one can
+    /// start; without it, every search asks git and says so.
+    pub daemon: Option<crate::watchman::Daemon>,
+}
+
+/// The start of the warning of a search that asks git because watchman
+/// cannot say what changed.
+pub const ASKED_GIT: &str = "warning: watchman cannot say what changed (";
+
+/// What a search says when its calls to watchman took longer than its
+/// budget: `watchman did not answer within ...`, or `watchman
+/// get-sockname did not answer within ...`.
+const LATE: &str = " did not answer within ";
+
+/// How many times [`Remote::tried`] runs a search that came late, at most.
+const TRIES: usize = 10;
+
+/// The files below `dir`, to put back.
+fn cached(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for path in entries.map(|e| e.unwrap().path()) {
+        match path.is_dir() {
+            true => files.extend(cached(&path)),
+            false => files.push((path.clone(), std::fs::read(path).unwrap())),
+        }
+    }
+    files
+}
+
+/// The files below `dir` as `files` holds them.
+fn put_back(dir: &Path, files: &[(PathBuf, Vec<u8>)]) {
+    for (path, _) in cached(dir) {
+        if files.iter().all(|(p, _)| *p != path) {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    for (path, bytes) in files {
+        std::fs::write(path, bytes).unwrap();
+    }
 }
 
 impl Remote {
@@ -63,6 +106,10 @@ impl Remote {
             &["clone", "-q", &origin.display().to_string(), "client"],
         );
         let client = std::fs::canonicalize(client).unwrap();
+        let daemon = crate::watchman::Daemon::start();
+        if let Some(daemon) = &daemon {
+            daemon.watch(&client);
+        }
         Self {
             s,
             origin,
@@ -70,17 +117,74 @@ impl Remote {
             _server: server,
             addr,
             client,
+            daemon,
         }
     }
 
-    /// `args` through the server from `cwd`, with `FMGREP_SERVER`.
+    /// `args` through the server from `cwd`, with `FMGREP_SERVER`, and the
+    /// private daemon's socket when there is one; by [`Self::tried`].
     pub fn search(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.s
-            .fmgrep(cwd)
-            .env("FMGREP_SERVER", &self.addr)
-            .args(args)
-            .output()
-            .expect("spawn fmgrep")
+        self.tried(|| {
+            let mut cmd = self.s.fmgrep(cwd);
+            if let Some(daemon) = &self.daemon {
+                cmd.env("WATCHMAN_SOCK", &daemon.sock);
+            }
+            cmd.env("FMGREP_SERVER", &self.addr)
+                .args(args)
+                .output()
+                .expect("spawn fmgrep")
+        })
+    }
+
+    /// `run`, a search that asks the private daemon, run again while it
+    /// came late, at most [`TRIES`] times, as the library tests' `tried`
+    /// does: on a loaded machine the client's budget for its calls to
+    /// watchman can run out; the search then asks git and says that
+    /// watchman did not answer, which a test of the ask does not mean to
+    /// test. Each late try is undone: the files of the cache directory,
+    /// the records, go back as they were. Each late try must answer as the
+    /// last one. Fails, with the late warning, when every try came late.
+    pub fn tried(&self, mut run: impl FnMut() -> Output) -> Output {
+        let cache = self.s.path("cache");
+        let mut lates: Vec<Output> = Vec::new();
+        loop {
+            let records = cached(&cache);
+            let out = run();
+            if self.daemon.is_none() || !stderr(&out).contains(LATE) {
+                let answer = |o: &Output| (comparable(&stdout(o)), o.status.code());
+                for late in &lates {
+                    assert_eq!(answer(late), answer(&out), "a late search answers the same");
+                }
+                return out;
+            }
+            assert!(
+                lates.len() + 1 < TRIES,
+                "{TRIES} tries came late: {}",
+                stderr(&out)
+            );
+            put_back(&cache, &records);
+            lates.push(out);
+            // Past the test harness's capture, so that a run's log counts
+            // them.
+            let test = std::thread::current().name().unwrap_or("?").to_owned();
+            let _ = writeln!(std::io::stderr(), "{test}: try {} came late", lates.len());
+        }
+    }
+
+    /// The stderr of `out`, less the warning that git was asked because
+    /// watchman cannot say, when no daemon runs: each such search prints
+    /// it once. With a daemon, it stays, to fail the test.
+    pub fn warnings(&self, out: &Output) -> String {
+        let text = stderr(out);
+        if self.daemon.is_some() {
+            return text;
+        }
+        let asked = text.lines().filter(|l| l.starts_with(ASKED_GIT)).count();
+        assert!(asked <= 1, "{text}");
+        text.lines()
+            .filter(|l| !l.starts_with(ASKED_GIT))
+            .map(|l| format!("{l}\n"))
+            .collect()
     }
 
     /// What a local index of the client's checkout prints for `args` from
@@ -113,7 +217,7 @@ impl Remote {
             .filter(|l| !l.starts_with("warning:"))
             .map(|l| format!("{l}\n"))
             .collect();
-        assert_eq!(stderr(&got), errors.concat(), "{rel} {args:?}");
+        assert_eq!(self.warnings(&got), errors.concat(), "{rel} {args:?}");
         assert_eq!(
             (comparable(&stdout(&got)), got.status.code()),
             (comparable(&stdout(&want)), want.status.code()),
@@ -202,7 +306,7 @@ fn a_search_that_cannot_compare_its_checkout_warns_once() {
     // A clone that has the commit: nothing to say.
     let out = r.search(&r.client, &["-l", "printk"]);
     assert_eq!(
-        (stdout(&out), stderr(&out)),
+        (stdout(&out), r.warnings(&out)),
         (all.to_owned(), String::new())
     );
 }

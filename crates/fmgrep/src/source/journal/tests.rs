@@ -76,6 +76,7 @@ fn a_record_is_used_only_by_its_index_build() {
         of: "index /src/linux/.fmgrep@7".into(),
         token: token("c:1:2"),
         baseline: Some(baseline),
+        extra: None,
     };
     assert_eq!(record, want);
     let file = path("/src/linux", "/src/linux/.fmgrep").unwrap();

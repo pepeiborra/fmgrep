@@ -181,12 +181,17 @@ fn network(fs: &str) -> bool {
 struct Record {
     v: u32,
     root: String,
-    /// What the baseline differs from: `index <dir>@<started_ns>`.
+    /// What the baseline differs from: `index <dir>@<started_ns>`, or
+    /// `git <commit>`.
     of: String,
     token: Token,
     /// Ascending root-relative paths that may differ from the index; `None`
     /// when more than [`named_cap`] do.
     baseline: Option<Vec<String>>,
+    /// What else a search through a server checks before it builds on the
+    /// baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra: Option<serde_json::Value>,
 }
 
 /// What a load learned before it re-checks anything.
@@ -258,6 +263,18 @@ pub struct Of {
     of: String,
     /// Says what a record of another `of` was written for.
     other: &'static str,
+}
+
+impl Of {
+    /// A checkout's record against served commit `id`: one per checkout and
+    /// commit, so that searches through servers of two commits keep two.
+    pub fn commit(id: &str) -> Self {
+        Self {
+            key: format!("git {id}"),
+            of: format!("git {id}"),
+            other: "another commit",
+        }
+    }
 }
 
 impl Index {
@@ -532,6 +549,102 @@ pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap
         of: of.of,
         token,
         baseline: (baseline.len() <= cap).then_some(baseline),
+        extra: None,
+    };
+    record.write(&of.key);
+}
+
+/// What a search through a server learned of its checkout from its record
+/// and watchman, before it asks git anything.
+pub enum Remembered {
+    /// A token taken now; the record's baseline and extra; and the paths
+    /// under the root that changed since the record's token, unsorted.
+    Since {
+        token: Token,
+        baseline: Vec<String>,
+        extra: serde_json::Value,
+        changed: Vec<String>,
+    },
+    /// A token taken now, and why there is no baseline to build on.
+    Fresh { token: Token, why: String },
+    /// Why watchman cannot say what changed.
+    Cannot(String),
+}
+
+/// The record of the checkout at canonical `root` against `of`, and what
+/// watchman says changed since it; at any checkout size.
+pub fn remembered(root: &Path, of: &Of) -> Remembered {
+    let root_str = match unaskable(root) {
+        Err(why) => return Remembered::Cannot(why),
+        Ok(root_str) => root_str,
+    };
+    #[cfg(unix)]
+    {
+        let why = match Record::read(root_str, of).and_then(same_socket) {
+            Ok(record) => {
+                let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
+                match w.mark(root) {
+                    Ok(token) => {
+                        let (baseline, extra) = (record.baseline, record.extra);
+                        return match (w.since(&record.token, root), baseline, extra) {
+                            (Ok(changed), Some(baseline), Some(extra)) => Remembered::Since {
+                                token,
+                                baseline,
+                                extra,
+                                changed,
+                            },
+                            (Err(why), _, _) => Remembered::Fresh { token, why },
+                            _ => Remembered::Fresh {
+                                token,
+                                why: "the record holds no baseline".to_owned(),
+                            },
+                        };
+                    }
+                    Err(why) => why,
+                }
+            }
+            Err(why) => why,
+        };
+        match watchman::Watchman::find(ASK_WAIT).and_then(|w| w.mark(root)) {
+            Ok(token) => Remembered::Fresh { token, why },
+            Err(why) => Remembered::Cannot(why),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root_str, of);
+        unreachable!("unaskable refuses every root here")
+    }
+}
+
+/// Whether the checkout at canonical `root` keeps a record against `of`:
+/// one was saved after git compared them.
+pub fn recorded(root: &Path, of: &Of) -> bool {
+    root.to_str()
+        .is_some_and(|root| Record::read(root, of).is_ok())
+}
+
+/// Save `token`, `baseline` (ascending) and `extra` as what differs from
+/// `of` in the checkout at canonical `root`.
+pub fn remember(
+    root: &Path,
+    of: &Of,
+    token: Token,
+    baseline: Vec<String>,
+    extra: serde_json::Value,
+) {
+    let Some(root) = root.to_str() else {
+        return cannot_save(format_args!(
+            "the record (the checkout's path is not UTF-8)"
+        ));
+    };
+    let record = Record {
+        v: VERSION,
+        root: root.to_owned(),
+        of: of.of.clone(),
+        token,
+        baseline: Some(baseline),
+        extra: Some(extra),
     };
     record.write(&of.key);
 }
