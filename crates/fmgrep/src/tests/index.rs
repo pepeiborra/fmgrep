@@ -82,7 +82,7 @@ fn stored_docs_index_writes_both_shards_and_tables() {
     let (manifest, docs, blobs) = read_back(&output);
     assert_eq!(manifest.format, MANIFEST_FORMAT);
     assert!(manifest.store_docs && manifest.corpus_root.is_none());
-    assert_eq!(manifest.doc_lens, vec![12, 2, 0]);
+    assert_eq!(*manifest.doc_lens, [12, 2, 0]);
     assert_eq!(manifest.doc_lens.iter().sum::<u64>(), manifest.num_bytes);
 
     let doc_shard = std::fs::read(output.join(DOCS_SHARD)).unwrap();
