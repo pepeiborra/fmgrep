@@ -58,7 +58,9 @@ fn tcp_server_flag_equals_local_search() {
     for store_docs in [false, true] {
         let (_tmp, docs) = stage();
         let index = do_index(&docs, store_docs).display().to_string();
-        let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+        let mut serve = fmgrep();
+        serve.args(["serve", &index, "--no-watch"]);
+        let mut server = Server::spawn_cmd(serve.env("FMGREP_VERBOSE", "1"));
         let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
         let mut addr = String::new();
         stdout.read_line(&mut addr).unwrap();
@@ -77,6 +79,12 @@ fn tcp_server_flag_equals_local_search() {
         }
         let all = [&["--json", "--"][..], &TERMS].concat();
         assert_eq!(client(addr, &all), query(&index, &TERMS), "{store_docs}");
+        let verbose = fmgrep()
+            .args(["--server", addr, "printk"])
+            .env("FMGREP_VERBOSE", "1")
+            .output()
+            .expect("spawn fmgrep");
+        assert_eq!(stderr(&verbose), "", "the client prints no spans");
         let status: serde_json::Value = serde_json::from_str(&client(addr, &["--status"])).unwrap();
         let bytes: usize = DOCS.iter().map(|(_, b)| b.len()).sum();
         assert_eq!(status["files"], DOCS.len(), "{store_docs}");
@@ -89,6 +97,8 @@ fn tcp_server_flag_equals_local_search() {
             rest, "",
             "{store_docs}: stdout carries the readiness line only"
         );
+        let err = served_stderr(&mut server);
+        assert!(!err.contains("note: span"), "{err}");
     }
 }
 
@@ -471,6 +481,70 @@ fn an_unreachable_server_falls_back_to_a_local_index() {
     assert!(out.stdout.is_empty());
     let want = format!("error: cannot reach the server at {closed}: ");
     assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
+}
+
+/// Under `FMGREP_VERBOSE=1` a search that a local index answers ends with
+/// its spans on stderr, after the warning that the server was passed over;
+/// a search that a server answers prints none. Without the variable no
+/// search prints spans.
+#[test]
+fn spans_print_only_when_a_local_index_answers() {
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    ok(&["index", &docs.display().to_string()]);
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let (live, closed) = (server.addr(), closed_port());
+    let away = tmp.path().join("away");
+    std::fs::create_dir(&away).unwrap();
+    let dotdir = std::fs::canonicalize(&docs).unwrap().join(".fmgrep");
+    let dotdir = dotdir.display();
+    let unreachable =
+        format!("warning: Using local index {dotdir}: cannot reach the server at {closed} (");
+    let passed_over =
+        format!("warning: Using local index {dotdir}, not the server at {live} (FMGREP_SERVER)");
+    // (cwd, FMGREP_SERVER, --server, the warning when a local index answers)
+    let cases = [
+        (&docs, None, Some(&closed), Some(&unreachable)),
+        (&docs, Some(&live), None, Some(&passed_over)),
+        (&away, None, Some(&live), None),
+        (&away, Some(&live), None, None),
+    ];
+    for (cwd, env, flag, warning) in cases {
+        for verbose in [false, true] {
+            let mut cmd = fmgrep();
+            cmd.current_dir(cwd).env_remove("FMGREP_VERBOSE");
+            if verbose {
+                cmd.env("FMGREP_VERBOSE", "1");
+            }
+            if let Some(addr) = env {
+                cmd.env("FMGREP_SERVER", addr);
+            }
+            if let Some(addr) = flag {
+                cmd.args(["--server", addr]);
+            }
+            let start = Instant::now();
+            let out = cmd.args(["-l", "printk"]).output().expect("spawn fmgrep");
+            let wall = start.elapsed();
+            let what = format!("{cwd:?} {env:?} {flag:?} {verbose}");
+            let err = stderr(&out);
+            assert_eq!(out.status.code(), Some(0), "{what}: {err}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "a.bin\nb.bin\n");
+            // The warning comes first, and the spans last.
+            let spans = match warning {
+                Some(want) => {
+                    let (first, rest) = err.split_once('\n').expect(&err);
+                    assert!(first.starts_with(want.as_str()), "{what}: {err}");
+                    rest
+                }
+                None => &err,
+            };
+            match verbose && warning.is_some() {
+                true => crate::roundtrip::check_spans(spans, false, wall),
+                false => assert_eq!(spans, "", "{what}"),
+            }
+        }
+    }
+    shutdown(&mut server, &live);
 }
 
 /// The server scopes a search to the client's cwd.
