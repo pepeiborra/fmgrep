@@ -31,7 +31,10 @@ other program: fmgrep does not call `rg`.
 `fmgrep index --store-docs` of the top of a git checkout runs `git` to
 learn which commit the stored files are (the served commit,
 [docs/index-format.md](docs/index-format.md#served-commit)). Without git
-the index records no commit, and says why.
+the index records no commit, and says why. A search through a server that
+reports a served commit runs `git` in the client's checkout; without git
+it prints the server's answer alone, with a warning that local changes
+are ignored.
 
 [Watchman](https://facebook.github.io/watchman/), the file watcher, is a
 soft dependency of a search: a search works without it, with the same
