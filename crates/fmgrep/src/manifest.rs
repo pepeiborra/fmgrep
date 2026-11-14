@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,9 @@ pub const MANIFEST_FORMAT: u32 = 8;
 
 /// The manifest, in the layout of [`bin`].
 pub const MANIFEST_BIN: &str = "manifest.bin";
+
+/// What [`write_manifest`] writes before it renames it to [`MANIFEST_BIN`].
+pub const MANIFEST_TMP: &str = "manifest.bin.tmp";
 
 /// The manifest of an index of format 7 or older: refused by its number.
 pub const MANIFEST_JSON: &str = "manifest.json";
@@ -120,14 +123,22 @@ pub fn create_output_dir(output: &Path) -> Result<(), String> {
 }
 
 /// Write `manifest.bin`. Written last: a partial index dir is never
-/// queryable.
+/// queryable. The bytes go to [`MANIFEST_TMP`] in the same directory,
+/// which is synced and then renamed over `manifest.bin`: a reader sees the
+/// whole manifest or none, and a crash leaves no `manifest.bin` with
+/// blocks that were never written.
 pub fn write_manifest(output: &Path, manifest: &Manifest) -> Result<(), String> {
-    let path = output.join(MANIFEST_BIN);
-    let cannot = |e: std::io::Error| format!("error: cannot write {}: {e}", path.display());
-    let mut out =
-        BufWriter::with_capacity(SHARD_WRITE_BUFFER, File::create(&path).map_err(cannot)?);
-    bin::encode(manifest, &mut out).map_err(cannot)?;
-    out.flush().map_err(cannot)
+    let (path, tmp) = (output.join(MANIFEST_BIN), output.join(MANIFEST_TMP));
+    let wrote = (|| {
+        let mut out = BufWriter::with_capacity(SHARD_WRITE_BUFFER, File::create(&tmp)?);
+        bin::encode(manifest, &mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    wrote.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("error: cannot write {}: {e}", path.display())
+    })
 }
 
 /// Read + validate the manifest at `dir` without touching the shards.
@@ -408,6 +419,31 @@ mod tests {
         let manifest = stage(&dir, &[b"hello", b"bye"], &[b"blob"]);
         assert_eq!(read_manifest(&dir), Ok(manifest));
         assert!(!dir.join(MANIFEST_JSON).exists());
+    }
+
+    #[test]
+    fn a_manifest_write_replaces_the_whole_file_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        let manifest = stage(&dir, &[b"hello", b"bye"], &[b"blob"]);
+        let before = std::fs::read(dir.join(MANIFEST_BIN)).unwrap();
+        // A stale temporary file is overwritten, then renamed away.
+        std::fs::write(dir.join(MANIFEST_TMP), b"stale").unwrap();
+        write_manifest(&dir, &manifest).unwrap();
+        assert_eq!(std::fs::read(dir.join(MANIFEST_BIN)).unwrap(), before);
+        assert!(!dir.join(MANIFEST_TMP).exists());
+        // A write that fails keeps the manifest there was, and leaves no
+        // temporary file.
+        let mut skewed = manifest.clone();
+        skewed.doc_lens.pop();
+        let err = write_manifest(&dir, &skewed).unwrap_err();
+        assert!(
+            err.contains("cannot write") && err.contains("skew"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(dir.join(MANIFEST_BIN)).unwrap(), before);
+        assert!(!dir.join(MANIFEST_TMP).exists());
+        assert_eq!(read_manifest(&dir), Ok(manifest));
     }
 
     #[test]
