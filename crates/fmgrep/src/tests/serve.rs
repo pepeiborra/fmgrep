@@ -81,13 +81,22 @@ fn serve_stdio_matches_query() {
         keys.sort_unstable();
         let want = [
             "files",
+            "format",
             "index_size_bytes",
+            "index_started_ns",
             "load_us",
             "num_bytes",
             "root",
             "store_docs",
+            "watch",
+            "watchman",
         ];
         assert_eq!(keys, want, "store_docs={store_docs}");
+        let started = read_manifest(&index).unwrap().index_started_ns;
+        assert_eq!(status["format"], 8);
+        assert_eq!(status["index_started_ns"], started);
+        assert_eq!(status["watch"], false, "--no-watch");
+        assert!(status["watchman"].is_null());
         let docs = match store_docs {
             true => index.clone(),
             false => PathBuf::from(read_manifest(&index).unwrap().corpus_root.unwrap()),

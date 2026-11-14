@@ -75,6 +75,11 @@ impl Loaded {
         self.docs.refusal()
     }
 
+    /// What a server last said of watchman, until it answers again.
+    pub fn said(&self) -> Option<String> {
+        self.docs.said()
+    }
+
     /// Before a served query, re-check what changed since the last one.
     pub fn recheck(&self, manifest: &Manifest) {
         self.docs.recheck(&manifest.files);

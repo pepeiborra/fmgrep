@@ -537,6 +537,11 @@ fn status_names_what_a_search_reads() {
     ))
     .unwrap();
     assert!(want.is_match(&served[1]), "{served:?}");
+    let index = regex::Regex::new(r"^index: format 8, built \d+ s ago$").unwrap();
+    assert!(index.is_match(&served[2]), "{served:?}");
+    let once = "changes: the server checked the tree once at its start and asks watchman nothing \
+                (--no-watch)";
+    assert_eq!(served[3..], [once]);
     let flag = lines(&run_in(&docs, &["status", "--server", &addr]));
     assert_eq!(flag[0], format!("a search here uses the server at {addr}"));
 

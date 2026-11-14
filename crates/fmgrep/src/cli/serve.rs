@@ -117,6 +117,20 @@ pub struct ServeStatus {
     pub load_us: u64,
     /// The documents' directory: the tree, or the index directory holding `docs.shard`.
     pub root: String,
+    /// The manifest's format; absent from an older server's reply, as are
+    /// the fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    /// When the index began, in ns since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_started_ns: Option<i64>,
+    /// Whether the server asks watchman what changed before each query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<bool>,
+    /// What the server last said of watchman on stderr: why the last ask
+    /// checked every file; `null` when watchman answered.
+    #[serde(default)]
+    pub watchman: Option<String>,
 }
 
 /// What `serve` serves.
@@ -137,6 +151,8 @@ struct Served<'m> {
     manifest: &'m Manifest,
     index_dir: &'m Path,
     root: PathBuf,
+    /// Whether it asks watchman before each query.
+    watch: bool,
 }
 
 impl Served<'_> {
@@ -186,6 +202,10 @@ impl Served<'_> {
             index_size_bytes: self.manifest.index_size_bytes,
             load_us: self.docs.load_wall.as_micros() as u64,
             root: self.root.display().to_string(),
+            format: Some(self.manifest.format),
+            index_started_ns: Some(self.manifest.index_started_ns),
+            watch: Some(self.watch),
+            watchman: self.docs.said(),
         }
     }
 }
@@ -412,6 +432,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         manifest: req.manifest,
         index_dir: req.index_dir,
         root,
+        watch: req.watch && !req.manifest.store_docs,
     })
 }
 

@@ -225,6 +225,14 @@ impl DocStore {
         }
     }
 
+    /// What a server last said of watchman; never for stored docs.
+    pub fn said(&self) -> Option<String> {
+        match &self.source {
+            Source::Files(f) => f.said(),
+            Source::Shard { .. } => None,
+        }
+    }
+
     /// Why a server cannot use watchman at all; never for stored docs.
     pub fn refusal(&self) -> Option<String> {
         match &self.source {

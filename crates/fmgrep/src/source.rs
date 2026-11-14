@@ -784,6 +784,13 @@ impl Files {
             .clone()
     }
 
+    /// What a server last said of watchman on stderr, until watchman
+    /// answers again: `None` when the last ask was answered.
+    pub fn said(&self) -> Option<String> {
+        let said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
+        said.clone()
+    }
+
     /// A server's start that took no token says why: its first query
     /// prints a warning only when the reason differs.
     fn degraded(&self, why: String) {

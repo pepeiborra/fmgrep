@@ -112,6 +112,17 @@ added later, never renamed; `null` means not known, or does not apply:
 A script reads the paths with
 `fmgrep status --json | jq -r '.index.manifest.files[]'`.
 
+For a server, the lines after the first give the served tree and its
+size, the index format and age, and how the server learns what changed:
+
+```console
+$ FMGREP_SERVER=build1:7777 fmgrep status
+a search here uses the server at build1:7777 (FMGREP_SERVER)
+server: tree /srv/ghc, 26787 files, 84.7 MiB of text, 73.2 MiB of index, loaded in 412 ms
+index: format 8, built 5 h ago
+changes: the server asks watchman before each query; at its last ask watchman answered
+```
+
 ### Layout
 
 Integers are little-endian, of the widths below, with no alignment and no

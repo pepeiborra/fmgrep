@@ -246,6 +246,38 @@ fn on_a_network_filesystem_status_asks_no_daemon() {
     assert!(notes().is_empty() && records(tmp.path()).is_empty());
 }
 
+/// A server that asks watchman before each query says so in its status
+/// reply, and that watchman answered its last ask.
+#[test]
+fn a_watching_server_reports_watchmans_last_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((_folder, output, _daemon)) = indexed(tmp.path(), AB) else {
+        return;
+    };
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["printk"]}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"status"}"#,
+        "\n"
+    );
+    let mut out = Vec::new();
+    let args = ["serve", "--stdio", output.to_str().unwrap()];
+    dispatch_to(args, &mut input.as_bytes(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let reply: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+    let status = &reply["result"];
+    assert_eq!(
+        (&status["watch"], &status["format"]),
+        (&json(true), &json(8))
+    );
+    assert!(status["watchman"].is_null(), "{status}");
+    notes();
+}
+
+fn json(v: impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(v).unwrap()
+}
+
 /// With a record, `status` counts what the next search re-checks: the
 /// same stale, added and gone files, from what watchman names.
 #[test]

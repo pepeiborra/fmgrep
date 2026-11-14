@@ -65,6 +65,9 @@ impl Changes {
     }
 }
 
+/// How a server that watches learns what changed.
+const ASKS: &str = "the server asks watchman before each query";
+
 /// The `changes:` line of an index that holds the files.
 const STORED: &str = "none: the index holds the files; a search reads none of the tree";
 
@@ -216,14 +219,35 @@ fn served(
         (true, Some(tree)) => format!("tree {} (stored documents)", tree.display()),
         (true, None) => format!("index {} (stored documents)", status.root),
     };
-    let line = format!(
-        "server: {place}, {} files, {} of text, {} of index, loaded in {}",
-        status.files,
-        size(status.num_bytes),
-        size(status.index_size_bytes),
-        took(status.load_us),
-    );
-    [first, line].iter().try_for_each(|l| print::line(out, l))
+    let mut lines = vec![
+        first,
+        format!(
+            "server: {place}, {} files, {} of text, {} of index, loaded in {}",
+            status.files,
+            size(status.num_bytes),
+            size(status.index_size_bytes),
+            took(status.load_us),
+        ),
+    ];
+    // An older server says neither.
+    if let (Some(format), Some(started)) = (status.format, status.index_started_ns) {
+        lines.push(format!(
+            "index: format {format}, built {} ago",
+            ago(started)
+        ));
+    }
+    let changes = match (status.store_docs, status.watch, &status.watchman) {
+        (true, _, _) => Some(STORED.to_owned()),
+        (false, Some(true), None) => Some(format!("{ASKS}; at its last ask watchman answered")),
+        (false, Some(true), Some(said)) => Some(format!("{ASKS}; at its last ask: {said}")),
+        (false, Some(false), _) => Some(
+            "the server checked the tree once at its start and asks watchman nothing (--no-watch)"
+                .to_owned(),
+        ),
+        (false, None, _) => None,
+    };
+    lines.extend(changes.map(|c| format!("changes: {c}")));
+    lines.iter().try_for_each(|l| print::line(out, l))
 }
 
 fn encoded(report: &Report<'_>) -> Result<String, String> {
@@ -300,5 +324,45 @@ mod tests {
         assert_eq!(ago(now - 3 * 3600 * s), "3 h");
         assert_eq!(ago(now - 2 * 86400 * s), "2 d");
         assert_eq!(ago(now + 60 * s), "0 s", "a clock that moved back");
+    }
+
+    /// The human lines on a server's reply.
+    fn served_lines(reply: &str) -> Vec<String> {
+        let status: ServeStatus = serde_json::from_str(reply).unwrap();
+        let server = Server {
+            addr: "h:1".to_owned(),
+            env: false,
+        };
+        let mut out = Vec::new();
+        served(&mut out, false, "here", server, status).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        text.lines().skip(2).map(str::to_owned).collect()
+    }
+
+    /// A reply of an older server, without the index and watchman fields,
+    /// still decodes, and prints only the lines it can.
+    #[test]
+    fn a_server_reply_says_how_the_server_learns_what_changed() {
+        let old = r#"{"store_docs":false,"files":2,"num_bytes":3,"index_size_bytes":4,"load_us":5,"root":"/t"}"#;
+        assert!(served_lines(old).is_empty());
+        let with = |watch: &str, said: &str| {
+            let reply = format!(
+                r#"{{"store_docs":false,"files":2,"num_bytes":3,"index_size_bytes":4,"load_us":5,"root":"/t","format":8,"index_started_ns":0,"watch":{watch},"watchman":{said}}}"#
+            );
+            served_lines(&reply)
+        };
+        let ask = "changes: the server asks watchman before each query";
+        let got = with("true", "null");
+        assert!(got[0].starts_with("index: format 8, built "), "{got:?}");
+        assert_eq!(got[1], format!("{ask}; at its last ask watchman answered"));
+        let late = r#""watchman cannot say what changed (watchman did not answer within 100 ms); checked every file""#;
+        let got = with("true", late);
+        let want = format!("{ask}; at its last ask: {}", late.trim_matches('"'));
+        assert_eq!(got[1], want);
+        let got = with("false", "null");
+        assert!(
+            got[1].ends_with("asks watchman nothing (--no-watch)"),
+            "{got:?}"
+        );
     }
 }
