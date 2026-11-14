@@ -27,7 +27,7 @@ fn sample(paths: &[&str], shards: usize, root: Option<&str>) -> Manifest {
                 )
             })
             .collect(),
-        doc_lens,
+        doc_lens: doc_lens.into(),
         blob_lens: (0..shards as u64).map(|s| 100 + s).collect(),
         corpus_root: root.map(str::to_owned),
     }
@@ -124,7 +124,7 @@ fn a_manifest_reads_back_equal() {
     max.bom_bytes = u64::MAX;
     max.index_size_bytes = u64::MAX;
     max.build_time_us = u64::MAX;
-    max.doc_lens = vec![u64::MAX];
+    max.doc_lens = vec![u64::MAX].into();
     max.blob_lens = vec![u64::MAX];
     let mut before_epoch = small();
     before_epoch.index_started_ns = -5;
@@ -192,32 +192,72 @@ fn every_truncation_is_refused() {
     }
 }
 
-/// Whether `c`, a changed manifest file, is refused with the advice to
-/// re-index (true), or reads back as a manifest that writes the same bytes
-/// (false). Never a panic.
-fn refused_or_whole(c: &[u8], what: &str) -> bool {
-    match read(c) {
+/// What becomes of a changed manifest file.
+#[derive(Debug, PartialEq)]
+enum Fate {
+    /// Refused at open, with the advice to re-index.
+    Open,
+    /// Opened; refused with the manifest's words by the first read of a
+    /// damaged path, and by the check of all of them.
+    Read,
+    /// Reads back as a manifest that writes the same bytes.
+    Whole,
+}
+
+/// What becomes of `c`, a changed manifest file. Never a panic, and never a
+/// path read back other than its bytes.
+fn fate(c: &[u8], what: &str) -> Fate {
+    let got = match read(c) {
         Err(e) => {
             assert!(
                 e.ends_with("re-run `index`") || e.contains("re-run `index` with"),
                 "{what}: {e}"
             );
-            true
+            return Fate::Open;
         }
-        Ok(got) => {
+        Ok(got) => got,
+    };
+    let files = &got.files;
+    let each: Vec<_> = (0..files.len()).map(|id| files.path(id)).collect();
+    for (id, path) in each.iter().enumerate() {
+        match path {
+            Ok(path) => assert_eq!(path.map(str::as_bytes), files.raw(id), "{what}"),
+            Err(e) => assert_eq!(e, &refusal("holds a path that is not UTF-8"), "{what}"),
+        }
+    }
+    match files.checked() {
+        Ok(all) => {
+            assert!(each.iter().enumerate().all(|(id, p)| *p == Ok(all.get(id))));
             assert_eq!(bytes(&got), c, "{what}");
-            false
+            Fate::Whole
+        }
+        Err(e) => {
+            // The paths tile the text, so the text fails exactly when a
+            // path does.
+            assert!(each.iter().any(Result::is_err), "{what}: {e}");
+            assert!(e.starts_with(&format!("error: {AT} ")), "{what}: {e}");
+            Fate::Read
         }
     }
 }
 
-/// A changed byte is refused, or reads back whole. A changed length or
-/// scalar reads back changed, as a changed JSON number did.
+/// The refusal of the manifest at [`AT`] for `why`.
+fn refusal(why: &str) -> String {
+    format!("error: {AT} {why}; re-run `index`")
+}
+
+/// A changed byte is refused at open, refused where a path it damages is
+/// read, or reads back whole. A changed length or scalar reads back
+/// changed, as a changed JSON number did. Only a change of the path ends
+/// or of the path text opens and is refused when read.
 #[test]
 fn every_byte_change_is_refused_or_reads_back_whole() {
     for m in [small(), mid()] {
         let b = bytes(&m);
-        let (mut refusals, mut reads) = (0, 0);
+        let off = offsets(&m);
+        let ends = off.path_ends..off.path_ends + 8 * m.files.len();
+        let late = |i: usize| ends.contains(&i) || i >= off.paths;
+        let mut seen = std::collections::BTreeMap::new();
         for at in 0..b.len() {
             for new in [b[at] ^ 0x01, b[at] ^ 0x80, 0x00, 0xFF] {
                 if new == b[at] {
@@ -225,13 +265,12 @@ fn every_byte_change_is_refused_or_reads_back_whole() {
                 }
                 let mut c = b.clone();
                 c[at] = new;
-                match refused_or_whole(&c, &format!("byte {at} = {new:#x}")) {
-                    true => refusals += 1,
-                    false => reads += 1,
-                }
+                let fate = fate(&c, &format!("byte {at} = {new:#x}"));
+                assert!(fate != Fate::Read || late(at), "byte {at}");
+                *seen.entry(format!("{fate:?}")).or_insert(0) += 1;
             }
         }
-        assert!(refusals > 0 && reads > 0, "{refusals} {reads}");
+        assert_eq!(seen.len(), 3, "{seen:?}");
     }
 }
 
@@ -257,7 +296,7 @@ fn edge_values_in_every_word_are_refused_or_read_back() {
             ] {
                 let mut c = b.clone();
                 put(&mut c, at, v);
-                refused_or_whole(&c, &format!("word {at} = {v:#x}"));
+                fate(&c, &format!("word {at} = {v:#x}"));
             }
         }
     }
@@ -305,36 +344,14 @@ fn each_bad_header_is_refused_by_name() {
     refused(&c, "is truncated");
 }
 
-/// `io::repeat` never ends: a read of the whole of it would not return.
 #[test]
-fn a_foreign_file_is_refused_from_its_header_alone() {
-    let at = Path::new(AT);
-    let err = read_file(io::repeat(0), at).unwrap_err();
-    assert_eq!(
-        err,
-        format!("error: {AT} is not an fmgrep manifest; re-run `index`")
-    );
-    let format = MANIFEST_FORMAT + 1;
-    let mut head = MAGIC.to_vec();
-    head.extend(format.to_le_bytes());
-    let err = read_file(head.as_slice().chain(io::repeat(0)), at).unwrap_err();
-    assert!(
-        err.contains(&format!("unsupported manifest format {format} in {AT}")),
-        "{err}"
-    );
-}
-
-#[test]
-fn a_read_gives_every_byte_of_the_file() {
-    let at = Path::new(AT);
+fn a_short_file_is_refused_by_where_it_ends() {
     let b = bytes(&mid());
-    assert_eq!(read_file(b.as_slice(), at).unwrap(), b);
-    // A file shorter than the header, with the magic and the format, is
-    // read whole; decode then names where it ends.
-    assert_eq!(read_file(&b[..50], at).unwrap(), &b[..50]);
-    assert_eq!(
-        read_file(&b[..5], at).unwrap_err(),
-        format!("error: {AT} is truncated: its 5 byte(s) end inside its header; re-run `index`")
+    refused(&[], "is truncated: its 0 byte(s) end inside its header");
+    refused(&b[..5], "is truncated: its 5 byte(s) end inside its header");
+    refused(
+        &b[..50],
+        "is truncated: its 50 byte(s) end inside its header",
     );
 }
 
@@ -345,6 +362,13 @@ fn each_bad_section_is_refused_by_name() {
     let mut c = b.clone();
     put(&mut c, at.path_ends + 8, get(&b, at.path_ends) - 1);
     refused(&c, "records the end of path 1 before the end of path 0");
+    // An end past the next one: every path read alone could be UTF-8, so
+    // only the ascending ends, checked at open, refuse it.
+    let m = sample(&["a.c", "b.c", "c.c", "d.c"], 1, None);
+    let (mut c, at) = (bytes(&m), offsets(&m));
+    put(&mut c, at.path_ends + 8, 12);
+    refused(&c, "records the end of path 2 before the end of path 1");
+    let (b, at) = (bytes(&small()), offsets(&small()));
     let mut c = b.clone();
     put(&mut c, at.label_ends + 8, 0);
     refused(
@@ -355,19 +379,43 @@ fn each_bad_section_is_refused_by_name() {
     let mut c = b.clone();
     put(&mut c, at.path_ends + 16, get(&b, at.path_ends + 16) + 1);
     refused(&c, "is truncated");
-    for (offset, what) in [
-        (at.root, "a corpus_root"),
-        (at.labels, "a shard label"),
-        (at.paths, "a path"),
-    ] {
+    for (offset, what) in [(at.root, "a corpus_root"), (at.labels, "a shard label")] {
         let mut c = b.clone();
         c[offset] = 0xFF;
         refused(&c, &format!("holds {what} that is not UTF-8"));
     }
+}
+
+/// A damaged path text opens. The path it damages is refused when it is
+/// read, with the manifest's words; the others read back; the check of
+/// every path refuses it with the words it had at open before.
+#[test]
+fn a_damaged_path_is_refused_when_read() {
+    let not_utf8 = refusal("holds a path that is not UTF-8");
+    // small(): "a.c", "b/c.rs", "d"; the first byte of "b/c.rs".
+    let (b, at) = (bytes(&small()), offsets(&small()));
+    let mut c = b.clone();
+    c[at.paths + 3] = 0xFF;
+    let got = read(&c).unwrap();
+    let files = &got.files;
+    assert_eq!(files.path(0), Ok(Some("a.c")));
+    assert_eq!(files.path(1), Err(not_utf8.clone()));
+    assert_eq!(files.path(2), Ok(Some("d")));
+    assert_eq!(files.checked().err(), Some(not_utf8.clone()));
+    assert_eq!(fate(&c, "a byte of path 1"), Fate::Read);
+    // An end inside a character.
     let m = sample(&["é", "b"], 1, None);
     let (mut c, at) = (bytes(&m), offsets(&m));
     put(&mut c, at.path_ends, 1);
-    refused(&c, "cuts path 0 inside a character");
+    let got = read(&c).unwrap();
+    let files = &got.files;
+    assert_eq!(files.path(0), Err(not_utf8.clone()));
+    assert_eq!(files.path(1), Err(not_utf8.clone()));
+    assert_eq!(
+        files.checked().err(),
+        Some(refusal("cuts path 0 inside a character"))
+    );
+    assert_eq!(fate(&c, "an end inside é"), Fate::Read);
 }
 
 /// A later fmgrep fills the served commit: this one checks it and reads
@@ -396,7 +444,7 @@ fn a_manifest_the_layout_cannot_hold_is_not_written() {
     m.num_docs += 1;
     assert!(encode(&m, &mut Vec::new()).is_err());
     let mut m = small();
-    m.doc_lens.pop();
+    m.doc_lens = m.doc_lens[1..].to_vec().into();
     assert!(encode(&m, &mut Vec::new()).is_err());
     let mut m = small();
     m.blob_lens.pop();
@@ -429,11 +477,55 @@ fn values_are_checked_as_before() {
     check(&|m| m.store_docs = true, "records a corpus_root");
     check(&|m| m.bom_bytes = m.num_bytes + 1, "BOM byte(s)");
     check(
-        &|m| m.doc_lens.truncate(2),
+        &|m| m.doc_lens = m.doc_lens[..2].to_vec().into(),
         "per-doc tables skew (files=3 doc_lens=2)",
     );
     check(
         &|m| m.blob_lens.truncate(1),
         "blob tables skew (blobs=2 blob_lens=1)",
     );
+}
+
+/// The read-ahead covers the header and the tables, and never more than
+/// the file.
+#[test]
+fn the_tables_end_where_the_root_starts() {
+    for m in [small(), mid()] {
+        let b = bytes(&m);
+        assert_eq!(tables_len(&b), offsets(&m).root);
+        // Counts the file cannot hold ask for no read-ahead: decode
+        // refuses them.
+        for count in [u64::MAX, 1 << 26, b.len() as u64 / 16] {
+            for at in [16, 64] {
+                let mut c = b.clone();
+                put(&mut c, at, count);
+                assert_eq!(tables_len(&c), 0, "count {count} at {at}");
+                assert!(read(&c).is_err());
+            }
+        }
+    }
+    assert_eq!(tables_len(&bytes(&small())[..50]), 0);
+}
+
+/// A file of another kind or format is refused from its header alone: its
+/// counts size no read-ahead, however large the file.
+#[test]
+fn a_foreign_header_asks_for_no_read_ahead() {
+    // A count of 2^20 documents, and the bytes to hold their tables.
+    let n = 1 << 20;
+    let mut b = bytes(&small());
+    put(&mut b, 16, n);
+    b.resize(88 + 16 * (n as usize + 2), 0);
+    assert_eq!(tables_len(&b), b.len());
+    let format = (MANIFEST_FORMAT - 1).to_le_bytes();
+    for (at, with, why) in [
+        (0..8, &b"NOTMANIF"[..], "is not an fmgrep manifest"),
+        (8..12, &format[..], "unsupported manifest format 7"),
+    ] {
+        let mut c = b.clone();
+        c[at].copy_from_slice(with);
+        assert_eq!(tables_len(&c), 0, "{why}");
+        let err = read(&c).unwrap_err();
+        assert!(err.contains(why), "{err}");
+    }
 }

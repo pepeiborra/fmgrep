@@ -172,7 +172,7 @@ fn a_bad_glob_fails_the_request() {
         index_started_ns: 0,
         files: Default::default(),
         blobs: vec![],
-        doc_lens: vec![],
+        doc_lens: vec![].into(),
         blob_lens: vec![],
         corpus_root: None,
     };

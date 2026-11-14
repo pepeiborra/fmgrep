@@ -81,7 +81,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             index_started_ns: i64::try_from(since_epoch.as_nanos()).unwrap_or(i64::MAX),
             files: docs.paths.into_iter().collect(),
             blobs,
-            doc_lens: docs.lens,
+            doc_lens: docs.lens.into(),
             blob_lens,
             corpus_root: docs.root,
         };

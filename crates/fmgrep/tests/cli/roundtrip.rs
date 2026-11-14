@@ -334,6 +334,74 @@ fn status_of_a_refused_index_fails_as_a_search() {
     assert_eq!(stderr(&status), stderr(&search));
 }
 
+/// A damaged path in the manifest is refused by what reads it, in the
+/// manifest's words: a search that prints it, before any line of that
+/// term; `status --json`; a files-layout search, which reads every path;
+/// a server, at start. What reads no damaged path answers as on the whole
+/// index.
+#[test]
+fn a_damaged_path_is_refused_by_what_reads_it() {
+    let files: [(&str, &[u8]); 3] = [("a.c", b"printk"), ("b.c", b"zz"), ("c.c", b"printk zz")];
+    for store_docs in [true, false] {
+        let (tmp, docs) = stage_files(&files);
+        let whole = tmp.path().join("whole");
+        let out = run(&index_argv(&docs, &whole, store_docs, &[]));
+        assert!(out.status.success(), "index: {}", stderr(&out));
+        let index_dir = do_index(&docs, store_docs);
+        let path = index_dir.join("manifest.bin");
+        let mut raw = std::fs::read(&path).unwrap();
+        // The path text "a.cb.cc.c" ends the file: damage the "b" of "b.c".
+        let at = raw.len() - 6;
+        assert_eq!(raw[at], b'b');
+        raw[at] = 0xFF;
+        std::fs::write(&path, raw).unwrap();
+        let words = format!(
+            "error: {} holds a path that is not UTF-8; re-run `index`\n",
+            path.display()
+        );
+        let (index, whole) = (index_dir.display().to_string(), whole.display().to_string());
+        let refused = |args: &[&str]| {
+            let out = run(args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+            assert!(out.stdout.is_empty(), "{args:?}");
+            assert_eq!(stderr(&out), words, "{args:?}");
+        };
+        refused(&["status", "--json", &index]);
+        let status = run(&["status", &index]);
+        assert!(status.status.success(), "{}", stderr(&status));
+        assert!(String::from_utf8_lossy(&status.stdout).contains("num_docs: 3"));
+        let served = fmgrep()
+            .args(["serve", &index, "--stdio", "--no-watch"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(served.status.code(), Some(2), "{}", stderr(&served));
+        assert_eq!(stderr(&served), words);
+        // "zz" prints b.c then c.c: nothing of it is printed.
+        refused(&["--index", &index, "zz"]);
+        refused(&["--index", &index, "-l", "zz", "printk"]);
+        if !store_docs {
+            // The files layout reads every path at load.
+            refused(&["--index", &index, "printk"]);
+            continue;
+        }
+        for args in [
+            &["printk"][..],
+            &["-l", "printk"],
+            &["-c", "printk"],
+            &["missing"],
+        ] {
+            let got = run(&[&["--index", &index][..], args].concat());
+            let want = run(&[&["--index", &whole][..], args].concat());
+            assert_eq!(
+                (got.status.code(), &got.stdout, stderr(&got)),
+                (want.status.code(), &want.stdout, stderr(&want)),
+                "{args:?}"
+            );
+        }
+    }
+}
+
 /// `status` is not a search: under `FMGREP_VERBOSE=1` it prints the same
 /// stdout, exits the same and prints no spans, on a good index and on a
 /// refused one.

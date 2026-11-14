@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::manifest::{Checked, DOCS_SHARD, FileTable, Manifest, shard_offsets};
+use crate::manifest::{Checked, DOCS_SHARD, FileTable, Lens, Manifest, shard_offsets};
 use crate::source::{Files, Index, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
@@ -88,7 +88,8 @@ enum Source {
 /// opened until a batch has a non-empty read.
 pub struct DocStore {
     source: Source,
-    lens: Vec<u64>,
+    /// The manifest's `doc_lens`, shared, not copied.
+    lens: Lens,
     cache: HashMap<usize, Vec<u8>>,
     cached_bytes: u64,
     max_cached_bytes: u64,
@@ -161,13 +162,13 @@ impl DocStore {
                 Source::Files(Box::new(files))
             }
         };
-        Ok(Self::of(source, &manifest.doc_lens))
+        Ok(Self::of(source, manifest.doc_lens.clone()))
     }
 
-    fn of(source: Source, lens: &[u64]) -> Self {
+    fn of(source: Source, lens: Lens) -> Self {
         Self {
             source,
-            lens: lens.to_vec(),
+            lens,
             cache: HashMap::new(),
             cached_bytes: 0,
             max_cached_bytes: MAX_CACHED_BYTES,
@@ -186,12 +187,15 @@ impl DocStore {
     #[cfg(test)]
     fn shard(path: PathBuf, doc_lens: &[u64]) -> Result<Self, String> {
         let offsets = shard_offsets(doc_lens)?;
-        Ok(Self::of(Source::Shard { path, offsets }, doc_lens))
+        Ok(Self::of(
+            Source::Shard { path, offsets },
+            doc_lens.to_vec().into(),
+        ))
     }
 
     #[cfg(test)]
     fn files(files: Files, doc_lens: &[u64]) -> Self {
-        Self::of(Source::Files(Box::new(files)), doc_lens)
+        Self::of(Source::Files(Box::new(files)), doc_lens.to_vec().into())
     }
 
     /// Joined before it returns: the stale set is known on return.
