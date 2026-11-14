@@ -434,7 +434,8 @@ pub fn answer_expr(
         // Every path the expression may print is checked before its first
         // line.
         paths.check(root.yes.iter().chain(&root.maybe).copied())?;
-        sink.corpus(num_docs, manifest.num_bytes - manifest.bom_bytes)?;
+        let (n, bytes) = docs.corpus(manifest, req.output.json());
+        sink.corpus(n, bytes)?;
         sink.term_start(&report.term)?;
     }
     let filter = req.filter.as_ref();
