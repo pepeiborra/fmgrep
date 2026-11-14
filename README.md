@@ -28,6 +28,11 @@ or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
 To build fmgrep you need only Rust (above). To run a search you need no
 other program: fmgrep does not call `rg`.
 
+`fmgrep index --store-docs` of the top of a git checkout runs `git` to
+learn which commit the stored files are (the served commit,
+[docs/index-format.md](docs/index-format.md#served-commit)). Without git
+the index records no commit, and says why.
+
 [Watchman](https://facebook.github.io/watchman/), the file watcher, is a
 soft dependency of a search: a search works without it, with the same
 answers. `fmgrep serve` needs it, unless given `--no-watch` or a
