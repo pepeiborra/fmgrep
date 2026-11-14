@@ -62,6 +62,11 @@ pub fn status(out: &mut dyn Write, json: bool, dir: &Path, m: &Manifest) -> Resu
         format!("shards: {}", m.blobs.len()),
     ];
     lines.extend(m.corpus_root.as_ref().map(|r| format!("corpus_root: {r}")));
+    lines.extend(
+        m.commit
+            .as_ref()
+            .map(|c| format!("commit: {} {}", c.vcs, c.id)),
+    );
     lines.iter().try_for_each(|l| line(out, l))
 }
 
@@ -99,7 +104,7 @@ fn matches(n: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{FileTable, MANIFEST_FORMAT, damaged};
+    use crate::manifest::{Commit, FileTable, MANIFEST_FORMAT, damaged};
 
     fn manifest(files: FileTable) -> Manifest {
         Manifest {
@@ -116,6 +121,7 @@ mod tests {
             blobs: vec![],
             blob_lens: vec![],
             corpus_root: None,
+            commit: None,
         }
     }
 
@@ -143,5 +149,39 @@ mod tests {
             status_json(&cut),
             Err("error: idx/manifest.bin cuts path 0 inside a character; re-run `index`".into())
         );
+    }
+
+    /// The served commit is the last line, and the last key of `--json`.
+    #[test]
+    fn status_prints_the_served_commit_last() {
+        let m = Manifest {
+            format: MANIFEST_FORMAT,
+            store_docs: true,
+            num_docs: 1,
+            num_bytes: 3,
+            bom_bytes: 0,
+            index_size_bytes: 9,
+            build_time_us: 7,
+            index_started_ns: 5,
+            files: ["a.c"].into_iter().collect(),
+            blobs: vec!["shard-00000000-00000001.bin".into()],
+            doc_lens: vec![3].into(),
+            blob_lens: vec![11],
+            corpus_root: None,
+            commit: Some(Commit {
+                vcs: "git".into(),
+                id: "1a2b".into(),
+            }),
+        };
+        let printed = |json| {
+            let mut out = Vec::new();
+            status(&mut out, json, Path::new("/idx"), &m).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let text = printed(false);
+        assert!(text.ends_with("shards: 1\ncommit: git 1a2b\n"), "{text}");
+        let json = printed(true);
+        let tail = r#""blob_lens":[11],"commit":{"vcs":"git","id":"1a2b"}}"#;
+        assert!(json.ends_with(&format!("{tail}\n")), "{json}");
     }
 }

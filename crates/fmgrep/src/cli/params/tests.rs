@@ -175,6 +175,7 @@ fn a_bad_glob_fails_the_request() {
         doc_lens: vec![].into(),
         blob_lens: vec![],
         corpus_root: None,
+        commit: None,
     };
     let err = p.request(Path::new("idx"), &manifest, None).err().unwrap();
     assert!(err.starts_with("error: invalid glob 'a[b'"), "{err}");
