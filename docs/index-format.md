@@ -29,7 +29,7 @@ with `--output` reads them from the manifest's `corpus_root`.
 ## manifest.bin
 
 The manifest holds these fields. `fmgrep status --json` prints them as one
-JSON object on one line, in this order.
+JSON object, in this order, under `.index.manifest`.
 
 | field | type | meaning |
 |---|---|---|
@@ -50,13 +50,29 @@ JSON object on one line, in this order.
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
 
-`fmgrep status [PATH]` reads the manifest of the index at or above PATH
-(default: the current directory) as a search does, and refuses what a
-search refuses. It prints one `name: value` line per scalar field, plus
-`index` (the index directory) and `shards` (the number of blobs).
-`fmgrep status --json` prints the manifest itself: the fields above, in
-that order, on one line. A script reads the paths with
-`fmgrep status --json | jq -r '.files[]'`.
+### fmgrep status
+
+`fmgrep status [PATH]` says what a search started in PATH (default: the
+current directory) reads: the index found by walking up, which wins over
+`FMGREP_SERVER`, else that server; with `--server ADDR`, that server, or
+the index a search falls back to when it cannot be reached. It reads the
+manifest as a search does, and refuses what a search refuses, with the
+same words and exit 2. The first line is always `a search here uses
+...` (`a search in DIR uses ...` with a PATH), with the note a search
+warns, such as `, not the server at ADDR (FMGREP_SERVER)`.
+
+`fmgrep status --json` prints one JSON object on one line. Keys may be
+added later, never renamed; `null` means not known, or does not apply:
+
+| key | type | holds |
+|---|---|---|
+| `uses` | string | `"index"` or `"server"` |
+| `note` | string or null | what a search warns after `Using local index DIR` |
+| `index` | object or null | `{dir, manifest}`: the canonical index directory, and the manifest, with the fields above in that order |
+| `server` | object or null | `{addr, env, status}`: the address, whether `FMGREP_SERVER` gave it, and the reply that `fmgrep --status` prints |
+
+A script reads the paths with
+`fmgrep status --json | jq -r '.index.manifest.files[]'`.
 
 ### Layout
 

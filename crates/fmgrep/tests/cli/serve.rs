@@ -451,22 +451,15 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
         (hits.into(), "".into())
     );
 
-    // `status` reads the local index and never the variable.
+    // `status` of a search that an index found by walking up answers.
     let local = run_in(&docs, &["status", "--json"]);
     assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
     let out = run_bad(&docs, &["status", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
-    let out = run_bad(&away, &["status"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        stderr(&out).contains("no .fmgrep index"),
-        "{}",
-        stderr(&out)
-    );
 
-    // A search or `--status` that would reach the server fails.
-    for argv in [&words[..], &["--status"]] {
+    // A search, `status` or `--status` that would reach the server fails.
+    for argv in [&words[..], &["--status"], &["status"]] {
         let out = run_bad(&away, argv);
         assert_eq!(out.status.code(), Some(2));
         assert!(out.stdout.is_empty());
@@ -477,43 +470,102 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
     }
 }
 
-/// `fmgrep status` reports on the local index whatever `FMGREP_SERVER`
-/// holds; `fmgrep --status` reports on the server; `fmgrep -- status`
-/// searches for the word.
-#[test]
-fn status_reads_the_local_index_and_dash_dash_status_the_server() {
+/// A served `idx` of the staged docs, and a `.fmgrep` in them that also
+/// holds `s.txt`, written once the server checked the tree: `-l status`
+/// finds it only in the local index. Then `<tmp>/away`, below no index.
+fn served_and_local() -> (tempfile::TempDir, std::path::PathBuf, Server, String) {
     let (tmp, docs) = stage();
     let index = do_index(&docs, false).display().to_string();
     let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
     let addr = server.addr();
     std::fs::write(docs.join("s.txt"), b"status\n").unwrap();
     ok(&["index", &docs.display().to_string()]);
+    std::fs::create_dir(tmp.path().join("away")).unwrap();
+    (tmp, docs, server, addr)
+}
+
+/// What a search, or `status`, read: the local index with the note a
+/// search warns, the server, or the error that both print.
+#[derive(Debug, PartialEq)]
+enum Source {
+    Local(String),
+    Served,
+    Failed(String),
+}
+
+/// `fmgrep status` names what a search started in PATH (else the cwd)
+/// reads: the index found by walking up, which wins over `FMGREP_SERVER`;
+/// else that server; with `--server`, that server, else the index it
+/// falls back to. `--status` prints the server's own reply, which
+/// `status --json` holds under `.server.status`; `-- status` searches.
+#[test]
+fn status_names_what_a_search_reads() {
+    let (tmp, docs, mut server, addr) = served_and_local();
     let away = tmp.path().join("away");
-    std::fs::create_dir(&away).unwrap();
+    let dotdir = std::fs::canonicalize(docs.join(".fmgrep")).unwrap();
+    let tree = std::fs::canonicalize(&docs).unwrap();
+    let lines = |out: &Output| -> Vec<String> {
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(out));
+        assert_eq!(stderr(out), "");
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().map(str::to_owned).collect()
+    };
 
-    let local = run_in(&docs, &["status", "--json"]);
-    assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
-    let m: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
-    assert_eq!(m["num_docs"], DOCS.len() + 1);
-    for value in [addr.as_str(), "not an address", ""] {
-        let out = run_env(&docs, value, &["status", "--json"]);
-        assert_eq!(out.status.code(), Some(0), "{value}: {}", stderr(&out));
-        assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
-        let out = run_env(&away, value, &["status"]);
-        assert_eq!(out.status.code(), Some(2), "{value}");
-        assert!(out.stdout.is_empty(), "{value}");
-        assert!(
-            stderr(&out).contains("no .fmgrep index"),
-            "{}",
-            stderr(&out)
-        );
-    }
+    let local = lines(&run_in(&docs, &["status"]));
+    let first = format!("a search here uses the local index {}", dotdir.display());
+    assert_eq!(local[0], first);
+    let passed = lines(&run_env(&docs, &addr, &["status"]));
+    let note = format!(", not the server at {addr} (FMGREP_SERVER)");
+    assert_eq!(passed[0], format!("{first}{note}"));
+    assert_eq!(passed[1..], local[1..], "the server is not asked");
+    let sub = lines(&run_in(&away, &["status", &docs.display().to_string()]));
+    let first = format!(
+        "a search in {} uses the local index {}",
+        tree.display(),
+        dotdir.display()
+    );
+    assert_eq!(sub[0], first);
 
-    // `--status` asks the server, which serves the index without s.txt.
+    let served = lines(&run_env(&away, &addr, &["status"]));
+    assert_eq!(
+        served[0],
+        format!("a search here uses the server at {addr} (FMGREP_SERVER)")
+    );
+    let want = regex::Regex::new(&format!(
+        r"^server: tree {}, 3 files, \d+ B of text, [\d.]+ KiB of index, loaded in \d+ ms$",
+        regex::escape(&tree.display().to_string())
+    ))
+    .unwrap();
+    assert!(want.is_match(&served[1]), "{served:?}");
+    let flag = lines(&run_in(&docs, &["status", "--server", &addr]));
+    assert_eq!(flag[0], format!("a search here uses the server at {addr}"));
+
+    let out = run_env(&away, &addr, &["status", "--json"]);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["uses"], "server");
+    assert_eq!(report["server"]["addr"], addr.as_str());
+    assert_eq!(report["server"]["env"], true);
+    assert!(report["index"].is_null() && report["note"].is_null());
     let out = run_env(&docs, &addr, &["--status"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    let served: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(served["files"], DOCS.len());
+    let raw: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(raw["files"], DOCS.len(), "the served index has no s.txt");
+    assert_eq!(report["server"]["status"], raw);
+
+    // Down: FMGREP_SERVER fails; --server falls back to the index above.
+    let closed = closed_port();
+    let out = run_env(&away, &closed, &["status"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let want = format!("error: cannot reach the server at {closed} (FMGREP_SERVER): ");
+    assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
+    let fell = lines(&run_in(&docs, &["status", "--server", &closed]));
+    let want = format!(
+        "a search here uses the local index {}: cannot reach the server at {closed} (",
+        dotdir.display()
+    );
+    assert!(fell[0].starts_with(&want), "{fell:?}");
+    assert_eq!(fell[1..], local[1..]);
 
     // `-- status` is a search: through the server from away, of the local
     // index (with the warning) under docs.
@@ -525,6 +577,90 @@ fn status_reads_the_local_index_and_dash_dash_status_the_server() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "s.txt\n");
     assert!(stderr(&out).starts_with("warning: Using local index"));
     shutdown(&mut server, &addr);
+}
+
+/// What `status --json` names, in `Source`'s terms.
+fn reported(out: &Output, dotdir: &Path, live: &str) -> Source {
+    if out.status.code() != Some(0) {
+        return Source::Failed(stderr(out));
+    }
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    match r["uses"].as_str() {
+        Some("index") => {
+            assert_eq!(r["index"]["dir"], dotdir.to_str().unwrap());
+            Source::Local(r["note"].as_str().unwrap_or_default().to_owned())
+        }
+        Some("server") => {
+            assert_eq!(r["server"]["addr"], live);
+            Source::Served
+        }
+        _ => panic!("{r}"),
+    }
+}
+
+/// In every row of the choice (cwd below an index or not; FMGREP_SERVER
+/// unset, up or down; `--server` absent, up or down) `status` names the
+/// source that a search reads, with the search's note or error.
+#[test]
+fn status_and_a_search_agree_on_the_source() {
+    let (tmp, docs, mut server, live) = served_and_local();
+    let away = tmp.path().join("away");
+    let closed = closed_port();
+    let dotdir = std::fs::canonicalize(docs.join(".fmgrep")).unwrap();
+    let warned = format!("warning: Using local index {}", dotdir.display());
+    let mut rows = Vec::new();
+    for cwd in [&docs, &away] {
+        for env in [None, Some(&live), Some(&closed)] {
+            for flag in [None, Some(&live), Some(&closed)] {
+                let run = |head: &[&str], tail: &[&str]| {
+                    let mut cmd = fmgrep();
+                    cmd.current_dir(cwd).args(head);
+                    if let Some(addr) = env {
+                        cmd.env("FMGREP_SERVER", addr);
+                    }
+                    if let Some(addr) = flag {
+                        cmd.args(["--server", addr]);
+                    }
+                    cmd.args(tail).output().expect("spawn fmgrep")
+                };
+                let what = format!("{cwd:?} {env:?} {flag:?}");
+                let out = run(&[], &["-l", "status"]);
+                let err = stderr(&out);
+                let searched = match (out.status.code(), &out.stdout[..]) {
+                    (Some(0), b"s.txt\n") => match err.strip_prefix(&warned) {
+                        Some(note) => Source::Local(note.trim_end().to_owned()),
+                        None if err.is_empty() => Source::Local(String::new()),
+                        None => panic!("{what}: {err}"),
+                    },
+                    (Some(1), b"") => Source::Served,
+                    (Some(2), b"") => Source::Failed(err),
+                    _ => panic!("{what}: {out:?}"),
+                };
+                let status = run(&["status"], &["--json"]);
+                assert_eq!(reported(&status, &dotdir, &live), searched, "{what}");
+                let kind = match &searched {
+                    Source::Served => "server",
+                    Source::Failed(_) => "error",
+                    Source::Local(n) if n.is_empty() => "index",
+                    Source::Local(n) if n.starts_with(": cannot reach") => "fallback",
+                    Source::Local(_) => "passed over",
+                };
+                let up = |a: Option<&String>| a == Some(&live);
+                let want = match (cwd == &docs, env, flag) {
+                    (_, _, Some(_)) if up(flag) => "server",
+                    (true, _, Some(_)) => "fallback",
+                    (true, None, None) => "index",
+                    (true, Some(_), None) => "passed over",
+                    (false, _, None) if up(env) => "server",
+                    (false, _, _) => "error",
+                };
+                assert_eq!(kind, want, "{what}");
+                rows.push(kind);
+            }
+        }
+    }
+    assert_eq!(rows.len(), 18);
+    shutdown(&mut server, &live);
 }
 
 /// `--server` that cannot be reached: an index found by walking up answers,

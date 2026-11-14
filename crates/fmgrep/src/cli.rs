@@ -9,6 +9,7 @@ mod locate;
 mod params;
 mod print;
 mod serve;
+mod status;
 
 use crate::events::JsonSink;
 use crate::filter::SearchPath;
@@ -19,7 +20,7 @@ use crate::query::run_query;
 use crate::remote::Conn;
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport};
-use args::{Cli, Command, Search, ServeArgs, StatusArgs};
+use args::{Cli, Command, Search, ServeArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
 use serve::{ServeRequest, run_client, run_serve};
@@ -47,29 +48,26 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
     Ok(Outcome::Done)
 }
 
-/// `status`: the manifest of the index at or above PATH, as a search
-/// reads it.
-fn status(a: &StatusArgs, out: &mut dyn Write) -> Result<Outcome, String> {
-    let (found, manifest) = open_index(a.path.as_deref())?;
-    let dir = std::fs::canonicalize(&found.index_dir).unwrap_or(found.index_dir);
-    print::status(out, a.json, &dir, &manifest)?;
-    Ok(Outcome::Done)
-}
-
 /// The index found from `start` (else the cwd) and its manifest. A
 /// files-source dotdir reads the tree it sits in, not the manifest's.
 fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
     let span = tracing::info_span!("locate").entered();
     let found = locate(start.unwrap_or(Path::new(".")))?;
-    if !found.index_dir.join(BLOBS_SHARD).is_file() {
-        return Err(format!(
-            "error: {} has no {BLOBS_SHARD}",
-            found.index_dir.display()
-        ));
-    }
+    has_blobs(&found)?;
     drop(span);
     let manifest = tracing::info_span!("manifest").in_scope(|| read_manifest(&found.index_dir))?;
     Ok((found, manifest))
+}
+
+/// Refuse an index without its blob shard, as a search does.
+fn has_blobs(found: &Located) -> Result<(), String> {
+    match found.index_dir.join(BLOBS_SHARD).is_file() {
+        true => Ok(()),
+        false => Err(format!(
+            "error: {} has no {BLOBS_SHARD}",
+            found.index_dir.display()
+        )),
+    }
 }
 
 /// `typed`, resolved from the cwd, as `p`'s PATHs into the indexed `tree`.
@@ -370,7 +368,10 @@ fn dispatch_in(
             Ok(Outcome::Index(summary))
         }
         Some(Command::Serve(a)) => serve(a, input, out),
-        Some(Command::Status(a)) => status(a, out),
+        Some(Command::Status(a)) => {
+            let (path, server) = (a.path.as_deref(), a.server.as_deref());
+            status::run(path, server, a.json, env, out).map(|()| Outcome::Done)
+        }
         None => search(&cli.search, env, input, out, tty, printing),
     }
 }

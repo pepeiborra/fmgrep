@@ -65,7 +65,7 @@ pub enum Command {
     /// Answer searches over JSON-RPC
     #[command(display_name = "fmgrep")]
     Serve(ServeArgs),
-    /// Report on the local index at or above PATH; --status reports on a server
+    /// Say what a search here would read, and how much changed since the index
     #[command(display_name = "fmgrep")]
     Status(StatusArgs),
 }
@@ -112,9 +112,12 @@ pub struct ServeArgs {
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Report on the index at or above PATH
+    /// Report on a search started in PATH
     pub path: Option<PathBuf>,
-    /// Print the manifest as JSON
+    /// Report on this server, as a search's --server does
+    #[arg(long, value_name = "ADDR", value_parser = NonEmptyStringValueParser::new())]
+    pub server: Option<String>,
+    /// Print the report as one JSON object
     #[arg(long)]
     pub json: bool,
 }

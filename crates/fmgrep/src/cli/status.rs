@@ -1,0 +1,211 @@
+//! `status`: what a search started in PATH would read, and the state of
+//! it, for a person or, under `--json`, as one object.
+
+use std::io::Write;
+use std::path::Path;
+
+use serde::Serialize;
+
+use super::serve::{ServeStatus, status_on};
+use super::{Choice, Env, Reached, Server, choose, has_blobs, print, reach, served_tree, tree_of};
+use crate::manifest::{Manifest, read_manifest};
+
+/// `status --json`. Keys may be added, never renamed; `null` is "not
+/// known" or "does not apply".
+#[derive(Serialize)]
+struct Report<'a> {
+    /// `"index"` or `"server"`.
+    uses: &'static str,
+    /// What a search warns after `Using local index DIR`.
+    note: Option<String>,
+    index: Option<IndexReport<'a>>,
+    server: Option<ServerReport>,
+}
+
+#[derive(Serialize)]
+struct IndexReport<'a> {
+    /// Canonical.
+    dir: String,
+    manifest: &'a Manifest,
+}
+
+#[derive(Serialize)]
+struct ServerReport {
+    addr: String,
+    /// Whether `FMGREP_SERVER` gave it.
+    env: bool,
+    /// What `fmgrep --status` prints.
+    status: ServeStatus,
+}
+
+/// Report on what a search started in `path` (else the cwd) reads: the
+/// index or server that [`choose`] and [`reach`] pick, with `server` as a
+/// search's `--server`. Fails where that search fails before it searches,
+/// with its words.
+pub fn run(
+    path: Option<&Path>,
+    server: Option<&str>,
+    json: bool,
+    env: Env,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let start = path.unwrap_or(Path::new("."));
+    let here = match path {
+        Some(p) => format!("in {}", canonical(p)),
+        None => "here".to_owned(),
+    };
+    let (found, note) = match choose(None, server, env, start)? {
+        Choice::Index { found, note } => (found, note),
+        Choice::Server(server) => match reach(&server, start)? {
+            Reached::Conn(mut conn) => {
+                let status = status_on(&mut conn)?;
+                return served(out, json, &here, server, status);
+            }
+            Reached::Index { found, note } => (found, Some(note)),
+        },
+    };
+    has_blobs(&found)?;
+    let manifest = read_manifest(&found.index_dir)?;
+    let dir = canonical(&found.index_dir);
+    if json {
+        let report = Report {
+            uses: "index",
+            note,
+            index: Some(IndexReport {
+                dir,
+                manifest: &manifest,
+            }),
+            server: None,
+        };
+        return print::line(out, &encoded(&report)?);
+    }
+    let note = note.unwrap_or_default();
+    let mut lines = vec![
+        format!("a search {here} uses the local index {dir}{note}"),
+        format!(
+            "index: format {}, built {} ago, {} files, {} of text, {} of index",
+            manifest.format,
+            ago(manifest.index_started_ns),
+            manifest.num_docs,
+            size(manifest.num_bytes),
+            size(manifest.index_size_bytes),
+        ),
+    ];
+    lines.extend(tree_of(&found, &manifest).map(|t| format!("tree: {}", canonical(&t))));
+    lines.iter().try_for_each(|l| print::line(out, l))
+}
+
+/// The report on a server that answered.
+fn served(
+    out: &mut dyn Write,
+    json: bool,
+    here: &str,
+    server: Server,
+    status: ServeStatus,
+) -> Result<(), String> {
+    let first = format!("a search {here} uses {server}");
+    if json {
+        let report = Report {
+            uses: "server",
+            note: None,
+            index: None,
+            server: Some(ServerReport {
+                addr: server.addr,
+                env: server.env,
+                status,
+            }),
+        };
+        return print::line(out, &encoded(&report)?);
+    }
+    let root = Path::new(&status.root);
+    let place = match (status.store_docs, served_tree(root, status.store_docs)) {
+        (false, _) => format!("tree {}", status.root),
+        (true, Some(tree)) => format!("tree {} (stored documents)", tree.display()),
+        (true, None) => format!("index {} (stored documents)", status.root),
+    };
+    let line = format!(
+        "server: {place}, {} files, {} of text, {} of index, loaded in {}",
+        status.files,
+        size(status.num_bytes),
+        size(status.index_size_bytes),
+        took(status.load_us),
+    );
+    [first, line].iter().try_for_each(|l| print::line(out, l))
+}
+
+fn encoded(report: &Report<'_>) -> Result<String, String> {
+    serde_json::to_string(report).map_err(|e| format!("error: failed to encode status: {e}"))
+}
+
+/// `p` resolved, else as given.
+fn canonical(p: &Path) -> String {
+    let resolved = std::fs::canonicalize(p);
+    resolved.as_deref().unwrap_or(p).display().to_string()
+}
+
+/// How long ago `ns` (since the epoch) was, in its largest whole unit.
+fn ago(ns: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let secs = now.saturating_sub(u128::try_from(ns).unwrap_or(0)) / 1_000_000_000;
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs / 60),
+        3600..86400 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86400),
+    }
+}
+
+/// `bytes` in binary units, one decimal past bytes.
+fn size(bytes: u64) -> String {
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for u in units {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = u;
+    }
+    match unit {
+        "B" => format!("{bytes} B"),
+        _ => format!("{value:.1} {unit}"),
+    }
+}
+
+/// `us` microseconds, in ms below a second.
+fn took(us: u64) -> String {
+    match us {
+        0..1_000_000 => format!("{} ms", us / 1000),
+        _ => format!("{:.1} s", us as f64 / 1e6),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_and_times_read_in_their_largest_unit() {
+        let sizes = [(0, "0 B"), (1023, "1023 B"), (1024, "1.0 KiB")];
+        for (n, want) in sizes {
+            assert_eq!(size(n), want);
+        }
+        assert_eq!(size(20_508_468_838), "19.1 GiB");
+        assert_eq!(size(7 << 40), "7.0 TiB");
+        assert_eq!(took(3_100_000), "3.1 s");
+        assert_eq!(took(44_900), "44 ms");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let s = 1_000_000_000;
+        assert_eq!(ago(now - 5 * s), "5 s");
+        assert_eq!(ago(now - 240 * s), "4 min");
+        assert_eq!(ago(now - 3 * 3600 * s), "3 h");
+        assert_eq!(ago(now - 2 * 86400 * s), "2 d");
+        assert_eq!(ago(now + 60 * s), "0 s", "a clock that moved back");
+    }
+}

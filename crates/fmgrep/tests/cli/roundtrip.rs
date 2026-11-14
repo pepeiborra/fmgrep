@@ -47,7 +47,8 @@ fn index_refuses_to_overwrite_and_reports_argv_errors() {
 fn status_json(index: &Path) -> serde_json::Value {
     let out = run(&["status".as_ref(), "--json".as_ref(), index.as_os_str()]);
     assert!(out.status.success(), "status: {}", stderr(&out));
-    serde_json::from_slice(&out.stdout).unwrap()
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    report["index"]["manifest"].clone()
 }
 
 /// The build window and thread counts are a schedule, not a format: the
@@ -210,11 +211,16 @@ fn index_defaults_to_a_dotdir_found_from_subdirectories() {
     }
 }
 
-/// `status --json` prints the manifest a search reads, with the fields and
-/// the order an older fmgrep wrote to manifest.json; plain `status` prints
-/// its scalars; `-- status` searches for the word.
+/// `status --json` prints, under `.index.manifest`, the manifest a search
+/// reads, with the fields and the order an older fmgrep wrote to
+/// manifest.json; plain `status` names the index, its format, age and
+/// sizes, and the tree; `-- status` searches for the word.
 #[test]
 fn status_prints_the_manifest_of_the_index() {
+    let index_line = regex::Regex::new(
+        r"^index: format 8, built \d+ s ago, 4 files, \d+ B of text, [\d.]+ KiB of index$",
+    )
+    .unwrap();
     for store_docs in [false, true] {
         let (_tmp, root) = stage();
         std::fs::write(root.join("s.txt"), "status\n").unwrap();
@@ -235,7 +241,14 @@ fn status_prints_the_manifest_of_the_index() {
         );
         let text = String::from_utf8(json.stdout).unwrap();
         assert_eq!(text.lines().count(), 1, "{text}");
-        let m: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["uses"], "index");
+        assert_eq!(report["index"]["dir"], dotdir.to_str().unwrap());
+        assert_eq!(
+            (&report["note"], &report["server"]),
+            (&serde_json::Value::Null, &serde_json::Value::Null)
+        );
+        let m = &report["index"]["manifest"];
         let mut want_keys = vec![
             "format",
             "store_docs",
@@ -279,27 +292,13 @@ fn status_prints_the_manifest_of_the_index() {
         let out = run_in(&root, &["status"]);
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         let text = String::from_utf8(out.stdout).unwrap();
-        let mut want = vec![format!("index: {}", dotdir.display())];
-        for key in [
-            "format",
-            "store_docs",
-            "num_docs",
-            "num_bytes",
-            "bom_bytes",
-            "index_size_bytes",
-            "build_time_us",
-            "index_started_ns",
-        ] {
-            want.push(format!("{key}: {}", m[key]));
-        }
-        want.push(format!("shards: {}", m["blobs"].as_array().unwrap().len()));
-        if !store_docs {
-            want.push(format!(
-                "corpus_root: {}",
-                m["corpus_root"].as_str().unwrap()
-            ));
-        }
-        assert_eq!(text.lines().collect::<Vec<_>>(), want, "{store_docs}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        let first = format!("a search here uses the local index {}", dotdir.display());
+        assert_eq!(lines[0], first);
+        assert!(index_line.is_match(lines[1]), "{text}");
+        let tree = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(lines[2], format!("tree: {}", tree.display()));
 
         for args in [&["--", "status"][..], &["-l", "status"]] {
             let out = run_in(&root, args);

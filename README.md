@@ -112,27 +112,23 @@ compiler/GHC/Driver/Main/Hsc.hs
   To search for one of these words, put `--` or any flag first:
   `fmgrep -- status`, `fmgrep -n status`.
 
-To see what an index holds:
+To see what a search here would read:
 
 ```console
 $ fmgrep status
-index: /home/me/ghc/.fmgrep
-format: 8
-store_docs: false
-num_docs: 26787
-num_bytes: 88781005
-bom_bytes: 6
-index_size_bytes: 76771936
-build_time_us: 1997204
-index_started_ns: 1763061773123456789
-shards: 1
-corpus_root: /home/me/ghc
+a search here uses the local index /home/me/ghc/.fmgrep
+index: format 8, built 2 d ago, 26787 files, 84.7 MiB of text, 73.2 MiB of index
+tree: /home/me/ghc
 ```
 
-`fmgrep status --json` prints the manifest as one JSON line, with the file
-list ([fields](docs/index-format.md#manifestbin)). `fmgrep status` reads
-the local index, whatever `FMGREP_SERVER` holds; `fmgrep --status` reports
-on a server.
+`fmgrep status [PATH]` names the index or the server that a search
+started in PATH (else the cwd) reads, by the same rule as a search:
+`--server ADDR`, else the index found by walking up, else
+`FMGREP_SERVER`. It fails where that search would fail, with the same
+words. `fmgrep status --json` prints one JSON object
+([fields](docs/index-format.md#fmgrep-status)): the manifest is under
+`.index.manifest`, with the file list. `fmgrep --status` prints a
+server's own status reply.
 
 For many searches in a row, keep the index loaded in a server:
 

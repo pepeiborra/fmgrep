@@ -111,10 +111,10 @@ enum Answer {
 #[derive(Serialize, Deserialize)]
 pub struct ServeStatus {
     pub store_docs: bool,
-    files: usize,
-    num_bytes: u64,
-    index_size_bytes: u64,
-    load_us: u64,
+    pub files: usize,
+    pub num_bytes: u64,
+    pub index_size_bytes: u64,
+    pub load_us: u64,
     /// The documents' directory: the tree, or the index directory holding `docs.shard`.
     pub root: String,
 }

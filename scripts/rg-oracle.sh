@@ -612,8 +612,8 @@ if [[ -n "$CORPUS_DIR" ]]; then
     IDX="$WORK/index"
     "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} --output "$IDX" "$CORPUS" >&2
     manifest_ok "$IDX"
-    jq -r '.files[]' "$WORK/manifest" | tr '\n' '\0' > "$WORK/all0"
-    echo "corpus=$CORPUS store_docs=$STORE_DOCS files=$(jq '.files | length' "$WORK/manifest")"
+    jq -r '.index.manifest.files[]' "$WORK/manifest" | tr '\n' '\0' > "$WORK/all0"
+    echo "corpus=$CORPUS store_docs=$STORE_DOCS files=$(jq '.index.manifest.files | length' "$WORK/manifest")"
     spawn_serve "$IDX" serve SERVER ADDR
 
     pair and t:HscEnv t:DynFlags
