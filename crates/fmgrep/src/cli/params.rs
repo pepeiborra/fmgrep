@@ -57,7 +57,8 @@ pub struct QueryParams {
     /// False for one file PATH, as in rg.
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub filename: bool,
-    /// Rendering modes: send the output as byte frames before the response.
+    /// Rendering modes: send one frame per output event (the corpus, a
+    /// term's start and end, each matching file) before the response.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
     /// `lines` and `only`: print rg's statistics after each term's output.
