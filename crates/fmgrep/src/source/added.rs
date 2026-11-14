@@ -76,10 +76,12 @@ impl super::Files {
     /// changed ignore input affects.
     pub fn discover(&self, files: &[String], lens: &[u64]) {
         let known = &*self.known;
+        let span = tracing::info_span!("discovery").entered();
         match &known.recorded {
             Some(recorded) => known.discover_recorded(recorded, files, lens),
             None => known.discover(&known.root, &known.root, files, lens),
         }
+        drop(span);
         known.complete.store(true, Ordering::Release);
         let n = known.added().live().count();
         if n > 0 && crate::verbose::verbose() {

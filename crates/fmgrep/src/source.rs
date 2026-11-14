@@ -534,6 +534,7 @@ impl Files {
         if !self.known.each_query && !journal::due(files.len()) {
             return false;
         }
+        let _span = tracing::info_span!("watchman").entered();
         let (root, recorded) = match self.askable(files) {
             Ok(askable) => askable,
             Err(why) if self.known.each_query => {
@@ -728,6 +729,7 @@ impl Files {
 
     /// Stat every doc; each newly gone one warns, in doc order.
     pub fn stat_all(&self, files: &[String], lens: &[u64]) {
+        let _span = tracing::info_span!("stat").entered();
         self.known.stat_all(files, lens, false);
     }
 
