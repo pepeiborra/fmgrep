@@ -11,7 +11,7 @@ use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::Ask;
-use crate::manifest::{Checked, DOCS_SHARD, Manifest};
+use crate::manifest::{Checked, Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
@@ -110,6 +110,10 @@ enum Answer {
 /// `status` result.
 #[derive(Serialize, Deserialize)]
 pub struct ServeStatus {
+    /// The manifest format of the served index; absent from a server older
+    /// than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
     pub store_docs: bool,
     files: usize,
     num_bytes: u64,
@@ -117,6 +121,9 @@ pub struct ServeStatus {
     load_us: u64,
     /// The documents' directory: the tree, or the index directory holding `docs.shard`.
     pub root: String,
+    /// The served commit: the commit whose files a `store_docs` index holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
 }
 
 /// What `serve` serves.
@@ -182,12 +189,14 @@ impl Served<'_> {
 
     fn status(&self) -> ServeStatus {
         ServeStatus {
+            format: Some(self.manifest.format),
             store_docs: self.manifest.store_docs,
             files: self.manifest.num_docs,
             num_bytes: self.manifest.num_bytes,
             index_size_bytes: self.manifest.index_size_bytes,
             load_us: self.docs.load_wall.as_micros() as u64,
             root: self.root.display().to_string(),
+            commit: self.manifest.commit.clone(),
         }
     }
 }
@@ -455,7 +464,8 @@ pub fn run_serve(
 }
 
 /// `status` of a server: `first`, then one `name: value` line per field of
-/// its reply, in the reply's order; under `--json` the reply.
+/// its reply, in the reply's order, `none` for a field it leaves out;
+/// under `--json` the reply.
 pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> Result<(), String> {
     if json {
         let reply = serde_json::to_string(s)
@@ -464,21 +474,28 @@ pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> 
     }
     // No `..`: a new field of the reply does not compile until it prints.
     let ServeStatus {
+        format,
         store_docs,
         files,
         num_bytes,
         index_size_bytes,
         load_us,
         root,
+        commit,
     } = s;
+    let or_none = |v: Option<String>| v.unwrap_or_else(|| "none".to_owned());
+    let format = or_none(format.map(|f| f.to_string()));
+    let commit = or_none(commit.as_ref().map(|c| format!("{} {}", c.vcs, c.id)));
     let lines = [
         first.to_owned(),
+        format!("format: {format}"),
         format!("store_docs: {store_docs}"),
         format!("files: {files}"),
         format!("num_bytes: {num_bytes}"),
         format!("index_size_bytes: {index_size_bytes}"),
         format!("load_us: {load_us}"),
         format!("root: {root}"),
+        format!("commit: {commit}"),
     ];
     lines.iter().try_for_each(|l| print::line(out, l))
 }

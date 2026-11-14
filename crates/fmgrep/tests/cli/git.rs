@@ -140,6 +140,33 @@ impl Sandbox {
     }
 }
 
+impl Sandbox {
+    /// `fmgrep serve <index> <flags>` over TCP: the server and its address.
+    pub fn serve(&self, index: &Path, flags: &[&str]) -> (crate::Server, String) {
+        let mut cmd = self.fmgrep(self.tmp.path());
+        cmd.arg("serve").arg(index).args(flags);
+        let mut server = crate::Server::spawn_cmd(&mut cmd);
+        let addr = server.addr();
+        assert!(!addr.is_empty(), "serve {} did not start", index.display());
+        (server, addr)
+    }
+
+    /// `status --server addr --json`: the reply of the server at `addr`.
+    pub fn status(&self, addr: &str) -> serde_json::Value {
+        let out = self.run(self.tmp.path(), &["status", "--server", addr, "--json"]);
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// `status --server addr`: one line per field of the reply.
+    pub fn status_lines(&self, addr: &str) -> Vec<String> {
+        let out = self.run(self.tmp.path(), &["status", "--server", addr]);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+}
+
 /// The `commit` a manifest records, as `status --json` prints it; plain
 /// `status` prints the same commit as the last line of the manifest's,
 /// before what the check of changes did, or none.
