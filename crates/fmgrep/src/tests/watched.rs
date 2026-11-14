@@ -80,7 +80,7 @@ pub(super) fn indexed(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, P
 /// [`indexed`], then the first search, which took a token.
 fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
     let (folder, output, daemon) = indexed(tmp, files)?;
-    query_it(&output, false, &["printk"]);
+    found(&daemon, &output, &["-l"], &["printk"]);
     assert_eq!(notes(), [ONCE]);
     assert_eq!(records(tmp).len(), 1, "the first token");
     daemon.sent();
@@ -100,6 +100,125 @@ pub(super) fn cannot(why: &str) -> String {
     format!("watchman cannot say what changed ({why}); checked every file")
 }
 
+/// What a search or a server says when its calls to watchman took longer
+/// than the product's 100 ms in all: it checked every file instead.
+pub(super) fn late() -> String {
+    cannot("watchman did not answer within 100 ms")
+}
+
+/// How many times the helpers below run a search or a query that came
+/// late, at most.
+pub(super) const TRIES: usize = 10;
+
+/// Says, past the test harness's capture, that try `n` came late, so that
+/// a run's log counts them.
+pub(super) fn came_late(n: usize) {
+    use std::io::Write as _;
+    let test = std::thread::current().name().unwrap_or("?").to_owned();
+    let _ = writeln!(std::io::stderr(), "{test}: try {n} came late");
+}
+
+/// The warnings not yet taken by [`notes`], put back after `kept`.
+pub(super) fn give_back(kept: Vec<String>, got: Vec<String>) {
+    NOTES.with_borrow(|n| {
+        let mut n = n.lock().unwrap();
+        let later = std::mem::replace(&mut *n, kept);
+        n.extend(got);
+        n.extend(later);
+    });
+}
+
+/// The files in this thread's cache directory, to put back.
+fn cached() -> Vec<(PathBuf, Vec<u8>)> {
+    let Some(dir) = CACHE.with_borrow(Clone::clone) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let paths = entries.map(|e| e.unwrap().path());
+    paths
+        .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+        .collect()
+}
+
+fn put_back(files: &[(PathBuf, Vec<u8>)]) {
+    for (path, _) in cached() {
+        if files.iter().all(|(p, _)| *p != path) {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    for (path, bytes) in files {
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+/// `run`, a search or a load that asks `daemon`, run again while its one
+/// warning is [`late`], at most [`TRIES`] times. On a loaded machine the
+/// product's 100 ms for its calls to watchman can run out; it then checks
+/// every file and says so, which a test of the ask does not mean to test.
+/// Each late try is undone: its records go back as they were, and
+/// [`Daemon::sent`] skips its commands. Returns the last try's answer, its
+/// warnings left for [`notes`], and the late tries' answers. `run` must
+/// not take the warnings itself. Fails, with the late warning, when every
+/// try came late.
+pub(super) fn tried<T>(daemon: &Daemon, mut run: impl FnMut() -> T) -> (T, Vec<T>) {
+    let kept = notes();
+    let mut lates = Vec::new();
+    loop {
+        let records = cached();
+        let from = daemon.fence();
+        let answer = run();
+        let got = notes();
+        if got != [late()] {
+            give_back(kept, got);
+            return (answer, lates);
+        }
+        assert!(
+            lates.len() + 1 < TRIES,
+            "{TRIES} tries came late: {}",
+            late()
+        );
+        daemon.skip_since(from);
+        put_back(&records);
+        lates.push(answer);
+        came_late(lates.len());
+    }
+}
+
+/// [`tried`], and every late try answered as the last one did.
+pub(super) fn on_time<T: PartialEq + std::fmt::Debug>(
+    daemon: &Daemon,
+    run: impl FnMut() -> T,
+) -> T {
+    let (answer, lates) = tried(daemon, run);
+    for late in lates {
+        assert_eq!(late, answer, "a late search answers the same");
+    }
+    answer
+}
+
+/// Whether a load of `index` re-checks only what watchman and the
+/// baseline name, by [`tried`]: a late load checks every file.
+fn replayed(daemon: &Daemon, index: &Path) -> bool {
+    let (replayed, lates) = tried(daemon, || replays(index));
+    assert!(lates.iter().all(|r| !r), "a late load checks every file");
+    replayed
+}
+
+/// [`printed`], by [`on_time`].
+fn found(daemon: &Daemon, index: &Path, flags: &[&str], terms: &[&str]) -> String {
+    on_time(daemon, || printed(index, flags, terms))
+}
+
+/// [`printed`], by [`tried`], for a change that only watchman names: a
+/// late search checks every file, which finds a binary file rewritten as
+/// text, or a directory moved in with an old stamp, only once a directory
+/// above it is listed (docs/index-format.md). Its answer may differ.
+fn named(daemon: &Daemon, index: &Path, flags: &[&str], terms: &[&str]) -> String {
+    tried(daemon, || printed(index, flags, terms)).0
+}
+
 #[test]
 fn a_first_search_takes_a_token_then_checks_every_file() {
     let tmp = tempfile::tempdir().unwrap();
@@ -108,7 +227,8 @@ fn a_first_search_takes_a_token_then_checks_every_file() {
     };
     assert!(records(tmp.path()).is_empty());
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let ab = "a.c\nb.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert_eq!(daemon.sent(), TAKES);
     assert_eq!(notes(), [ONCE]);
     let record = record(tmp.path());
@@ -126,7 +246,7 @@ fn a_first_search_takes_a_token_then_checks_every_file() {
     );
     assert_eq!(token["watch"], record["root"]);
     assert_eq!(record["baseline"], serde_json::json!(["b.c"]));
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     let asked = ["watch-list", "get-config", "clock", "clock", "query"];
     assert_eq!(daemon.sent(), asked, "the token question");
     assert!(notes().is_empty(), "the second search asks watchman");
@@ -135,13 +255,14 @@ fn a_first_search_takes_a_token_then_checks_every_file() {
 #[test]
 fn a_later_search_uses_the_socket_in_its_record() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, _daemon)) = watched(tmp.path(), AB) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
         return;
     };
     let before = clock(tmp.path());
     WATCHMAN.set(None);
     std::fs::write(folder.join("c.c"), b"printk\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
+    let ac = "a.c\nc.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ac);
     assert!(notes().is_empty(), "found through the record alone");
     assert_ne!(clock(tmp.path()), before, "a newer token");
 }
@@ -166,7 +287,8 @@ fn watchman_sock_set_to_another_socket_wins_over_the_record() {
     assert!(why.len() == 1 && why[0].starts_with(&line), "{why:?}");
     assert_eq!(record(tmp.path()), kept, "the record is kept as it was");
     WATCHMAN.set(Some(daemon.sock.clone()));
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nc.c\n");
+    let ac = "a.c\nc.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ac);
     assert!(notes().is_empty(), "the record serves again");
 }
 
@@ -262,24 +384,24 @@ fn index_and_a_search_start_watchman_and_ask_it_to_watch_the_tree() {
     assert_eq!(daemon.roots(), [root.to_str().unwrap()], "the watch");
     assert!(notes().is_empty() && records(tmp.path()).is_empty());
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
-    assert_eq!(
-        runs(tmp.path()).lines().count(),
-        2,
-        "the search runs it too"
-    );
+    // How many times each search ran the client.
+    let search = |why: &str, runs_it: usize| {
+        let before = runs(tmp.path()).lines().count();
+        let answer = printed(&output, &["-l"], &["printk"]);
+        let after = runs(tmp.path()).lines().count();
+        assert_eq!(after, before + runs_it, "{why}");
+        answer
+    };
+    let ab = "a.c\nb.c\n";
+    assert_eq!(on_time(&daemon, || search("the search runs it too", 1)), ab);
     assert_eq!(notes(), [ONCE]);
     assert_eq!(
         record(tmp.path())["token"]["sock"],
         daemon.sock.to_str().unwrap()
     );
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let kept = "the record has the socket";
+    assert_eq!(on_time(&daemon, || search(kept, 0)), ab);
     assert!(notes().is_empty(), "the token question");
-    assert_eq!(
-        runs(tmp.path()).lines().count(),
-        2,
-        "the record has the socket"
-    );
 }
 
 /// `index` asks watchman to watch the tree, does not wait for the reply
@@ -306,12 +428,13 @@ fn index_asks_for_a_watch_without_waiting_and_a_search_takes_the_token() {
     assert_eq!(daemon.roots(), [root.to_str().unwrap()], "the watch");
     assert!(records(tmp.path()).is_empty(), "no token");
     assert!(notes().is_empty(), "index prints nothing");
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), "a.c\n");
     assert_eq!(notes(), [ONCE]);
     assert_eq!(records(tmp.path()).len(), 1, "the first token");
     put(&folder, "b.c", b"printk now\n");
     daemon.sent();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let ab = "a.c\nb.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert_eq!(daemon.sent().last().unwrap(), "query");
     assert!(notes().is_empty());
 }
@@ -361,13 +484,14 @@ fn a_restarted_watchman_or_a_lost_watch_makes_a_new_baseline() {
     let before = clock(tmp.path());
     daemon.restart();
     daemon.watch(&folder);
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let ab = "a.c\nb.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert_eq!(notes(), [once], "restarted");
     let asked = ["watch-list", "get-config", "clock", "clock", "query"];
     assert_eq!(daemon.sent(), asked, "the token just taken is kept");
     assert_ne!(clock(tmp.path()), before);
     assert_eq!(baseline(tmp.path()), serde_json::json!(["b.c"]));
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert!(notes().is_empty(), "watched again: the record is used");
     daemon.unwatch(&folder);
     let before = clock(tmp.path());
@@ -390,14 +514,15 @@ fn a_restarted_watchman_or_a_lost_watch_makes_a_new_baseline() {
 #[test]
 fn a_rebuilt_index_does_not_use_the_old_record() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, _daemon)) = watched(tmp.path(), AB) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
         return;
     };
     let first = records(tmp.path());
     std::fs::remove_dir_all(&output).unwrap();
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
     index_it(&folder, &output, false);
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let ab = "a.c\nb.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     let once = format!(
         "checked every file once ({} was written for another index build); later searches ask \
          watchman",
@@ -413,13 +538,13 @@ fn a_rebuilt_index_does_not_use_the_old_record() {
 #[test]
 fn two_trees_or_two_indexes_keep_two_records() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, _daemon)) = watched(tmp.path(), AB) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
         return;
     };
     let other = tmp.path().join("idx2");
     index_it(&folder, &other, false);
-    query_it(&other, false, &["printk"]);
-    query_it(&output, false, &["printk"]);
+    found(&daemon, &other, &["-l"], &["printk"]);
+    found(&daemon, &output, &["-l"], &["printk"]);
     assert_eq!(records(tmp.path()).len(), 2);
 }
 
@@ -433,15 +558,15 @@ fn past_the_limit_the_record_holds_no_baseline() {
     for i in 0..65 {
         put(&folder, &format!("n{i}.c"), b"printk\n");
     }
-    let found = printed(&output, &["-l"], &["printk"]);
-    assert_eq!(found.lines().count(), 66);
+    let all = found(&daemon, &output, &["-l"], &["printk"]);
+    assert_eq!(all.lines().count(), 66);
     let over = "more than 64 paths may differ from the index; checked every file (re-run index)";
     assert_eq!(notes(), [over]);
     assert_eq!(baseline(tmp.path()), serde_json::Value::Null);
     let after = clock(tmp.path());
     assert_ne!(after, before);
     daemon.sent();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), found);
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), all);
     assert_eq!(notes(), [over], "every search, until re-index");
     assert_eq!(daemon.sent(), TAKES, "no token question");
     assert_ne!(clock(tmp.path()), after);
@@ -451,7 +576,7 @@ fn past_the_limit_the_record_holds_no_baseline() {
 fn an_unwritable_cache_says_so_and_still_answers() {
     use std::os::unix::fs::PermissionsExt as _;
     let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, _daemon)) = indexed(tmp.path(), AB) else {
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
         return;
     };
     let cache = tmp.path().join("cache");
@@ -459,7 +584,7 @@ fn an_unwritable_cache_says_so_and_still_answers() {
     let mode = |m: u32| std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(m));
     mode(0o500).unwrap();
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
-    let answer = printed(&output, &["-l"], &["printk"]);
+    let answer = found(&daemon, &output, &["-l"], &["printk"]);
     mode(0o755).unwrap();
     assert_eq!(answer, "a.c\nb.c\n");
     let got = notes();
@@ -475,7 +600,7 @@ fn an_unwritable_cache_says_so_and_still_answers() {
 #[test]
 fn a_search_writes_nothing_into_the_index() {
     let tmp = tempfile::tempdir().unwrap();
-    let Some((folder, output, _daemon)) = indexed(tmp.path(), AB) else {
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
         return;
     };
     let listing = |dir: &Path| {
@@ -492,8 +617,10 @@ fn a_search_writes_nothing_into_the_index() {
     };
     let before = listing(&output);
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    for _ in 0..2 {
+        let ab = "a.c\nb.c\n";
+        assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
+    }
     assert_eq!(listing(&output), before, "the index directory is as built");
     assert_eq!(records(tmp.path()).len(), 1);
 }
@@ -564,7 +691,8 @@ fn a_tree_on_a_network_filesystem_takes_no_token_and_checks_every_file() {
     }
     // FUSE (bindfs, EdenFS) passes events on: a token.
     MOUNTS.set(Some(mounted(tmp.path(), &root, "fuse.bindfs")));
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let ab = "a.c\nb.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert_eq!(notes(), [ONCE]);
     assert_eq!(daemon.sent(), TAKES);
     assert_eq!(baseline(tmp.path()), serde_json::json!(["b.c"]));
@@ -622,14 +750,16 @@ fn the_baseline_carries_what_differs_between_searches() {
     };
     std::fs::write(folder.join("a.c"), b"printk edited\n").unwrap();
     std::fs::write(folder.join("n.c"), b"printk new\n").unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nn.c\n");
+    let an = "a.c\nn.c\n";
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), an);
     let asked = ["watch-list", "get-config", "clock", "clock", "query"];
     assert_eq!(daemon.sent(), asked);
     assert_eq!(baseline(tmp.path()), serde_json::json!(["a.c", "n.c"]));
     std::fs::remove_file(folder.join("n.c")).unwrap();
-    assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:1\n");
+    assert_eq!(found(&daemon, &output, &["-c"], &["printk"]), "a.c:1\n");
     assert_eq!(baseline(tmp.path()), serde_json::json!(["a.c"]));
-    assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:1\n", "carried");
+    let carried = found(&daemon, &output, &["-c"], &["printk"]);
+    assert_eq!(carried, "a.c:1\n", "carried");
     assert_eq!(baseline(tmp.path()), serde_json::json!(["a.c"]));
     assert!(notes().is_empty());
 }
@@ -638,25 +768,26 @@ fn the_baseline_carries_what_differs_between_searches() {
 fn a_new_ignore_file_deep_in_the_tree_hides_its_files_from_every_later_search() {
     let tmp = tempfile::tempdir().unwrap();
     let docs: &[(&str, &[u8])] = &[("a.c", b"printk\n"), ("x/y/z/k.c", b"printk\n")];
-    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), docs) else {
         return;
     };
+    let search = || found(&daemon, &output, &["-l"], &["printk"]);
     let hidden = serde_json::json!(["x/y/z/.ignore", "x/y/z/k.c"]);
     put(&folder, "x/y/z/.ignore", b"k.c\n");
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(search(), "a.c\n");
     assert_eq!(baseline(tmp.path()), hidden, "the ignore file is kept");
     for _ in 0..2 {
-        assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+        assert_eq!(search(), "a.c\n");
     }
     // Before the first search: the stat pass finds it in its listed dir.
     for record in records(tmp.path()) {
         std::fs::remove_file(record).unwrap();
     }
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(search(), "a.c\n");
     assert_eq!(baseline(tmp.path()), hidden);
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(search(), "a.c\n");
     std::fs::remove_file(folder.join("x/y/z/.ignore")).unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nx/y/z/k.c\n");
+    assert_eq!(search(), "a.c\nx/y/z/k.c\n");
     assert_eq!(baseline(tmp.path()), serde_json::json!([]));
     notes();
 }
@@ -684,32 +815,30 @@ fn a_changed_ignore_file_warns_at_every_load() {
         ("b.c", b"printk\n"),
         ("x/y/z/k.c", b"printk\n"),
     ];
-    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), docs) else {
         return;
     };
-    assert!(replays(&output));
+    let search = || found(&daemon, &output, &["-l"], &["printk"]);
+    assert!(replayed(&daemon, &output));
     assert!(notes().is_empty(), "no ignore file changed");
     put(&folder, ".ignore", b"*.o\nb.c\n");
     put(&folder, "x/y/z/.ignore", b"k.c\n");
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\n");
+    assert_eq!(search(), "a.c\n");
     notes();
     for _ in 0..2 {
-        assert!(replays(&output));
+        assert!(replayed(&daemon, &output));
         assert_eq!(notes(), [ignores_changed(2)]);
     }
     std::fs::remove_file(folder.join("x/y/z/.ignore")).unwrap();
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nx/y/z/k.c\n");
+    assert_eq!(search(), "a.c\nx/y/z/k.c\n");
     notes();
-    assert!(replays(&output));
+    assert!(replayed(&daemon, &output));
     assert_eq!(notes(), [ignores_changed(1)], "the edited one");
     put(&folder, ".ignore", b"*.o\n");
     backdate(&folder);
-    assert_eq!(
-        printed(&output, &["-l"], &["printk"]),
-        "a.c\nb.c\nx/y/z/k.c\n"
-    );
+    assert_eq!(search(), "a.c\nb.c\nx/y/z/k.c\n");
     notes();
-    assert!(replays(&output));
+    assert!(replayed(&daemon, &output));
     assert!(notes().is_empty(), "both as indexed");
 }
 
@@ -722,12 +851,13 @@ fn a_dir_swapped_in_is_listed_down_to_its_files() {
         ("a/sub/f.c", b"printk old\n"),
         ("b/sub/f.c", b"printk newer\n"),
     ];
-    let Some((folder, output, _daemon)) = watched(tmp.path(), docs) else {
+    let Some((folder, output, daemon)) = watched(tmp.path(), docs) else {
         return;
     };
     std::fs::remove_dir_all(folder.join("a")).unwrap();
     std::fs::rename(folder.join("b"), folder.join("a")).unwrap();
-    assert_eq!(printed(&output, &["-l"], &["newer"]), "a/sub/f.c\n");
+    let newer = named(&daemon, &output, &["-l"], &["newer"]);
+    assert_eq!(newer, "a/sub/f.c\n");
     assert_eq!(
         baseline(tmp.path()),
         serde_json::json!(["a/sub/f.c", "b/sub/f.c"])
@@ -748,7 +878,7 @@ fn named_changes_answer_like_a_fresh_index() {
         ("sub/mw/m.c", b"printk moved\n"),
         ("sub/s.c", b"printk deleted\n"),
     ];
-    let Some((folder, stale, _daemon)) = watched(tmp.path(), docs) else {
+    let Some((folder, stale, daemon)) = watched(tmp.path(), docs) else {
         return;
     };
     let at = |rel: &str| folder.join(rel);
@@ -760,9 +890,9 @@ fn named_changes_answer_like_a_fresh_index() {
     put(&folder, "kb/k.dat", b"printk text now\n");
     put(&folder, "ig/y.c", b"printk still ignored\n");
     std::fs::rename(at("r.c"), at("r2.c")).unwrap();
-    assert!(replays(&stale), "{:?}", notes());
+    assert!(replayed(&daemon, &stale), "{:?}", notes());
     let want = "a.c\nb.c\nkb/k.dat\nnew/deep/n.c\nr2.c\nsub/keep.c\nsub/mv2/m.c\n";
-    assert_eq!(printed(&stale, &["-l"], &["printk"]), want);
+    assert_eq!(named(&daemon, &stale, &["-l"], &["printk"]), want);
     put(&folder, "kb/k.dat", b"printk\0binary");
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
@@ -807,7 +937,7 @@ fn edits_before_the_first_search_and_between_searches_answer_like_a_fresh_index(
     std::fs::rename(at("p/cp"), at("p/q")).unwrap();
     put(&folder, "x/y/z/.ignore", b"k.c\n");
     let want = "a.c\nb.c\ng.gen\nmv2/m.c\nnew/deep/n.c\np/q/r.c\nsub/s.c\nsub/t.c\n";
-    assert_eq!(printed(&stale, &["-l"], &["printk"]), want);
+    assert_eq!(found(&daemon, &stale, &["-l"], &["printk"]), want);
     assert_eq!(notes(), [ONCE]);
     let differ = [
         "a.c",
@@ -826,7 +956,7 @@ fn edits_before_the_first_search_and_between_searches_answer_like_a_fresh_index(
     // The second search asks the token question; watchman reports what
     // it saw after the token, which the stat pass found already.
     daemon.sent();
-    assert!(replays(&stale), "{:?}", notes());
+    assert!(replayed(&daemon, &stale), "{:?}", notes());
     assert_eq!(daemon.sent().last().unwrap(), "query");
     assert_eq!(baseline(tmp.path()), serde_json::json!(differ));
     answers_like(&stale, &fresh("fresh1"), &terms, &["printk", "now"]);
@@ -836,7 +966,7 @@ fn edits_before_the_first_search_and_between_searches_answer_like_a_fresh_index(
     put(&folder, "new/deep/m.c", b"deep printk two\n");
     std::fs::rename(at("mv2"), at("mv3")).unwrap();
     put(&folder, ".ignore", b"*.gen\nb.c\n");
-    assert!(replays(&stale), "{:?}", notes());
+    assert!(replayed(&daemon, &stale), "{:?}", notes());
     answers_like(&stale, &fresh("fresh2"), &terms, &["printk", "now", "deep"]);
     let want = "a.c\nmv3/m.c\nnew/deep/m.c\nnew/deep/n.c\np/q/r.c\nsub/s.c\n";
     assert_eq!(
@@ -865,12 +995,12 @@ fn watchman_answers_like_the_stat_pass() {
         put(&folder, rel, bytes);
     }
     put(&outside, "t/deep/x.c", b"deep printk\n");
-    let Some(_daemon) = live(tmp.path(), &folder) else {
+    let Some(daemon) = live(tmp.path(), &folder) else {
         return;
     };
     let stale = tmp.path().join("idx");
     index_it(&folder, &stale, false);
-    query_it(&stale, false, &["printk"]);
+    found(&daemon, &stale, &["-l"], &["printk"]);
     assert_eq!(notes(), [ONCE], "the first search takes the token");
     put(&folder, ".ignore", b"a2.c\n");
     put(&folder, "a.c", b"printk one\nprintk printk\n");
@@ -882,13 +1012,13 @@ fn watchman_answers_like_the_stat_pass() {
     std::fs::rename(folder.join("mw"), folder.join("mv2")).unwrap();
     std::fs::rename(folder.join("r.c"), folder.join("r2.c")).unwrap();
     std::fs::remove_file(folder.join("d.c")).unwrap();
-    assert!(replays(&stale), "{:?}", notes());
+    assert!(replayed(&daemon, &stale), "{:?}", notes());
     let want = "a.c\nb.c\nig.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
-    assert_eq!(printed(&stale, &["-l"], &["printk"]), want);
+    assert_eq!(named(&daemon, &stale, &["-l"], &["printk"]), want);
     put(&folder, "kb/k.dat", b"printk\0binary");
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
-    assert!(replays(&stale));
+    assert!(replayed(&daemon, &stale));
     let terms = ["printk", "aa", "deep", "now"];
     answers_like(
         &stale,
@@ -905,24 +1035,28 @@ fn watchman_skips_the_stat_pass() {
         tmp.path(),
         &[("a.c", b"printk hello printk"), ("b.c", b"nothing here")],
     );
-    let Some(_daemon) = live(tmp.path(), &folder) else {
+    let Some(daemon) = live(tmp.path(), &folder) else {
         return;
     };
     let output = tmp.path().join("idx");
     index_it(&folder, &output, false);
-    query_it(&output, false, &["printk"]);
+    found(&daemon, &output, &["-l"], &["printk"]);
     assert_eq!(notes(), [ONCE], "the first search takes the token");
     let mut stamps = std::fs::read(output.join("docs.stamps")).unwrap();
     stamps[0] ^= 1;
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
     let manifest = read_manifest(&output).unwrap();
-    let mut docs =
-        crate::fetch::DocStore::open(&output, &manifest, None, crate::fetch::Ask::Load).unwrap();
+    let ((mut docs, replayed), lates) = tried(&daemon, || {
+        let ask = crate::fetch::Ask::Load;
+        let docs = crate::fetch::DocStore::open(&output, &manifest, None, ask).unwrap();
+        let replayed = docs.replay(manifest.files.checked().unwrap());
+        (docs, replayed)
+    });
     assert!(
-        docs.replay(manifest.files.checked().unwrap()),
-        "{:?}",
-        notes()
+        lates.iter().all(|(_, r)| !r),
+        "a late load checks every file"
     );
+    assert!(replayed, "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");
     docs.stat_all(manifest.files.checked().unwrap());

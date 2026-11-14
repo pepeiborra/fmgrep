@@ -483,20 +483,29 @@ fn each_served_query_sees_the_changes_made_before_it() {
         return;
     };
     let (addr, server) = spawn_server(&index, &[]);
-    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [5, 5]);
+    // What the server's start said, if it took no token.
+    let notes = super::watched::notes();
+    let said = &mut notes
+        .into_iter()
+        .find(|n| n.starts_with("watchman cannot say"));
+    use super::served::served_on_time as on_time;
+    let ask = |said: &mut Option<String>, terms: &[&str]| {
+        on_time(&daemon, said, || served_totals(&addr, terms)).0
+    };
+    assert_eq!(ask(said, &["printk", "/pr[i1]ntk/"]), [5, 5]);
     std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
-    assert_eq!(served_totals(&addr, &["printk"]), [4], "an edit");
+    assert_eq!(ask(said, &["printk"]), [4], "an edit");
     std::fs::create_dir_all(corpus.join("new/deep")).unwrap();
     std::fs::write(corpus.join("new/deep/n.c"), b"printk after printk\n").unwrap();
     std::fs::write(corpus.join("bin.dat"), b"printk\0").unwrap();
-    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [6, 6]);
-    let (_, listed) = client(&addr, &["-l", "--", "printk"]).unwrap();
-    assert_eq!(listed, "a.c\nab.c\nnew/deep/n.c\n");
+    assert_eq!(ask(said, &["printk", "/pr[i1]ntk/"]), [6, 6]);
+    let list = || client(&addr, &["-l", "--", "printk"]).unwrap().1;
+    assert_eq!(on_time(&daemon, said, list).0, "a.c\nab.c\nnew/deep/n.c\n");
     std::fs::remove_file(corpus.join("ab.c")).unwrap();
     std::fs::remove_file(corpus.join("a.c")).unwrap();
-    assert_eq!(served_totals(&addr, &["printk"]), [2], "deletes");
+    assert_eq!(ask(said, &["printk"]), [2], "deletes");
     std::fs::write(corpus.join("ab.c"), b"printk back\n").unwrap();
-    assert_eq!(served_totals(&addr, &["printk"]), [3], "back");
+    assert_eq!(ask(said, &["printk"]), [3], "back");
     assert_eq!(daemon.sent().last().unwrap(), "query");
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
@@ -531,7 +540,8 @@ fn serve_no_watch_asks_watchman_nothing() {
         return;
     };
     ASK_FROM.set(Some(0));
-    assert_eq!(printed(&index, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let search = || printed(&index, &["-l"], &["printk"]);
+    assert_eq!(super::watched::on_time(&daemon, search), "a.c\nb.c\n");
     assert!(!daemon.sent().is_empty(), "a search asks");
     let record = |dir: &Path| {
         let files = std::fs::read_dir(dir.join("cache")).unwrap();
@@ -648,13 +658,24 @@ fn serve_starts_while_watchman_hangs() {
         [late],
         "once: the start and the query"
     );
+    // Queries the test does not mean to be late; the server said `late`.
+    let mut said = Some(late.to_owned());
+    let mut ask = |terms: &[&str]| {
+        let totals = || served_totals(&addr, terms);
+        super::served::served_on_time(&daemon, &mut said, totals).0
+    };
     std::fs::write(corpus.join("c.c"), b"printk\n").unwrap();
-    assert_eq!(served_totals(&addr, &["printk"]), [4]);
+    assert_eq!(ask(&["printk"]), [4]);
     let takes = super::watched::TAKES;
     assert_eq!(daemon.sent(), takes, "a first token, nothing more");
+    let once = "checked every file once (no token from an earlier query); the next query asks \
+                watchman";
+    assert_eq!(super::watched::notes(), [once]);
     std::fs::write(corpus.join("d.c"), b"printk\n").unwrap();
-    assert_eq!(served_totals(&addr, &["printk"]), [5]);
+    assert_eq!(ask(&["printk"]), [5]);
     assert_eq!(daemon.sent(), [&takes[..], &["query"]].concat(), "asked");
+    let again = "each query re-checks only what watchman reports again";
+    assert_eq!(super::watched::notes(), [again]);
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }
