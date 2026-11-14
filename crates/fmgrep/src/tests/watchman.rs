@@ -31,6 +31,12 @@ pub(crate) struct Daemon {
     guard: Option<Child>,
     /// How much of the log [`Self::sent`] has read.
     read: Cell<usize>,
+    /// The connections whose commands [`Self::sent`] skips: from one
+    /// [`Self::fence`] to a later one, both included. The daemon numbers
+    /// its connections from 1 again at each start.
+    skipped: RefCell<Vec<(u64, u64)>>,
+    /// The fence taken by [`Self::hang`], until [`Self::resume`].
+    hung: Cell<Option<u64>>,
     /// Daemons take turns: on a loaded machine, several at once can answer
     /// later than a search waits.
     _turn: MutexGuard<'static, ()>,
@@ -77,6 +83,8 @@ impl Daemon {
             child: RefCell::new(None),
             guard: None,
             read: Cell::new(0),
+            skipped: RefCell::new(Vec::new()),
+            hung: Cell::new(None),
             _turn: turn,
         };
         daemon.spawn();
@@ -89,6 +97,8 @@ impl Daemon {
 
     fn spawn(&mut self) {
         let _ = std::fs::remove_file(&self.sock);
+        self.skipped.get_mut().clear();
+        self.hung.set(None);
         let arg = |flag: &str, name: &str| format!("--{flag}={}", self.file(name).display());
         let out = std::fs::OpenOptions::new()
             .create(true)
@@ -179,12 +189,54 @@ impl Daemon {
     }
 
     /// The daemon stops in place: it accepts connections and answers none.
+    /// Call it while the test sends nothing else.
     pub(crate) fn hang(&self) {
+        self.hung.set(Some(self.fence()));
         self.signal("-STOP");
     }
 
+    /// The daemon runs again. It then runs the commands sent while it was
+    /// stopped, which their senders gave up on, each on a thread of its
+    /// own and at no set time: [`Self::sent`] skips them.
     pub(crate) fn resume(&self) {
         self.signal("-CONT");
+        let from = self.hung.take().expect("resume follows hang");
+        self.skip_since(from);
+    }
+
+    /// The number the daemon gives a connection made now: a `get-pid`
+    /// command, sent now and found in the log. The daemon numbers its
+    /// connections in the order it accepts them, and accepts them in the
+    /// order they were made.
+    pub(crate) fn fence(&self) -> u64 {
+        let me = format!(":pid={}] dispatch_command: get-pid", std::process::id());
+        let probes = || -> Vec<u64> {
+            let log = std::fs::read(self.file("log")).unwrap();
+            String::from_utf8_lossy(&log)
+                .lines()
+                .filter(|line| line.ends_with(&me))
+                .map(|line| client(line).unwrap_or_else(|| panic!("no client number: {line}")))
+                .collect()
+        };
+        let before = probes().len();
+        self.exchange(&json!(["get-pid"]))
+            .unwrap_or_else(|e| panic!("get-pid: {e}; {}", self.state()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let after = probes();
+            if after.len() > before {
+                return after[after.len() - 1];
+            }
+            assert!(Instant::now() < deadline, "no get-pid line in the log");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// [`Self::sent`] skips the commands of the connections made since
+    /// `from`, a [`Self::fence`], up to now.
+    pub(crate) fn skip_since(&self, from: u64) {
+        let to = self.fence();
+        self.skipped.borrow_mut().push((from, to));
     }
 
     /// One command's reply, or its error. A command that gets no reply
@@ -244,11 +296,19 @@ impl Daemon {
     }
 
     /// The commands that this test process sent since the last call, in
-    /// order, as the daemon logged them. A `version` command marks the
-    /// end, as the log is written behind the replies.
+    /// order, as the daemon logged them, but for those [`Self::skip_since`]
+    /// names and the fences. A `version` command marks the end, as the log
+    /// is written behind the replies.
     pub(crate) fn sent(&self) -> Vec<String> {
         self.call(&json!(["version"])).unwrap();
         let me = format!(":pid={}] dispatch_command: ", std::process::id());
+        let skipped = |line: &str| {
+            let n = client(line);
+            let skipped = self.skipped.borrow();
+            skipped
+                .iter()
+                .any(|&(from, to)| n.is_some_and(|n| from <= n && n <= to))
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let log = std::fs::read(self.file("log")).unwrap();
@@ -263,19 +323,27 @@ impl Daemon {
                 let Some((_, name)) = line.trim_end().split_once(&me) else {
                     continue;
                 };
-                if name.ends_with("(completed)") {
+                if name.ends_with("(completed)") || name == "get-pid" {
                     continue;
                 }
                 if name == "version" {
                     self.read.set(self.read.get() + at);
                     return names;
                 }
-                names.push(name.to_owned());
+                if !skipped(line) {
+                    names.push(name.to_owned());
+                }
             }
             assert!(Instant::now() < deadline, "no version line in the log");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// The connection number in a log line `... [client=<n>:...] ...`.
+fn client(line: &str) -> Option<u64> {
+    let (_, rest) = line.split_once("[client=")?;
+    rest.split(':').next()?.parse().ok()
 }
 
 impl Drop for Daemon {

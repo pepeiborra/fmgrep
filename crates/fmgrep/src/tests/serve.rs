@@ -650,10 +650,11 @@ fn serve_starts_while_watchman_hangs() {
     );
     std::fs::write(corpus.join("c.c"), b"printk\n").unwrap();
     assert_eq!(served_totals(&addr, &["printk"]), [4]);
-    assert_eq!(daemon.sent().last().unwrap(), "clock");
+    let takes = super::watched::TAKES;
+    assert_eq!(daemon.sent(), takes, "a first token, nothing more");
     std::fs::write(corpus.join("d.c"), b"printk\n").unwrap();
     assert_eq!(served_totals(&addr, &["printk"]), [5]);
-    assert_eq!(daemon.sent().last().unwrap(), "query");
+    assert_eq!(daemon.sent(), [&takes[..], &["query"]].concat(), "asked");
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }
