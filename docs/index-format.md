@@ -8,7 +8,8 @@ file holds and the rules a reader relies on.
 `fmgrep index PATH` writes `PATH/.fmgrep/` (`--output DIR` elsewhere). The
 directory must not already exist. `manifest.bin` is written last, so an
 interrupted build leaves nothing queryable, and a failed build removes the
-directory.
+directory. It is written to `manifest.bin.tmp`, which is synced and then
+renamed to `manifest.bin`: a crash leaves the whole manifest or none.
 
 | file | present | holds |
 |---|---|---|
