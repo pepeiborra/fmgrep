@@ -28,6 +28,7 @@
 
 use crate::marks::{Marks, section_bytes};
 use crate::packed::Packed;
+use crate::row::BwtPos;
 use crate::wavelet::{self, MAX_DEPTH, MAX_STARTS, Params, Shape, WaveletMatrix, depth_for};
 use crate::{DOC_END, Error, MAX_TEXT_BYTES};
 use zerocopy::little_endian::{U32, U64};
@@ -227,9 +228,23 @@ impl Header {
         }
     }
 
-    /// The BWT's wavelet levels in `bytes`.
-    pub fn bwt<'a>(&'a self, bytes: &'a [u8]) -> WaveletMatrix<'a> {
+    /// The BWT's wavelet levels in `bytes`. Private: they take a plain
+    /// position, so `View` reads them through [`Header::rank`] and
+    /// [`Header::access_rank`], which take a `BwtPos`.
+    fn bwt<'a>(&'a self, bytes: &'a [u8]) -> WaveletMatrix<'a> {
         WaveletMatrix::new(bytes, &self.wavelet)
+    }
+
+    /// Occurrences of `code` in the BWT before `at`.
+    #[inline]
+    pub fn rank(&self, bytes: &[u8], code: u8, at: BwtPos) -> usize {
+        self.bwt(bytes).rank(code, at.get())
+    }
+
+    /// The BWT code at `at` and its occurrences before it.
+    #[inline]
+    pub fn access_rank(&self, bytes: &[u8], at: BwtPos) -> (u8, usize) {
+        self.bwt(bytes).access_rank(at.get())
     }
 
     /// Most LF steps from a row to a marked one.

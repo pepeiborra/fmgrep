@@ -494,8 +494,8 @@ fn bwt_matches_naive_rotation_sort() {
         let got: Vec<Option<u8>> = (0..=text.len())
             .map(|row| {
                 (row != index.header.sentinel_row).then(|| {
-                    let at = view.bwt_pos(Row::new(row)).get();
-                    byte_of[usize::from(view.bwt().access_rank(at).0)]
+                    let at = view.bwt_pos(Row::new(row));
+                    byte_of[usize::from(view.header.access_rank(view.bytes, at).0)]
                 })
             })
             .collect();
