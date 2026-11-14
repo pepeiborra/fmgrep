@@ -15,19 +15,21 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::checkout::{changes, short};
+use super::checkout::{Local, changes, resolve, short};
 use super::params::MAX_SKIP;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
 
 /// The skip list of the checkout at `top` against the served commit
-/// `commit`, or why the checkout cannot be compared. Where watchman cannot
+/// `commit`, and the files of it this client searches; or why the
+/// checkout cannot be compared. A search that asked git says so only
+/// once the client can search the files it lists. Where watchman cannot
 /// say what changed, git is asked on every search, and the warning says so
 /// once for each reason and served commit, until watchman answers (always
 /// under `FMGREP_VERBOSE`).
-pub fn skip_list(top: &Path, commit: &str) -> Result<Vec<String>, String> {
+pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), String> {
     let of = Of::commit(commit);
-    let (token, _why) = match remembered(top, &of) {
+    let (token, why) = match remembered(top, &of) {
         Remembered::Since {
             token,
             baseline,
@@ -36,7 +38,8 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         } => match since(top, baseline, &extra, changed) {
             Ok(skip) => {
                 remember(top, &of, token, skip.clone(), extra);
-                return Ok(skip);
+                let local = resolve(top, &skip, commit)?;
+                return Ok((skip, local));
             }
             Err(why) => (token, why),
         },
@@ -44,6 +47,8 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         Remembered::Cannot(why) => {
             let asked = Instant::now();
             let skip = changes(top, commit)?;
+            let took = asked.elapsed();
+            let local = resolve(top, &skip, commit)?;
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
@@ -51,13 +56,13 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<Vec<String>, String> {
                     "watchman cannot say what changed ({why}); asked git what differs from the \
                      served commit {} (took {})",
                     short(commit),
-                    crate::verbose::Us(asked.elapsed().as_secs_f64() * 1e6)
+                    crate::verbose::Us(took.as_secs_f64() * 1e6)
                 ));
             }
             if let Some(keep) = said {
                 keep();
             }
-            return Ok(skip);
+            return Ok((skip, local));
         }
     };
     // The inputs before git reads them: one that moves while git runs
@@ -65,15 +70,28 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     // once it is done: when they differ, a file may have come to be named
     // after the first list, and its stamp is in no list; no record is
     // saved.
+    let asked = Instant::now();
     let listed = settings(top);
     let git = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
     let skip = changes(top, commit)?;
-    if settings(top) == listed {
+    let same = settings(top) == listed;
+    let took = asked.elapsed();
+    if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env()});
         remember(top, &of, token, skip.clone(), extra);
     }
-    Ok(skip)
+    let local = resolve(top, &skip, commit)?;
+    let next = match same {
+        true => "later searches ask watchman",
+        false => "git's config files changed while git ran; the next search asks git again",
+    };
+    super::warn(&format!(
+        "asked git what differs from the served commit {} ({why}; took {}); {next}",
+        short(commit),
+        crate::verbose::Us(took.as_secs_f64() * 1e6)
+    ));
+    Ok((skip, local))
 }
 
 /// The baseline plus what watchman says `changed`, when the variables

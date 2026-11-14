@@ -93,6 +93,7 @@ fn later_searches_ask_watchman_not_git() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
     assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
+    asked_again(&r, &out, "no record of an earlier search");
     let c = &r.client;
     let changes: [fn(&Remote, &Path); 7] = [
         |r, c| {
@@ -129,6 +130,25 @@ fn later_searches_ask_watchman_not_git() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert!(runs.iter().any(|r| r.contains("diff-tree")), "{runs:?}");
     assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
+    let head = std::fs::canonicalize(c.join(".git/HEAD")).unwrap();
+    let index = std::fs::canonicalize(c.join(".git/index")).unwrap();
+    let text = stderr(&out);
+    let moved = [&head, &index].map(|p| format!("({} changed;", p.display()));
+    assert!(moved.iter().any(|m| text.contains(m)), "{text}");
+}
+
+/// The one line of a search that asked git for a new baseline, `why`.
+fn asked_again(r: &Remote, out: &Output, why: &str) {
+    let text = stderr(out);
+    let want = format!(
+        "warning: asked git what differs from the served commit {} ({why}; took ",
+        &r.commit[..7]
+    );
+    assert!(
+        text.starts_with(&want) && text.ends_with("); later searches ask watchman\n"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
 }
 
 /// A restarted daemon, or another one, cannot say what changed since the
@@ -148,6 +168,9 @@ fn a_restarted_or_another_daemon_asks_git_again() {
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\n");
+    let why = "watchman restarted, added the watch again or pruned deleted files since the last \
+               search";
+    asked_again(&r, &out, why);
     let mut other = r.s.fmgrep(&r.client);
     let out = other
         .env("WATCHMAN_SOCK", r.s.path("no-daemon"))
@@ -243,7 +266,7 @@ fn the_line_returns_once_watchman_has_answered_and_gone() {
     assert!(search(&none).starts_with(ASKED_GIT));
     assert_eq!(search(&none), "");
     let (out, _) = logged(&r, &log, &path, &["-l", "printk"]);
-    assert_eq!(stderr(&out), "", "a new baseline says nothing");
+    asked_again(&r, &out, "no record of an earlier search");
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
     assert_eq!((stderr(&out), runs), (String::new(), Vec::new()));
     assert!(search(&none).starts_with(ASKED_GIT), "watchman went away");
@@ -351,8 +374,8 @@ fn a_config_file_without_settings_is_stamped() {
 
 /// A file that `include.path` names in place of another while git runs
 /// for the baseline: the client asks git for its settings again once git
-/// is done, and saves no record when they differ; the next search asks
-/// git again and sees what that file sets.
+/// is done, saves no record when they differ, and says so; the next
+/// search asks git again and sees what that file sets.
 #[test]
 fn a_config_file_named_while_git_runs_is_seen() {
     let r = Remote::new(&FILES);
@@ -384,12 +407,15 @@ fn a_config_file_named_while_git_runs_is_seen() {
         runs.iter().any(|r| r.contains("status")) && text.starts_with(converts),
         "{text}"
     );
+    let text = stderr(&first);
+    let tail = "; git's config files changed while git ran; the next search asks git again\n";
+    assert!(text.ends_with(tail), "{text}");
 }
 
 /// The variables that choose which config and attributes files git reads
 /// are kept in the record: a search under another value of one asks git
-/// again, and one that turns on a system config file that sets
-/// `core.autocrlf` falls back with the warning.
+/// again and names it, and one that turns on a system config file that
+/// sets `core.autocrlf` falls back with the warning.
 #[test]
 fn another_choice_of_config_files_asks_git_again() {
     let r = Remote::new(&FILES);
@@ -431,7 +457,9 @@ fn another_choice_of_config_files_asks_git_again() {
         ("GIT_ATTR_SOURCE", "HEAD"),
     ] {
         env.push((var, value));
-        assert!(search(&env).0, "{var}");
+        let (asked, out) = search(&env);
+        assert!(asked, "{var}");
+        asked_again(&r, &out, &format!("{var} changed"));
         assert!(!search(&env).0, "{var}: the new record");
     }
 }
