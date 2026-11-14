@@ -1,0 +1,357 @@
+//! Which commit a `--store-docs` index records as served, on real git
+//! repositories.
+
+use crate::git::{Sandbox, commit_of};
+
+const FILES: [(&str, &str); 3] = [
+    ("a.c", "printk a\n"),
+    ("dir/b.c", "printk b\n"),
+    ("dir/c.h", "printk c\n"),
+];
+
+/// The one `note:` line of an index build's stderr.
+fn note(stderr: &str) -> String {
+    let notes: Vec<&str> = stderr.lines().filter(|l| l.starts_with("note:")).collect();
+    assert_eq!(notes.len(), 1, "{stderr}");
+    notes[0].to_owned()
+}
+
+#[test]
+fn a_clean_checkout_records_its_head() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (index, stderr) = s.index(&repo, "idx");
+    let head = s.head(&repo);
+    assert_eq!(
+        note(&stderr),
+        format!("note: the index holds commit {head}")
+    );
+    assert_eq!(commit_of(&index), Some(head));
+}
+
+/// A change made to a checkout.
+type Change = fn(&Sandbox, &std::path::Path);
+
+#[test]
+fn a_changed_checkout_records_no_commit() {
+    let s = Sandbox::new();
+    let cases: [(&str, Change, &str); 7] = [
+        (
+            "edited",
+            |s, repo| s.write(repo, &[("a.c", "printk edited\n")]),
+            "a.c differs from HEAD",
+        ),
+        (
+            "untracked",
+            |s, repo| s.write(repo, &[("new.c", "printk new\n")]),
+            "new.c is not tracked by git",
+        ),
+        (
+            "staged",
+            |s, repo| {
+                s.write(repo, &[("a.c", "printk staged\n")]);
+                s.git(repo, &["add", "a.c"]);
+            },
+            "a.c differs from HEAD",
+        ),
+        (
+            "gitlink",
+            |s, repo| {
+                let head = s.head(repo);
+                let info = format!("160000,{head},sub");
+                s.git(repo, &["update-index", "--add", "--cacheinfo", &info]);
+                s.git(repo, &["commit", "-q", "-m", "sub"]);
+                // A submodule not checked out: an empty directory.
+                std::fs::create_dir(repo.join("sub")).unwrap();
+            },
+            "the checkout holds a submodule (sub)",
+        ),
+        // Files that git status does not see, absent from the tree.
+        (
+            "sparse",
+            |s, repo| {
+                s.git(repo, &["sparse-checkout", "set", "--no-cone", "/a.c"]);
+            },
+            "git hides changes to 2 files (assume-unchanged or skip-worktree)",
+        ),
+        (
+            "skip-worktree",
+            |s, repo| {
+                s.git(repo, &["update-index", "--skip-worktree", "dir/b.c"]);
+                std::fs::remove_file(repo.join("dir/b.c")).unwrap();
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+        (
+            "assume-unchanged",
+            |s, repo| {
+                s.git(repo, &["update-index", "--assume-unchanged", "dir/b.c"]);
+                std::fs::remove_file(repo.join("dir/b.c")).unwrap();
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+    ];
+    for (name, change, why) in cases {
+        let repo = s.repo(name, &FILES);
+        change(&s, &repo);
+        let (index, stderr) = s.index(&repo, &format!("idx-{name}"));
+        let want = format!("note: the index records no served commit ({why})");
+        assert_eq!(note(&stderr), want, "{name}");
+        assert_eq!(commit_of(&index), None, "{name}");
+    }
+}
+
+#[test]
+fn only_the_top_of_a_checkout_records_a_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (index, stderr) = s.index(&repo.join("dir"), "idx-dir");
+    let want = format!(
+        "note: the index records no served commit ({} is not the top of its git checkout, {})",
+        repo.join("dir").display(),
+        repo.display()
+    );
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&index), None);
+
+    let plain = s.path("plain");
+    s.write(&plain, &FILES);
+    let (index, stderr) = s.index(&plain, "idx-plain");
+    let plain = std::fs::canonicalize(plain).unwrap();
+    let want = format!(
+        "note: the index records no served commit ({} is in no git checkout)",
+        plain.display()
+    );
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&index), None);
+
+    let unborn = s.path("unborn");
+    s.write(&unborn, &FILES);
+    s.git(&unborn, &["init", "-q", "-b", "main"]);
+    let (_, stderr) = s.index(&unborn, "idx-unborn");
+    let want = "note: the index records no served commit (the checkout has no commit yet)";
+    assert_eq!(note(&stderr), want);
+}
+
+/// A file that git converts on checkout differs from its blob, though git
+/// status shows no change: its stored text decides.
+#[test]
+fn a_converted_file_records_no_commit() {
+    let s = Sandbox::new();
+    let set: [(&str, &[&[&str]]); 2] = [
+        ("crlf", &[&["config", "core.autocrlf", "true"]]),
+        (
+            "filter",
+            &[
+                &["config", "filter.up.smudge", "tr a-z A-Z"],
+                &["config", "filter.up.clean", "tr A-Z a-z"],
+            ],
+        ),
+    ];
+    for (name, config) in set {
+        let repo = s.repo(name, &FILES);
+        s.write(&repo, &[(".gitattributes", "*.c filter=up\n")]);
+        s.commit(&repo, "attributes");
+        for args in config {
+            s.git(&repo, args);
+        }
+        std::fs::remove_file(repo.join("a.c")).unwrap();
+        s.git(&repo, &["checkout", "--", "a.c"]);
+        assert_eq!(s.git(&repo, &["status", "--porcelain"]), "", "{name}");
+        let (index, stderr) = s.index(&repo, &format!("idx-{name}"));
+        let want = "note: the index records no served commit (a.c differs from its blob in HEAD)";
+        assert_eq!(note(&stderr), want, "{name}");
+        assert_eq!(commit_of(&index), None, "{name}");
+    }
+}
+
+/// The build time that `index` reports counts the check of the served
+/// commit: with a git that waits a second before it reads the blobs, it
+/// is a second or more.
+#[test]
+fn the_build_time_counts_the_check_of_the_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let path = wrapped_git(&s, "[ \"$3\" = cat-file ] && sleep 1\n");
+    let output = s.path("idx").display().to_string();
+    let out = s
+        .fmgrep(&repo)
+        .env("PATH", path)
+        .args(["index", "--store-docs", "--json", ".", "--output", &output])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let us = summary["build_time_us"].as_u64().unwrap();
+    assert!(us >= 1_000_000, "{us}");
+    assert_eq!(commit_of(&s.path("idx")), Some(s.head(&repo)));
+}
+
+/// An index that reads the tree records no commit and says nothing of one.
+#[test]
+fn a_plain_index_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let output = s.path("idx").display().to_string();
+    let out = s.run(&repo, &["index", ".", "--output", &output]);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("note:"));
+    assert_eq!(commit_of(&s.path("idx")), None);
+}
+
+/// A `PATH` whose first `git` is a shell script that runs `body`, then the
+/// real git, `$real`, with the same arguments: `-C`, the directory, then
+/// git's own.
+fn wrapped_git(s: &Sandbox, body: &str) -> String {
+    let path = std::env::var("PATH").unwrap();
+    let real = std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|git| git.is_file())
+        .expect("git on PATH");
+    let script = format!(
+        "#!/bin/sh\nreal='{}'\n{body}exec \"$real\" \"$@\"\n",
+        real.display()
+    );
+    s.write(&s.path("wrapped"), &[("git", &script)]);
+    let wrapped = s.path("wrapped/git");
+    let mut mode = std::fs::metadata(&wrapped).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    std::fs::set_permissions(&wrapped, mode).unwrap();
+    format!("{}:{path}", s.path("wrapped").display())
+}
+
+/// The index of `repo` built with `PATH` set to `path`: its stderr.
+fn index_with(s: &Sandbox, repo: &std::path::Path, path: &str) -> String {
+    let output = s.path("idx").display().to_string();
+    let out = s
+        .fmgrep(repo)
+        .env("PATH", path)
+        .args(["index", "--store-docs", ".", "--output", &output])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(out.status.success(), "{stderr}");
+    stderr
+}
+
+/// The stored files are compared with the blobs of HEAD's tree, not with
+/// git's index, which can change after git status: a file edited for the
+/// walk, restored for git status, then staged as the walk read it.
+#[test]
+fn a_file_staged_after_git_status_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    // The first git status edits a.c after it ran, and the walk reads the
+    // edit; the second restores a.c before it runs; git ls-files -v, the
+    // next git, stages the edit.
+    let body = format!(
+        "edit() {{ printf 'printk staged\\n' > \"$2/a.c\"; }}\n\
+         case \"$3 $4\" in\n\
+         'status '*)\n\
+           [ -e '{seen}' ] && printf 'printk a\\n' > \"$2/a.c\" && exec \"$real\" \"$@\"\n\
+           \"$real\" \"$@\"; code=$?; touch '{seen}'; edit \"$@\"; exit $code ;;\n\
+         'ls-files -v') edit \"$@\"; \"$real\" -C \"$2\" add a.c ;;\n\
+         esac\n",
+        seen = s.path("seen").display()
+    );
+    let stderr = index_with(&s, &repo, &wrapped_git(&s, &body));
+    assert_eq!(s.git(&repo, &["diff", "--cached", "--name-only"]), "a.c\n");
+    let want = "note: the index records no served commit (a.c differs from its blob in HEAD)";
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&s.path("idx")), None);
+}
+
+/// A file moved away from the walk and put back before the second git
+/// status is missing from the index, though git status shows no change:
+/// its folder changed during the build.
+#[test]
+fn a_file_moved_away_from_the_walk_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let away = s.path("away.c").display().to_string();
+    // The first git status moves dir/b.c away after it ran; the second
+    // puts it back before it runs.
+    let body = format!(
+        "if [ \"$3\" = status ]; then\n\
+           [ -e '{seen}' ] && mv '{away}' \"$2/dir/b.c\" && exec \"$real\" \"$@\"\n\
+           \"$real\" \"$@\"; code=$?; touch '{seen}'; mv \"$2/dir/b.c\" '{away}'; exit $code\n\
+         fi\n",
+        seen = s.path("seen").display()
+    );
+    let stderr = index_with(&s, &repo, &wrapped_git(&s, &body));
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let want = "note: the index records no served commit (the folder dir changed during the build)";
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&s.path("idx")), None);
+}
+
+/// Git's replace refs are not followed: a checkout reset to a replaced
+/// HEAD holds the replacement's files, which another checkout of HEAD
+/// does not have.
+#[test]
+fn a_replaced_head_records_no_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let head = s.head(&repo);
+    s.write(&repo, &[("a.c", "printk replaced\n")]);
+    let other = s.commit(&repo, "other");
+    s.git(&repo, &["replace", &head, &other]);
+    s.git(&repo, &["reset", "-q", "--hard", &head]);
+    assert_eq!(s.head(&repo), head);
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let text = std::fs::read_to_string(repo.join("a.c")).unwrap();
+    assert_eq!(text, "printk replaced\n");
+    let (index, stderr) = s.index(&repo, "idx");
+    let want = "note: the index records no served commit (a.c differs from HEAD)";
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&index), None);
+}
+
+/// A file that git turns binary on checkout is left out of the index,
+/// though its blob is text that a checkout without the filter searches.
+#[test]
+fn a_file_made_binary_on_checkout_records_no_commit() {
+    let s = Sandbox::new();
+    let extra = [
+        ("nul.c", "printk Z\n"),
+        (".gitattributes", "nul.c filter=nul\n"),
+    ];
+    let repo = s.repo("repo", &[&FILES[..], &extra].concat());
+    s.git(&repo, &["config", "filter.nul.smudge", "tr Z '\\000'"]);
+    s.git(&repo, &["config", "filter.nul.clean", "tr '\\000' Z"]);
+    std::fs::remove_file(repo.join("nul.c")).unwrap();
+    s.git(&repo, &["checkout", "--", "nul.c"]);
+    assert_eq!(std::fs::read(repo.join("nul.c")).unwrap(), b"printk \0\n");
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let (index, stderr) = s.index(&repo, "idx");
+    assert!(stderr.contains("skipped 1 non-text file(s)"), "{stderr}");
+    let want = "note: the index records no served commit (nul.c differs from its blob in HEAD)";
+    assert_eq!(note(&stderr), want);
+    assert_eq!(commit_of(&index), None);
+}
+
+/// A blob that git cannot read gives git's own reason.
+#[test]
+fn an_unreadable_blob_says_why_git_failed() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let oid = s.git(&repo, &["rev-parse", "HEAD:a.c"]);
+    let object = repo
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(oid[2..].trim());
+    let mut mode = std::fs::metadata(&object).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o644);
+    std::fs::set_permissions(&object, mode).unwrap();
+    std::fs::write(&object, "not an object").unwrap();
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let (index, stderr) = s.index(&repo, "idx");
+    let note = note(&stderr);
+    assert!(
+        note.starts_with("note: the index records no served commit (git failed: "),
+        "{note}"
+    );
+    assert!(!note.contains("has no blob"), "{note}");
+    assert_eq!(commit_of(&index), None);
+}

@@ -91,6 +91,9 @@ pub struct WalkNotes {
     /// read; then, `None` when absent, those of the root and its ancestors
     /// (`../`-prefixed) and the global excludes file (absolute).
     pub ignores: Vec<(String, Option<Stamp>)>,
+    /// Every file the index walk listed and left out, binary or too large,
+    /// root-relative.
+    pub skipped: Vec<String>,
 }
 
 /// The ignore files a directory may hold, besides [`GIT_EXCLUDE`].
@@ -186,7 +189,7 @@ pub fn for_each_listed_doc(
     listed: impl FnOnce(usize),
     mut f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
 ) -> Result<WalkNotes, String> {
-    let (rels, notes) = list(root, exclude)?;
+    let (rels, mut notes) = list(root, exclude)?;
     if rels.is_empty() {
         return Err(format!(
             "error: no indexable files in {} (every file is ignored, hidden or a symlink)",
@@ -217,6 +220,7 @@ pub fn for_each_listed_doc(
                     if !binary || verbose() {
                         eprintln!("warning: skipping {rel}: {why}");
                     }
+                    notes.skipped.push(rel.clone());
                     continue;
                 }
             };
@@ -255,6 +259,7 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
     let notes = Arc::new(Mutex::new(WalkNotes {
         dirs: vec![(String::new(), stamp(root))],
         ignores: Vec::new(),
+        skipped: Vec::new(),
     }));
     let mut walk = builder(root);
     let (seen, base) = (Arc::clone(&notes), root.to_path_buf());
