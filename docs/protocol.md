@@ -68,7 +68,7 @@ response line each, after any [frames](#streamed-output).
 | `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output, and `lines` reports matches (below) |
 | `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
 | `commit` | string | absent | the served commit (hex id) the client compared its checkout with; a server that serves another, or none, answers -32001 |
-| `skip` | [string] | [] | the skip list: files the server leaves out, because the client searches them itself; each a path from the root, or `d/` for every file below `d`; at most 10,000; needs `commit` and `stream`, else -32602 |
+| `skip` | [string] | [] | the skip list: files the server leaves out, because the client searches them itself; each a path from the root, `d/` for every file below `d`, or `/` for every file; at most 10,000; needs `commit` and `stream`, else -32602 |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -246,21 +246,23 @@ that checkout, as a local index of the checkout would read them, and the
 query carries `commit`: the server's tree may be anywhere. The client
 then runs `git status` in the checkout, and `git diff-tree` between the
 commit and HEAD when HEAD moved: each path that differs from the commit
-(an untracked directory as `d/`; also each tracked file that the
-client's `info/exclude` or global excludes file ignores) goes on the
-query's `skip` list, the client searches those files itself as a local
-index of the checkout would hold them, and it prints its files between
-the server's in path order. Where the client cannot list the changes
-soundly (assume-unchanged or skip-worktree entries, a sparse checkout, a
-filter, line-ending, `ident` or encoding conversion that applies to a
-tracked file, a submodule, an ignore file that differs from the commit
-or lies above the checkout, more than 10,000 differing files), it sends
-no skip list and warns that local changes are ignored, with the reason.
-When the client warns so because it cannot compare at all (a checkout
-that lacks the served commit), PATH arguments and the cwd still resolve
-against the top of the cwd's checkout, and the query carries the served
-commit. Otherwise (no checkout, a server that serves no commit, or the
-served tree itself) they resolve against the served tree.
+(an untracked directory as `d/`, and for an ignore file that differs the
+whole directory it governs; also each tracked file that the client's
+`info/exclude` or global excludes file ignores) goes on the query's
+`skip` list, the client searches those files itself as a local index of
+the checkout would hold them, and it prints its files between the
+server's in path order. Where the client cannot list the changes soundly
+(assume-unchanged or skip-worktree entries, a sparse checkout, a filter,
+line-ending, `ident` or encoding conversion that applies to a tracked
+file, a submodule, an ignore file above the checkout, more than 10,000
+differing paths or files to search, as when a changed ignore file
+governs a large directory), it sends no skip list and warns that local
+changes are ignored, with the reason. When the client warns so because
+it cannot compare at all (a checkout that lacks the served commit), PATH
+arguments and the cwd still resolve against the top of the cwd's
+checkout, and the query carries the served commit. Otherwise (no
+checkout, a server that serves no commit, or the served tree itself)
+they resolve against the served tree.
 
 When the client searches files itself, counts, rg's JSON summary and
 the `--stats` block cover its files and the server's.

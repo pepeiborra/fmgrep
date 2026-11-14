@@ -250,6 +250,115 @@ fn a_partial_clone_answers_and_fetches_nothing() {
     assert!(!log.contains(r#""fetch""#), "{log}");
 }
 
+/// An ignore file that differs from the served commit: the client searches
+/// the whole directory it governs, so files that it now hides or shows
+/// print as a local index of the checkout would print them.
+#[test]
+fn a_changed_ignore_file_searches_its_whole_directory() {
+    let files = [
+        (".gitignore", "*.log\n"),
+        ("a.c", "printk a\n"),
+        ("dir/.gitignore", "*.tmp\n"),
+        ("dir/.rgignore", "skip.c\n"),
+        ("dir/b.c", "printk b\n"),
+        ("dir/keep.h", "printk keep\n"),
+        ("dir/sub/c.c", "printk c\n"),
+        ("e.c", "printk e\n"),
+    ];
+    let r = Remote::new(&files);
+    let cases: [(&str, Change); 5] = [
+        ("an edited .gitignore below the top", |r, c| {
+            r.s.write(
+                c,
+                &[
+                    ("dir/.gitignore", "*.tmp\n*.h\n"),
+                    ("dir/x.tmp", "printk tmp\n"),
+                ],
+            )
+        }),
+        ("a new untracked .ignore", |r, c| {
+            r.s.write(
+                c,
+                &[("dir/sub/.ignore", "c.c\n"), ("dir/sub/d.c", "printk d\n")],
+            )
+        }),
+        ("a deleted .rgignore", |r, c| {
+            r.s.write(c, &[("dir/skip.c", "printk skip\n")]);
+            r.s.git(c, &["rm", "-q", "dir/.rgignore"]);
+        }),
+        ("a .gitignore whose files are tracked", |r, c| {
+            r.s.write(c, &[("dir/.gitignore", "*.c\n")])
+        }),
+        ("the top's .gitignore", |r, c| {
+            r.s.write(
+                c,
+                &[(".gitignore", "*.log\ne.c\n"), ("new.log", "printk log\n")],
+            )
+        }),
+    ];
+    for (name, change) in cases {
+        reset(&r);
+        change(&r, &r.client);
+        for args in [&["printk"][..], &["-l", "printk"], &["-c", "printk", "dir"]] {
+            r.same("", args);
+        }
+        let _ = name;
+    }
+}
+
+/// More files to search than a query may list, from a new directory and
+/// then from a changed ignore file at the top that governs the whole
+/// checkout: the server's answer alone, and the true reason.
+#[test]
+fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
+    let r = Remote::new(&FILES);
+    let many: Vec<(String, String)> = (0..10_001)
+        .map(|i| (format!("many/{i:05}.c"), "printk\n".to_owned()))
+        .collect();
+    let many: Vec<(&str, &str)> = many.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    r.s.write(&r.client, &many);
+    let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let short = &r.commit[..7];
+    let out = r.search(&r.client, &["-l", "printk"]);
+    let why = format!("more than 10000 files differ from the served commit {short}");
+    assert_eq!(stderr(&out), crate::remote::ignored(&why));
+    assert_eq!(stdout(&out), served);
+    r.s.write(&r.client, &[(".gitignore", "*.log\n*.tmp\n")]);
+    let out = r.search(&r.client, &["-l", "printk"]);
+    let why = "the ignore file .gitignore differs from the served commit and governs more than \
+               10000 files";
+    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(stdout(&out), served);
+}
+
+/// The limit counts each file once, though two entries of the skip list
+/// cover it: a new directory `!new/`, which sorts before the `/` of a
+/// changed top `.gitignore`; and a commit that replaced the file `a` with
+/// a directory of files, with an untracked `a-b/` between `a` and `a/...`
+/// on the skip list. 6,000 files each: the merged answer.
+#[test]
+fn the_limit_counts_each_file_once() {
+    let mut files = FILES.to_vec();
+    files.push(("a", "printk a\n"));
+    let r = Remote::new(&files);
+    let many = |dir: &str| {
+        let many: Vec<(String, String)> = (0..6_000)
+            .map(|i| (format!("{dir}/{i:04}.c"), "printk\n".to_owned()))
+            .collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        r.s.write(&r.client, &many);
+    };
+    r.s.write(&r.client, &[(".gitignore", "*.log\n*.tmp\n")]);
+    many("!new");
+    r.same("", &["-c", "printk"]);
+    reset(&r);
+    r.s.git(&r.client, &["rm", "-q", "a"]);
+    many("a");
+    r.s.commit(&r.client, "a directory");
+    r.s.write(&r.client, &[("a-b/x.c", "printk x\n")]);
+    r.same("", &["-c", "printk"]);
+}
+
 /// Tracked files that the client's own excludes ignore (its global excludes
 /// file, its `info/exclude`, also from a linked worktree, a directory
 /// pattern, a rule of one that the other negates) are left out, as its
@@ -439,7 +548,7 @@ type Unsound = (Change, &'static str);
 fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     let r = Remote::new(&FILES);
     let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
-    let cases: [Unsound; 12] = [
+    let cases: [Unsound; 11] = [
         (
             |r, c| {
                 r.s.git(c, &["update-index", "--assume-unchanged", "z.c"]);
@@ -507,10 +616,6 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
         (
             |r, _| r.s.write(r.s.tmp.path(), &[(".ignore", "*.h\n")]),
             "an ignore file above the checkout applies ({tmp}/.ignore)",
-        ),
-        (
-            |r, c| r.s.write(c, &[(".gitignore", "*.log\n*.h\n")]),
-            "an ignore file differs from the served commit (.gitignore)",
         ),
     ];
     let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
