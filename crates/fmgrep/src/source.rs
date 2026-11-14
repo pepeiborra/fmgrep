@@ -437,6 +437,22 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
     items.iter().map(f).collect()
 }
 
+/// What a load asks watchman with: [`Files::ready`].
+struct Ready<'a> {
+    index: &'a journal::Index,
+    root: PathBuf,
+    recorded: &'a Arc<Recorded>,
+}
+
+/// Why a load does not ask watchman.
+enum Unready {
+    /// No ask is due: no index to ask for, or a search of fewer than
+    /// 50,000 files, where the stat pass is as fast.
+    NotDue,
+    /// Watchman cannot answer for this index or tree: why.
+    Cannot(String),
+}
+
 /// Docs a query treats apart from the index's answer, each ascending.
 #[derive(Debug, Default, PartialEq)]
 pub struct Snapshot {
@@ -509,6 +525,25 @@ impl Files {
         self.index = Some(index);
     }
 
+    /// The checks a load makes before it asks watchman, in order: an
+    /// index to ask for, a tree large enough (a search's only), then
+    /// [`Self::askable`]. The index, the canonical root and the walk's
+    /// record to ask with, or why not.
+    fn ready(&self, files: &FileTable) -> Result<Ready<'_>, Unready> {
+        let Some(index) = &self.index else {
+            return Err(Unready::NotDue);
+        };
+        if !self.known.each_query && !journal::due(files.len()) {
+            return Err(Unready::NotDue);
+        }
+        let (root, recorded) = self.askable(files).map_err(Unready::Cannot)?;
+        Ok(Ready {
+            index,
+            root,
+            recorded,
+        })
+    }
+
     /// The canonical root and the walk's record to ask with, or why not.
     fn askable(&self, files: &FileTable) -> Result<(PathBuf, &Arc<Recorded>), String> {
         if !*self.sorted.get_or_init(|| files.is_sorted()) {
@@ -529,15 +564,18 @@ impl Files {
     /// ask is due (a server's always is), or, saying why on stderr, when
     /// watchman cannot say.
     pub fn replay(&self, files: &FileTable, lens: &[u64]) -> bool {
-        let Some(index) = &self.index else {
-            return false;
+        let ready = match self.ready(files) {
+            Ok(ready) => Ok(ready),
+            Err(Unready::NotDue) => return false,
+            Err(Unready::Cannot(why)) => Err(why),
         };
-        if !self.known.each_query && !journal::due(files.len()) {
-            return false;
-        }
         let _span = tracing::info_span!("watchman").entered();
-        let (root, recorded) = match self.askable(files) {
-            Ok(askable) => askable,
+        let Ready {
+            index,
+            root,
+            recorded,
+        } = match ready {
+            Ok(ready) => ready,
             Err(why) if self.known.each_query => {
                 *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
                 return false;

@@ -320,13 +320,14 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
             ..Asked::default()
         },
     };
-    let root_str = match unaskable(root) {
-        Err(why) => return fail(why, true),
-        Ok(root_str) => root_str,
+    let usable = match usable(root, index) {
+        Err(Unusable::Never(why)) => return fail(why, true),
+        Err(Unusable::NoRecord(why)) => Err(why),
+        Ok(record) => Ok(record),
     };
     #[cfg(unix)]
     {
-        let (why, taken) = match Record::read(root_str, index).and_then(same_socket) {
+        let (why, taken) = match usable {
             Ok(record) => {
                 let sock = record.token.sock.clone().into();
                 let w = watchman::Watchman::at(sock, ASK_WAIT).served(served);
@@ -358,7 +359,33 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
     }
     #[cfg(not(unix))]
     {
-        let _ = (root_str, index, docs);
+        let _ = (usable, docs);
+        unreachable!("unaskable refuses every root here")
+    }
+}
+
+/// Why a load cannot ask with a record.
+#[derive(Debug)]
+enum Unusable {
+    /// Watchman cannot answer for the tree at all: the platform, a path
+    /// that is not UTF-8, a network filesystem.
+    Never(String),
+    /// No record to ask since: none, unreadable, malformed, of another
+    /// index build, or of another daemon than `WATCHMAN_SOCK` names.
+    NoRecord(String),
+}
+
+/// The read-only half of an ask: the record of canonical `root` and
+/// `index`, or why there is none to use. Asks watchman nothing.
+fn usable(root: &Path, index: &Index) -> Result<Record, Unusable> {
+    let root_str = unaskable(root).map_err(Unusable::Never)?;
+    #[cfg(unix)]
+    return Record::read(root_str, index)
+        .and_then(same_socket)
+        .map_err(Unusable::NoRecord);
+    #[cfg(not(unix))]
+    {
+        let _ = (root_str, index);
         unreachable!("unaskable refuses every root here")
     }
 }
