@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::manifest::{DOCS_SHARD, FileTable, Manifest, shard_offsets};
+use crate::manifest::{Checked, DOCS_SHARD, FileTable, Manifest, shard_offsets};
 use crate::source::{Files, Index, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
@@ -195,7 +195,7 @@ impl DocStore {
     }
 
     /// Joined before it returns: the stale set is known on return.
-    pub fn stat_all(&self, files: &FileTable) {
+    pub fn stat_all(&self, files: Checked<'_>) {
         if let Source::Files(f) = &self.source {
             f.stat_all(files, &self.lens);
         }
@@ -204,7 +204,7 @@ impl DocStore {
     /// Re-check what watchman and the saved baseline name instead of
     /// [`Self::stat_all`] and discovery: false when watchman cannot say, or
     /// for stored docs.
-    pub fn replay(&self, files: &FileTable) -> bool {
+    pub fn replay(&self, files: Checked<'_>) -> bool {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
             Source::Shard { .. } => false,
@@ -221,7 +221,7 @@ impl DocStore {
 
     /// Before a served query, re-check what watchman reports as changed
     /// since the last query; nothing for stored docs, or unless asked to.
-    pub fn recheck(&self, files: &FileTable) {
+    pub fn recheck(&self, files: Checked<'_>) {
         if let Source::Files(f) = &self.source {
             f.recheck(files, &self.lens);
         }
@@ -229,15 +229,21 @@ impl DocStore {
 
     /// Once the stat pass and discovery, or the replay, are done: save the
     /// watchman token and what differs, once, in the user's cache.
-    pub fn checkpoint(&self, files: &FileTable) {
-        if let Source::Files(f) = &self.source {
-            f.checkpoint(files);
+    pub fn checkpoint(&self, files: &FileTable) -> Result<(), String> {
+        match &self.source {
+            Source::Files(f) => f.checkpoint(files),
+            Source::Shard { .. } => Ok(()),
         }
+    }
+
+    /// Whether the documents are read from `docs.shard`.
+    pub fn stored(&self) -> bool {
+        matches!(self.source, Source::Shard { .. })
     }
 
     /// Register the text files under the root that ascending `files` does
     /// not list; nothing for stored docs.
-    pub fn discover(&self, files: &FileTable) {
+    pub fn discover(&self, files: Checked<'_>) {
         if let Source::Files(f) = &self.source {
             f.discover(files, &self.lens);
         }
@@ -378,7 +384,7 @@ impl Source {
                 pread_exact(file, &mut buf, lo).map_err(err)?;
                 Ok(Some(buf))
             }
-            Source::Files(f) => match files.get(doc_idx) {
+            Source::Files(f) => match files.path(doc_idx)? {
                 Some(rel) => Ok(f.read(doc_idx, rel, buf)),
                 None => Ok(f.read_added(doc_idx)),
             },
@@ -443,11 +449,42 @@ pub struct Paths<'a> {
     added: Arc<[String]>,
 }
 
-impl Paths<'_> {
-    pub fn path(&self, doc: usize) -> Option<&str> {
+impl<'a> Paths<'a> {
+    /// The manifest's paths, and no added doc.
+    #[cfg(test)]
+    pub fn of(files: &'a FileTable) -> Self {
+        Paths {
+            files,
+            added: Arc::new([]),
+        }
+    }
+
+    /// The path of `doc`, checked; `None` past the added docs.
+    pub fn path(&self, doc: usize) -> Result<Option<&str>, String> {
         match doc.checked_sub(self.files.len()) {
-            None => Some(&self.files[doc]),
-            Some(slot) => self.added.get(slot).map(String::as_str),
+            None => self.files.path(doc),
+            Some(slot) => Ok(self.added.get(slot).map(String::as_str)),
+        }
+    }
+
+    /// Check the path of each of `docs`: before any of them is printed.
+    pub fn check(&self, docs: impl IntoIterator<Item = usize>) -> Result<(), String> {
+        docs.into_iter()
+            .try_for_each(|doc| self.path(doc).map(drop))
+    }
+
+    /// Every path, the manifest's then the added docs', after one check of
+    /// the whole manifest text.
+    pub fn all(&self) -> Result<impl Iterator<Item = &str>, String> {
+        let added = self.added.iter().map(String::as_str);
+        Ok(self.files.checked()?.iter().chain(added))
+    }
+
+    /// The bytes of the path of `doc`: their order is the paths' order.
+    fn raw(&self, doc: usize) -> Option<&[u8]> {
+        match doc.checked_sub(self.files.len()) {
+            None => self.files.raw(doc),
+            Some(slot) => self.added.get(slot).map(String::as_bytes),
         }
     }
 
@@ -457,7 +494,7 @@ impl Paths<'_> {
         if a < n && b < n {
             return a.cmp(&b);
         }
-        self.path(a).cmp(&self.path(b)).then(a.cmp(&b))
+        self.raw(a).cmp(&self.raw(b)).then(a.cmp(&b))
     }
 
     /// Id-ascending `ids` into path order.

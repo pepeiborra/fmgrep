@@ -23,9 +23,10 @@ struct Served {
 fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
     let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
-    if !docs.replay(&manifest.files) {
-        docs.discover(&manifest.files);
-        docs.stat_all(&manifest.files);
+    let files = manifest.files.checked().unwrap();
+    if !docs.replay(files) {
+        docs.discover(files);
+        docs.stat_all(files);
     }
     Served {
         docs,
@@ -37,10 +38,10 @@ impl Served {
     /// One query's re-check: the paths it reads in full (stale, then
     /// added) and those it drops; then the record, as a query saves it.
     fn query(&mut self) -> (Vec<String>, Vec<String>) {
-        self.docs.recheck(&self.files);
+        self.docs.recheck(self.files.checked().unwrap());
         self.docs.begin();
         let paths = self.docs.paths(&self.files);
-        let name = |&id: &usize| paths.path(id).unwrap().to_owned();
+        let name = |&id: &usize| paths.path(id).unwrap().unwrap().to_owned();
         let read = self.docs.stale().iter().map(name).collect();
         let gone = self
             .docs
@@ -48,7 +49,7 @@ impl Served {
             .iter()
             .filter(|&&id| self.docs.is_gone(id));
         let gone = gone.map(name).collect();
-        self.docs.checkpoint(&self.files);
+        self.docs.checkpoint(&self.files).unwrap();
         (read, gone)
     }
 

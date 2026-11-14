@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 mod bin;
 mod files;
 
-pub use files::{FileTable, partition_ids};
+#[cfg(test)]
+pub(crate) use files::damaged;
+pub use files::{Checked, FileTable, partition_ids};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
@@ -154,8 +156,7 @@ pub fn write_manifest(output: &Path, manifest: &Manifest) -> Result<(), String> 
 /// 460,000 paths, a map with read-ahead advice was about 0.7 ms faster
 /// with a warm cache, a map without the advice was slower, and with a
 /// cold cache a map with the advice took about twice as long as a read.
-/// The buffer of the read becomes the text of the path table; a map
-/// would need a copy of that text.
+/// The path table views the buffer of the read in place.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
     let path = dir.join(MANIFEST_BIN);
     let cannot = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
@@ -284,7 +285,7 @@ fn read_docs(dir: &Path, manifest: &Manifest) -> Result<Vec<crate::Document>, St
     }
     let offsets = shard_offsets(&manifest.doc_lens)?;
     let mut docs = Vec::with_capacity(manifest.files.len());
-    for (pos, name) in manifest.files.iter().enumerate() {
+    for (pos, name) in manifest.files.checked()?.iter().enumerate() {
         let (lo, hi) = (offsets[pos] as usize, offsets[pos + 1] as usize);
         let bytes = bytes.get(lo..hi).ok_or_else(|| {
             format!(

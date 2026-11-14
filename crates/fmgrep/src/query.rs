@@ -10,7 +10,7 @@ use crate::blobs::BlobSlots;
 use crate::expr::Expr;
 use crate::fetch::{Ask, DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
-use crate::manifest::Manifest;
+use crate::manifest::{Checked, Manifest};
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
@@ -76,8 +76,8 @@ impl Loaded {
     }
 
     /// Before a served query, re-check what changed since the last one.
-    pub fn recheck(&self, manifest: &Manifest) {
-        self.docs.recheck(&manifest.files);
+    pub fn recheck(&self, files: Checked<'_>) {
+        self.docs.recheck(files);
     }
 
     /// Indexed files missing at load.
@@ -105,12 +105,14 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 /// Load the persisted index and its documents, and check coverage. Alongside
 /// the index load the files layout re-checks what watchman names, else
 /// stats every doc and discovers added files; `ask` says when watchman is
-/// asked, at load and in [`Loaded::recheck`].
+/// asked, at load and in [`Loaded::recheck`]. `checked` is the manifest's
+/// paths when the caller has checked them already, as a server has.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
     corpus_root: Option<&Path>,
     ask: Ask,
+    checked: Option<Checked<'_>>,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
     let load = tracing::info_span!("load").entered();
@@ -123,28 +125,39 @@ pub fn load(
     let hooks = crate::tests::Hooks::here();
     let load_id = load.id();
     // Plain threads: fixed blocking passes that overlap the load.
-    let (index, wait) = std::thread::scope(|scope| {
+    let (index, fresh, wait) = std::thread::scope(|scope| {
         let fresh = scope.spawn(move || {
             // A new thread is in no span: name the parent.
             let check = tracing::info_span!(parent: load_id, "check");
             let _span = check.enter();
             #[cfg(test)]
             hooks.apply();
+            // Stored docs need no path here.
+            if docs_ref.stored() {
+                return Ok(());
+            }
+            // The files layout reads every path: one check of them all.
+            let files = match checked {
+                Some(files) => files,
+                None => files.checked()?,
+            };
             // A server that refuses to serve needs no stat pass.
             if docs_ref.replay(files) || docs_ref.refusal().is_some() {
-                return;
+                return Ok(());
             }
             let check = check.clone();
             scope.spawn(move || check.in_scope(|| docs_ref.discover(files)));
             docs_ref.stat_all(files);
+            Ok::<_, String>(())
         });
         let index =
             tracing::info_span!("index").in_scope(|| DocfmIndex::load(&blobs, &manifest.doc_lens));
         let wait = tracing::info_span!("wait").entered();
-        fresh.join().expect("the stat pass panicked");
-        (index, wait)
+        let fresh = fresh.join().expect("the stat pass panicked");
+        (index, fresh, wait)
     });
     drop(wait);
+    fresh?;
     let index = index.map_err(|e| format!("error: {e}"))?;
     let loaded = Loaded {
         docs,
@@ -174,7 +187,13 @@ fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
 
 /// [`load`] then [`answer`].
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
-    let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, Ask::Load)?;
+    let (index, mut loaded) = load(
+        req.index_dir,
+        req.manifest,
+        req.corpus_root,
+        Ask::Load,
+        None,
+    )?;
     let report = answer(&index, &mut loaded, req, sink);
     tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
     report
@@ -205,13 +224,13 @@ pub fn answer(
         }
     };
     drop(query);
-    tracing::info_span!("save").in_scope(|| loaded.docs.checkpoint(&req.manifest.files));
+    tracing::info_span!("save").in_scope(|| loaded.docs.checkpoint(&req.manifest.files))?;
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter
         && !report.queries.iter().any(matched)
         && f.excludes_all(&loaded.docs.paths(&req.manifest.files), |id| {
             loaded.docs.is_gone(id)
-        })
+        })?
     {
         let why = match f.globs() {
             true => "the globs exclude every file",
@@ -327,7 +346,10 @@ fn answer_terms(
             }
         })
         .collect();
-    let cover = req.filter.as_ref().and_then(|f| f.cover(&manifest.files));
+    let cover = match &req.filter {
+        Some(f) => f.cover(&manifest.files)?,
+        None => None,
+    };
     let reads = match (&req.filter, cover.as_deref()) {
         (Some(f), Some(c)) => {
             let literals: Vec<Option<&[u8]>> = probes
@@ -340,14 +362,19 @@ fn answer_terms(
                 .collect();
             let paths = docs.paths(&manifest.files);
             let ids = c.iter().cloned().flatten();
-            let kept = f.kept(&paths, ids.filter(|&i| manifest.doc_lens[i] > 0));
+            let mut failed = None;
+            let kept = f.kept(
+                &paths,
+                ids.filter(|&i| manifest.doc_lens[i] > 0),
+                &mut failed,
+            );
             let file_us = boolean::read_band(loaded.band).min_us;
             let costs = read::Costs {
                 file_us,
                 locate_us: loaded.locate_us,
             };
             let fetched = |l: &[u8]| reads_exact(req.output, l);
-            read::read_instead(
+            let reads = read::read_instead(
                 index,
                 &literals,
                 c,
@@ -355,7 +382,8 @@ fn answer_terms(
                 &manifest.doc_lens,
                 costs,
                 fetched,
-            )
+            );
+            failed.map_or(Ok(reads), Err)?
         }
         _ => probes.iter().map(|_| None).collect(),
     };
@@ -403,9 +431,9 @@ fn answer_terms(
         let paths = docs.paths(&manifest.files);
         let mut stale = docs.stale().to_vec();
         if let Some(f) = &req.filter {
-            f.retain(&paths, &mut exact, |e| e.0);
-            f.retain(&paths, &mut candidates, |&id| id);
-            f.retain(&paths, &mut stale, |&id| id);
+            f.retain(&paths, &mut exact, |e| e.0)?;
+            f.retain(&paths, &mut candidates, |&id| id)?;
+            f.retain(&paths, &mut stale, |&id| id)?;
         }
         let mut scan = scan_ids(req.output, literal, &candidates, &exact);
         if !stale.is_empty() {
@@ -413,6 +441,10 @@ fn answer_terms(
             scan.sort_unstable();
         }
         paths.sort(&mut scan);
+        // Every path the term may print is checked before its first line.
+        if emit {
+            paths.check(exact.iter().map(|e| e.0).chain(scan.iter().copied()))?;
+        }
         let mut counts = if emit {
             TermCounts::from_matching(req.output)
         } else {
@@ -608,7 +640,7 @@ fn emit_probe_exact(
 
 fn path_of<'a>(paths: &'a Paths<'_>, doc: usize) -> Result<&'a str, String> {
     paths
-        .path(doc)
+        .path(doc)?
         .ok_or_else(|| format!("error: doc {doc} is neither indexed nor added"))
 }
 

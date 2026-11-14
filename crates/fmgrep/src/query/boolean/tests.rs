@@ -643,7 +643,7 @@ fn measured_band(index: &std::path::Path, expr: &Expr) -> ReadBand {
     let manifest = crate::manifest::read_manifest(index).unwrap();
     let answers = |measure: bool| {
         let (fm, mut loaded) =
-            super::super::load(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
+            super::super::load(index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
         if measure {
             loaded.measure_band(&manifest);
         }

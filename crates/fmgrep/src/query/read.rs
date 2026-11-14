@@ -244,7 +244,7 @@ mod tests {
         let measured = |index: &std::path::Path| {
             let manifest = crate::manifest::read_manifest(index).unwrap();
             let (fm, mut loaded) =
-                super::super::load(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
+                super::super::load(index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
             assert_eq!(loaded.locate_us, locate_us(None));
             loaded.measure_locate(&fm);
             (fm, loaded.locate_us)

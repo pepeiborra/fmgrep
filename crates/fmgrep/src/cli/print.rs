@@ -43,7 +43,11 @@ pub fn index_summary(out: &mut dyn Write, json: bool, s: &IndexSummary) -> Resul
 /// tables.
 pub fn status(out: &mut dyn Write, json: bool, dir: &Path, m: &Manifest) -> Result<(), String> {
     if json {
-        return line(out, &encoded("manifest", m)?);
+        // Every path is printed, and the encoding checks the path text
+        // once. The paths are the only part of a manifest whose encoding
+        // can fail: a damaged one is refused in the manifest's words.
+        let json = serde_json::to_string(m).map_err(|e| e.to_string())?;
+        return line(out, &json);
     }
     let mut lines = vec![
         format!("index: {}", dir.display()),
@@ -90,4 +94,54 @@ pub fn counts_summary(out: &mut dyn Write, report: &OutputReport) -> Result<(), 
 
 fn matches(n: u64) -> &'static str {
     if n == 1 { "match" } else { "matches" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{FileTable, MANIFEST_FORMAT, damaged};
+
+    fn manifest(files: FileTable) -> Manifest {
+        Manifest {
+            format: MANIFEST_FORMAT,
+            store_docs: true,
+            num_docs: files.len(),
+            num_bytes: 0,
+            bom_bytes: 0,
+            index_size_bytes: 0,
+            build_time_us: 0,
+            index_started_ns: 0,
+            doc_lens: std::iter::repeat_n(0, files.len()).collect(),
+            files,
+            blobs: vec![],
+            blob_lens: vec![],
+            corpus_root: None,
+        }
+    }
+
+    fn status_json(m: &Manifest) -> Result<String, String> {
+        let mut out = Vec::new();
+        status(&mut out, true, Path::new("idx"), m)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// `status --json` prints the manifest's JSON; a damaged path is
+    /// refused in the manifest's words, as the whole check gives them, not
+    /// as a failed encoding.
+    #[test]
+    fn status_json_refuses_a_damaged_path_in_the_manifests_words() {
+        let m = manifest(["a.c", "é/b.c"].into_iter().collect());
+        let want = serde_json::to_string(&m).unwrap() + "\n";
+        assert_eq!(status_json(&m), Ok(want));
+        let not_utf8 = manifest(damaged(&[3, 5], b"a.cb\xFF"));
+        assert_eq!(
+            status_json(&not_utf8),
+            Err("error: idx/manifest.bin holds a path that is not UTF-8; re-run `index`".into())
+        );
+        let cut = manifest(damaged(&[1, 3], "éb".as_bytes()));
+        assert_eq!(
+            status_json(&cut),
+            Err("error: idx/manifest.bin cuts path 0 inside a character; re-run `index`".into())
+        );
+    }
 }
