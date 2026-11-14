@@ -194,12 +194,17 @@ fn network(fs: &str) -> bool {
 struct Record {
     v: u32,
     root: String,
-    /// What the baseline differs from: `index <dir>@<started_ns>`.
+    /// What the baseline differs from: `index <dir>@<started_ns>`, or
+    /// `git <commit>`.
     of: String,
     token: Token,
     /// Ascending root-relative paths that may differ from the index; `None`
     /// when more than [`named_cap`] do.
     baseline: Option<Vec<String>>,
+    /// What else a search through a server checks before it builds on the
+    /// baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra: Option<serde_json::Value>,
 }
 
 /// What a load learned before it re-checks anything.
@@ -273,6 +278,18 @@ pub struct Of {
     other: &'static str,
 }
 
+impl Of {
+    /// A checkout's record against served commit `id`: one per checkout and
+    /// commit, so that searches through servers of two commits keep two.
+    pub fn commit(id: &str) -> Self {
+        Self {
+            key: format!("git {id}"),
+            of: format!("git {id}"),
+            other: "another commit",
+        }
+    }
+}
+
 impl Index {
     /// The index directory names the file, its build the baseline.
     fn of(&self) -> Result<Of, String> {
@@ -318,26 +335,31 @@ impl Record {
             ));
             return None;
         };
-        static WRITES: AtomicUsize = AtomicUsize::new(0);
-        let n = WRITES.fetch_add(1, Ordering::Relaxed);
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("record");
-        let tmp = path.with_file_name(format!(".{name}.{}.{n}", std::process::id()));
         let bytes = serde_json::to_vec(self).expect("a record serializes");
-        let wrote = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&tmp, bytes))
-            .and_then(|()| std::fs::rename(&tmp, &path));
-        if let Err(e) = wrote {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = write_atomic(&path, &bytes) {
             cannot_save(format_args!("{} ({e})", path.display()));
             return None;
         }
         Some(path)
     }
+}
+
+/// `bytes` into `path` by a rename: a crash leaves the old file or the
+/// new one, and two writers leave one of theirs.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITES: AtomicUsize = AtomicUsize::new(0);
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.{}.{n}", std::process::id()));
+    let wrote = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if wrote.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    wrote
 }
 
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
@@ -557,8 +579,172 @@ pub fn save(
         of: of.of,
         token,
         baseline: (baseline.len() <= cap).then_some(baseline),
+        extra: None,
     };
     record.write(&of.key)
+}
+
+/// What a search through a server learned of its checkout from its record
+/// and watchman, before it asks git anything.
+pub enum Remembered {
+    /// A token taken now; the record's baseline and extra; and the paths
+    /// under the root that changed since the record's token, unsorted.
+    Since {
+        token: Token,
+        baseline: Vec<String>,
+        extra: serde_json::Value,
+        changed: Vec<String>,
+    },
+    /// A token taken now, and why there is no baseline to build on.
+    Fresh { token: Token, why: String },
+    /// Why watchman cannot say what changed.
+    Cannot(String),
+}
+
+/// The record of the checkout at canonical `root` against `of`, and what
+/// watchman says changed since it; at any checkout size. Once watchman
+/// answers, the note of [`unsaid`] goes.
+pub fn remembered(root: &Path, of: &Of) -> Remembered {
+    let found = look(root, of);
+    if !matches!(found, Remembered::Cannot(_)) {
+        forget(root);
+    }
+    found
+}
+
+/// [`remembered`], before the note goes.
+fn look(root: &Path, of: &Of) -> Remembered {
+    let root_str = match unaskable(root) {
+        Err(why) => return Remembered::Cannot(why),
+        Ok(root_str) => root_str,
+    };
+    #[cfg(unix)]
+    {
+        let why = match Record::read(root_str, of).and_then(same_socket) {
+            Ok(record) => {
+                let w = watchman::Watchman::at(record.token.sock.clone().into(), ASK_WAIT);
+                match w.mark(root) {
+                    Ok(token) => {
+                        let (baseline, extra) = (record.baseline, record.extra);
+                        return match (w.since(&record.token, root), baseline, extra) {
+                            (Ok(changed), Some(baseline), Some(extra)) => Remembered::Since {
+                                token,
+                                baseline,
+                                extra,
+                                changed,
+                            },
+                            (Err(why), _, _) => Remembered::Fresh { token, why },
+                            _ => Remembered::Fresh {
+                                token,
+                                why: "the record holds no baseline".to_owned(),
+                            },
+                        };
+                    }
+                    Err(why) => why,
+                }
+            }
+            Err(why) => why,
+        };
+        match watchman::Watchman::find(ASK_WAIT).and_then(|w| w.mark(root)) {
+            Ok(token) => Remembered::Fresh { token, why },
+            Err(why) => Remembered::Cannot(why),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root_str, of);
+        unreachable!("unaskable refuses every root here")
+    }
+}
+
+/// A search that could not ask watchman, for `why`, and said so: the note
+/// that keeps the next one quiet.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Said {
+    v: u32,
+    root: String,
+    of: String,
+    why: String,
+}
+
+const SAID_VERSION: u32 = 1;
+
+/// The note of the checkout at canonical `root`:
+/// `<cache>/<basename of root>-<16 hex>.said`. One per checkout, so that
+/// the served commit moving replaces it.
+fn said_path(root: &str) -> Option<PathBuf> {
+    let base = Path::new(root).file_name().and_then(|n| n.to_str());
+    let hash = fnv(format!("{root}\0said").as_bytes());
+    Some(cache_dir()?.join(format!("{}-{hash:016x}.said", base.unwrap_or("root"))))
+}
+
+/// For a search of the checkout at canonical `root` against `of` that
+/// cannot ask watchman, for reason `why`: `None` when the last such
+/// search already said this, for this commit; else what to run once it
+/// has said it, which keeps the note. A note that cannot be read, is
+/// malformed or was written by another fmgrep version is not used; one
+/// that cannot be written is not kept, and the next search says it again.
+pub fn unsaid(root: &Path, of: &Of, why: &str) -> Option<Box<dyn FnOnce()>> {
+    let said = root.to_str().map(|root| Said {
+        v: SAID_VERSION,
+        root: root.to_owned(),
+        of: of.of.clone(),
+        why: why.to_owned(),
+    });
+    let path = said.as_ref().and_then(|s| said_path(&s.root));
+    let (Some(said), Some(path)) = (said, path) else {
+        return Some(Box::new(|| {}));
+    };
+    let last = std::fs::read(&path).ok();
+    let last = last.and_then(|b| serde_json::from_slice::<Said>(&b).ok());
+    if last.as_ref() == Some(&said) {
+        return None;
+    }
+    Some(Box::new(move || {
+        let bytes = serde_json::to_vec(&said).expect("a note serializes");
+        let _ = write_atomic(&path, &bytes);
+    }))
+}
+
+/// Drop the note of the checkout at canonical `root`: watchman answered, so
+/// the next time it cannot is news.
+fn forget(root: &Path) {
+    if let Some(path) = root.to_str().and_then(said_path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether the checkout at canonical `root` keeps a record against `of`:
+/// one was saved after git compared them.
+pub fn recorded(root: &Path, of: &Of) -> bool {
+    root.to_str()
+        .is_some_and(|root| Record::read(root, of).is_ok())
+}
+
+/// Save `token`, `baseline` (ascending) and `extra` as what differs from
+/// `of` in the checkout at canonical `root`.
+pub fn remember(
+    root: &Path,
+    of: &Of,
+    token: Token,
+    baseline: Vec<String>,
+    extra: serde_json::Value,
+) {
+    let Some(root) = root.to_str() else {
+        return cannot_save(format_args!(
+            "the record (the checkout's path is not UTF-8)"
+        ));
+    };
+    let record = Record {
+        v: VERSION,
+        root: root.to_owned(),
+        of: of.of.clone(),
+        token,
+        baseline: Some(baseline),
+        extra: Some(extra),
+    };
+    record.write(&of.key);
 }
 
 /// Whether [`warn`] keeps its lines for [`kept`] instead of printing them.

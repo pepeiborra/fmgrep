@@ -12,6 +12,8 @@ mod merged;
 mod remote;
 mod roundtrip;
 mod serve;
+#[cfg(unix)]
+mod watched;
 /// The library tests' private watchman daemon.
 #[cfg(unix)]
 #[allow(dead_code)]
