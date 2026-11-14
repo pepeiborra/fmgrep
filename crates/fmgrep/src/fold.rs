@@ -156,7 +156,7 @@ fn fold_any_capped<C: BackwardCursor>(root: C, plan: &FoldPlan, cap: usize) -> O
 /// Located folded matches, or `None` when the live-interval cap
 /// was hit. Each surviving interval is a whole match, so no term is searched
 /// a second time.
-pub fn fold_locate<C: LocatingCursor>(root: C, plan: &FoldPlan) -> Option<Vec<usize>> {
+pub fn fold_locate<C: LocatingCursor>(root: C, plan: &FoldPlan) -> Option<Vec<C::Hit>> {
     fold_locate_capped(root, plan, MAX_LIVE)
 }
 
@@ -164,7 +164,7 @@ fn fold_locate_capped<C: LocatingCursor>(
     root: C,
     plan: &FoldPlan,
     cap: usize,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<C::Hit>> {
     let live = fold_walk(root, plan, cap)?;
     let mut hits = Vec::new();
     for cursor in &live {

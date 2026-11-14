@@ -29,8 +29,10 @@ impl BackwardCursor for docfm::Cursor<'_> {
 }
 
 impl LocatingCursor for docfm::Cursor<'_> {
-    fn locate(&self, visit: &mut dyn FnMut(usize)) {
-        docfm::Cursor::locate(self, visit);
+    type Hit = ShardDoc;
+
+    fn locate(&self, visit: &mut impl FnMut(ShardDoc)) {
+        docfm::Cursor::locate(self, &mut |hit| visit(ShardDoc(hit)));
     }
 }
 
@@ -96,9 +98,9 @@ impl ShardMeta {
         }
     }
 
-    /// The shard-local ordinal of a located `hit`, if it names a document.
-    fn sub_of(&self, hit: usize) -> Option<ShardDoc> {
-        (hit < self.kept.len()).then_some(ShardDoc(hit))
+    /// A located `hit`, if it names one of the shard's documents.
+    fn sub_of(&self, hit: ShardDoc) -> Option<ShardDoc> {
+        (hit.0 < self.kept.len()).then_some(hit)
     }
 
     /// `structure` if it indexes this shard's non-empty document count.
@@ -121,7 +123,7 @@ impl ShardMeta {
         }
         let mut subs = Vec::new();
         structure.locate(term, &mut |hit| {
-            if let Some(sub) = self.sub_of(hit) {
+            if let Some(sub) = self.sub_of(ShardDoc(hit)) {
                 subs.push(sub);
             }
         });
@@ -246,7 +248,7 @@ impl ShardMeta {
     pub fn docs_at(
         &self,
         structure: &Structure,
-        hits: Option<Vec<usize>>,
+        hits: Option<Vec<ShardDoc>>,
         anchor: Option<&[u8]>,
     ) -> Vec<usize> {
         let Some(hits) = hits else {
@@ -341,7 +343,7 @@ const VERIFY_MAX_HITS: u64 = 1024;
 /// their bytes.
 pub struct Probe {
     /// Shard-local ordinal of the source document.
-    sub: usize,
+    sub: ShardDoc,
     term: Vec<u8>,
     /// `(prefix length, count in the source document)`, shortest first.
     wants: Vec<(usize, u64)>,
@@ -373,7 +375,11 @@ pub fn sample_probes(kept: &[&Document]) -> Vec<Probe> {
                         wants.push((len, count_overlapping(hay, &finder)));
                     }
                 }
-                probes.push(Probe { sub, term, wants });
+                probes.push(Probe {
+                    sub: ShardDoc(sub),
+                    term,
+                    wants,
+                });
             }
         }
         sub += stride;
@@ -415,7 +421,7 @@ pub fn self_check(
         locate(&p.term[..len], &mut |hit| {
             total += 1;
             if hit < kept {
-                here += u64::from(hit == p.sub);
+                here += u64::from(ShardDoc(hit) == p.sub);
             } else {
                 stray = true;
             }
