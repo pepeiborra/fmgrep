@@ -328,6 +328,12 @@ pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Vec<Stri
     walk_changed(root, vec![under.to_path_buf()], exclude, |_| false)
 }
 
+/// [`walk_paths`] under `under`, or none once it lists more than `limit`
+/// files: the walk stops there.
+pub fn walk_paths_within(root: &Path, under: &Path, limit: usize) -> Option<Vec<String>> {
+    walk_within(root, vec![under.to_path_buf()], None, |_| false, limit)
+}
+
 /// [`walk_paths`] under each of `dirs`, never descending into a directory
 /// whose relative path `prune` holds.
 pub fn walk_changed(
@@ -336,6 +342,17 @@ pub fn walk_changed(
     exclude: Option<&Path>,
     prune: impl Fn(&str) -> bool + Send + Sync + 'static,
 ) -> Vec<String> {
+    walk_within(root, dirs, exclude, prune, usize::MAX).unwrap_or_default()
+}
+
+/// [`walk_changed`], or none once it lists more than `limit` files.
+fn walk_within(
+    root: &Path,
+    dirs: Vec<PathBuf>,
+    exclude: Option<&Path>,
+    prune: impl Fn(&str) -> bool + Send + Sync + 'static,
+    limit: usize,
+) -> Option<Vec<String>> {
     // The walker never filters its roots.
     let mut matcher = rules(root);
     let mut seeds = dirs.into_iter().filter(|dir| {
@@ -343,7 +360,7 @@ pub fn walk_changed(
         rel.is_empty() || !matcher.matched(&rel, true).is_ignore()
     });
     let Some(first) = seeds.next() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let mut walk = builder(&first);
     for seed in seeds {
@@ -362,17 +379,21 @@ pub fn walk_changed(
             if let Ok(entry) = entry
                 && entry.file_type().is_some_and(|t| t.is_file())
             {
-                found
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(relative_path(root, entry.path()));
+                let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
+                found.push(relative_path(root, entry.path()));
+                if found.len() > limit {
+                    return ignore::WalkState::Quit;
+                }
             }
             ignore::WalkState::Continue
         })
     });
     let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if found.len() > limit {
+        return None;
+    }
     found.sort_unstable();
-    found
+    Some(found)
 }
 
 /// The walk's one default-verbosity line: what the per-file `warning:` lines

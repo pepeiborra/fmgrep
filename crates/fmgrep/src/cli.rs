@@ -328,10 +328,7 @@ fn searched(report: OutputReport, p: &QueryParams) -> Result<OutputReport, Strin
 /// checkout cannot be compared.
 fn mine(top: &Path, commit: &str) -> Result<(Vec<String>, checkout::Local), String> {
     let skip = checkout::changes(top, commit)?;
-    let local = checkout::resolve(top, &skip)?;
-    if local.files.len() > params::MAX_SKIP {
-        return Err(checkout::over(local.files.len(), commit));
-    }
+    let local = checkout::resolve(top, &skip, commit)?;
     Ok((skip, local))
 }
 
