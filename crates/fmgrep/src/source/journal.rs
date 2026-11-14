@@ -627,6 +627,12 @@ pub fn recorded(root: &Path, of: &Of) -> bool {
         .is_some_and(|root| Record::read(root, of).is_ok())
 }
 
+/// The file of the record of the checkout at canonical `root` against
+/// `of`, whether it exists or not.
+pub fn record_path(root: &Path, of: &Of) -> Option<PathBuf> {
+    path(root.to_str()?, &of.key)
+}
+
 /// Save `token`, `baseline` (ascending) and `extra` as what differs from
 /// `of` in the checkout at canonical `root`.
 pub fn remember(
