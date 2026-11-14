@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::*;
 
@@ -496,8 +497,114 @@ fn verbose_prints_the_plan_on_stderr_and_leaves_stdout_alone() {
     }
 }
 
+/// A row of the span block: its name, depth, thread, and start and took in
+/// ms.
+struct Row {
+    name: String,
+    depth: usize,
+    thread: u64,
+    start: f64,
+    took: f64,
+}
+
+/// The rows and the total of a stderr that holds the span block and
+/// nothing else.
+fn span_rows(stderr: &str) -> (Vec<Row>, f64) {
+    let lines: Vec<&str> = stderr.lines().collect();
+    let [head, rows @ .., last] = &lines[..] else {
+        panic!("{stderr}")
+    };
+    let want = "note: span                 thread  start ms  took ms";
+    assert_eq!(*head, want, "{stderr}");
+    let total = last.strip_prefix("note: total").expect(stderr);
+    let rows = rows.iter().map(|line| {
+        let rest = line.strip_prefix("note: ").expect(stderr);
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let [name, thread, start, took] = words[..] else {
+            panic!("{stderr}")
+        };
+        Row {
+            name: name.to_owned(),
+            depth: (rest.len() - rest.trim_start().len()) / 2,
+            thread: thread.parse().unwrap(),
+            start: start.parse().unwrap(),
+            took: took.parse().unwrap(),
+        }
+    });
+    (rows.collect(), total.trim().parse().expect(stderr))
+}
+
+/// The span block of one search: each span under its parent and inside
+/// it; spans of one thread under one parent follow each other; `check`,
+/// `stat` and `discovery` run on other threads than the main one; `wait`
+/// ends after `check`; the top adds up to the total, and the total is
+/// within the process's wall time.
+fn check_spans(err: &str, store_docs: bool, wall: Duration) {
+    // Each figure is rounded to 0.01 ms.
+    const ROUND: f64 = 0.02;
+    let (rows, total) = span_rows(err);
+    let parent = |i: usize| {
+        let depth = rows[i].depth.checked_sub(1)?;
+        (0..i).rev().find(|&j| rows[j].depth == depth)
+    };
+    let mut shape: Vec<(&str, Option<&str>)> = (0..rows.len())
+        .map(|i| (&*rows[i].name, parent(i).map(|j| &*rows[j].name)))
+        .collect();
+    shape.sort();
+    let mut want = vec![
+        ("search", None),
+        ("locate", Some("search")),
+        ("manifest", Some("search")),
+        ("load", Some("search")),
+        ("open", Some("load")),
+        ("index", Some("load")),
+        ("check", Some("load")),
+        ("wait", Some("load")),
+        ("query", Some("search")),
+        ("save", Some("search")),
+        ("drop", Some("search")),
+        ("flush", None),
+    ];
+    if !store_docs {
+        want.extend([("stat", Some("check")), ("discovery", Some("check"))]);
+    }
+    want.sort();
+    assert_eq!(shape, want, "{err}");
+    let end = |r: &Row| r.start + r.took;
+    for (i, r) in rows.iter().enumerate() {
+        let beside = ["check", "stat", "discovery"].contains(&&*r.name);
+        assert_eq!(r.thread != 0, beside, "{}: {err}", r.name);
+        if let Some(p) = parent(i).map(|j| &rows[j]) {
+            assert!(r.start >= p.start - ROUND, "{}: {err}", r.name);
+            assert!(end(r) <= end(p) + ROUND, "{}: {err}", r.name);
+        }
+        for (j, q) in rows.iter().enumerate().take(i) {
+            if parent(j) == parent(i) && q.thread == r.thread {
+                assert!(r.start >= end(q) - ROUND, "{} {}: {err}", q.name, r.name);
+            }
+        }
+    }
+    let at = |name: &str| rows.iter().find(|r| r.name == name).unwrap();
+    if !store_docs {
+        assert_eq!(at("stat").thread, at("check").thread, "{err}");
+        assert_ne!(at("discovery").thread, at("check").thread, "{err}");
+    }
+    // The main thread waits for check, and check ends at its last exit,
+    // on its own thread or on discovery's.
+    assert!(end(at("wait")) >= end(at("check")) - ROUND, "{err}");
+    let (search, flush) = (at("search"), at("flush"));
+    assert!(flush.start - end(search) < 5.0, "{err}");
+    assert!(
+        total >= end(flush) - ROUND && total - end(flush) < 5.0,
+        "{err}"
+    );
+    assert!(total <= wall.as_secs_f64() * 1e3, "{wall:?}: {err}");
+}
+
 /// Every output mode prints the same stdout and exits the same with and
 /// without `FMGREP_VERBOSE=1`, and prints nothing on stderr without it.
+/// With it, a search ends with its span block on stderr, and `index`
+/// prints none.
 #[test]
 fn verbose_leaves_stdout_and_the_exit_status_alone() {
     const MODES: [&[&str]; 9] = [
@@ -517,6 +624,11 @@ fn verbose_leaves_stdout_and_the_exit_status_alone() {
             ("b.c", b"int x;\nprintk(x);\nreturn;\n"),
         ]);
         let index = do_index(&docs, store_docs).display().to_string();
+        let again = index_argv(&docs, &docs.with_file_name("again"), store_docs, &[]);
+        let out = fmgrep().args(again).env("FMGREP_VERBOSE", "1").output();
+        let out = out.expect("spawn fmgrep");
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!stderr(&out).contains("note: span"), "{}", stderr(&out));
         for args in MODES {
             let search = |verbose: bool| {
                 let mut cmd = fmgrep();
@@ -525,9 +637,11 @@ fn verbose_leaves_stdout_and_the_exit_status_alone() {
                 if verbose {
                     cmd.env("FMGREP_VERBOSE", "1");
                 }
-                cmd.output().expect("spawn fmgrep")
+                let start = Instant::now();
+                let out = cmd.output().expect("spawn fmgrep");
+                (out, start.elapsed())
             };
-            let (plain, verbose) = (search(false), search(true));
+            let ((plain, _), (verbose, wall)) = (search(false), search(true));
             let what = format!("{store_docs} {args:?}");
             let code = if args.contains(&"absent") { 1 } else { 0 };
             assert_eq!(plain.status.code(), Some(code), "{what}");
@@ -535,6 +649,7 @@ fn verbose_leaves_stdout_and_the_exit_status_alone() {
             let stdout = |o: &Output| serve::timeless(&o.stdout);
             assert_eq!(stdout(&plain), stdout(&verbose), "{what}");
             assert_eq!(stderr(&plain), "", "{what}");
+            check_spans(&stderr(&verbose), store_docs, wall);
         }
     }
 }

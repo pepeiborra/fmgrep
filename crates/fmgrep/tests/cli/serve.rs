@@ -58,7 +58,9 @@ fn tcp_server_flag_equals_local_search() {
     for store_docs in [false, true] {
         let (_tmp, docs) = stage();
         let index = do_index(&docs, store_docs).display().to_string();
-        let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+        let mut serve = fmgrep();
+        serve.args(["serve", &index, "--no-watch"]);
+        let mut server = Server::spawn_cmd(serve.env("FMGREP_VERBOSE", "1"));
         let mut stdout = BufReader::new(server.0.stdout.take().unwrap());
         let mut addr = String::new();
         stdout.read_line(&mut addr).unwrap();
@@ -77,6 +79,12 @@ fn tcp_server_flag_equals_local_search() {
         }
         let all = [&["--json", "--"][..], &TERMS].concat();
         assert_eq!(client(addr, &all), query(&index, &TERMS), "{store_docs}");
+        let verbose = fmgrep()
+            .args(["--server", addr, "printk"])
+            .env("FMGREP_VERBOSE", "1")
+            .output()
+            .expect("spawn fmgrep");
+        assert_eq!(stderr(&verbose), "", "the client prints no spans");
         let status: serde_json::Value = serde_json::from_str(&client(addr, &["--status"])).unwrap();
         let bytes: usize = DOCS.iter().map(|(_, b)| b.len()).sum();
         assert_eq!(status["files"], DOCS.len(), "{store_docs}");
@@ -89,6 +97,8 @@ fn tcp_server_flag_equals_local_search() {
             rest, "",
             "{store_docs}: stdout carries the readiness line only"
         );
+        let err = served_stderr(&mut server);
+        assert!(!err.contains("note: span"), "{err}");
     }
 }
 
