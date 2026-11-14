@@ -63,6 +63,13 @@ pub struct QueryParams {
     /// `lines` and `only`: print rg's statistics after each term's output.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stats: bool,
+    /// The manifest format the client reads: a server of another refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    /// The served commit the client compared its checkout with: a server
+    /// that serves another, or none, refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -143,6 +150,8 @@ impl Default for QueryParams {
             filename: true,
             stream: false,
             stats: false,
+            format: None,
+            commit: None,
         }
     }
 }

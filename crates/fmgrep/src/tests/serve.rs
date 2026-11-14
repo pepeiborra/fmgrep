@@ -156,6 +156,53 @@ fn a_lines_report_counts_matched_lines_unless_stats() {
     }
 }
 
+/// `index`'s manifest, recording served commit `id`.
+pub(crate) fn pin(index: &Path, id: &str) {
+    crate::manifest::rewrite(index, |m| {
+        m.commit = Some(crate::manifest::Commit {
+            vcs: "git".into(),
+            id: id.into(),
+        });
+    });
+}
+
+/// A query pinned to another format or served commit is refused with
+/// -32001; one pinned to this server's is answered.
+#[test]
+fn a_query_pinned_to_another_index_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = staged(&tmp.path().join("plain"), true);
+    let pinned = staged(&tmp.path().join("pinned"), true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&pinned, id);
+    let ask = |params: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],{params}}}}}"#
+        )
+    };
+    let refused = |index: &Path, params: &str, message: &str| {
+        let got = serve_stdio(index, &[&ask(params)]);
+        assert_eq!(got[0]["error"]["code"], -32001, "{params}: {got:?}");
+        assert_eq!(got[0]["error"]["message"], message, "{params}");
+    };
+    let ours = format!("this server serves commit {id} of index format 8");
+    refused(&pinned, r#""format":7"#, &ours);
+    refused(&pinned, r#""commit":"ffff""#, &ours);
+    refused(&pinned, &format!(r#""format":7,"commit":"{id}""#), &ours);
+    let none = "this server serves no commit, of index format 8";
+    refused(&plain, &format!(r#""commit":"{id}""#), none);
+    for (index, params) in [
+        (&pinned, format!(r#""format":8,"commit":"{id}""#)),
+        (&plain, r#""format":8"#.to_owned()),
+    ] {
+        let got = serve_stdio(index, &[&ask(&params)]);
+        assert_eq!(
+            got[0]["result"]["queries"][0]["total_matches"], 4,
+            "{params}"
+        );
+    }
+}
+
 #[test]
 fn malformed_requests_are_refused_and_serving_continues() {
     let tmp = tempfile::tempdir().unwrap();
