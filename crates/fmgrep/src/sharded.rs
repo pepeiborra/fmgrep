@@ -161,21 +161,28 @@ impl DocfmIndex {
 
     /// Map every shard of the persisted slots, re-deriving the plan from the
     /// labels and `doc_lens`. `blobs.shard` must not change while loaded.
+    ///
+    /// Each shard is checked on its own, so all are checked at once; the
+    /// error is the lowest failing slot's, as a pass in slot order finds it.
     pub fn load(blobs: &BlobSlots<'_>, doc_lens: &[u64]) -> Result<Self, String> {
         let plan = plan_from_labels(labels_of(blobs), doc_lens.len(), doc_lens)?;
-        let metas: Vec<ShardMeta> = plan
-            .into_iter()
-            .map(|range| ShardMeta::new(range.clone(), &doc_lens[range]))
+        let checked: Vec<Result<(ShardMeta, Structure), String>> = plan
+            .into_par_iter()
+            .zip(map_slots(blobs)?)
+            .enumerate()
+            .map(|(slot, (range, blob))| {
+                let meta = ShardMeta::new(range.clone(), &doc_lens[range]);
+                let structure =
+                    docfm::FmIndex::view(blob).map_err(|e| format!("shard slot {slot}: {e}"))?;
+                let structure = meta
+                    .admit(structure)
+                    .map_err(|e| format!("shard slot {slot}: {e}; refusing a tampered index"))?;
+                Ok((meta, structure))
+            })
             .collect();
-        let mut shards = Vec::with_capacity(metas.len());
-        for (slot, (blob, meta)) in map_slots(blobs)?.into_iter().zip(&metas).enumerate() {
-            let structure =
-                docfm::FmIndex::view(blob).map_err(|e| format!("shard slot {slot}: {e}"))?;
-            shards.push(
-                meta.admit(structure)
-                    .map_err(|e| format!("shard slot {slot}: {e}; refusing a tampered index"))?,
-            );
-        }
+        let (metas, shards) = checked
+            .into_iter()
+            .collect::<Result<(Vec<_>, Vec<_>), _>>()?;
         Ok(Self {
             metas,
             shards,
