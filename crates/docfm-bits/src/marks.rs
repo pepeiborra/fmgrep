@@ -138,19 +138,30 @@ impl<'a> Marks<'a> {
         (k, p)
     }
 
-    /// The marks the high bits hold, for checking against the header.
+    /// The marks the high bits hold, for checking against the header. It
+    /// reads every word of the high bits, so the words before the last are
+    /// counted over one slice, a loop the compiler turns into vector code;
+    /// bytes missing from the slice count as zeros, as [`Self::high_word`]
+    /// reads them.
     #[inline]
     pub fn total(&self) -> usize {
-        (0..self.shape.high_bits.div_ceil(64))
-            .map(|w| {
-                let mut word = self.high_word(w);
-                let span = self.shape.high_bits - 64 * w;
-                if span < 64 {
-                    word &= (1u64 << span) - 1;
-                }
-                word.count_ones() as usize
-            })
-            .sum()
+        let s = self.shape;
+        let Some(last) = s.high_bits.div_ceil(64).checked_sub(1) else {
+            return 0;
+        };
+        let end = (s.highs_at + 8 * last).min(self.bytes.len());
+        let (words, tail) = self.bytes[s.highs_at.min(end)..end].as_chunks::<8>();
+        let body: usize = words
+            .iter()
+            .map(|&w| u64::from_le_bytes(w).count_ones() as usize)
+            .sum();
+        let tail = u64_at(tail, 0).count_ones() as usize;
+        let span = s.high_bits - 64 * last;
+        let mut word = self.high_word(last);
+        if span < 64 {
+            word &= (1u64 << span) - 1;
+        }
+        body + tail + word.count_ones() as usize
     }
 
     /// Whether `row` is marked, and the marks before it; `row` clamps to
