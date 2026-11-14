@@ -46,6 +46,7 @@ JSON object on one line, in this order.
 | `doc_lens` | [u64] | byte length per document, parallel to `files` |
 | `blob_lens` | [u64] | byte length per blob, parallel to `blobs` |
 | `corpus_root` | string | absolute path of the tree; present iff not `store_docs` |
+| `commit` | `{vcs, id}` | the served commit: the commit whose files the documents are, byte for byte; only with `store_docs`, and optional |
 
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
@@ -58,7 +59,8 @@ the note that the search warns when it passes over a server. For an
 index, it reads the manifest and opens the index as a search does, and
 refuses what a search refuses there, a `blobs.shard` of the wrong
 length included. It prints one `name: value` line per scalar field,
-plus `shards` (the number of blobs).
+plus `shards` (the number of blobs), then `commit: git <id>` when the
+manifest records a served commit.
 
 Of the files layout, status then runs the search's check of what
 changed ([staleness](#staleness), [watchman](#watchman)) as a search
@@ -105,7 +107,7 @@ padding. The header is 88 bytes:
 | 56 | 8 | `index_started_ns` |
 | 64 | 8 | shards: the number of `blobs` |
 | 72 | 8 | bytes of `corpus_root`; 0 when absent |
-| 80 | 8 | bytes of the served commit; 0 |
+| 80 | 8 | bytes of the served commit; 0 when absent |
 
 The sections follow, in this order, each right after the one before:
 
@@ -116,7 +118,7 @@ The sections follow, in this order, each right after the one before:
 | `blob_lens` | 8 per shard | one u64 per shard |
 | label ends | 8 per shard | where each label ends in the label text |
 | `corpus_root` | its length | UTF-8 |
-| served commit | its length | UTF-8; reserved |
+| served commit | its length | UTF-8: the VCS, one space, the id |
 | label text | the last label end | the `blobs` labels, joined |
 | path text | the last path end | the `files` paths, joined, by id |
 
@@ -125,9 +127,11 @@ follow the same rule. The file ends where the path text ends. One count
 gives the length of two tables: `num_docs` for `files` and `doc_lens`,
 shards for `blobs` and `blob_lens`.
 
-The served commit is reserved for a later version, which names in it the
-commit a server serves. This version writes none and reads past one that
-is UTF-8.
+The served commit section holds `git 1a2b...`: the VCS, one space, then
+the full commit id. It is empty, with a length of 0, when the index
+records no commit. Format 8 has had this section from the start, so an
+index written before fmgrep filled it reads as one with no commit, and an
+fmgrep that left it empty reads past one that is UTF-8.
 
 ### Checks
 
@@ -147,8 +151,11 @@ refuses, with exit 2:
   holds every table the header counts;
 - path or label ends that go back, or label ends inside a character;
 - a `corpus_root`, served commit or label that is not UTF-8;
+- a served commit that is not a VCS name (lowercase ASCII letters and
+  digits), one space and an id of lowercase hex digits;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
+- a served commit without `store_docs`;
 - `bom_bytes > num_bytes`;
 - labels that do not partition `0..num_docs`, or a `blobs.shard` whose
   length is not the sum of `blob_lens`.
