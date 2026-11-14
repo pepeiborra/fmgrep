@@ -91,6 +91,7 @@ fn tcp_server_flag_equals_local_search() {
         assert_eq!(status["files"], DOCS.len(), "{store_docs}");
         assert_eq!(status["num_bytes"], bytes, "{store_docs}");
         assert_eq!(status["store_docs"], store_docs, "{store_docs}");
+        assert_eq!(status["format"], 8, "{store_docs}");
         shutdown(&mut server, addr);
         let mut rest = String::new();
         stdout.read_to_string(&mut rest).unwrap();
@@ -528,7 +529,9 @@ fn status_names_what_a_search_uses() {
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let lines: Vec<&str> = text.lines().collect();
     let uses = format!("a search here uses the server at {addr} (FMGREP_SERVER)");
-    assert_eq!(lines[..3], [&uses, "store_docs: false", "files: 3"]);
+    let head = [uses.as_str(), "format: 8", "store_docs: false", "files: 3"];
+    let got = (&lines[..4], lines.last().copied());
+    assert_eq!(got, (&head[..], Some("commit: none")));
     let out = run_env(&away, &addr, &["status", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(out.stdout, reply.stdout);

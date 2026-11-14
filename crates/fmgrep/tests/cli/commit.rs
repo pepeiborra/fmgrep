@@ -800,3 +800,29 @@ fn a_pattern_after_blanks_outside_records_no_commit() {
     );
     assert_eq!(commit_of(&index), None);
 }
+
+/// A server's `status` reports the format and the served commit of a
+/// `--store-docs` index, and no commit for an index that reads the tree;
+/// `fmgrep status --server` prints both, one line each.
+#[test]
+fn status_reports_the_served_commit() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (index, _) = s.index(&repo, "idx");
+    let (_server, addr) = s.serve(&index, &[]);
+    let status = s.status(&addr);
+    assert_eq!(status["format"], 8);
+    assert_eq!(status["commit"]["vcs"], "git");
+    assert_eq!(status["commit"]["id"], s.head(&repo));
+    let lines = s.status_lines(&addr);
+    let commit = format!("commit: git {}", s.head(&repo));
+    assert_eq!(lines[1], "format: 8", "{lines:?}");
+    assert_eq!(lines.last(), Some(&commit), "{lines:?}");
+    let plain = s.path("plain").display().to_string();
+    let out = s.run(&repo, &["index", ".", "--output", &plain]);
+    assert!(out.status.success());
+    let (_server, addr) = s.serve(&s.path("plain"), &["--no-watch"]);
+    assert!(s.status(&addr).get("commit").is_none());
+    let lines = s.status_lines(&addr);
+    assert_eq!(lines.last().map(String::as_str), Some("commit: none"));
+}
