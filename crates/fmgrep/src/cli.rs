@@ -120,9 +120,73 @@ fn tree_of(found: &Located, manifest: &Manifest) -> Option<PathBuf> {
         .or_else(|| manifest.corpus_root.as_ref().map(PathBuf::from))
 }
 
-/// A search: through `--server`; else of `--index`; else of the index found
-/// by walking up from the cwd, or through the server that `env`
-/// (`FMGREP_SERVER`) gives when none is found. `env` is called only then.
+/// What a search started in `start` reads, before it reads anything.
+enum Choice {
+    /// The index found, and what a search warns of the server it passed
+    /// over, if any.
+    Index {
+        found: Located,
+        note: Option<String>,
+    },
+    Server(Server),
+}
+
+/// `--server`; else `--index`; else the index found by walking up from
+/// `start`, which wins over the server that `env` (`FMGREP_SERVER`)
+/// gives; else that server. `env` is called only when neither flag is
+/// given, and a value that is not UTF-8 fails only a choice that needs it.
+fn choose(
+    index: Option<&Path>,
+    server: Option<&str>,
+    env: Env,
+    start: &Path,
+) -> Result<Choice, String> {
+    if let Some(addr) = server {
+        let addr = addr.to_owned();
+        return Ok(Choice::Server(Server { addr, env: false }));
+    }
+    if let Some(index) = index {
+        let found = locate(index)?;
+        return Ok(Choice::Index { found, note: None });
+    }
+    Ok(match (locate(start), env()) {
+        (Ok(found), Ok(Some(addr))) => {
+            let note = format!(", not {}", Server { addr, env: true });
+            Choice::Index {
+                found,
+                note: Some(note),
+            }
+        }
+        (Ok(found), _) => Choice::Index { found, note: None },
+        (Err(_), Ok(Some(addr))) => Choice::Server(Server { addr, env: true }),
+        (Err(_), Err(e)) | (Err(e), Ok(None)) => return Err(e),
+    })
+}
+
+/// A connection to a server, or the index a search falls back to.
+enum Reached {
+    Conn(Conn),
+    Index { found: Located, note: String },
+}
+
+/// Connect to `server`. When `--server` gave it and it cannot be reached,
+/// an index found by walking up from `start` answers instead; with
+/// `FMGREP_SERVER`, such an index has already won.
+fn reach(server: &Server, start: &Path) -> Result<Reached, String> {
+    let e = match Conn::connect(&server.addr) {
+        Ok(conn) => return Ok(Reached::Conn(conn)),
+        Err(e) => e,
+    };
+    if !server.env
+        && let Ok(found) = locate(start)
+    {
+        let note = format!(": cannot reach {server} ({e})");
+        return Ok(Reached::Index { found, note });
+    }
+    Err(format!("error: cannot reach {server}: {e}"))
+}
+
+/// A search: what [`choose`] and [`reach`] pick from the cwd.
 fn search(
     s: &Search,
     env: Env,
@@ -150,30 +214,21 @@ fn search(
     p.cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if let Some(addr) = &s.server {
-        return client(Server { addr, env: false }, p, &typed, s.json, out);
+    let cwd = Path::new(".");
+    let (found, note) = match choose(s.index.as_deref(), s.server.as_deref(), env, cwd)? {
+        Choice::Index { found, note } => (found, note),
+        Choice::Server(server) => match reach(&server, cwd)? {
+            Reached::Conn(conn) => return client(conn, p, &typed, s.json, out),
+            Reached::Index { found, note } => (found, Some(note)),
+        },
+    };
+    if let Some(note) = note {
+        warn(&format!(
+            "Using local index {}{note}",
+            found.index_dir.display()
+        ));
     }
-    if s.index.is_none() {
-        match env() {
-            Ok(None) => {}
-            Ok(Some(addr)) => match locate(Path::new(".")) {
-                Ok(found) => warn(&format!(
-                    "Using local index {}, not the server at {addr} (FMGREP_SERVER)",
-                    found.index_dir.display()
-                )),
-                Err(_) => {
-                    let server = Server {
-                        addr: &addr,
-                        env: true,
-                    };
-                    return client(server, p, &typed, s.json, out);
-                }
-            },
-            // A value that is not UTF-8 fails only a search that would use it.
-            Err(e) if locate(Path::new(".")).is_err() => return Err(e),
-            Err(_) => {}
-        }
-    }
+    // `local` finds the index again, inside its spans.
     local(s.index.as_deref(), p, &typed, s.json, out)
 }
 
@@ -206,13 +261,13 @@ fn warn(line: &str) {
 }
 
 /// A server's address, and whether `FMGREP_SERVER` gave it.
-#[derive(Clone, Copy)]
-struct Server<'a> {
-    addr: &'a str,
+#[derive(Debug, PartialEq)]
+struct Server {
+    addr: String,
     env: bool,
 }
 
-impl std::fmt::Display for Server<'_> {
+impl std::fmt::Display for Server {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.env {
             true => write!(f, "the server at {} (FMGREP_SERVER)", self.addr),
@@ -221,32 +276,15 @@ impl std::fmt::Display for Server<'_> {
     }
 }
 
-/// A search through `server`: one connection; PATHs resolve against the
-/// served tree. When `--server` gives a server that cannot be reached, an
-/// index found by walking up answers, with a warning.
+/// A search through a server, on `conn`; PATHs resolve against the served
+/// tree.
 fn client(
-    server: Server<'_>,
+    mut conn: Conn,
     mut p: QueryParams,
     typed: &[String],
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
-    let mut conn = match Conn::connect(server.addr) {
-        Ok(conn) => conn,
-        Err(e) => {
-            // With `FMGREP_SERVER`, such an index has already won.
-            if !server.env
-                && let Ok(found) = locate(Path::new("."))
-            {
-                warn(&format!(
-                    "Using local index {}: cannot reach {server} ({e})",
-                    found.index_dir.display()
-                ));
-                return local(None, p, typed, json, out);
-            }
-            return Err(format!("error: cannot reach {server}: {e}"));
-        }
-    };
     if !typed.is_empty() {
         let status = serve::status_on(&mut conn)?;
         let root = Path::new(&status.root);
@@ -408,3 +446,6 @@ pub fn run() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
