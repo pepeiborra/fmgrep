@@ -12,6 +12,13 @@ struct Fix {
     index: PathBuf,
 }
 
+impl Fix {
+    /// The paths of `files`, checked.
+    fn paths(&self) -> Checked<'_> {
+        self.files.checked().unwrap()
+    }
+}
+
 /// `docs.shard`, then the files layout.
 const SOURCES: [bool; 2] = [true, false];
 
@@ -31,7 +38,7 @@ fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
     std::fs::create_dir_all(&index).unwrap();
     let files: FileTable = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
     let (mut mtimes, mut lens, mut file_lens) = (Vec::new(), Vec::new(), Vec::new());
-    for (id, (name, d)) in files.iter().zip(docs).enumerate() {
+    for (id, (name, d)) in files.checked().unwrap().iter().zip(docs).enumerate() {
         std::fs::write(root.join(name), d).unwrap();
         mtimes.push(Stamp::of(&std::fs::metadata(root.join(name)).unwrap()).mtime_ns);
         let text = crate::binary::text(d.to_vec()).unwrap();
@@ -601,7 +608,7 @@ fn files_fetch_reads_original_bytes() {
 /// A files-layout store after the load stat, and a query begun.
 fn loaded(fix: &Fix) -> DocStore {
     let mut store = reader(fix);
-    store.stat_all(&fix.files);
+    store.stat_all(fix.paths());
     store.begin();
     store
 }
@@ -611,7 +618,7 @@ fn files_changed_since_load_read_current_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
     let mut store = loaded(&fix);
-    std::fs::write(fix.path.join(&fix.files[1]), b"zzz").unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[1]), b"zzz").unwrap();
     assert_eq!(
         bytes_of(&mut store, &fix, &[0, 1]).unwrap(),
         [b"printk".to_vec(), b"zzz".to_vec()]
@@ -625,10 +632,10 @@ fn files_changed_since_load_read_current_bytes() {
     // Same size, new mtime: read whole all the same.
     let file = std::fs::File::options()
         .write(true)
-        .open(fix.path.join(&fix.files[0]))
+        .open(fix.path.join(&fix.paths()[0]))
         .unwrap();
     file.set_modified(std::time::UNIX_EPOCH).unwrap();
-    std::fs::write(fix.path.join(&fix.files[0]), b"PRINTK").unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[0]), b"PRINTK").unwrap();
     let mut store = reader(&fix);
     assert_eq!(bytes_of(&mut store, &fix, &[0]).unwrap(), [b"PRINTK"]);
     store.begin();
@@ -640,7 +647,7 @@ fn files_missing_at_read_are_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
     let mut store = loaded(&fix);
-    std::fs::remove_file(fix.path.join(&fix.files[0])).unwrap();
+    std::fs::remove_file(fix.path.join(&fix.paths()[0])).unwrap();
     assert_eq!(bytes_of(&mut store, &fix, &[0, 1]).unwrap(), [b"zz"]);
     store.begin();
     let (mut exact, mut candidates) = (vec![(0, 1), (1, 1)], vec![0, 1]);
@@ -652,8 +659,8 @@ fn files_missing_at_read_are_skipped() {
 fn stale_scan_merges_into_ascending_stream() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"printk zz", b"aa"]);
-    std::fs::write(fix.path.join(&fix.files[1]), b"zzzz").unwrap();
-    std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[1]), b"zzzz").unwrap();
+    std::fs::remove_file(fix.path.join(&fix.paths()[2])).unwrap();
     let mut store = loaded(&fix);
     assert_eq!(store.stale(), [1]);
     assert_eq!(store.changed(), [1, 2]);
@@ -668,7 +675,7 @@ fn stale_scan_merges_into_ascending_stream() {
 fn stale_bytes_stay_cached_across_terms() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
-    std::fs::write(fix.path.join(&fix.files[1]), b"zz and more").unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[1]), b"zz and more").unwrap();
     let mut store = loaded(&fix);
     store.max_cached_bytes = 0;
     for _ in 0..3 {
@@ -694,7 +701,7 @@ fn stale_bytes_stay_cached_across_terms() {
 fn stale_doc_turned_binary_is_excluded() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
-    std::fs::write(fix.path.join(&fix.files[1]), b"zz\0").unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[1]), b"zz\0").unwrap();
     let mut store = loaded(&fix);
     assert_eq!(store.stale(), [1]);
     assert_eq!(bytes_of(&mut store, &fix, &[0, 1]).unwrap(), [b"printk"]);
@@ -722,7 +729,11 @@ fn indexed_utf16_doc_stays_fresh_and_reads_as_utf8() {
 fn stale_doc_rewritten_as_utf16_reads_as_utf8() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
-    std::fs::write(fix.path.join(&fix.files[1]), crate::binary::utf16le("zz ü")).unwrap();
+    std::fs::write(
+        fix.path.join(&fix.paths()[1]),
+        crate::binary::utf16le("zz ü"),
+    )
+    .unwrap();
     let mut store = loaded(&fix);
     assert_eq!(store.stale(), [1]);
     assert_eq!(
@@ -735,7 +746,7 @@ fn stale_doc_rewritten_as_utf16_reads_as_utf8() {
 fn empty_recorded_doc_that_grew_is_read() {
     let tmp = tempfile::tempdir().unwrap();
     let fix = stage_files(tmp.path(), &[b"", b"zz"]);
-    std::fs::write(fix.path.join(&fix.files[0]), b"printk").unwrap();
+    std::fs::write(fix.path.join(&fix.paths()[0]), b"printk").unwrap();
     let mut store = loaded(&fix);
     assert_eq!(bytes_of(&mut store, &fix, &[0]).unwrap(), [b"printk"]);
 }
@@ -746,8 +757,8 @@ fn discovered(fix: &Fix, added: &[(&str, &[u8])]) -> DocStore {
         std::fs::write(fix.path.join(rel), bytes).unwrap();
     }
     let mut store = reader(fix);
-    store.stat_all(&fix.files);
-    store.discover(&fix.files);
+    store.stat_all(fix.paths());
+    store.discover(fix.paths());
     store.begin();
     store
 }
@@ -819,7 +830,7 @@ fn paths_cmp_orders_added_ids_among_manifest_ids() {
         added: ["a", "c", "e"].map(String::from).into(),
     };
     assert_eq!(
-        [paths.path(1), paths.path(2), paths.path(4), paths.path(5)],
+        [paths.path(1), paths.path(2), paths.path(4), paths.path(5)].map(Result::unwrap),
         [Some("d"), Some("a"), Some("e"), None]
     );
     assert!(paths.cmp(0, 1).is_lt() && paths.cmp(2, 0).is_lt());

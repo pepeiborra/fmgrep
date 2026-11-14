@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use rayon::prelude::*;
 
 use crate::Stamp;
-use crate::manifest::FileTable;
+use crate::manifest::{Checked, FileTable};
 
 mod added;
 mod journal;
@@ -197,7 +197,7 @@ impl Known {
 
     /// Stat `id` against its stamp, an ignored doc only if `force`: why it
     /// is gone, if it is.
-    fn stat(&self, id: usize, files: &FileTable, lens: &[u64], force: bool) -> Option<String> {
+    fn stat(&self, id: usize, files: Checked<'_>, lens: &[u64], force: bool) -> Option<String> {
         let (kind, why) = match std::fs::metadata(self.root.join(&files[id])) {
             Ok(meta) if self.stamps.holds(id, &meta, lens[id]) => (FRESH, None),
             Ok(_) => (STALE, None),
@@ -232,7 +232,7 @@ impl Known {
 
     /// Stat `ids` (ascending), ignored ones only if `force`, then warn about
     /// the gone ones in order, or once when over half the docs are.
-    fn stat_ids(&self, ids: &[usize], files: &FileTable, lens: &[u64], force: bool) {
+    fn stat_ids(&self, ids: &[usize], files: Checked<'_>, lens: &[u64], force: bool) {
         let gone = parallel(ids, |&id| self.stat(id, files, lens, force));
         let n = gone.iter().flatten().count();
         if n * 2 > self.state.len() {
@@ -253,7 +253,7 @@ impl Known {
         }
     }
 
-    fn stat_all(&self, files: &FileTable, lens: &[u64], force: bool) {
+    fn stat_all(&self, files: Checked<'_>, lens: &[u64], force: bool) {
         let ids: Vec<usize> = (0..self.state.len()).collect();
         self.stat_ids(&ids, files, lens, force);
     }
@@ -275,7 +275,7 @@ impl Known {
         &self,
         recorded: &Arc<Recorded>,
         paths: &[String],
-        files: &FileTable,
+        files: Checked<'_>,
         lens: &[u64],
     ) -> Result<usize, ()> {
         let root = &self.root;
@@ -379,7 +379,7 @@ impl Known {
     }
 
     /// [`Self::discover`] of the outermost of root-relative `scopes`.
-    fn discover_scopes(&self, scopes: Vec<String>, files: &FileTable, lens: &[u64]) {
+    fn discover_scopes(&self, scopes: Vec<String>, files: Checked<'_>, lens: &[u64]) {
         let root = &self.root;
         for scope in outermost(scopes) {
             self.discover(root, &root.join(scope), files, lens);
@@ -510,7 +510,7 @@ impl Files {
     }
 
     /// The canonical root and the walk's record to ask with, or why not.
-    fn askable(&self, files: &FileTable) -> Result<(PathBuf, &Arc<Recorded>), String> {
+    fn askable(&self, files: Checked<'_>) -> Result<(PathBuf, &Arc<Recorded>), String> {
         if !*self.sorted.get_or_init(|| files.is_sorted()) {
             return Err("the manifest lists files out of order; re-run index".to_owned());
         }
@@ -528,7 +528,7 @@ impl Files {
     /// baseline) instead of [`Self::stat_all`] and discovery: false when no
     /// ask is due (a server's always is), or, saying why on stderr, when
     /// watchman cannot say.
-    pub fn replay(&self, files: &FileTable, lens: &[u64]) -> bool {
+    pub fn replay(&self, files: Checked<'_>, lens: &[u64]) -> bool {
         let Some(index) = &self.index else {
             return false;
         };
@@ -608,7 +608,7 @@ impl Files {
     /// every file as a new load would. On stderr, why every file was
     /// checked, each time the reason changes, and a note once watchman
     /// answers again.
-    pub fn recheck(&self, files: &FileTable, lens: &[u64]) {
+    pub fn recheck(&self, files: Checked<'_>, lens: &[u64]) {
         if self.index.is_none() || !self.known.each_query {
             return;
         }
@@ -636,7 +636,7 @@ impl Files {
         &self,
         root: &Path,
         recorded: &Arc<Recorded>,
-        files: &FileTable,
+        files: Checked<'_>,
         lens: &[u64],
     ) -> Option<String> {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
@@ -664,7 +664,7 @@ impl Files {
 
     /// What a new load finds: every doc statted, ignored ones too, then
     /// discovery, which marks again what the rules skip.
-    fn check_all(&self, files: &FileTable, lens: &[u64]) {
+    fn check_all(&self, files: Checked<'_>, lens: &[u64]) {
         self.known.stat_all(files, lens, true);
         self.discover(files, lens);
     }
@@ -672,12 +672,12 @@ impl Files {
     /// Once every doc is known, save the last token and what differs now
     /// (the baseline) in the user's cache: once per process, so a server
     /// saves after its first query that has a token.
-    pub fn checkpoint(&self, files: &FileTable) {
+    pub fn checkpoint(&self, files: &FileTable) -> Result<(), String> {
         let Some(index) = &self.index else {
-            return;
+            return Ok(());
         };
         if self.saved.load(Ordering::Acquire) || !self.known.complete.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let token = self
             .last
@@ -685,16 +685,14 @@ impl Files {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let (Some(token), Ok(root)) = (token, self.known.root.canonicalize()) else {
-            return;
+            return Ok(());
         };
         self.saved.store(true, Ordering::Release);
         let snap = self.snapshot();
-        let mut baseline: Vec<String> = snap
-            .stale
-            .iter()
-            .chain(&snap.gone)
-            .map(|&id| files[id].to_owned())
-            .collect();
+        let mut baseline = Vec::new();
+        for &id in snap.stale.iter().chain(&snap.gone) {
+            baseline.extend(files.path(id)?.map(str::to_owned));
+        }
         let recorded = self.known.recorded.as_deref();
         baseline.extend(
             snap.added
@@ -712,6 +710,7 @@ impl Files {
         baseline.dedup();
         let cap = journal::named_cap(files.len());
         journal::save(&root, index, token, baseline, cap);
+        Ok(())
     }
 
     /// Never take `index_dir` for an added file. Before any watch or
@@ -729,7 +728,7 @@ impl Files {
     }
 
     /// Stat every doc; each newly gone one warns, in doc order.
-    pub fn stat_all(&self, files: &FileTable, lens: &[u64]) {
+    pub fn stat_all(&self, files: Checked<'_>, lens: &[u64]) {
         let _span = tracing::info_span!("stat").entered();
         self.known.stat_all(files, lens, false);
     }
@@ -899,12 +898,19 @@ mod tests {
         pub(super) lens: Vec<u64>,
     }
 
+    impl Fix {
+        /// The paths of `files`, checked.
+        pub(super) fn paths(&self) -> Checked<'_> {
+            self.files.checked().unwrap()
+        }
+    }
+
     pub(super) fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
         let path = dir.join("corpus");
         std::fs::create_dir_all(&path).unwrap();
         let files: FileTable = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
         let mut mtimes = Vec::new();
-        for (name, d) in files.iter().zip(docs) {
+        for (name, d) in files.checked().unwrap().iter().zip(docs) {
             std::fs::write(path.join(name), d).unwrap();
             mtimes.push(Stamp::of(&std::fs::metadata(path.join(name)).unwrap()).mtime_ns);
         }
@@ -943,11 +949,11 @@ mod tests {
     fn stat_all_finds_stale_and_gone_and_warns_once() {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"printk zz"]);
-        std::fs::write(fix.path.join(&fix.files[1]), b"zzzz").unwrap();
-        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
+        std::fs::write(fix.path.join(&fix.paths()[1]), b"zzzz").unwrap();
+        std::fs::remove_file(fix.path.join(&fix.paths()[2])).unwrap();
         let files = open_files(&fix);
         assert!(!files.changed(), "nothing is statted at open");
-        files.stat_all(&fix.files, &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens);
         assert_eq!(files.kinds(), [FRESH, STALE, GONE]);
         assert_eq!(stale_gone(&files), (vec![1], vec![2]));
         assert!(files.changed() && files.warned(2) && !files.warned(1));
@@ -960,12 +966,12 @@ mod tests {
         let docs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
         let fix = stage_files(tmp.path(), &docs);
         let files = open_files(&fix);
-        let path = |id: usize| fix.path.join(&fix.files[id]);
-        files.stat_all(&fix.files, &fix.lens);
+        let path = |id: usize| fix.path.join(&fix.paths()[id]);
+        files.stat_all(fix.paths(), &fix.lens);
         assert!(!files.changed());
         std::fs::write(path(150), b"changed!!").unwrap();
         std::fs::remove_file(path(7)).unwrap();
-        files.stat_all(&fix.files, &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens);
         assert_eq!(stale_gone(&files), (vec![150], vec![7]));
         // A reappearing file is stale; one matching its stamp again is fresh.
         std::fs::write(path(7), b"back").unwrap();
@@ -980,7 +986,7 @@ mod tests {
                 + std::time::Duration::from_nanos(files.known.stamps.get(150) as u64),
         )
         .unwrap();
-        files.stat_all(&fix.files, &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens);
         assert_eq!(stale_gone(&files), (vec![7], vec![]));
         assert_eq!(files.known.changed.load(Ordering::Acquire), 1);
     }
@@ -990,14 +996,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
         let files = open_files(&fix);
-        files.stat_all(&fix.files, &fix.lens);
-        std::fs::write(fix.path.join(&fix.files[1]), b"zz grew").unwrap();
-        std::fs::write(fix.path.join(&fix.files[2]), b"a\0binary").unwrap();
-        let read = |id: usize| files.read(id, &fix.files[id], vec![0; fix.lens[id] as usize]);
+        files.stat_all(fix.paths(), &fix.lens);
+        std::fs::write(fix.path.join(&fix.paths()[1]), b"zz grew").unwrap();
+        std::fs::write(fix.path.join(&fix.paths()[2]), b"a\0binary").unwrap();
+        let read = |id: usize| files.read(id, &fix.paths()[id], vec![0; fix.lens[id] as usize]);
         assert_eq!(read(0).as_deref(), Some(&b"printk"[..]));
         assert_eq!(read(1).as_deref(), Some(&b"zz grew"[..]));
         assert_eq!(read(2), None);
-        std::fs::remove_file(fix.path.join(&fix.files[0])).unwrap();
+        std::fs::remove_file(fix.path.join(&fix.paths()[0])).unwrap();
         assert_eq!(read(0), None);
         assert_eq!(files.kinds(), [GONE, STALE, GONE]);
         assert!(files.warned(0) && files.warned(2));
@@ -1010,12 +1016,12 @@ mod tests {
         let files = open_files(&fix);
         files.known.set(1, IGNORED);
         files.known.set(2, IGNORED);
-        std::fs::write(fix.path.join(&fix.files[1]), b"zz changed").unwrap();
-        std::fs::remove_file(fix.path.join(&fix.files[2])).unwrap();
-        files.stat_all(&fix.files, &fix.lens);
+        std::fs::write(fix.path.join(&fix.paths()[1]), b"zz changed").unwrap();
+        std::fs::remove_file(fix.path.join(&fix.paths()[2])).unwrap();
+        files.stat_all(fix.paths(), &fix.lens);
         assert_eq!(files.kinds(), [FRESH, IGNORED, IGNORED]);
         assert_eq!(stale_gone(&files), (vec![], vec![1, 2]));
-        assert_eq!(files.read(1, &fix.files[1], vec![0; 2]), None);
+        assert_eq!(files.read(1, &fix.paths()[1], vec![0; 2]), None);
         assert!(!files.warned(1) && !files.warned(2));
     }
 
@@ -1052,7 +1058,9 @@ mod tests {
         let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
         files.record(Recorded::open(&fix.index).unwrap().unwrap());
         let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
-        let kept = files.known.replay(&recorded, &named, &fix.files, &fix.lens);
+        let kept = files
+            .known
+            .replay(&recorded, &named, fix.paths(), &fix.lens);
         (files, kept)
     }
 
@@ -1115,7 +1123,9 @@ mod tests {
         let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
         let replay = |named: &[&str]| {
             let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
-            files.known.replay(&recorded, &named, &fix.files, &fix.lens)
+            files
+                .known
+                .replay(&recorded, &named, fix.paths(), &fix.lens)
         };
         let put = |rel: &str| {
             std::fs::create_dir_all(fix.path.join(rel).parent().unwrap()).unwrap();
@@ -1146,13 +1156,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_named(tmp.path(), &["a.c", "sub/b.c"]);
         let (files, _) = replayed(&fix, &[]);
-        files.check_all(&fix.files, &fix.lens);
+        files.check_all(fix.paths(), &fix.lens);
         assert_eq!(files.kinds(), [FRESH, FRESH]);
         std::fs::write(fix.path.join("sub/.ignore"), b"b.c\n").unwrap();
-        files.check_all(&fix.files, &fix.lens);
+        files.check_all(fix.paths(), &fix.lens);
         assert_eq!(files.kinds(), [FRESH, IGNORED]);
         std::fs::remove_file(fix.path.join("sub/.ignore")).unwrap();
-        files.check_all(&fix.files, &fix.lens);
+        files.check_all(fix.paths(), &fix.lens);
         assert_eq!(files.kinds(), [FRESH, FRESH], "as a new load finds it");
         assert!(!files.warned(1));
     }

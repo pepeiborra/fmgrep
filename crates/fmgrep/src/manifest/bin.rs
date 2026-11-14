@@ -46,6 +46,7 @@ use std::path::Path;
 use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+use super::files::Store;
 use super::{FileTable, Manifest, refuse_foreign};
 
 const MAGIC: [u8; 8] = *b"fmmanif\0";
@@ -121,15 +122,15 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
     };
     out.write_all(head.as_bytes())?;
     write_words(out, m.doc_lens.iter().copied())?;
-    write_words(out, ends_of(m.files.iter()))?;
+    write_words(out, ends_of(paths(&m.files)))?;
     write_words(out, m.blob_lens.iter().copied())?;
     write_words(out, ends_of(m.blobs.iter()))?;
     out.write_all(root.as_bytes())?;
     for label in &m.blobs {
         out.write_all(label.as_bytes())?;
     }
-    for path in m.files.iter() {
-        out.write_all(path.as_bytes())?;
+    for path in paths(&m.files) {
+        out.write_all(path)?;
     }
     Ok(())
 }
@@ -142,8 +143,13 @@ fn write_words(out: &mut impl Write, values: impl Iterator<Item = u64>) -> io::R
     Ok(())
 }
 
+/// The bytes of each path of `files`, as they were read.
+fn paths(files: &FileTable) -> impl Iterator<Item = &[u8]> {
+    (0..files.len()).map(|id| files.raw(id).unwrap_or_default())
+}
+
 /// The end of each of `texts` in their concatenation.
-fn ends_of<S: AsRef<str>>(texts: impl Iterator<Item = S>) -> impl Iterator<Item = u64> {
+fn ends_of<S: AsRef<[u8]>>(texts: impl Iterator<Item = S>) -> impl Iterator<Item = u64> {
     texts.scan(0, |end, text| {
         *end += text.as_ref().len() as u64;
         Some(*end)
@@ -186,18 +192,19 @@ fn truncated(path: &Path, len: usize, what: &str) -> String {
     )
 }
 
-/// Read `bytes`, the whole of the `manifest.bin` at `path`. The path text
-/// ends the file: it moves to the front of the buffer, and the buffer
-/// becomes the text of [`FileTable`], so no new block holds it. A failure
-/// that the bytes show reads "error: `path` ...; re-run `index`". The
-/// checks of the values are the caller's ([`super::validate`]).
-pub fn decode(mut bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
+/// Read `bytes`, the whole of the `manifest.bin` at `path`. The path table
+/// views its ends and its text where they lie in `bytes`. A failure that
+/// the bytes show reads "error: `path` ...; re-run `index`". The checks of
+/// the values are the caller's ([`super::validate`]).
+pub fn decode(bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
+    let store = Store::new(bytes);
+    let bytes: &[u8] = &store;
     let bad = |why: String| refuse(path, why);
     let len = bytes.len();
     let short = |what: &str| truncated(path, len, what);
 
-    check_prefix(&bytes, path)?;
-    let Ok((head, rest)) = OnDisk::read_from_prefix(&bytes) else {
+    check_prefix(bytes, path)?;
+    let Ok((head, rest)) = OnDisk::read_from_prefix(bytes) else {
         return Err(short("header"));
     };
     let flags = head.flags.get();
@@ -235,35 +242,34 @@ pub fn decode(mut bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
     let labels = utf8(labels, "a shard label")?;
     let label_ends = with_zero(label_ends);
     cuts(labels, &label_ends, "shard label").map_err(&bad)?;
-    let blobs = pieces(labels, &label_ends);
-    let corpus_root = (!root.is_empty()).then(|| root.to_owned());
-    let doc_lens = doc_lens.iter().map(|w| w.get()).collect();
-    let blob_lens = blob_lens.iter().map(|w| w.get()).collect();
-    let path_ends = with_zero(path_ends);
-    let paths_at = len - paths.len();
-
-    // The views of the bytes end here. The path text moves to the front of
-    // the buffer, and the buffer gives back the bytes it no longer holds.
-    bytes.drain(..paths_at);
-    bytes.shrink_to_fit();
-    let text =
-        String::from_utf8(bytes).map_err(|_| bad("holds a path that is not UTF-8".into()))?;
-    cuts(&text, &path_ends, "path").map_err(&bad)?;
+    let files = FileTable::from_parts(
+        store.clone(),
+        offset(bytes, path_ends.as_bytes()),
+        len - paths.len(),
+        path_ends.len(),
+        path,
+    );
+    files.checked()?;
     Ok(Manifest {
         format: head.prefix.format.get(),
         store_docs: flags & STORE_DOCS != 0,
-        num_docs: path_ends.len() - 1,
+        num_docs: files.len(),
         num_bytes: head.num_bytes.get(),
         bom_bytes: head.bom_bytes.get(),
         index_size_bytes: head.index_size_bytes.get(),
         build_time_us: head.build_time_us.get(),
         index_started_ns: head.index_started_ns.get(),
-        files: FileTable::from_parts(text, path_ends),
-        blobs,
-        doc_lens,
-        blob_lens,
-        corpus_root,
+        blobs: pieces(labels, &label_ends),
+        doc_lens: doc_lens.iter().map(|w| w.get()).collect(),
+        blob_lens: blob_lens.iter().map(|w| w.get()).collect(),
+        corpus_root: (!root.is_empty()).then(|| root.to_owned()),
+        files,
     })
+}
+
+/// Where `part`, a slice of `whole`, starts in it.
+fn offset(whole: &[u8], part: &[u8]) -> usize {
+    part.as_ptr() as usize - whole.as_ptr() as usize
 }
 
 /// The `n` words at the front of `rest`, and the bytes after them; `None`

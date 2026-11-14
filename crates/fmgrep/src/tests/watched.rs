@@ -12,7 +12,7 @@ fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
     let docs =
         crate::fetch::DocStore::open(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
-    docs.replay(&manifest.files)
+    docs.replay(manifest.files.checked().unwrap())
 }
 
 /// The warnings given on this thread since the last call.
@@ -918,10 +918,14 @@ fn watchman_skips_the_stat_pass() {
     let manifest = read_manifest(&output).unwrap();
     let mut docs =
         crate::fetch::DocStore::open(&output, &manifest, None, crate::fetch::Ask::Load).unwrap();
-    assert!(docs.replay(&manifest.files), "{:?}", notes());
+    assert!(
+        docs.replay(manifest.files.checked().unwrap()),
+        "{:?}",
+        notes()
+    );
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");
-    docs.stat_all(&manifest.files);
+    docs.stat_all(manifest.files.checked().unwrap());
     docs.begin();
     assert_eq!(docs.stale(), [0], "the stat pass: the tampered stamp");
 }

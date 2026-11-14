@@ -85,8 +85,8 @@ impl PathFilter {
     }
 
     /// Ascending disjoint id ranges of `files` holding every file a search
-    /// keeps; None when unbounded.
-    pub fn cover(&self, files: &FileTable) -> Option<Vec<Range<usize>>> {
+    /// keeps; None when unbounded. Err when a path it reads is refused.
+    pub fn cover(&self, files: &FileTable) -> Result<Option<Vec<Range<usize>>>, String> {
         let includes: Option<Vec<&str>> = match self.includes {
             0 => None,
             _ => self
@@ -120,20 +120,19 @@ impl PathFilter {
             }
         }
         if prefixes.iter().any(|(p, _)| p.is_empty()) {
-            return None;
+            return Ok(None);
         }
-        let mut ranges: Vec<Range<usize>> = prefixes
-            .iter()
-            .map(|(p, exact)| {
-                let lo = files.partition_point(0..files.len(), |f| f < p.as_str());
-                let hi = match exact {
-                    true => lo + usize::from(files.get(lo) == Some(p.as_str())),
-                    false => files.partition_point(lo..files.len(), |f| f.starts_with(p.as_str())),
-                };
-                lo..hi
-            })
-            .filter(|r| !r.is_empty())
-            .collect();
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(prefixes.len());
+        for (p, exact) in &prefixes {
+            let lo = files.partition_point(0..files.len(), |f| f < p.as_str())?;
+            let hi = match exact {
+                true => lo + usize::from(files.path(lo)? == Some(p.as_str())),
+                false => files.partition_point(lo..files.len(), |f| f.starts_with(p.as_str()))?,
+            };
+            if lo < hi {
+                ranges.push(lo..hi);
+            }
+        }
         ranges.sort_unstable_by_key(|r| r.start);
         let mut out: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
         for r in ranges {
@@ -142,7 +141,7 @@ impl PathFilter {
                 _ => out.push(r),
             }
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     /// What `seen` puts before every path below `root`; None when that
@@ -175,29 +174,60 @@ impl PathFilter {
         }
     }
 
-    /// The ids of `ids` a search keeps, in order.
+    /// The ids of `ids` a search keeps, in order. A path that is refused
+    /// ends them, and its refusal goes to `failed`: it is never dropped
+    /// as excluded.
     pub fn kept<'a>(
         &'a self,
         paths: &'a Paths<'_>,
         ids: impl Iterator<Item = usize> + 'a,
+        failed: &'a mut Option<String>,
     ) -> impl Iterator<Item = usize> + 'a {
         let mut keep = self.keeper();
-        ids.filter(move |&id| paths.path(id).is_some_and(&mut keep))
+        ids.map_while(move |id| match paths.path(id) {
+            Ok(path) => Some((id, path)),
+            Err(e) => {
+                *failed = Some(e);
+                None
+            }
+        })
+        .filter_map(move |(id, path)| path.is_some_and(&mut keep).then_some(id))
     }
 
-    pub fn retain<T>(&self, paths: &Paths<'_>, items: &mut Vec<T>, id: impl Fn(&T) -> usize) {
+    /// Keep the items whose file a search keeps; Err, and every item kept,
+    /// when a path is refused.
+    pub fn retain<T>(
+        &self,
+        paths: &Paths<'_>,
+        items: &mut Vec<T>,
+        id: impl Fn(&T) -> usize,
+    ) -> Result<(), String> {
         let mut keep = self.keeper();
-        items.retain(|t| paths.path(id(t)).is_some_and(&mut keep));
+        let mut failed = None;
+        items.retain(|t| match (&failed, paths.path(id(t))) {
+            (Some(_), _) => true,
+            (None, Ok(path)) => path.is_some_and(&mut keep),
+            (None, Err(e)) => {
+                failed = Some(e);
+                true
+            }
+        });
+        failed.map_or(Ok(()), Err)
     }
 
     /// Whether a search with no PATH has no file of `paths` but the `gone`
-    /// ones to search.
-    pub fn excludes_all(&self, paths: &Paths<'_>, gone: impl Fn(usize) -> bool) -> bool {
+    /// ones to search. It reads every path.
+    pub fn excludes_all(
+        &self,
+        paths: &Paths<'_>,
+        gone: impl Fn(usize) -> bool,
+    ) -> Result<bool, String> {
+        if !self.paths.iter().all(|p| p.name.is_empty()) {
+            return Ok(false);
+        }
         let mut keep = self.keeper();
-        self.paths.iter().all(|p| p.name.is_empty())
-            && (0..)
-                .map_while(|id| paths.path(id).map(|p| (id, p)))
-                .all(|(id, p)| gone(id) || !keep(p))
+        let mut all = paths.all()?.enumerate();
+        Ok(all.all(|(id, p)| gone(id) || !keep(p)))
     }
 
     /// Whether a search covers the file at a path, remembering the last
