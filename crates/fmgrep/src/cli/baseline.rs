@@ -16,7 +16,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use super::checkout::{Local, changes, resolve, short};
-use super::params::MAX_SKIP;
+use super::params::{MAX_SKIP, QueryParams};
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
 
@@ -26,8 +26,12 @@ use crate::vcs;
 /// once the client can search the files it lists. Where watchman cannot
 /// say what changed, git is asked on every search, and the warning says so
 /// once for each reason and served commit, until watchman answers (always
-/// under `FMGREP_VERBOSE`).
-pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), String> {
+/// under `FMGREP_VERBOSE`). `p` is the search, for the note.
+pub fn skip_list(
+    top: &Path,
+    commit: &str,
+    p: &QueryParams,
+) -> Result<(Vec<String>, Local), String> {
     let of = Of::commit(commit);
     let (token, why) = match remembered(top, &of) {
         Remembered::Since {
@@ -39,6 +43,15 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
             Ok(skip) => {
                 remember(top, &of, token, skip.clone(), extra);
                 let local = resolve(top, &skip, commit)?;
+                note(
+                    top,
+                    Some(&of),
+                    commit,
+                    "watchman since the baseline",
+                    &skip,
+                    &local,
+                    p,
+                );
                 return Ok((skip, local));
             }
             Err(why) => (token, why),
@@ -62,6 +75,15 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
             if let Some(keep) = said {
                 keep();
             }
+            note(
+                top,
+                None,
+                commit,
+                "git, as watchman cannot say",
+                &skip,
+                &local,
+                p,
+            );
             return Ok((skip, local));
         }
     };
@@ -91,7 +113,46 @@ pub fn skip_list(top: &Path, commit: &str) -> Result<(Vec<String>, Local), Strin
         short(commit),
         crate::verbose::Us(took.as_secs_f64() * 1e6)
     ));
+    let source = "git, a new baseline";
+    note(top, same.then_some(&of), commit, source, &skip, &local, p);
     Ok((skip, local))
+}
+
+/// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
+/// checkout at `top` came from (`source`), its size, the files of
+/// `local` that the client searches for `p` (those that its PATHs, globs
+/// and cwd keep, as `--stats` counts them), the served commit `commit`,
+/// and the record of `of`, when one is saved.
+fn note(
+    top: &Path,
+    of: Option<&Of>,
+    commit: &str,
+    source: &str,
+    skip: &[String],
+    local: &Local,
+    p: &QueryParams,
+) {
+    if !crate::verbose::verbose() {
+        return;
+    }
+    let record = of
+        .and_then(|of| crate::source::record_path(top, of))
+        .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+    let (n, bytes) = match p.filter() {
+        Ok(Some(f)) => {
+            (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i]))
+        }
+        _ => (local.files.len(), local.bytes),
+    };
+    let s = skip.len();
+    eprintln!(
+        "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
+         searched here; served commit {}; record {record}",
+        crate::verbose::plural(s),
+        crate::verbose::plural(n),
+        bytes,
+        short(commit)
+    );
 }
 
 /// The baseline plus what watchman says `changed`, when the variables

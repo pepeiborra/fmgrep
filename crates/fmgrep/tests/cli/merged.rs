@@ -844,3 +844,75 @@ fn what_converts_no_tracked_file_merges_local_changes() {
         r.same("", &["-l", "printk"]);
     }
 }
+
+/// `FMGREP_VERBOSE=1` adds one note: where the skip list came from, its
+/// size, the files searched here, the served commit and the record. A
+/// search that a server answers prints no spans, also when it merges. A
+/// PATH or the cwd keeps fewer files: the note counts those.
+#[test]
+fn fmgrep_verbose_notes_where_local_changes_come_from() {
+    let r = Remote::new(&FILES);
+    let c = &r.client;
+    r.s.write(c, &[("a.c", "printk edited\n"), ("n.c", "printk n\n")]);
+    let search_in = |cwd: &Path, args: &[&str], want: &str| {
+        let out = r.tried(|| {
+            let mut cmd = r.s.fmgrep(cwd);
+            if let Some(daemon) = &r.daemon {
+                cmd.env("WATCHMAN_SOCK", &daemon.sock);
+            }
+            (cmd.env("FMGREP_SERVER", &r.addr))
+                .env("FMGREP_VERBOSE", "1")
+                .args(args)
+                .output()
+                .unwrap()
+        });
+        assert_eq!(stdout(&out), want);
+        let text = stderr(&out);
+        let notes: Vec<String> = (text.lines())
+            .filter(|l| l.starts_with("note: local changes from "))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(notes.len(), 1, "{text}");
+        assert!(!text.contains("note: span"), "{text}");
+        notes[0].clone()
+    };
+    let search = || {
+        search_in(
+            c,
+            &["-l", "printk"],
+            "a.c\ndir/b.c\ndir/sub/c.h\ne.c\nn.c\n",
+        )
+    };
+    let shape = format!(
+        ": 2 paths on the skip list, 2 files (23 bytes) searched here; served commit {}; record ",
+        &r.commit[..7]
+    );
+    let sources = match r.daemon {
+        Some(_) => ["git, a new baseline", "watchman since the baseline"],
+        None => ["git, as watchman cannot say"; 2],
+    };
+    for source in sources {
+        let note = search();
+        let want = format!("note: local changes from {source}{shape}");
+        assert!(note.starts_with(&want), "{note}");
+        let record = &note[want.len()..];
+        match r.daemon {
+            Some(_) => assert!(Path::new(record).is_file(), "{note}"),
+            None => assert_eq!(record, "none"),
+        }
+    }
+    r.s.write(c, &[("dir/b.c", "printk b edited\n")]);
+    let scoped = [
+        (
+            c.clone(),
+            &["-l", "printk", "dir"][..],
+            "dir/b.c\ndir/sub/c.h\n",
+        ),
+        (c.join("dir"), &["-l", "printk"][..], "b.c\nsub/c.h\n"),
+    ];
+    for (cwd, args, want) in scoped {
+        let note = search_in(&cwd, args, want);
+        let counts = " on the skip list, 1 file (16 bytes) searched here; ";
+        assert!(note.contains(counts), "{note}");
+    }
+}

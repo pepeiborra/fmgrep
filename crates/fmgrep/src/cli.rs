@@ -373,7 +373,7 @@ fn client(
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
-            match baseline::skip_list(&top, &commit) {
+            match baseline::skip_list(&top, &commit, &p) {
                 Ok(changes) => ours = Some((top, changes)),
                 Err(why) => checkout::degraded(&why),
             }
