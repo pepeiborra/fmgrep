@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod bin;
+mod files;
+
+pub use files::{FileTable, partition_ids};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
@@ -51,7 +54,7 @@ pub struct Manifest {
     pub index_started_ns: i64,
     /// Corpus-relative path per doc, ascending by id: what a search reports as
     /// a match's file.
-    pub files: Vec<String>,
+    pub files: FileTable,
     /// Blob inventory: one `shard-<start>-<end>.bin` label per shard.
     pub blobs: Vec<String>,
     /// Raw byte length per doc, parallel to `files`: sizes docs without
@@ -276,7 +279,7 @@ fn read_docs(dir: &Path, manifest: &Manifest) -> Result<Vec<crate::Document>, St
         })?;
         docs.push(crate::Document {
             id: pos,
-            path: name.clone(),
+            path: name.to_owned(),
             bytes: bytes.to_vec(),
         });
     }
@@ -351,7 +354,7 @@ mod tests {
             index_size_bytes: 99,
             build_time_us: 7,
             index_started_ns: 9,
-            files: vec!["a/one.hs".into(), "b/two.hs".into()],
+            files: ["a/one.hs", "b/two.hs"].into_iter().collect(),
             blobs: vec!["shard-00000000-00000002.bin".into()],
             doc_lens: vec![6, 4],
             blob_lens: vec![11],

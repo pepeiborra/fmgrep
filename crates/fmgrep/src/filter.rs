@@ -7,6 +7,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::fetch::Paths;
+use crate::manifest::FileTable;
 
 /// A PATH argument.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +86,7 @@ impl PathFilter {
 
     /// Ascending disjoint id ranges of `files` holding every file a search
     /// keeps; None when unbounded.
-    pub fn cover(&self, files: &[String]) -> Option<Vec<Range<usize>>> {
+    pub fn cover(&self, files: &FileTable) -> Option<Vec<Range<usize>>> {
         let includes: Option<Vec<&str>> = match self.includes {
             0 => None,
             _ => self
@@ -124,12 +125,12 @@ impl PathFilter {
         let mut ranges: Vec<Range<usize>> = prefixes
             .iter()
             .map(|(p, exact)| {
-                let lo = files.partition_point(|f| f.as_str() < p.as_str());
-                let n = match exact {
-                    true => usize::from(files.get(lo) == Some(p)),
-                    false => files[lo..].partition_point(|f| f.starts_with(p.as_str())),
+                let lo = files.partition_point(0..files.len(), |f| f < p.as_str());
+                let hi = match exact {
+                    true => lo + usize::from(files.get(lo) == Some(p.as_str())),
+                    false => files.partition_point(lo..files.len(), |f| f.starts_with(p.as_str())),
                 };
-                lo..lo + n
+                lo..hi
             })
             .filter(|r| !r.is_empty())
             .collect();

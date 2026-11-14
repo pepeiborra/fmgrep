@@ -20,6 +20,10 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+fn table(v: &[&str]) -> FileTable {
+    v.iter().collect()
+}
+
 /// `(path, name)` pairs.
 fn named(paths: &[(&str, &str)]) -> Vec<SearchPath> {
     paths
@@ -337,7 +341,7 @@ fn the_cwd_of_a_search_without_paths_is_an_unnamed_path() {
 }
 
 fn cover(globs: &[&str], fold: bool, paths: &[&str], files: &[&str]) -> Option<Vec<Range<usize>>> {
-    filter(globs, &[], fold, paths).cover(&strings(files))
+    filter(globs, &[], fold, paths).cover(&table(files))
 }
 
 const ORDERED: [&str; 8] = [
@@ -378,7 +382,7 @@ fn unprefixed_folded_or_exclude_only_filters_are_unbounded() {
     assert_eq!(cover(&["p/**"], true, &[], &ORDERED), None);
     assert_eq!(cover(&["*.rs"], false, &["", "p"], &ORDERED), None);
     let iglob = PathFilter::new(&[], &strings(&["p/**"]), false, &[], "");
-    assert_eq!(iglob.unwrap().unwrap().cover(&strings(&ORDERED)), None);
+    assert_eq!(iglob.unwrap().unwrap().cover(&table(&ORDERED)), None);
 }
 
 #[test]
@@ -400,6 +404,7 @@ fn the_cover_holds_every_kept_file() {
         .collect();
     files.sort();
     files.dedup();
+    let files: FileTable = files.iter().collect();
     let sets: [&[&str]; 17] = [
         &["a/**"],
         &["/a*"],
@@ -454,7 +459,7 @@ fn the_cover_holds_every_kept_file() {
 
 #[test]
 fn a_cover_follows_the_path_the_globs_see() {
-    let files = strings(&FILES);
+    let files = table(&FILES);
     let at = |cwd: &str, globs: &[&str], paths: &[(&str, &str)]| {
         let cover = from(cwd, globs, paths).cover(&files);
         cover.map(|c| c.into_iter().map(|r| (r.start, r.end)).collect::<Vec<_>>())

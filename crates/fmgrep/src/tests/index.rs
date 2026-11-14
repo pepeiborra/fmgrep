@@ -41,7 +41,7 @@ fn load_index_ignores_stray_root_files() {
     assert_eq!(index_it(&folder, &output, true).num_files, 1);
     std::fs::write(output.join("extra.bin"), b"junk").unwrap();
     let (manifest, docs, blobs) = read_back(&output);
-    assert_eq!(manifest.files, vec!["a.c".to_string()]);
+    assert_eq!(manifest.files, ["a.c"].into_iter().collect());
     assert_eq!(manifest.blobs, vec!["shard-00000000-00000001.bin"]);
     assert_eq!(docs, vec![b"hello".to_vec()]);
     assert_eq!(

@@ -9,6 +9,7 @@ use std::sync::{Arc, MutexGuard, PoisonError};
 
 use super::{IGNORED, Known, Recorded, parallel};
 use crate::binary::sniff_text;
+use crate::manifest::{FileTable, partition_ids};
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
 #[derive(Default)]
@@ -74,7 +75,7 @@ impl super::Files {
     /// not list, and mark the indexed ones an ignore rule now skips; with a
     /// record, only changed and new directories are listed, and the dirs a
     /// changed ignore input affects.
-    pub fn discover(&self, files: &[String], lens: &[u64]) {
+    pub fn discover(&self, files: &FileTable, lens: &[u64]) {
         let known = &*self.known;
         match &known.recorded {
             Some(recorded) => known.discover_recorded(recorded, files, lens),
@@ -88,27 +89,27 @@ impl super::Files {
     }
 }
 
-/// The first index of ascending `files`, from `from` on, not below `rel`.
-fn seek(files: &[String], from: usize, rel: &str) -> usize {
+/// The first index, from `from` on, of an ascending list of `len` paths
+/// (`path(i)` reads item `i`) not below `rel`.
+fn seek<'a>(len: usize, path: impl Fn(usize) -> &'a str, from: usize, rel: &str) -> usize {
     let (mut lo, mut step) = (from, 1);
-    while lo + step <= files.len() && files[lo + step - 1].as_str() < rel {
+    while lo + step <= len && path(lo + step - 1) < rel {
         lo += step;
         step *= 2;
     }
-    let hi = (lo + step).min(files.len());
-    lo + files[lo..hi].partition_point(|f| f.as_str() < rel)
+    partition_ids(lo..(lo + step).min(len), |i| path(i) < rel)
 }
 
 /// Ids of ascending `files` at or under `rel`, `""` the root.
 pub(super) fn docs_under<'a>(
-    files: &'a [String],
+    files: &'a FileTable,
     rel: &'a str,
 ) -> impl Iterator<Item = usize> + 'a {
-    let exact = files.binary_search_by(|f| f.as_str().cmp(rel)).ok();
+    let exact = files.binary_search(rel).ok();
     let dir = format!("{rel}/");
     let lo = match rel {
         "" => 0,
-        _ => files.partition_point(|f| f.as_str() < dir.as_str()),
+        _ => files.partition_point(0..files.len(), |f| f < dir.as_str()),
     };
     let tree =
         (lo..files.len()).take_while(move |&id| rel.is_empty() || files[id].starts_with(&dir));
@@ -116,13 +117,13 @@ pub(super) fn docs_under<'a>(
 }
 
 /// Ascending `walked` minus ascending `files`.
-pub(super) fn unlisted(walked: Vec<String>, files: &[String]) -> Vec<String> {
+pub(super) fn unlisted(walked: Vec<String>, files: &FileTable) -> Vec<String> {
     let mut at = 0;
     walked
         .into_iter()
         .filter(|rel| {
-            at = seek(files, at, rel);
-            files.get(at) != Some(rel)
+            at = seek(files.len(), |i| &files[i], at, rel);
+            files.get(at) != Some(rel.as_str())
         })
         .collect()
 }
@@ -170,15 +171,16 @@ impl Known {
     /// Walk `under` (at or below `root`) and reconcile what it holds: an
     /// indexed doc the rule skips, or no longer a regular file, is ignored;
     /// one the walk missed or lists again is statted.
-    pub fn discover(&self, root: &Path, under: &Path, files: &[String], lens: &[u64]) {
+    pub fn discover(&self, root: &Path, under: &Path, files: &FileTable, lens: &[u64]) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
         };
         let (mut skipped, mut back, mut at) = (Vec::new(), Vec::new(), 0);
         for id in docs_under(files, rel) {
-            at = seek(&walked, at, &files[id]);
-            match (walked.get(at) == Some(&files[id]), self.kind(id) == IGNORED) {
+            at = seek(walked.len(), |i| walked[i].as_str(), at, &files[id]);
+            let listed = walked.get(at).map(String::as_str) == Some(&files[id]);
+            match (listed, self.kind(id) == IGNORED) {
                 (false, false) => skipped.push(id),
                 (true, true) => back.push(id),
                 _ => {}
@@ -204,7 +206,7 @@ impl Known {
     /// [`Self::discover`] of the root, listing only the recorded dirs whose
     /// stamp moved and the new ones below them, then walking the dirs a
     /// changed ignore input affects.
-    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: &[String], lens: &[u64]) {
+    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: &FileTable, lens: &[u64]) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
         let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));

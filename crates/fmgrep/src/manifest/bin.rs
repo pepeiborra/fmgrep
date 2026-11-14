@@ -39,7 +39,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use super::{Manifest, refuse_foreign};
+use super::{FileTable, Manifest, refuse_foreign};
 
 const MAGIC: &[u8; 8] = b"fmmanif\0";
 
@@ -232,7 +232,7 @@ pub fn decode(input: &mut impl Read, len: u64, path: &Path) -> Result<Manifest, 
         index_size_bytes: u64_at(&head, 40),
         build_time_us: u64_at(&head, 48),
         index_started_ns: u64_at(&head, 56) as i64,
-        files: pieces(&text, &path_ends),
+        files: FileTable::from_parts(text, path_ends),
         blobs: pieces(&labels, &label_ends),
         doc_lens,
         blob_lens,

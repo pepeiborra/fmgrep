@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use rayon::prelude::*;
 
 use crate::Stamp;
+use crate::manifest::FileTable;
 
 mod added;
 mod journal;
@@ -196,7 +197,7 @@ impl Known {
 
     /// Stat `id` against its stamp, an ignored doc only if `force`: why it
     /// is gone, if it is.
-    fn stat(&self, id: usize, files: &[String], lens: &[u64], force: bool) -> Option<String> {
+    fn stat(&self, id: usize, files: &FileTable, lens: &[u64], force: bool) -> Option<String> {
         let (kind, why) = match std::fs::metadata(self.root.join(&files[id])) {
             Ok(meta) if self.stamps.holds(id, &meta, lens[id]) => (FRESH, None),
             Ok(_) => (STALE, None),
@@ -231,7 +232,7 @@ impl Known {
 
     /// Stat `ids` (ascending), ignored ones only if `force`, then warn about
     /// the gone ones in order, or once when over half the docs are.
-    fn stat_ids(&self, ids: &[usize], files: &[String], lens: &[u64], force: bool) {
+    fn stat_ids(&self, ids: &[usize], files: &FileTable, lens: &[u64], force: bool) {
         let gone = parallel(ids, |&id| self.stat(id, files, lens, force));
         let n = gone.iter().flatten().count();
         if n * 2 > self.state.len() {
@@ -252,7 +253,7 @@ impl Known {
         }
     }
 
-    fn stat_all(&self, files: &[String], lens: &[u64], force: bool) {
+    fn stat_all(&self, files: &FileTable, lens: &[u64], force: bool) {
         let ids: Vec<usize> = (0..self.state.len()).collect();
         self.stat_ids(&ids, files, lens, force);
     }
@@ -274,7 +275,7 @@ impl Known {
         &self,
         recorded: &Arc<Recorded>,
         paths: &[String],
-        files: &[String],
+        files: &FileTable,
         lens: &[u64],
     ) -> Result<usize, ()> {
         let root = &self.root;
@@ -292,7 +293,7 @@ impl Known {
                 }
                 continue;
             }
-            if let Ok(id) = files.binary_search_by(|f| f.as_str().cmp(rel)) {
+            if let Ok(id) = files.binary_search(rel) {
                 ids.push(id);
             } else if recorded.is_dir(rel) {
                 dirs.push(rel.clone());
@@ -317,13 +318,13 @@ impl Known {
             return Err(());
         }
         scopes.extend(new_dirs.into_iter().map(str::to_owned));
-        let seek = |key: &str| files.partition_point(|f| f.as_str() < key);
+        let seek = |key: &str| files.partition_point(0..files.len(), |f| f < key);
         let (mut listed, mut seen) = (Vec::new(), std::collections::HashSet::new());
         while let Some(dir) = dirs.pop() {
             if !seen.insert(dir.clone()) {
                 continue;
             }
-            ids.extend(direct(&dir, files.len(), |i| files[i].as_str(), seek));
+            ids.extend(direct(&dir, files.len(), |i| &files[i], seek));
             for (child, stamp) in recorded.child_dirs(&dir) {
                 match std::fs::symlink_metadata(root.join(child)) {
                     Ok(m) if m.is_dir() && Stamp::of(&m) == stamp => {}
@@ -378,7 +379,7 @@ impl Known {
     }
 
     /// [`Self::discover`] of the outermost of root-relative `scopes`.
-    fn discover_scopes(&self, scopes: Vec<String>, files: &[String], lens: &[u64]) {
+    fn discover_scopes(&self, scopes: Vec<String>, files: &FileTable, lens: &[u64]) {
         let root = &self.root;
         for scope in outermost(scopes) {
             self.discover(root, &root.join(scope), files, lens);
@@ -509,7 +510,7 @@ impl Files {
     }
 
     /// The canonical root and the walk's record to ask with, or why not.
-    fn askable(&self, files: &[String]) -> Result<(PathBuf, &Arc<Recorded>), String> {
+    fn askable(&self, files: &FileTable) -> Result<(PathBuf, &Arc<Recorded>), String> {
         if !*self.sorted.get_or_init(|| files.is_sorted()) {
             return Err("the manifest lists files out of order; re-run index".to_owned());
         }
@@ -527,7 +528,7 @@ impl Files {
     /// baseline) instead of [`Self::stat_all`] and discovery: false when no
     /// ask is due (a server's always is), or, saying why on stderr, when
     /// watchman cannot say.
-    pub fn replay(&self, files: &[String], lens: &[u64]) -> bool {
+    pub fn replay(&self, files: &FileTable, lens: &[u64]) -> bool {
         let Some(index) = &self.index else {
             return false;
         };
@@ -606,7 +607,7 @@ impl Files {
     /// every file as a new load would. On stderr, why every file was
     /// checked, each time the reason changes, and a note once watchman
     /// answers again.
-    pub fn recheck(&self, files: &[String], lens: &[u64]) {
+    pub fn recheck(&self, files: &FileTable, lens: &[u64]) {
         if self.index.is_none() || !self.known.each_query {
             return;
         }
@@ -634,7 +635,7 @@ impl Files {
         &self,
         root: &Path,
         recorded: &Arc<Recorded>,
-        files: &[String],
+        files: &FileTable,
         lens: &[u64],
     ) -> Option<String> {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
@@ -662,7 +663,7 @@ impl Files {
 
     /// What a new load finds: every doc statted, ignored ones too, then
     /// discovery, which marks again what the rules skip.
-    fn check_all(&self, files: &[String], lens: &[u64]) {
+    fn check_all(&self, files: &FileTable, lens: &[u64]) {
         self.known.stat_all(files, lens, true);
         self.discover(files, lens);
     }
@@ -670,7 +671,7 @@ impl Files {
     /// Once every doc is known, save the last token and what differs now
     /// (the baseline) in the user's cache: once per process, so a server
     /// saves after its first query that has a token.
-    pub fn checkpoint(&self, files: &[String]) {
+    pub fn checkpoint(&self, files: &FileTable) {
         let Some(index) = &self.index else {
             return;
         };
@@ -691,7 +692,7 @@ impl Files {
             .stale
             .iter()
             .chain(&snap.gone)
-            .map(|&id| files[id].clone())
+            .map(|&id| files[id].to_owned())
             .collect();
         let recorded = self.known.recorded.as_deref();
         baseline.extend(
@@ -727,7 +728,7 @@ impl Files {
     }
 
     /// Stat every doc; each newly gone one warns, in doc order.
-    pub fn stat_all(&self, files: &[String], lens: &[u64]) {
+    pub fn stat_all(&self, files: &FileTable, lens: &[u64]) {
         self.known.stat_all(files, lens, false);
     }
 
@@ -892,14 +893,14 @@ mod tests {
     pub(super) struct Fix {
         pub(super) path: PathBuf,
         index: PathBuf,
-        pub(super) files: Vec<String>,
+        pub(super) files: FileTable,
         pub(super) lens: Vec<u64>,
     }
 
     pub(super) fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
         let path = dir.join("corpus");
         std::fs::create_dir_all(&path).unwrap();
-        let files: Vec<String> = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
+        let files: FileTable = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
         let mut mtimes = Vec::new();
         for (name, d) in files.iter().zip(docs) {
             std::fs::write(path.join(name), d).unwrap();
