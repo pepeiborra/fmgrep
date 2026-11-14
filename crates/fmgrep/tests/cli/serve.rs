@@ -386,6 +386,68 @@ fn fmgrep_server_alone_prints_the_help() {
     );
 }
 
+/// An `FMGREP_SERVER` that is not UTF-8 fails only a search that would use
+/// it, and names the variable. Unix only: the value is raw bytes.
+#[cfg(unix)]
+#[test]
+fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
+    use std::os::unix::ffi::OsStrExt;
+    let run_bad = |cwd: &Path, argv: &[&str]| {
+        (fmgrep().current_dir(cwd))
+            .env("FMGREP_SERVER", OsStr::from_bytes(b"\xff\xfe"))
+            .args(argv)
+            .output()
+            .expect("spawn fmgrep")
+    };
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    let away = tmp.path().join("away");
+    std::fs::create_dir(&away).unwrap();
+    for argv in [&["--help"][..], &["--version"], &["serve", "--help"]] {
+        let out = run_bad(&away, argv);
+        assert_eq!(out.status.code(), Some(0), "{argv:?}: {}", stderr(&out));
+    }
+    let bare = run_bad(&away, &[]);
+    assert_eq!(bare.status.code(), Some(2));
+    assert!(stderr(&bare).contains("Usage: fmgrep"), "{}", stderr(&bare));
+
+    // `--server` and `--index` win; a subcommand runs.
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let addr = server.addr();
+    let words = ["-l", "printk"];
+    let hits = "a.bin\nb.bin\n";
+    for flag in [["--server", &addr], ["--index", &index]] {
+        let out = run_bad(&away, &[&flag[..], &words].concat());
+        assert_eq!(out.status.code(), Some(0), "{flag:?}: {}", stderr(&out));
+        assert_eq!(
+            (String::from_utf8_lossy(&out.stdout), stderr(&out)),
+            (hits.into(), "".into())
+        );
+    }
+    shutdown(&mut server, &addr);
+    let out = run_bad(&away, &["index", &docs.display().to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // An index found by walking up answers; the value is not looked at.
+    let out = run_bad(&docs, &words);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        (String::from_utf8_lossy(&out.stdout), stderr(&out)),
+        (hits.into(), "".into())
+    );
+
+    // A search or `--status` that would reach the server fails.
+    for argv in [&words[..], &["--status"]] {
+        let out = run_bad(&away, argv);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            stderr(&out),
+            "error: FMGREP_SERVER=\"\\xFF\\xFE\" is not UTF-8\n"
+        );
+    }
+}
+
 /// `--server` that cannot be reached: an index found by walking up answers,
 /// with one warning; with none, the search fails.
 #[test]
