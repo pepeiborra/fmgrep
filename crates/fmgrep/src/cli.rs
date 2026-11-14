@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
+mod frames;
 mod locate;
 mod params;
 mod print;

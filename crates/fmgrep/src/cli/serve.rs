@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::frames::{FileFrames, Frame};
 use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::Ask;
 use crate::manifest::{Checked, Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
-use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
 use crate::remote::{Conn, RpcError};
 use crate::sharded::DocfmIndex;
@@ -52,54 +52,6 @@ impl Rendered {
             bytes,
             report,
         }
-    }
-}
-
-const FRAME: usize = 64 << 10;
-/// Room for the longest header in front of a frame.
-const HEAD: usize = 8;
-
-/// `stream` output: `<len>\n<len bytes>` frames of at most [`FRAME`] bytes,
-/// each one write.
-struct Frames<'a> {
-    out: &'a mut dyn Write,
-    buf: Vec<u8>,
-}
-
-impl<'a> Frames<'a> {
-    fn new(out: &'a mut dyn Write) -> Self {
-        let mut buf = Vec::with_capacity(HEAD + FRAME);
-        buf.resize(HEAD, 0);
-        Self { out, buf }
-    }
-
-    fn emit(&mut self) -> std::io::Result<()> {
-        let len = self.buf.len() - HEAD;
-        if len == 0 {
-            return Ok(());
-        }
-        let head = format!("{len}\n");
-        let start = HEAD - head.len();
-        self.buf[start..HEAD].copy_from_slice(head.as_bytes());
-        let sent = self.out.write_all(&self.buf[start..]);
-        self.buf.truncate(HEAD);
-        sent
-    }
-}
-
-impl Write for Frames<'_> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        let n = b.len().min(HEAD + FRAME - self.buf.len());
-        self.buf.extend_from_slice(&b[..n]);
-        if self.buf.len() == HEAD + FRAME {
-            self.emit()?;
-        }
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.emit()?;
-        self.out.flush()
     }
 }
 
@@ -191,11 +143,11 @@ impl Served<'_> {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
             // Output so far precedes an error, as in a local search.
             _ if p.stream => {
-                let mut frames = Frames::new(out);
-                let rendered = render(p, false, &mut frames, run);
+                let mut frames = FileFrames::new(out);
+                let report = run(&mut frames);
                 let sent = frames.flush();
-                rendered.and_then(|report| {
-                    sent.map_err(|e| format!("{WRITE_FAILED} matches: {e}"))?;
+                report.and_then(|report| {
+                    sent?;
                     Ok(Answer::Rendered(Rendered {
                         text: None,
                         bytes: None,
@@ -548,28 +500,31 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
     ask_on(conn, "status")
 }
 
-/// Send one request to a server and print its result as a search would.
+/// Send one request to a server and print its result as a search would:
+/// each file's frame through this search's own writer.
 pub fn run_client(
     conn: &mut Conn,
     p: &QueryParams,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
+    render(p, json, out, |sink| remote(conn, p, sink)).map(Outcome::Query)
+}
+
+/// `p` (with `stream`) answered by the server: each event to `sink`, then
+/// the report.
+pub fn remote(
+    conn: &mut Conn,
+    p: &QueryParams,
+    sink: &mut dyn MatchSink,
+) -> Result<OutputReport, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
-    let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
-    let mut pipe = Pipe::new(&mut *out);
-    let result = conn.call("query", sent, &mut |b| match printed {
-        true => pipe.raw(b),
-        false => Ok(()),
+    let result = conn.call("query", sent, &mut |frame| {
+        Frame::decode(frame)?.replay(sink)
     })?;
-    pipe.finish()?;
-    let report = match p.mode {
-        Mode::Counts => conn.decode(result)?,
-        _ => conn.decode::<Rendered>(result)?.report,
-    };
-    if printed {
-        return Ok(Outcome::Query(report));
+    match p.mode {
+        Mode::Counts => conn.decode(result),
+        _ => Ok(conn.decode::<Rendered>(result)?.report),
     }
-    render(p, json, out, |_| Ok(report)).map(Outcome::Query)
 }
