@@ -20,21 +20,27 @@ pub struct RpcError {
     pub message: String,
 }
 
-/// One connection, one request in flight; every `Err` is printable.
+/// One connection, one request in flight; every `Err` of a call is
+/// printable.
 pub struct Conn {
     addr: String,
     stream: BufReader<TcpStream>,
 }
 
 impl Conn {
-    pub fn open(addr: &str) -> Result<Self, String> {
-        let io = |e: std::io::Error| format!("error: {addr}: {e}");
-        let stream = TcpStream::connect(addr).map_err(io)?;
-        stream.set_nodelay(true).map_err(io)?;
+    /// A connection to `addr`, or why the server cannot be reached.
+    pub fn connect(addr: &str) -> std::io::Result<Self> {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
         Ok(Self {
             addr: addr.to_owned(),
             stream: BufReader::with_capacity(64 << 10, stream),
         })
+    }
+
+    /// [`Self::connect`], with a printable error.
+    pub fn open(addr: &str) -> Result<Self, String> {
+        Self::connect(addr).map_err(|e| format!("error: cannot reach the server at {addr}: {e}"))
     }
 
     /// Frames go to `body` until the response line, whose `result` this is.
