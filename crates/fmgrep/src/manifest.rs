@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod bin;
+mod files;
+
+pub use files::{FileTable, partition_ids};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
@@ -51,7 +54,7 @@ pub struct Manifest {
     pub index_started_ns: i64,
     /// Corpus-relative path per doc, ascending by id: what a search reports as
     /// a match's file.
-    pub files: Vec<String>,
+    pub files: FileTable,
     /// Blob inventory: one `shard-<start>-<end>.bin` label per shard.
     pub blobs: Vec<String>,
     /// Raw byte length per doc, parallel to `files`: sizes docs without
@@ -140,6 +143,8 @@ pub fn write_manifest(output: &Path, manifest: &Manifest) -> Result<(), String> 
 /// 460,000 paths, a map with read-ahead advice was about 0.7 ms faster
 /// with a warm cache, a map without the advice was slower, and with a
 /// cold cache a map with the advice took about twice as long as a read.
+/// The buffer of the read becomes the text of the path table; a map
+/// would need a copy of that text.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
     let path = dir.join(MANIFEST_BIN);
     let cannot = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
@@ -154,7 +159,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
         open => open.map_err(cannot)?,
     };
     let bytes = bin::read_file(file, &path)?;
-    let manifest = bin::decode(&bytes, &path)?;
+    let manifest = bin::decode(bytes, &path)?;
     validate(&manifest, &path)?;
     Ok(manifest)
 }
@@ -236,7 +241,7 @@ fn refuse_foreign(path: &Path, format: u32) -> Result<(), String> {
 pub(crate) fn rewrite(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
     let path = dir.join(MANIFEST_BIN);
     let raw = std::fs::read(&path).unwrap();
-    let mut manifest = bin::decode(&raw, &path).unwrap();
+    let mut manifest = bin::decode(raw, &path).unwrap();
     edit(&mut manifest);
     write_manifest(dir, &manifest).unwrap();
 }
@@ -279,7 +284,7 @@ fn read_docs(dir: &Path, manifest: &Manifest) -> Result<Vec<crate::Document>, St
         })?;
         docs.push(crate::Document {
             id: pos,
-            path: name.clone(),
+            path: name.to_owned(),
             bytes: bytes.to_vec(),
         });
     }
@@ -354,7 +359,7 @@ mod tests {
             index_size_bytes: 99,
             build_time_us: 7,
             index_started_ns: 9,
-            files: vec!["a/one.hs".into(), "b/two.hs".into()],
+            files: ["a/one.hs", "b/two.hs"].into_iter().collect(),
             blobs: vec!["shard-00000000-00000002.bin".into()],
             doc_lens: vec![6, 4],
             blob_lens: vec![11],

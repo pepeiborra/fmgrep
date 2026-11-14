@@ -7,7 +7,7 @@ struct Fix {
     store_docs: bool,
     path: PathBuf,
     lens: Vec<u64>,
-    files: Vec<String>,
+    files: FileTable,
     /// Holds `docs.stamps` for the files layout.
     index: PathBuf,
 }
@@ -29,7 +29,7 @@ fn stage_files(dir: &Path, docs: &[&[u8]]) -> Fix {
     let index = dir.join("idx");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&index).unwrap();
-    let files: Vec<String> = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
+    let files: FileTable = (0..docs.len()).map(|i| format!("d{i:04}.c")).collect();
     let (mut mtimes, mut lens, mut file_lens) = (Vec::new(), Vec::new(), Vec::new());
     for (id, (name, d)) in files.iter().zip(docs).enumerate() {
         std::fs::write(root.join(name), d).unwrap();
@@ -103,7 +103,7 @@ fn stage_shard(dir: &Path, docs: &[&[u8]]) -> Fix {
         store_docs: true,
         path,
         lens: docs.iter().map(|d| d.len() as u64).collect(),
-        files: Vec::new(),
+        files: FileTable::default(),
         index: dir.to_path_buf(),
     }
 }
@@ -346,7 +346,7 @@ fn zero_length_candidates_need_no_shard() {
         store_docs: true,
         path: tmp.path().join("absent.shard"),
         lens: vec![0u64, 0],
-        files: Vec::new(),
+        files: FileTable::default(),
         index: tmp.path().to_path_buf(),
     };
     let mut shard = reader(&fix);
@@ -813,7 +813,7 @@ fn added_doc_is_read_whole_and_cached_across_terms() {
 
 #[test]
 fn paths_cmp_orders_added_ids_among_manifest_ids() {
-    let files: Vec<String> = ["b", "d"].map(String::from).to_vec();
+    let files: FileTable = ["b", "d"].into_iter().collect();
     let paths = Paths {
         files: &files,
         added: ["a", "c", "e"].map(String::from).into(),
