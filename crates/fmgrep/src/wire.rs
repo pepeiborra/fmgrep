@@ -59,6 +59,15 @@ pub struct OutputReport {
     pub index_size_bytes: u64,
     pub num_files_indexed: usize,
     pub queries: Vec<QueryReport>,
+    /// A query that may not fail on it (one that leaves files to its
+    /// client) found that its PATHs, cwd and globs kept it from every
+    /// file. Absent when false.
+    #[serde(default, skip_serializing_if = "is_no")]
+    pub none_searched: bool,
+}
+
+fn is_no(v: &bool) -> bool {
+    !*v
 }
 
 #[cfg(test)]
@@ -79,6 +88,7 @@ mod tests {
                 counts_exact: true,
                 leaves: Vec::new(),
             }],
+            none_searched: false,
         };
         let json = serde_json::to_string(&out).unwrap();
         // Counts mode stays byte-identical: no `files` key at all.

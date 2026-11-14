@@ -210,6 +210,7 @@ impl QueryParams {
             expr: self.expr.as_ref(),
             output: self.output(),
             filter: self.filter()?,
+            report_none: self.commit.is_some(),
         })
     }
 
