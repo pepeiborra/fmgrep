@@ -187,6 +187,36 @@ fn degenerate_sets_match_naive() {
     }
 }
 
+/// `total` over any bytes, too few, too many or the right number, counts
+/// what reading the high bits a word at a time counts: bytes past the end
+/// as zeros, bits past the high bits ignored.
+#[test]
+fn total_counts_any_bytes_as_word_reads_do() {
+    Dicetest::repeatedly().passes(3000).run(|mut fate| {
+        let rows = fate.roll(dice::usize(0..=3000));
+        let count = fate.roll(dice::usize(0..=rows));
+        let want = section_bytes(rows, count);
+        let len = fate.roll(dice::usize(0..=want + 80));
+        let bytes: Vec<u8> = (0..len).map(|_| fate.roll(dice::u8(..))).collect();
+        hint!("{rows} rows, {count} marks, {len} of {want} bytes");
+        let marks = Marks {
+            bytes: &bytes,
+            shape: Shape::new(rows, count),
+            rows,
+            count,
+        };
+        let high_bits = marks.shape.high_bits;
+        let by_words: usize = (0..high_bits.div_ceil(64))
+            .map(|w| {
+                let span = (high_bits - 64 * w).min(64);
+                let mask = if span < 64 { (1u64 << span) - 1 } else { !0 };
+                (marks.high_word(w) & mask).count_ones() as usize
+            })
+            .sum();
+        assert_eq!(marks.total(), by_words);
+    });
+}
+
 #[test]
 #[should_panic(expected = "assertion `left == right` failed")]
 fn write_refuses_a_section_of_the_wrong_size() {
