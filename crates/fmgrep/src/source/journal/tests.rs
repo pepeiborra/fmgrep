@@ -528,6 +528,8 @@ mod watchman_tests {
             ("n:foo", "c:1:2", false),
         ] {
             assert_eq!(ticked(a, b), later, "{a} {b}");
+            let harness = crate::tests::watchman::ticked(a, b);
+            assert_eq!(harness, later, "the tests' daemons wait by it: {a} {b}");
         }
     }
 
