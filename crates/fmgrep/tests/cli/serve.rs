@@ -372,6 +372,20 @@ fn fmgrep_server_gives_the_server() {
     assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
 }
 
+/// Bare `fmgrep` prints the help with `FMGREP_SERVER` set too: the
+/// variable is not an argument.
+#[test]
+fn fmgrep_server_alone_prints_the_help() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_env(tmp.path(), &closed_port(), &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out).contains("Usage: fmgrep [OPTIONS] [TERM]..."),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// `--server` that cannot be reached: an index found by walking up answers,
 /// with one warning; with none, the search fails.
 #[test]
