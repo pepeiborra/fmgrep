@@ -494,20 +494,40 @@ fn a_restarted_watchman_or_a_lost_watch_makes_a_new_baseline() {
     assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert!(notes().is_empty(), "watched again: the record is used");
     daemon.unwatch(&folder);
-    let before = clock(tmp.path());
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
-    assert_eq!(notes(), [once], "the watch is gone: added again");
-    let asked = [
-        "watch-list",
-        "watch-project",
-        "get-config",
-        "clock",
-        "clock",
-        "query",
-    ];
-    assert_eq!(daemon.sent(), asked);
-    assert_ne!(clock(tmp.path()), before);
-    assert_eq!(printed(&output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    let kept = record(tmp.path());
+    // The search adds the watch again, and its token must wait for the end
+    // of the crawl that follows, which the test cannot wait for first. A
+    // search too early takes no token, says why and keeps the record.
+    let (answer, lates) = tried(&daemon, || printed(&output, &["-l"], &["printk"]));
+    assert_eq!(answer, ab);
+    assert!(lates.iter().all(|late| late == ab));
+    let mut sent = daemon.sent();
+    // The watch is added again by this search, or by a late try before it.
+    if sent.get(1).map(String::as_str) == Some("watch-project") {
+        sent.remove(1);
+    } else {
+        assert!(!lates.is_empty(), "the watch is added again: {sent:?}");
+    }
+    let got = notes();
+    if got != [once] {
+        let root = std::fs::canonicalize(&folder).unwrap();
+        let root = root.display();
+        let crawling = cannot(&format!("watchman is still crawling {root}"));
+        let watching = format!("fmgrep asked watchman to watch {root}; later searches ask it");
+        let watching = cannot(&format!("{watching} once its crawl ends"));
+        assert!(
+            got == [crawling] && sent == TAKES || got == [watching] && sent == ["watch-list"],
+            "{got:?} {sent:?}"
+        );
+        assert_eq!(record(tmp.path()), kept, "too early: the record is kept");
+        daemon.watch(&folder);
+        assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
+        assert_eq!(notes(), [once], "the watch is gone: added again");
+        sent = daemon.sent();
+    }
+    assert_eq!(sent, asked, "a new token, then the token question");
+    assert_ne!(clock(tmp.path()), kept["token"]["clock"]);
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), ab);
     assert!(notes().is_empty(), "watched again: the record is used");
 }
 
