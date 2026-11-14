@@ -321,13 +321,13 @@ fn past_the_limit_an_ignore_file_that_governs_it_is_the_reason() {
     let short = &r.commit[..7];
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = format!("more than 10000 files differ from the served commit {short}");
-    assert_eq!(stderr(&out), crate::remote::ignored(&why));
+    assert_eq!(r.warnings(&out), crate::remote::ignored(&why));
     assert_eq!(stdout(&out), served);
     r.s.write(&r.client, &[(".gitignore", "*.log\n*.tmp\n")]);
     let out = r.search(&r.client, &["-l", "printk"]);
     let why = "the ignore file .gitignore differs from the served commit and governs more than \
                10000 files";
-    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(r.warnings(&out), crate::remote::ignored(why));
     assert_eq!(stdout(&out), served);
 }
 
@@ -414,7 +414,7 @@ fn tracked_files_the_clients_excludes_ignore_are_left_out() {
     r.s.write(&r.client, &[(".git/info/exclude", "*.h\n")]);
     let tree = std::fs::canonicalize(tree).unwrap();
     let out = r.search(&tree, &["-l", "printk"]);
-    assert_eq!(stderr(&out), "");
+    assert_eq!(r.warnings(&out), "");
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ne.c\n");
 }
 
@@ -673,7 +673,7 @@ fn a_checkout_nested_in_a_repository_ignores_only_its_ignore_files() {
         r.s.write(&tmp, &[(".gitignore", "*.c\n*.h\n")]);
         r.same("", &["-l", "printk"]);
         let out = r.search(&r.client, &["-l", "printk"]);
-        assert_eq!(stderr(&out), "", "{what}");
+        assert_eq!(r.warnings(&out), "", "{what}");
         assert_eq!(stdout(&out), found, "{what}");
         r.s.git(&tmp, &["init", "-q"]);
         r.s.write(&tmp, &[(".git/info/exclude", "*.c\n")]);
@@ -718,7 +718,7 @@ fn a_pattern_naming_a_path_outside_the_checkout_is_no_rule() {
     ] {
         r.s.write(&tmp, &[(".ignore", &format!("# a comment\n{pattern}\n"))]);
         let out = r.search(&r.client, &["-l", "printk"]);
-        assert_eq!(stderr(&out), "", "{pattern}");
+        assert_eq!(r.warnings(&out), "", "{pattern}");
         assert_eq!(stdout(&out), found, "{pattern}");
     }
     for pattern in [

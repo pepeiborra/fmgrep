@@ -76,6 +76,7 @@ fn a_record_is_used_only_by_its_index_build() {
         of: "index /src/linux/.fmgrep@7".into(),
         token: token("c:1:2"),
         baseline: Some(baseline),
+        extra: None,
     };
     assert_eq!(record, want);
     let file = path("/src/linux", "/src/linux/.fmgrep").unwrap();
@@ -116,6 +117,59 @@ fn a_record_is_used_only_by_its_index_build() {
     save(Path::new("/src/linux"), &idx, token("c:1:3"), many, 64);
     let over = Record::read("/src/linux", &idx.of().unwrap()).unwrap();
     assert_eq!(over.baseline, None, "past the cap");
+}
+
+/// A search that cannot ask watchman says why once for each checkout,
+/// served commit and reason: another reason or commit says it again, and
+/// so does one after watchman answered; a note that is damaged, or that
+/// cannot be written, keeps nothing.
+#[test]
+fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    crate::tests::CACHE.set(Some(tmp.path().join("cache")));
+    let src = Path::new("/src/linux");
+    let (a, b) = (Of::commit(&"a".repeat(40)), Of::commit(&"b".repeat(40)));
+    let say = |of: &Of, why: &str| match unsaid(src, of, why) {
+        Some(keep) => {
+            keep();
+            true
+        }
+        None => false,
+    };
+    assert!(say(&a, "no daemon"), "the first time");
+    assert!(!say(&a, "no daemon"), "the same reason, the same commit");
+    assert!(say(&a, "too late"), "another reason");
+    assert!(say(&a, "no daemon"), "back to the first one");
+    assert!(say(&b, "no daemon"), "another commit");
+    assert!(!say(&b, "no daemon"));
+    assert!(say(&a, "no daemon"), "the commit moved back");
+    assert!(unsaid(Path::new("/src/other"), &a, "no daemon").is_some());
+    let file = said_path("/src/linux").unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("linux-") && name.ends_with(".said"),
+        "{name}"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("cache")).unwrap().count(),
+        1
+    );
+    forget(src);
+    assert!(say(&a, "no daemon"), "watchman answered in between");
+    assert!(!say(&a, "no daemon"));
+    for bad in [&b"{"[..], br#"{"v":1}"#, b""] {
+        std::fs::write(&file, bad).unwrap();
+        assert!(say(&a, "no daemon"), "{bad:?}");
+    }
+    // A note that cannot be written says nothing, and the next search
+    // says it again.
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert!(unsaid(src, &a, "no daemon").is_some());
+    unsaid(src, &a, "no daemon").unwrap()();
+    assert!(unsaid(src, &a, "no daemon").is_some());
+    crate::tests::CACHE.set(None);
+    assert!(unsaid(src, &a, "no daemon").is_some(), "no cache directory");
 }
 
 #[test]

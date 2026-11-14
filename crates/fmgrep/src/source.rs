@@ -18,7 +18,10 @@ mod added;
 mod journal;
 mod recorded;
 
-pub use journal::{Index, keep, kept, not_due, request_watch};
+pub use journal::{
+    Index, Of, Remembered, keep, kept, not_due, recorded, remember, remembered, request_watch,
+    unsaid,
+};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
