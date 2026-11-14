@@ -217,7 +217,7 @@ fn a_client_ignores_local_indexes() {
     std::fs::create_dir(&other).unwrap();
     std::fs::write(other.join("e.bin"), b"printk elsewhere\n").unwrap();
     ok(&["index", &other.display().to_string()]);
-    let manifest = other.join(".fmgrep/manifest.json");
+    let manifest = other.join(".fmgrep/manifest.bin");
     let before = std::fs::read(&manifest).unwrap();
     assert_eq!(files(&other, &[]), want);
     assert_eq!(std::fs::read(&manifest).unwrap(), before);

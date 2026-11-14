@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::index::INDEX_DIR;
-use crate::manifest::{BLOBS_SHARD, MANIFEST_JSON};
+use crate::manifest::{BLOBS_SHARD, MANIFEST_BIN, MANIFEST_JSON};
 
 pub struct Located {
     pub index_dir: PathBuf,
@@ -32,7 +32,7 @@ pub fn locate(start: &Path) -> Result<Located, String> {
             root: Some(dir.to_path_buf()),
         })
         .ok_or_else(|| {
-            if abs.join(MANIFEST_JSON).is_file() {
+            if has_manifest(&abs) {
                 return format!("error: {} has no {BLOBS_SHARD}", abs.display());
             }
             format!(
@@ -44,7 +44,13 @@ pub fn locate(start: &Path) -> Result<Located, String> {
 
 /// A manifest alone could be a corpus file; the blob shard makes it an index.
 fn is_index(dir: &Path) -> bool {
-    dir.join(MANIFEST_JSON).is_file() && dir.join(BLOBS_SHARD).is_file()
+    has_manifest(dir) && dir.join(BLOBS_SHARD).is_file()
+}
+
+/// A manifest, or the `manifest.json` of an older fmgrep: found, then
+/// refused by its format.
+fn has_manifest(dir: &Path) -> bool {
+    dir.join(MANIFEST_BIN).is_file() || dir.join(MANIFEST_JSON).is_file()
 }
 
 #[cfg(test)]
@@ -53,7 +59,7 @@ mod tests {
 
     fn index_at(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(dir.join(MANIFEST_BIN), "").unwrap();
         std::fs::write(dir.join(BLOBS_SHARD), "").unwrap();
     }
 
@@ -95,23 +101,39 @@ mod tests {
         assert_eq!(got.index_dir, canon(&inner).join(INDEX_DIR));
     }
 
+    /// So that a search refuses it by its format.
+    #[test]
+    fn an_index_of_an_older_fmgrep_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = tmp.path().join("idx");
+        std::fs::create_dir_all(&idx).unwrap();
+        std::fs::write(idx.join(MANIFEST_JSON), "{}").unwrap();
+        std::fs::write(idx.join(BLOBS_SHARD), "").unwrap();
+        let got = locate(&idx).unwrap();
+        assert_eq!((got.index_dir, got.root), (idx, None));
+    }
+
     #[test]
     fn a_manifest_alone_is_corpus_not_index() {
-        let tmp = tempfile::tempdir().unwrap();
-        index_at(&tmp.path().join(INDEX_DIR));
-        std::fs::write(tmp.path().join("manifest.json"), "{}").unwrap();
-        let got = locate(tmp.path()).unwrap();
-        assert_eq!(got.index_dir, canon(tmp.path()).join(INDEX_DIR));
+        for name in [MANIFEST_BIN, MANIFEST_JSON] {
+            let tmp = tempfile::tempdir().unwrap();
+            index_at(&tmp.path().join(INDEX_DIR));
+            std::fs::write(tmp.path().join(name), "{}").unwrap();
+            let got = locate(tmp.path()).unwrap();
+            assert_eq!(got.index_dir, canon(tmp.path()).join(INDEX_DIR));
+        }
     }
 
     #[test]
     fn a_manifest_without_blobs_is_named_when_nothing_is_found() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("manifest.json"), "{}").unwrap();
-        match locate(tmp.path()) {
-            Err(e) => assert!(e.contains(BLOBS_SHARD), "{e}"),
-            // Only possible when some ancestor of the temp dir holds one.
-            Ok(got) => assert!(!got.index_dir.starts_with(canon(tmp.path()))),
+        for name in [MANIFEST_BIN, MANIFEST_JSON] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(name), "{}").unwrap();
+            match locate(tmp.path()) {
+                Err(e) => assert!(e.contains(BLOBS_SHARD), "{e}"),
+                // Only possible when some ancestor of the temp dir holds one.
+                Ok(got) => assert!(!got.index_dir.starts_with(canon(tmp.path()))),
+            }
         }
     }
 

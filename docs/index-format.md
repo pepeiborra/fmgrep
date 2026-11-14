@@ -1,18 +1,18 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 7): what each
+The on-disk layout `fmgrep index` writes (manifest format 8): what each
 file holds and the rules a reader relies on.
 
 ## Directory
 
 `fmgrep index PATH` writes `PATH/.fmgrep/` (`--output DIR` elsewhere). The
-directory must not already exist. `manifest.json` is written last, so an
+directory must not already exist. `manifest.bin` is written last, so an
 interrupted build leaves nothing queryable, and a failed build removes the
 directory.
 
 | file | present | holds |
 |---|---|---|
-| `manifest.json` | always | the document list, length tables and blob inventory |
+| `manifest.bin` | always | the document list, length tables and blob inventory |
 | `blobs.shard` | always | one docfm blob per shard, concatenated |
 | `docs.stamps` | default | one mtime per document, and the file length of each UTF-16 one |
 | `dirs.stamps` | default | every walked directory's `(size, mtime)` |
@@ -25,16 +25,16 @@ above it. A default index reads documents from the parent of its `.fmgrep`
 directory, so a tree moved with its index keeps working. An index written
 with `--output` reads them from the manifest's `corpus_root`.
 
-## manifest.json
+## manifest.bin
 
-One JSON object on one line, with the fields in this order. Unknown fields
-are refused.
+The manifest holds these fields. `fmgrep status --json` prints them as one
+JSON object on one line, in this order.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `7` |
+| `format` | u32 | `8` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
-| `num_docs` | usize | documents indexed |
+| `num_docs` | u64 | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
 | `bom_bytes` | u64 | leading UTF-8 BOM bytes over all documents |
 | `index_size_bytes` | u64 | the structures' size, plus the document text with `store_docs`; an accounting figure, not a file size |
@@ -57,16 +57,70 @@ search refuses. It prints one `name: value` line per scalar field, plus
 that order, on one line. A script reads the paths with
 `fmgrep status --json | jq -r '.files[]'`.
 
-A load refuses, with exit 2:
+### Layout
 
-- a `format` other than 7, naming the remedy: re-run `fmgrep index`. Old
-  indexes are refused, never upgraded;
+Integers are little-endian, of the widths below, with no alignment and no
+padding. The header is 88 bytes:
+
+| offset | width | holds |
+|---|---|---|
+| 0 | 8 | the magic `fmmanif` and a NUL byte |
+| 8 | 4 | `format` |
+| 12 | 4 | flags: bit 0 is `store_docs`; every other bit is 0 |
+| 16 | 8 | `num_docs` |
+| 24 | 8 | `num_bytes` |
+| 32 | 8 | `bom_bytes` |
+| 40 | 8 | `index_size_bytes` |
+| 48 | 8 | `build_time_us` |
+| 56 | 8 | `index_started_ns` |
+| 64 | 8 | shards: the number of `blobs` |
+| 72 | 8 | bytes of `corpus_root`; 0 when absent |
+| 80 | 8 | bytes of the served commit; 0 |
+
+The sections follow, in this order, each right after the one before:
+
+| section | bytes | holds |
+|---|---|---|
+| `doc_lens` | 8 per document | one u64 per document |
+| path ends | 8 per document | where each path ends in the path text |
+| `blob_lens` | 8 per shard | one u64 per shard |
+| label ends | 8 per shard | where each label ends in the label text |
+| `corpus_root` | its length | UTF-8 |
+| served commit | its length | UTF-8; reserved |
+| label text | the last label end | the `blobs` labels, joined |
+| path text | the last path end | the `files` paths, joined, by id |
+
+A path starts where the one before it ends; the first starts at 0. Labels
+follow the same rule. The file ends where the path text ends. One count
+gives the length of two tables: `num_docs` for `files` and `doc_lens`,
+shards for `blobs` and `blob_lens`.
+
+The served commit is reserved for a later version, which names in it the
+commit a server serves. This version writes none and reads past one that
+is UTF-8.
+
+### Checks
+
+A load reads `manifest.bin` front to back and refuses, with exit 2:
+
+- a file that does not start with the magic;
+- a `format` other than 8, read before anything else, naming the remedy:
+  re-run `fmgrep index`. Old indexes are refused, never upgraded. An
+  index of format 7 or older has a `manifest.json` instead, and is refused
+  by the format that file records;
+- flag bits other than bit 0;
+- a file size other than the one the counts, the lengths and the last ends
+  give (`is truncated`, or bytes past the last section). The counts are
+  checked against the file size before a buffer is sized from them;
+- path or label ends that go back, or that end inside a character;
+- a `corpus_root`, served commit, label or path that is not UTF-8;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
 - `bom_bytes > num_bytes`;
-- `files` / `doc_lens` or `blobs` / `blob_lens` of different lengths;
 - labels that do not partition `0..num_docs`, or a `blobs.shard` whose
   length is not the sum of `blob_lens`.
+
+A refusal of the bytes names the file and ends with "re-run `index`".
 
 ## Documents
 
@@ -391,5 +445,5 @@ them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
 The same tree, the same ignore files outside it (see Documents) and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and
 `docs.shard` bytes, whatever the thread counts. `docs.stamps`,
 `dirs.stamps` and `ignores.stamps` follow the mtimes. Only
-`build_time_us` and `index_started_ns` differ in the manifest, besides
+`build_time_us` and `index_started_ns` differ in `manifest.bin`, besides
 `corpus_root` when the tree moves.

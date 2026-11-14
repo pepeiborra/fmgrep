@@ -1,31 +1,34 @@
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-// Nothing reads or writes manifest.bin yet.
-#[cfg_attr(not(test), allow(dead_code))]
 mod bin;
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
-pub const MANIFEST_FORMAT: u32 = 7;
+pub const MANIFEST_FORMAT: u32 = 8;
 
+/// The manifest, in the layout of [`bin`].
+pub const MANIFEST_BIN: &str = "manifest.bin";
+
+/// The manifest of an index of format 7 or older: refused by its number.
 pub const MANIFEST_JSON: &str = "manifest.json";
 
-/// Concatenated document shard, at the index root next to `manifest.json`.
+/// Concatenated document shard, at the index root next to `manifest.bin`.
 pub const DOCS_SHARD: &str = "docs.shard";
 
-/// Concatenated blob shard, at the index root next to `manifest.json`.
+/// Concatenated blob shard, at the index root next to `manifest.bin`.
 pub const BLOBS_SHARD: &str = "blobs.shard";
 
 /// Write buffer for both shards: the encoders drive a few bytes per write
 /// through `dyn Write`.
 pub const SHARD_WRITE_BUFFER: usize = 1 << 20;
 
-/// On-disk manifest (`<index>/manifest.json`). Field order is the serialized
-/// order; do not reorder.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// On-disk manifest (`<index>/manifest.bin`). Field order is the order of
+/// `fmgrep status --json`; do not reorder.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Manifest {
     pub format: u32,
     /// Documents are read from `docs.shard`, not from the files under
@@ -59,7 +62,7 @@ pub struct Manifest {
     /// and its sum is the shard's expected byte count.
     pub blob_lens: Vec<u64>,
     /// Absolute UTF-8 path; present iff not `store_docs`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub corpus_root: Option<String>,
 }
 
@@ -73,8 +76,8 @@ impl Manifest {
     }
 }
 
-/// Read when a manifest does not parse, so any other format is refused by
-/// number.
+/// Read from a `manifest.json` that an older fmgrep wrote, so that its
+/// format is refused by number.
 #[derive(Deserialize)]
 struct Header {
     format: u32,
@@ -113,39 +116,64 @@ pub fn create_output_dir(output: &Path) -> Result<(), String> {
         .map_err(|e| format!("error: cannot create {}: {e}", output.display()))
 }
 
-/// Write `manifest.json`. Written last: a partial index dir is never
+/// Write `manifest.bin`. Written last: a partial index dir is never
 /// queryable.
 pub fn write_manifest(output: &Path, manifest: &Manifest) -> Result<(), String> {
-    let path = output.join(MANIFEST_JSON);
-    let json = serde_json::to_string(manifest)
-        .map_err(|e| format!("error: failed to encode manifest: {e}"))?;
-    std::fs::write(&path, format!("{json}\n"))
-        .map_err(|e| format!("error: cannot write {}: {e}", path.display()))
+    let path = output.join(MANIFEST_BIN);
+    let cannot = |e: std::io::Error| format!("error: cannot write {}: {e}", path.display());
+    let mut out =
+        BufWriter::with_capacity(SHARD_WRITE_BUFFER, File::create(&path).map_err(cannot)?);
+    bin::encode(manifest, &mut out).map_err(cannot)?;
+    out.flush().map_err(cannot)
 }
 
 /// Read + validate the manifest at `dir` without touching the shards.
 ///
 /// An index of another format is refused by number, whatever else its
-/// manifest holds. Table values stay unchecked against the shards — the
-/// query serves blobs verbatim — but every table length must be lockstep.
+/// manifest holds; so is the `manifest.json` of an older fmgrep. Table
+/// values stay unchecked against the shards — the query serves blobs
+/// verbatim — but every table length must be lockstep.
+///
+/// The file is read front to back into owned buffers, not mapped: on a
+/// cold cache a map read slower (measured on macOS). A map would hand
+/// [`bin::decode`] a reader over its bytes; the layout would not change.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
-    let manifest_path = dir.join(MANIFEST_JSON);
-    let raw = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("error: cannot read {}: {e}", manifest_path.display()))?;
-    let invalid = |e: serde_json::Error| format!("error: invalid {}: {e}", manifest_path.display());
-    let manifest = match serde_json::from_str::<Manifest>(&raw) {
-        Ok(m) => {
-            refuse_foreign(&manifest_path, m.format)?;
-            m
+    let path = dir.join(MANIFEST_BIN);
+    let cannot = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
+    let mut file = match File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let json = dir.join(MANIFEST_JSON);
+            return Err(match json.is_file() {
+                true => refuse_json(&json),
+                false => cannot(e),
+            });
         }
-        Err(e) => {
-            let header: Header = serde_json::from_str(&raw).map_err(invalid)?;
-            refuse_foreign(&manifest_path, header.format)?;
-            return Err(invalid(e));
-        }
+        opened => opened.map_err(cannot)?,
     };
-    validate(&manifest, &manifest_path)?;
+    let len = file.metadata().map_err(cannot)?.len();
+    let manifest = bin::decode(&mut file, len, &path)?;
+    validate(&manifest, &path)?;
     Ok(manifest)
+}
+
+/// The refusal of an index that an older fmgrep wrote: by the format its
+/// `manifest.json` records, if it records one.
+fn refuse_json(path: &Path) -> String {
+    let format = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Header>(&raw).ok())
+        .map(|h| h.format)
+        .filter(|&f| f != MANIFEST_FORMAT);
+    foreign(path, format)
+}
+
+/// The refusal of manifest format `format`, when it is known.
+fn foreign(path: &Path, format: Option<u32>) -> String {
+    let format = format.map(|f| format!(" {f}")).unwrap_or_default();
+    format!(
+        "error: unsupported manifest format{format} in {} (want {MANIFEST_FORMAT}); re-run `index` with this binary",
+        path.display()
+    )
 }
 
 /// The checks of a manifest's values that its encoding does not hold:
@@ -193,13 +221,30 @@ fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
 }
 
 fn refuse_foreign(path: &Path, format: u32) -> Result<(), String> {
-    if format != MANIFEST_FORMAT {
-        return Err(format!(
-            "error: unsupported manifest format {format} in {} (want {MANIFEST_FORMAT}); re-run `index` with this binary",
-            path.display()
-        ));
+    match format {
+        MANIFEST_FORMAT => Ok(()),
+        _ => Err(foreign(path, Some(format))),
     }
-    Ok(())
+}
+
+/// Rewrite the manifest at `dir` with `edit` applied, past the checks of
+/// its values: for tests of what a load refuses.
+#[cfg(test)]
+pub(crate) fn rewrite(dir: &Path, edit: impl FnOnce(&mut Manifest)) {
+    let path = dir.join(MANIFEST_BIN);
+    let raw = std::fs::read(&path).unwrap();
+    let mut manifest = bin::decode(&mut &raw[..], raw.len() as u64, &path).unwrap();
+    edit(&mut manifest);
+    write_manifest(dir, &manifest).unwrap();
+}
+
+/// Overwrite the bytes of the manifest at `dir` from offset `at` on.
+#[cfg(test)]
+pub(crate) fn patch(dir: &Path, at: usize, bytes: &[u8]) {
+    let path = dir.join(MANIFEST_BIN);
+    let mut raw = std::fs::read(&path).unwrap();
+    raw[at..at + bytes.len()].copy_from_slice(bytes);
+    std::fs::write(&path, raw).unwrap();
 }
 
 /// Slice the docs shard back into per-doc bytes in order. Test-only:
@@ -295,16 +340,8 @@ mod tests {
         manifest
     }
 
-    fn retag(dir: &Path, key: &str, value: serde_json::Value) {
-        let path = dir.join("manifest.json");
-        let mut v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        v[key] = value;
-        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
-    }
-
     #[test]
-    fn manifest_round_trips_through_json() {
+    fn status_json_keeps_the_field_order() {
         let m = Manifest {
             format: MANIFEST_FORMAT,
             store_docs: false,
@@ -321,10 +358,8 @@ mod tests {
             corpus_root: Some("/corpus".into()),
         };
         let json = serde_json::to_string(&m).unwrap();
-        let back: Manifest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, m);
-        // Wire field order is the declaration order; a reader keying on it
-        // must not see it drift.
+        // The order of the JSON that an older fmgrep wrote as manifest.json;
+        // a reader keying on it must not see it drift.
         let mut at = 0usize;
         for key in [
             "\"format\":",
@@ -346,7 +381,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
             at += pos + key.len();
         }
-        assert!(json.starts_with("{\"format\":7,"), "{json}");
+        assert!(json.starts_with("{\"format\":8,"), "{json}");
         for gone in ["engine", "index_name", "num_files_indexed"] {
             assert!(!json.contains(&format!("\"{gone}\"")), "{gone}: {json}");
         }
@@ -364,74 +399,124 @@ mod tests {
     }
 
     #[test]
-    fn other_manifest_formats_are_refused() {
-        // Every other layout fails at the explicit format check — never a
-        // missing-field error, never a silent rebuild.
+    fn an_index_reads_back_its_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        for format in [1u32, 2, 3, 4, 5, 12] {
-            let dir = tmp.path().join(format!("idx{format}"));
-            stage(&dir, &[b"hello"], &[b"blob"]);
-            retag(&dir, "format", serde_json::json!(format));
-            retag(&dir, "unknown_key", serde_json::json!(true));
-            let err = read_manifest(&dir).unwrap_err();
-            assert!(
-                err.contains(&format!("unsupported manifest format {format}")),
-                "format={format} got: {err}"
-            );
-            assert!(err.contains("re-run `index`"), "format={format} got: {err}");
-        }
+        let dir = tmp.path().join("idx");
+        let manifest = stage(&dir, &[b"hello", b"bye"], &[b"blob"]);
+        assert_eq!(read_manifest(&dir), Ok(manifest));
+        assert!(!dir.join(MANIFEST_JSON).exists());
     }
 
     #[test]
-    fn unknown_field_is_refused() {
+    fn other_manifest_formats_are_refused() {
+        // Every other layout fails at the explicit format check — never a
+        // flag or size error, never a silent rebuild.
         let tmp = tempfile::tempdir().unwrap();
-        for key in ["docs_source", "scm"] {
-            let dir = tmp.path().join(key);
+        for format in [1u32, 2, 3, 4, 5, 7, 9, 12] {
+            let dir = tmp.path().join(format!("idx{format}"));
             stage(&dir, &[b"hello"], &[b"blob"]);
-            retag(&dir, key, serde_json::json!("shard"));
+            patch(&dir, 8, &format.to_le_bytes());
+            patch(&dir, 12, &3u32.to_le_bytes());
             let err = read_manifest(&dir).unwrap_err();
-            assert!(err.contains("invalid") && err.contains(key), "got: {err}");
+            assert_eq!(
+                err,
+                format!(
+                    "error: unsupported manifest format {format} in {} (want 8); re-run `index` with this binary",
+                    dir.join(MANIFEST_BIN).display()
+                )
+            );
         }
+    }
+
+    /// The manifest.json of an older fmgrep, and no manifest.bin.
+    #[test]
+    fn an_index_of_an_older_fmgrep_is_refused_by_its_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = tmp.path().join(MANIFEST_JSON);
+        let want = |format: &str| {
+            format!(
+                "error: unsupported manifest format{format} in {} (want 8); re-run `index` with this binary",
+                json.display()
+            )
+        };
+        for (raw, format) in [
+            (r#"{"format":7,"store_docs":true,"files":[]}"#, " 7"),
+            (r#"{"format":1,"engine":"fmgrep"}"#, " 1"),
+            (r#"{"format":8}"#, ""),
+            (r#"{"files":[]}"#, ""),
+            ("not json", ""),
+        ] {
+            std::fs::write(&json, raw).unwrap();
+            assert_eq!(read_manifest(tmp.path()), Err(want(format)), "{raw}");
+        }
+        std::fs::remove_file(&json).unwrap();
+        let err = read_manifest(tmp.path()).unwrap_err();
+        assert!(
+            err.starts_with("error: cannot read") && err.contains(MANIFEST_BIN),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unknown_flags_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        stage(&dir, &[b"hello"], &[b"blob"]);
+        patch(&dir, 12, &(1u32 << 31 | 1).to_le_bytes());
+        let err = read_manifest(&dir).unwrap_err();
+        assert!(err.contains("sets unknown flag bits 0x80000000"), "{err}");
+        assert!(err.ends_with("; re-run `index`"), "{err}");
     }
 
     #[test]
     fn files_layout_needs_an_absolute_root() {
         let tmp = tempfile::tempdir().unwrap();
         for (store_docs, root) in [
-            (false, serde_json::Value::Null),
-            (false, serde_json::json!("relative/corpus")),
-            (true, serde_json::json!("/corpus")),
+            (false, None),
+            (false, Some("relative/corpus")),
+            (true, Some("/corpus")),
         ] {
-            let dir = tmp.path().join(format!("{store_docs}-{}", root.is_null()));
+            let dir = tmp.path().join(format!("{store_docs}-{}", root.is_none()));
             stage(&dir, &[b"hello"], &[b"blob"]);
-            retag(&dir, "store_docs", serde_json::json!(store_docs));
-            retag(&dir, "corpus_root", root.clone());
+            rewrite(&dir, |m| {
+                m.store_docs = store_docs;
+                m.corpus_root = root.map(str::to_owned);
+            });
             let err = read_manifest(&dir).unwrap_err();
             assert!(
                 err.contains("corpus_root") && err.contains("tampered"),
-                "{store_docs} {root}: {err}"
+                "{store_docs} {root:?}: {err}"
             );
         }
         let dir = tmp.path().join("ok");
         stage(&dir, &[b"hello"], &[b"blob"]);
-        retag(&dir, "store_docs", serde_json::json!(false));
-        retag(&dir, "corpus_root", serde_json::json!("/corpus"));
+        rewrite(&dir, |m| {
+            m.store_docs = false;
+            m.corpus_root = Some("/corpus".into());
+        });
         let manifest = read_manifest(&dir).unwrap();
         assert_eq!(manifest.corpus_root.as_deref(), Some("/corpus"));
     }
 
     #[test]
-    fn per_doc_and_blob_table_skew_rejected_as_tampered() {
-        // Every table is lockstep with the list it describes; any length skew is a
-        // tampered manifest, refused before either shard is touched. An empty
-        // `blobs` inventory skews `blob_lens` the same way.
+    fn a_changed_count_is_refused_at_open() {
+        // One count sizes each group of tables, so a changed count no longer
+        // matches the file's size.
         let tmp = tempfile::tempdir().unwrap();
-        for key in ["doc_lens", "blob_lens", "blobs"] {
-            let dir = tmp.path().join(key);
+        for (at, count, want) in [
+            (16, 2u64, "is truncated"),
+            (16, 0, "past its last section"),
+            (64, 2, "is truncated"),
+            (64, 0, "past its last section"),
+        ] {
+            let dir = tmp.path().join(format!("{at}-{count}"));
             stage(&dir, &[b"hello"], &[b"blob"]);
-            retag(&dir, key, serde_json::Value::Array(vec![]));
+            patch(&dir, at, &count.to_le_bytes());
             let err = read_manifest(&dir).unwrap_err();
-            assert!(err.contains("tampered"), "{key} got: {err}");
+            assert!(
+                err.contains(want) && err.ends_with("re-run `index`"),
+                "{at}: {err}"
+            );
         }
     }
 
@@ -488,17 +573,15 @@ mod tests {
         let dir = tmp.path().join("idx");
         stage(&dir, &[b"hello world", b"bye"], &[b"aa", b"bb"]);
         let shard_len = std::fs::metadata(dir.join(BLOBS_SHARD)).unwrap().len();
-        retag(
-            &dir,
-            "blob_lens",
-            serde_json::json!([u64::MAX, shard_len.wrapping_add(1)]),
-        );
+        rewrite(&dir, |m| {
+            m.blob_lens = vec![u64::MAX, shard_len.wrapping_add(1)]
+        });
         let err = load_index(&dir).unwrap_err();
         assert!(err.contains("skewed"), "wrapped blob sum got: {err}");
 
         let dir = tmp.path().join("idx2");
         stage(&dir, &[b"hello world", b"bye"], &[b"aa", b"bb"]);
-        retag(&dir, "doc_lens", serde_json::json!([u64::MAX, 1u64]));
+        rewrite(&dir, |m| m.doc_lens = vec![u64::MAX, 1]);
         let err = load_index(&dir).unwrap_err();
         assert!(err.contains("skewed"), "overflowing doc_lens got: {err}");
     }

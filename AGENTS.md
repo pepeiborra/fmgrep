@@ -61,6 +61,7 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 |---|---|
 | `no .fmgrep index in DIR or any parent` | run `fmgrep index` at the root |
 | `unsupported manifest format` | index from another version: remove `.fmgrep`, re-index |
+| `manifest.bin is truncated`, or another error naming `manifest.bin` | the index is damaged: remove `.fmgrep`, re-index |
 | `warning: excluding PATH: is missing` | deleted since indexing; skipped |
 | `warning: skipping PATH: over 2147483646 bytes` | too large to index; search it with rg |
 | `note: N file(s) changed since indexing` | searches read them in full; re-index |

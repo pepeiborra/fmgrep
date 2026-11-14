@@ -342,20 +342,16 @@ fn serve_err(index: &Path) -> String {
 fn serve_load_refusals_match_query() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), true);
-    let path = index.join("manifest.json");
-    let original = std::fs::read_to_string(&path).unwrap();
-    for (key, value) in [
-        ("format", serde_json::json!(1)),
-        ("num_docs", serde_json::json!(7)),
-        ("format", serde_json::json!(12)),
-    ] {
-        let mut v: serde_json::Value = serde_json::from_str(&original).unwrap();
-        v[key] = value;
-        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    let path = index.join(crate::manifest::MANIFEST_BIN);
+    let original = std::fs::read(&path).unwrap();
+    for (at, value) in [(8, 1u64), (16, 7), (8, 12)] {
+        std::fs::write(&path, &original).unwrap();
+        let width = if at == 8 { 4 } else { 8 };
+        crate::manifest::patch(&index, at, &value.to_le_bytes()[..width]);
         assert_eq!(
             serve_err(&index),
             query_it_err(&index, false, &["printk"]),
-            "{key}"
+            "{at}"
         );
     }
 }

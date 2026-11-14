@@ -1,0 +1,1 @@
+{"format":7,"store_docs":true,"num_docs":2,"num_bytes":17,"bom_bytes":0,"index_size_bytes":19459,"build_time_us":9302,"index_started_ns":1794611020087097000,"files":["a.c","b.c"],"blobs":["shard-00000000-00000002.bin"],"doc_lens":[13,4],"blob_lens":[16384]}

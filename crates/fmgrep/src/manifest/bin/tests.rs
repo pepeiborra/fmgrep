@@ -154,7 +154,7 @@ fn the_layout_is_fixed() {
     let m = sample(&["a.c", "é"], 1, Some("/r"));
     let want = [
         "666d6d616e696600", // magic
-        "07000000",         // format
+        "08000000",         // format
         "00000000",         // flags: the files layout
         "0200000000000000", // num_docs
         "0900000000000000", // num_bytes
