@@ -964,6 +964,10 @@ fn a_private_daemon_watches_logs_restarts_and_hangs() {
     );
     assert!(start.elapsed() >= Duration::from_millis(300));
     daemon.resume();
+    // The daemon runs the command sent during the hang now, for a client
+    // still connected: it is not in the list.
+    assert_eq!(daemon.sent(), ["clock"], "only the clock before the hang");
+    drop(conn);
     daemon.unwatch(&root);
     assert!(daemon.roots().is_empty());
 }
