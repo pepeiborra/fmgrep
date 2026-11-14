@@ -12,6 +12,11 @@ Bug reports, fixes and measurements are welcome.
   runs these tests on Linux, then `scripts/watchman-race.sh`, then
   `scripts/watchman-spawn.sh`, which starts the runner's own daemon and so
   runs only where `CI=true`.
+- Tests of git checkouts need `git` on `PATH`. They build real
+  repositories in temporary directories, with `GIT_CONFIG_GLOBAL` and
+  `GIT_CONFIG_SYSTEM` set to empty files and `HOME` and
+  `XDG_CONFIG_HOME` set to temporary directories, so that your git
+  config and global excludes file never reach them.
 - `fmgrep serve` asks watchman before each query. A test that starts a
   server of a tree it does not change passes `--no-watch`; a test of what a
   server sees change asks a private daemon.

@@ -62,6 +62,7 @@ mod term;
 #[cfg(test)]
 mod tests;
 mod unified;
+mod vcs;
 mod verbose;
 mod verify;
 mod walk;

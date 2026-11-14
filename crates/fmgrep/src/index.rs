@@ -8,6 +8,7 @@ use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manife
 use crate::plan::shard_bytes;
 use crate::sharded::DocfmIndex;
 use crate::source::{request_watch, write_stamps, write_walk};
+use crate::vcs::served;
 use crate::wire::IndexSummary;
 
 /// The default index directory, under the indexed folder.
@@ -23,9 +24,10 @@ pub struct IndexRequest<'a> {
 
 /// Build, persist and summarize an index. Printing is the caller's job.
 ///
-/// `build_time_us` is the index wall — the document stream, construction and
-/// the blob flush, all of it, so the number keeps its meaning however many
-/// shards are built at once; the manifest write is outside it. Once the
+/// `build_time_us` is the index wall — the document stream, construction,
+/// the blob flush and the check of the served commit, all of it, so the
+/// number keeps its meaning however many shards are built at once; the
+/// manifest write is outside it. Once the
 /// walk has listed the files, before it reads them, the stream asks
 /// watchman to watch the tree, so that watchman reads the tree while the
 /// index reads and builds. It records when it started. Any failure, error
@@ -45,6 +47,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
     let persist = |output: &Path| -> Result<Manifest, String> {
         let start = Instant::now();
         let started = SystemTime::now();
+        let before = req.store_docs.then(|| served::before(req.folder));
         let mut sink = create_sink(output)?;
         let cap = shard_bytes()?;
         #[cfg(test)]
@@ -68,7 +71,12 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             write_stamps(output, &docs.mtimes, &docs.file_lens)?;
             write_walk(output, &docs.walk, started)?;
         }
+        let commit = before
+            .map(|b| served::after(b, req.folder, output, &docs.paths, &docs.lens, &docs.walk));
         let build_time_us = start.elapsed().as_micros() as u64;
+        if let Some(commit) = &commit {
+            served::note(commit);
+        }
         let since_epoch = started.duration_since(UNIX_EPOCH).unwrap_or_default();
         let manifest = Manifest {
             format: MANIFEST_FORMAT,
@@ -84,7 +92,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             doc_lens: docs.lens.into(),
             blob_lens,
             corpus_root: docs.root,
-            commit: None,
+            commit: commit.and_then(Result::ok),
         };
         write_manifest(output, &manifest)?;
         Ok(manifest)

@@ -39,7 +39,7 @@ JSON object on one line, in this order.
 | `num_bytes` | u64 | sum of `doc_lens` |
 | `bom_bytes` | u64 | leading UTF-8 BOM bytes over all documents |
 | `index_size_bytes` | u64 | the structures' size, plus the document text with `store_docs`; an accounting figure, not a file size |
-| `build_time_us` | u64 | the index wall: walk, construction and blob flush |
+| `build_time_us` | u64 | the index wall: walk, construction, blob flush and the check of the served commit |
 | `index_started_ns` | i64 | when the index began, before it listed or read anything, in ns since the epoch |
 | `files` | [string] | corpus-relative path per document, by id |
 | `blobs` | [string] | one `shard-<start>-<end>.bin` label per shard |
@@ -494,6 +494,40 @@ sentinel and the 2 s rule are those of `dirs.stamps`.
 
 The documents concatenated, by id, with no separators; `doc_lens` slices
 them. They are stored as indexed: UTF-8 BOMs included, UTF-16 decoded.
+
+## Served commit
+
+A `--store-docs` index records `commit` when its stored documents are,
+byte for byte, the files of one git commit, as a checkout of that commit
+would index them. That commit is the served commit: a client in another
+checkout of the repository can find, with git, the files where it
+differs, and search those itself. The index runs git (with the
+repository variables of its environment removed, no optional locks, no
+replace refs and no fetch) and records HEAD only when all of these hold:
+
+1. the indexed folder is the top of its work tree (`git rev-parse
+   --show-toplevel`);
+2. `git status --porcelain=v2 --untracked-files=no
+   --ignore-submodules=none` shows no change, before the walk and after
+   the build, with the same HEAD, and then no folder that the walk listed
+   has changed since it listed it: a file moved away from the walk and
+   put back is missing from the index, though git status shows no change;
+3. no entry of `git ls-files -v` is skip-worktree or assume-unchanged:
+   git status does not see such a file, and a sparse checkout leaves it
+   out of the tree, so the index would lack it;
+4. every indexed file is a regular file (mode 100644 or 100755) of
+   HEAD's tree, `git ls-tree -r HEAD`, and no entry is a submodule (mode
+   160000);
+5. each stored document equals the text of its blob in that tree, read
+   with one `git cat-file --batch` and decoded as the index decodes a
+   file, and each file of the tree that the walk left out as binary or
+   too large would be left out as its blob too. A file that git converts
+   on checkout (line endings, a filter) differs here, though git status
+   shows no change.
+
+The build then prints `note: the index holds commit <id>`; otherwise
+`note: the index records no served commit (<why>)`, and the manifest has
+no `commit`. An index without `--store-docs` never runs git.
 
 ## Determinism
 
