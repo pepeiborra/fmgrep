@@ -86,7 +86,7 @@ with `--store-docs`, `check` holds no `watchman`, `stat` or `discovery`.
 |---|---|
 | `search` | the search of the local index: from the end of the argv parse or, when a local index answers in place of `--server` or `FMGREP_SERVER`, from just after the warning |
 | `locate` | find the index directory |
-| `manifest` | read and parse `manifest.json` |
+| `manifest` | read and decode `manifest.bin` |
 | `load` | `open`, `index` and `wait`, then note the files that changed |
 | `open` | open the documents and the shard files |
 | `index` | load each shard's FM-index |

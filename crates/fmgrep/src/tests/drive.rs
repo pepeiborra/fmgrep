@@ -246,12 +246,10 @@ fn blob_arity_skew_rejected_before_any_blob_byte() {
     let folder = stage_corpus(tmp.path(), &[("a.c", b"hello"), ("b.c", b"bye")]);
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    let path = output.join("manifest.json");
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    v["blobs"] = serde_json::json!(["shard-00000000-00000001.bin"]);
-    v["blob_lens"] = serde_json::json!([5]);
-    std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    crate::manifest::rewrite(&output, |m| {
+        m.blobs = vec!["shard-00000000-00000001.bin".into()];
+        m.blob_lens = vec![5];
+    });
     // Lengths kept lockstep with the shard, so the coverage is what refuses.
     std::fs::write(output.join(BLOBS_SHARD), b"hello").unwrap();
     let err = query_it_err(&output, false, &["hello"]);
@@ -265,28 +263,20 @@ fn unsupported_format_rejected_at_query() {
     let folder = stage_corpus(tmp.path(), &[("a.c", b"printk hello")]);
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    let path = output.join("manifest.json");
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    v["format"] = serde_json::json!(12);
-    std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    crate::manifest::patch(&output, 8, &12u32.to_le_bytes());
     let err = query_it_err(&output, false, &["printk"]);
     assert!(err.contains("unsupported manifest format 12"), "got: {err}");
 }
 
 #[test]
-fn coverage_skew_refuses_to_report() {
+fn a_changed_num_docs_is_refused_at_open() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(tmp.path(), &[("a.c", b"hello")]);
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    let path = output.join("manifest.json");
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    v["num_docs"] = serde_json::json!(7);
-    std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+    crate::manifest::patch(&output, 16, &7u64.to_le_bytes());
     let err = query_it_err(&output, false, &["hello"]);
-    assert!(err.contains("refusing to report skew"), "got: {err}");
+    assert!(err.contains("manifest.bin is truncated"), "got: {err}");
 }
 
 #[test]
@@ -308,7 +298,8 @@ fn old_format_manifest_is_refused() {
     std::fs::write(tmp.path().join(BLOBS_SHARD), b"").unwrap();
     let err = query_it_err(tmp.path(), false, &["printk"]);
     assert!(
-        err.contains("unsupported manifest format 1") && err.contains("re-run `index`"),
+        err.contains("unsupported manifest format 1 in")
+            && err.contains("manifest.json (want 8); re-run `index`"),
         "got: {err}"
     );
 }

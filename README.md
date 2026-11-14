@@ -117,7 +117,7 @@ To see what an index holds:
 ```console
 $ fmgrep status
 index: /home/me/ghc/.fmgrep
-format: 7
+format: 8
 store_docs: false
 num_docs: 26787
 num_bytes: 88781005
@@ -130,7 +130,7 @@ corpus_root: /home/me/ghc
 ```
 
 `fmgrep status --json` prints the manifest as one JSON line, with the file
-list ([fields](docs/index-format.md#manifestjson)). `fmgrep status` reads
+list ([fields](docs/index-format.md#manifestbin)). `fmgrep status` reads
 the local index, whatever `FMGREP_SERVER` holds; `fmgrep --status` reports
 on a server.
 
