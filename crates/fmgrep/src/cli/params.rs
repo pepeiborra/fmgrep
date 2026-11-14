@@ -60,6 +60,13 @@ pub struct QueryParams {
     /// Rendering modes: send the output as byte frames before the response.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
+    /// The manifest format the client reads: a server of another refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    /// The served commit the client compared its checkout with: a server
+    /// that serves another, or none, refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -139,6 +146,8 @@ impl Default for QueryParams {
             cwd: String::new(),
             filename: true,
             stream: false,
+            format: None,
+            commit: None,
         }
     }
 }
