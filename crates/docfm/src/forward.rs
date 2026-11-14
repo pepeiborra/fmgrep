@@ -196,12 +196,11 @@ impl View<'_> {
     /// next of `codes` from the back, else `None`.
     #[inline]
     fn back(&self, mut row: Row, codes: &[u8]) -> Option<Row> {
-        let bwt = self.bwt();
         for &want in codes.iter().rev() {
             if row == Row::new(self.header.sentinel_row) {
                 return None;
             }
-            let (code, rank) = bwt.access_rank(self.bwt_pos(row).get());
+            let (code, rank) = self.header.access_rank(self.bytes, self.bwt_pos(row));
             if code != want {
                 return None;
             }

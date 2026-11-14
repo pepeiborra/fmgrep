@@ -37,7 +37,6 @@ use docfm_bits::{marks, packed, wavelet};
 
 use crate::layout::{Config, Header};
 use crate::row::{BwtPos, Row};
-use crate::wavelet::WaveletMatrix;
 
 /// Longest text [`FmIndex::build`] accepts, the bound libsais once set; the
 /// format's `u32` rows would allow up to twice it.
@@ -166,11 +165,6 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    #[inline]
-    fn bwt(&self) -> WaveletMatrix<'_> {
-        self.header.bwt(self.bytes)
-    }
-
     /// Rows before `row` in the sentinel-free BWT.
     #[inline]
     fn bwt_pos(&self, row: Row) -> BwtPos {
@@ -180,7 +174,7 @@ impl View<'_> {
     /// `c[code]` + occurrences of `code` in BWT rows `0..row`, at most `n + 1`.
     #[inline]
     fn step(&self, code: u8, row: Row) -> Row {
-        let rank = self.bwt().rank(code, self.bwt_pos(row).get());
+        let rank = self.header.rank(self.bytes, code, self.bwt_pos(row));
         Row::new((self.header.c[usize::from(code)] as usize + rank).min(self.header.n + 1))
     }
 
@@ -195,7 +189,7 @@ impl View<'_> {
     /// sentinel's row.
     #[inline]
     fn lf(&self, row: Row) -> Row {
-        let (code, rank) = self.bwt().access_rank(self.bwt_pos(row).get());
+        let (code, rank) = self.header.access_rank(self.bytes, self.bwt_pos(row));
         self.lf_to(code, rank)
     }
 
