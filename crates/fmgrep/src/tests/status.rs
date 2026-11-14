@@ -245,3 +245,60 @@ fn on_a_network_filesystem_status_asks_no_daemon() {
     assert_eq!(why(&got), want);
     assert!(notes().is_empty() && records(tmp.path()).is_empty());
 }
+
+/// With a record, `status` counts what the next search re-checks: the
+/// same stale, added and gone files, from what watchman names.
+#[test]
+fn status_counts_what_the_next_search_scans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = watched(tmp.path(), AB) else {
+        return;
+    };
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    super::watched::put(&folder, "new/c.c", b"printk\n");
+    std::fs::remove_file(folder.join("a.c")).unwrap();
+    let (got, _) = changes(&output, &daemon);
+    assert_eq!(got["watchman"], true, "{got}");
+    let counts = [&got["stale"], &got["added"], &got["gone"]];
+    assert_eq!(counts, [1, 1, 1], "{got}");
+    assert_eq!(got["ignores"], serde_json::json!([]));
+    assert_eq!(got["ignores_all"], true, "new ignore files were looked for");
+    let manifest = read_manifest(&output).unwrap();
+    let ask = crate::fetch::Ask::Load;
+    let mut docs = crate::fetch::DocStore::open(&output, &manifest, None, ask).unwrap();
+    assert!(docs.replay(&manifest.files), "the search asks watchman");
+    docs.begin();
+    let n = manifest.files.len();
+    let stale = docs.stale().partition_point(|&d| d < n);
+    let scanned = (stale, docs.stale().len() - stale, docs.gone());
+    assert_eq!(scanned, (1, 1, 1));
+}
+
+/// On a tree that a search asks watchman about, when watchman cannot say,
+/// `status` runs no stat pass: the counts are not known, and only the
+/// recorded ignore inputs are statted.
+#[test]
+fn a_large_tree_watchman_cannot_cover_is_not_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (folder, output) = unwatched(tmp.path());
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    let got = status(&output)["changes"].clone();
+    for key in ["stale", "added", "gone"] {
+        assert!(got[key].is_null(), "{got}");
+    }
+    assert_eq!(got["ignores"], serde_json::json!([]));
+    assert_eq!(got["ignores_all"], false, "only the recorded inputs: {got}");
+    let mut out = Vec::new();
+    let args = ["status", output.to_str().unwrap()];
+    dispatch_to(args, &mut std::io::empty(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let tail: Vec<&str> = text.lines().skip(4).collect();
+    assert_eq!(
+        tail,
+        [
+            "since the index: not known without checking every file; a search checks",
+            "ignore files: none changed since the index (of those the index recorded)",
+        ]
+    );
+    assert!(notes().is_empty() && records(tmp.path()).is_empty());
+}

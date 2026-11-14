@@ -301,10 +301,11 @@ impl Recorded {
                 scopes.push(rel.to_owned());
             }
         }
+        let names = (0..self.ignores.rows.len()).filter(|&i| moved[i]);
         IgnoreScopes {
             scopes: outermost(scopes),
             found,
-            moved: moved.iter().filter(|&&m| m).count(),
+            moved: names.map(|i| self.ignores.path(i).to_owned()).collect(),
         }
     }
 }
@@ -316,8 +317,8 @@ pub struct IgnoreScopes {
     pub scopes: Vec<String>,
     /// The ignore files in the changed dirs that the index did not record.
     pub found: Vec<String>,
-    /// How many recorded ignore inputs moved.
-    pub moved: usize,
+    /// The recorded ignore inputs that moved, ascending.
+    pub moved: Vec<String>,
 }
 
 /// `rel` of an ignores row against `root`: `../` climbs, an absolute path is itself.

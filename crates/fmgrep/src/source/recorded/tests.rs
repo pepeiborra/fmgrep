@@ -155,11 +155,12 @@ fn ignore_scopes_name_the_dir_of_a_moved_row_and_the_root_above_it() {
     let (root, recorded) = recorded_tree(tmp.path(), &files);
     let scopes = || {
         let got = recorded.ignore_scopes(&root, &[]);
-        (got.scopes, got.moved)
+        (got.scopes, got.moved.len())
     };
     assert_eq!(scopes(), (vec![], 0));
     std::fs::write(root.join("sub/.ignore"), b"x\ny\n").unwrap();
     assert_eq!(scopes(), (vec!["sub".to_owned()], 1));
+    assert_eq!(recorded.ignore_scopes(&root, &[]).moved, ["sub/.ignore"]);
     std::fs::remove_file(root.join("a/b/.rgignore")).unwrap();
     assert_eq!(scopes(), (vec!["a/b".to_owned(), "sub".to_owned()], 2));
     std::fs::write(root.join("../.ignore"), b"*.c\n").unwrap();
@@ -208,7 +209,7 @@ fn a_new_ignore_file_in_a_changed_dir_is_a_scope() {
     assert_eq!(changed, [root.join("c"), root.join("e")]);
     let got = recorded.ignore_scopes(&root, &changed);
     assert_eq!(
-        (got.scopes, got.found, got.moved),
+        (got.scopes, got.found, got.moved.len()),
         (vec!["c".to_owned()], vec!["c/.gitignore".to_owned()], 0)
     );
     assert!(

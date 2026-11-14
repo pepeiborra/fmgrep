@@ -10,7 +10,7 @@ use super::serve::{ServeStatus, status_on};
 use super::{Choice, Env, Reached, Server, choose, has_blobs, print, reach, served_tree, tree_of};
 use crate::fetch::{Ask, DocStore};
 use crate::manifest::{Manifest, read_manifest};
-use crate::source::Looked;
+use crate::source::{Ignores, Looked};
 
 /// `status --json`. Keys may be added, never renamed; `null` is "not
 /// known" or "does not apply".
@@ -35,6 +35,34 @@ struct Changes {
     why: Option<String>,
     /// The record that a search keeps for the next one, when it exists.
     record: Option<String>,
+    /// Indexed files whose size or mtime moved; `null` when not counted.
+    stale: Option<usize>,
+    /// Text files the index does not list; `null` when not counted.
+    added: Option<usize>,
+    /// Indexed files missing, unreadable or now ignored; `null` when not
+    /// counted.
+    gone: Option<usize>,
+    /// Ignore inputs changed since the index; `null` when the index records
+    /// none.
+    ignores: Option<Vec<String>>,
+    /// Whether `ignores` looked for new ignore files too, or only statted
+    /// those the index recorded; `null` with `ignores`.
+    ignores_all: Option<bool>,
+}
+
+impl Changes {
+    fn of(l: Looked) -> Self {
+        Self {
+            watchman: l.watchman,
+            why: (!l.watchman).then_some(l.line),
+            record: l.record.map(|r| r.display().to_string()),
+            stale: l.counts.map(|c| c.stale),
+            added: l.counts.map(|c| c.added),
+            gone: l.counts.map(|c| c.gone),
+            ignores_all: l.ignores.as_ref().map(|i| i.all),
+            ignores: l.ignores.map(|i| i.names),
+        }
+    }
 }
 
 /// The `changes:` line of an index that holds the files.
@@ -96,11 +124,7 @@ pub fn run(
                 dir,
                 manifest: &manifest,
             }),
-            changes: looked.map(|l| Changes {
-                watchman: l.watchman,
-                why: (!l.watchman).then_some(l.line),
-                record: l.record.map(|r| r.display().to_string()),
-            }),
+            changes: looked.map(Changes::of),
             server: None,
         };
         return print::line(out, &encoded(&report)?);
@@ -120,7 +144,47 @@ pub fn run(
     lines.extend(tree_of(&found, &manifest).map(|t| format!("tree: {}", canonical(&t))));
     let changes = looked.as_ref().map_or(STORED, |l: &Looked| &l.line);
     lines.push(format!("changes: {changes}"));
+    if let Some(l) = &looked {
+        lines.push(format!("since the index: {}", counted(l)));
+        lines.push(format!("ignore files: {}", ignores(l.ignores.as_ref())));
+    }
     lines.iter().try_for_each(|l| print::line(out, l))
+}
+
+/// The `since the index:` line.
+fn counted(l: &Looked) -> String {
+    match l.counts {
+        Some(c) => format!(
+            "{} stale, {} added, {} gone (a search reads {} file{} in full)",
+            c.stale,
+            c.added,
+            c.gone,
+            c.stale + c.added,
+            crate::verbose::plural(c.stale + c.added),
+        ),
+        None => "not known without checking every file; a search checks".to_owned(),
+    }
+}
+
+/// The `ignore files:` line.
+fn ignores(found: Option<&Ignores>) -> String {
+    let Some(found) = found else {
+        return "not known: the index records none".to_owned();
+    };
+    let n = found.names.len();
+    let dirs = if n == 1 {
+        "its directory"
+    } else {
+        "their directories"
+    };
+    match (n, found.all) {
+        (0, true) => "none changed since the index".to_owned(),
+        (0, false) => "none changed since the index (of those the index recorded)".to_owned(),
+        _ => format!(
+            "{n} changed since the index ({}); every search reads {dirs} again (re-run index)",
+            found.names.join(", ")
+        ),
+    }
 }
 
 /// The report on a server that answered.

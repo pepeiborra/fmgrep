@@ -78,6 +78,21 @@ changed since the index, and why it checks every file when it does:
 | `fewer than 50000 files: every search checks every file, which is fast here` | a search does not ask watchman |
 | `none: the index holds the files; a search reads none of the tree` | `index --store-docs` |
 
+Then `since the index:` counts the indexed files whose size or mtime
+moved (stale), the text files the index does not list (added), and the
+indexed files that are missing or now ignored (gone), as the next search
+finds them; a search reads the stale and added files in full. `status`
+counts them only where a search counts them cheaply: when watchman can
+say what changed, or below 50,000 files, where a search runs the stat
+pass anyway. On a larger tree that watchman cannot cover the line says
+`not known without checking every file; a search checks`: `status` does
+not run the stat pass that the search would. `ignore files:` names the
+ignore inputs changed since the index, which make every search read
+their directories again; without counts, only the inputs the index
+recorded are checked, and the line says so. An index without
+`dirs.stamps` and `ignores.stamps` records no ignore inputs: the line is
+then `not known: the index records none`.
+
 `status` changes nothing to say so: it takes no token, saves no record,
 asks watchman to watch nothing and starts no daemon (it runs the client
 with `--no-spawn`). Its question to watchman is synced, as a search's
@@ -91,7 +106,7 @@ added later, never renamed; `null` means not known, or does not apply:
 | `uses` | string | `"index"` or `"server"` |
 | `note` | string or null | what a search warns after `Using local index DIR` |
 | `index` | object or null | `{dir, manifest}`: the canonical index directory, and the manifest, with the fields above in that order |
-| `changes` | object or null | for a local files layout, `{watchman, why, record}`: whether watchman can say what changed, else the `changes:` line, and the record's path when one exists |
+| `changes` | object or null | for a local files layout, `{watchman, why, record, stale, added, gone, ignores, ignores_all}`: whether watchman can say what changed, else the `changes:` line, the record's path when one exists, the three counts (null when not counted), the changed ignore inputs (null when the index records none), and whether new ignore files were looked for too (false: only the inputs the index recorded were checked) |
 | `server` | object or null | `{addr, env, status}`: the address, whether `FMGREP_SERVER` gave it, and the reply that `fmgrep --status` prints |
 
 A script reads the paths with

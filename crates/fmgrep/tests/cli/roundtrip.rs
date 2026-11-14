@@ -293,7 +293,7 @@ fn status_prints_the_manifest_of_the_index() {
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         let text = String::from_utf8(out.stdout).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines.len(), if store_docs { 4 } else { 6 }, "{text}");
         let first = format!("a search here uses the local index {}", dotdir.display());
         assert_eq!(lines[0], first);
         assert!(index_line.is_match(lines[1]), "{text}");
@@ -304,6 +304,14 @@ fn status_prints_the_manifest_of_the_index() {
             false => "fewer than 50000 files: every search checks every file, which is fast here",
         };
         assert_eq!(lines[3], format!("changes: {changes}"));
+        if !store_docs {
+            let since =
+                "since the index: 0 stale, 0 added, 0 gone (a search reads 0 files in full)";
+            assert_eq!(
+                lines[4..],
+                [since, "ignore files: none changed since the index"]
+            );
+        }
         let changes = &report["changes"];
         match store_docs {
             true => assert!(changes.is_null(), "{changes}"),
@@ -319,6 +327,105 @@ fn status_prints_the_manifest_of_the_index() {
             );
         }
     }
+}
+
+/// Every file and its bytes under `dir`, by path.
+fn files_under(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut all: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .map(|p| (p.clone(), std::fs::read(&p).unwrap()))
+        .collect();
+    all.sort();
+    all
+}
+
+/// Below 50,000 files `status` counts what changed since the index, as
+/// the stat pass that every search there runs finds it: stale, added and
+/// gone files, and the ignore files that changed. It writes nothing into
+/// the index.
+#[test]
+fn status_counts_what_changed_in_a_small_tree() {
+    let files: [(&str, &[u8]); 5] = [
+        ("a.c", b"printk a\n"),
+        ("b.c", b"printk b\n"),
+        ("sub/c.c", b"printk c\n"),
+        (".ignore", b"skip.txt\n"),
+        ("skip.txt", b"printk skipped\n"),
+    ];
+    let (_tmp, root) = stage_files(&[]);
+    // Older than 2 s, so that the index records their stamps.
+    let old = std::time::SystemTime::now() - Duration::from_secs(10);
+    for (rel, bytes) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &file, bytes).unwrap();
+        file.set_modified(old).unwrap();
+    }
+    let out = run_in(&root, &["index"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = |args: &[&str]| {
+        let out = run_in(&root, &[&["status"][..], args].concat());
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stderr(&out), "", "status says nothing on stderr");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let lines = report(&[]);
+    let lines: Vec<&str> = lines.lines().collect();
+    assert_eq!(
+        lines[3..],
+        [
+            "changes: fewer than 50000 files: every search checks every file, which is fast here",
+            "since the index: 0 stale, 0 added, 0 gone (a search reads 0 files in full)",
+            "ignore files: none changed since the index",
+        ]
+    );
+    std::fs::write(root.join("a.c"), b"printk a, edited\n").unwrap();
+    std::fs::write(root.join("d.c"), b"printk d\n").unwrap();
+    std::fs::remove_file(root.join("b.c")).unwrap();
+    std::fs::write(root.join(".ignore"), b"skip.txt\nc.c\n").unwrap();
+    let index = files_under(&root.join(".fmgrep"));
+    let lines = report(&[]);
+    let lines: Vec<&str> = lines.lines().collect();
+    assert_eq!(
+        lines[4..],
+        [
+            "since the index: 1 stale, 1 added, 2 gone (a search reads 2 files in full)",
+            "ignore files: 1 changed since the index (.ignore); every search reads its directory \
+             again (re-run index)",
+        ]
+    );
+    let json: serde_json::Value = serde_json::from_str(&report(&["--json"])).unwrap();
+    let changes = &json["changes"];
+    assert_eq!(
+        [&changes["stale"], &changes["added"], &changes["gone"]],
+        [1, 1, 2]
+    );
+    assert_eq!(changes["ignores"], serde_json::json!([".ignore"]));
+    assert_eq!(changes["ignores_all"], true);
+    assert_eq!(
+        (changes["watchman"].as_bool(), &changes["record"]),
+        (Some(false), &serde_json::Value::Null)
+    );
+    assert_eq!(
+        files_under(&root.join(".fmgrep")),
+        index,
+        "the index is untouched"
+    );
+    // The search that follows finds the same.
+    let out = run_in(&root, &["-l", "printk"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.c\nd.c\n");
+    let err = stderr(&out);
+    assert!(err.contains("/docs/b.c: is missing"), "{err}");
+    assert!(
+        err.contains("1 ignore file changed since the index"),
+        "{err}"
+    );
+    assert!(
+        err.contains("note: 1 file(s) changed since indexing"),
+        "{err}"
+    );
 }
 
 /// `status` refuses what a search refuses, with the same words.

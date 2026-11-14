@@ -141,6 +141,8 @@ struct Known {
     /// baseline keeps them, so later loads walk their dirs again. A set: a
     /// server finds the same ones again at each query that walks there.
     new_ignores: Mutex<std::collections::BTreeSet<String>>,
+    /// The recorded ignore inputs that moved, as this load last found.
+    moved_ignores: Mutex<Vec<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
     /// Whether a server asks watchman again before each query: its
@@ -373,7 +375,11 @@ impl Known {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len();
-        let n = changes.moved + new;
+        let n = changes.moved.len() + new;
+        *self
+            .moved_ignores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = changes.moved;
         if n > 0 && !self.quiet {
             ignores_changed(n, self.each_query);
         }
@@ -447,6 +453,30 @@ pub struct Looked {
     pub line: String,
     /// The record of the tree and index, when one exists.
     pub record: Option<PathBuf>,
+    /// What differs from the index, when counted.
+    pub counts: Option<Counts>,
+    /// The ignore inputs changed since the index; `None` when the index
+    /// records none.
+    pub ignores: Option<Ignores>,
+}
+
+/// What differs from the index: [`Snapshot`]'s sizes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Counts {
+    /// Indexed files whose size or mtime moved.
+    pub stale: usize,
+    /// Text files the index does not list.
+    pub added: usize,
+    /// Indexed files missing, unreadable or now ignored.
+    pub gone: usize,
+}
+
+/// Ignore inputs changed since the index, ascending.
+#[derive(Debug, PartialEq)]
+pub struct Ignores {
+    pub names: Vec<String>,
+    /// Whether new ignore files were looked for, not only the recorded ones.
+    pub all: bool,
 }
 
 /// What a load asks watchman with: [`Files::ready`].
@@ -516,6 +546,7 @@ impl Files {
                 recorded: None,
                 rules: Mutex::default(),
                 new_ignores: Mutex::default(),
+                moved_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
                 each_query: false,
                 quiet: false,
@@ -567,11 +598,18 @@ impl Files {
     /// What a search would learn from watchman, with nothing changed:
     /// [`Self::ready`]'s checks, then [`journal::look`], then a re-check
     /// of what watchman and the record name, as [`Self::replay`] makes it.
+    ///
+    /// It counts what differs from the index only where a search counts it
+    /// cheaply: when watchman can say, or below 50,000 files, where a
+    /// search runs the stat pass anyway. Else only the recorded ignore
+    /// inputs are statted.
     pub fn look(&self, files: &FileTable, lens: &[u64]) -> Looked {
         let line = |line: String| Looked {
             watchman: false,
             line,
             record: None,
+            counts: None,
+            ignores: self.recorded_ignores(),
         };
         let Ready {
             index,
@@ -580,10 +618,19 @@ impl Files {
         } = match self.ready(files) {
             Ok(ready) => ready,
             Err(Unready::NotDue) => {
-                return line(format!(
-                    "fewer than {} files: every search checks every file, which is fast here",
-                    journal::MIN_DOCS
-                ));
+                // Discovery beside the stat pass, as a load runs them.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| self.discover(files, lens));
+                    self.known.stat_all(files, lens, false);
+                });
+                return Looked {
+                    counts: Some(self.counts()),
+                    ignores: self.ignores_seen(),
+                    ..line(format!(
+                        "fewer than {} files: every search checks every file, which is fast here",
+                        journal::MIN_DOCS
+                    ))
+                };
             }
             Err(Unready::Cannot(why)) => return line(journal::every(&why)),
         };
@@ -607,7 +654,45 @@ impl Files {
             watchman,
             line,
             record,
+            counts: watchman.then(|| self.counts()),
+            ignores: match watchman {
+                true => self.ignores_seen(),
+                false => self.recorded_ignores(),
+            },
         }
+    }
+
+    /// The docs stale and gone, and the files added, as now known.
+    fn counts(&self) -> Counts {
+        let snap = self.snapshot();
+        Counts {
+            stale: snap.stale.len(),
+            added: snap.added.len(),
+            gone: snap.gone.len(),
+        }
+    }
+
+    /// The ignore inputs that changed since the index, as a re-check found
+    /// them: the recorded ones that moved and the new ones it saw; `None`
+    /// without the walk's record.
+    fn ignores_seen(&self) -> Option<Ignores> {
+        self.known.recorded.as_ref()?;
+        let lock =
+            |m: &Mutex<Vec<String>>| m.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let mut names = lock(&self.known.moved_ignores);
+        let new = self.known.new_ignores.lock();
+        names.extend(new.unwrap_or_else(PoisonError::into_inner).iter().cloned());
+        names.sort_unstable();
+        names.dedup();
+        Some(Ignores { names, all: true })
+    }
+
+    /// The recorded ignore inputs that moved since the index, statted now;
+    /// `None` without the walk's record.
+    fn recorded_ignores(&self) -> Option<Ignores> {
+        let recorded = self.known.recorded.as_ref()?;
+        let names = recorded.ignore_scopes(&self.known.root, &[]).moved;
+        Some(Ignores { names, all: false })
     }
 
     /// The canonical root and the walk's record to ask with, or why not.
