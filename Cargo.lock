@@ -260,6 +260,7 @@ dependencies = [
  "termcolor",
  "tracing",
  "typed-index-collections",
+ "zerocopy",
 ]
 
 [[package]]

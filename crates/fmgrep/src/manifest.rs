@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+// Nothing reads or writes manifest.bin yet.
+#[cfg_attr(not(test), allow(dead_code))]
+mod bin;
+
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
 pub const MANIFEST_FORMAT: u32 = 7;
@@ -140,6 +144,14 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
             return Err(invalid(e));
         }
     };
+    validate(&manifest, &manifest_path)?;
+    Ok(manifest)
+}
+
+/// The checks of a manifest's values that its encoding does not hold:
+/// `corpus_root` present iff not `store_docs`, and absolute; `bom_bytes`
+/// within `num_bytes`; each table as long as the list it describes.
+fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
     match (manifest.store_docs, &manifest.corpus_root) {
         (false, Some(root)) if Path::new(root).is_absolute() => {}
         (false, _) => {
@@ -177,7 +189,7 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
         ));
     }
     debug_assert!(manifest.files.is_sorted());
-    Ok(manifest)
+    Ok(())
 }
 
 fn refuse_foreign(path: &Path, format: u32) -> Result<(), String> {
