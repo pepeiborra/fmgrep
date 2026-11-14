@@ -68,6 +68,7 @@ response line each, after any [frames](#streamed-output).
 | `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output, and `lines` reports matches (below) |
 | `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
 | `commit` | string | absent | the served commit (hex id) the client compared its checkout with; a server that serves another, or none, answers -32001 |
+| `skip` | [string] | [] | the skip list: files the server leaves out, because the client searches them itself; each a path from the root, or `d/` for every file below `d`; at most 10,000; needs `commit` and `stream`, else -32602 |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -113,7 +114,7 @@ printed bytes:
 
 | event | payload |
 |---|---|
-| the corpus, once | `{"corpus":[docs,bytes]}`: what rg's `--json` summary and `--stats` count as searched |
+| the corpus, once | `{"corpus":[docs,bytes]}`: what rg's `--json` summary and `--stats` count as searched, less the skip list's files (their bytes less their BOMs in `json_matches` and with `stats`, which print them) |
 | a term starts | `{"term":"<term>"}` |
 | a matching file | `{"doc":"<path from the root>","path":"<path as printed>","stats":[matches,matched_lines,bytes_printed]}`, a newline, then the file's printed bytes; the three counts are 0 in `lines` without `stats` |
 | a term ends | `{"end":<QueryReport>}` |
