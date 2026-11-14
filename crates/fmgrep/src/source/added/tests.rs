@@ -8,6 +8,8 @@ use super::super::tests::Fix;
 use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
+use crate::manifest::FileTable;
+#[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
 
 /// Live added paths, ascending by slot.
@@ -122,7 +124,7 @@ fn stage_recorded(
 
 /// The fixture's files, with its record unless `walk_all`, after discovery.
 #[cfg(unix)]
-fn discovered(fix: &Fix, manifest: &[String], walk_all: bool) -> Files {
+fn discovered(fix: &Fix, manifest: &FileTable, walk_all: bool) -> Files {
     let mut files = open_files(fix);
     if !walk_all {
         let index = fix.path.parent().unwrap();
@@ -188,9 +190,7 @@ fn recorded_discovery_follows_a_renamed_dir() {
     let extra: &[(&str, &[u8])] = &[("mw/m.c", b"printk"), ("mw/in/i.c", b"printk")];
     let now = std::time::SystemTime::now();
     let fix = stage_recorded(tmp.path(), &[b"printk"], extra, now);
-    let manifest: Vec<String> = [fix.files[0].as_str(), "mw/in/i.c", "mw/m.c"]
-        .map(String::from)
-        .to_vec();
+    let manifest: FileTable = [&fix.files[0], "mw/in/i.c", "mw/m.c"].into_iter().collect();
     assert!(live(&discovered(&fix, &manifest, false)).is_empty());
     std::fs::rename(fix.path.join("mw"), fix.path.join("mv2")).unwrap();
     assert_eq!(
@@ -278,7 +278,7 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     let sub = fix.path.join("sub");
     std::fs::create_dir(&sub).unwrap();
     std::fs::rename(fix.path.join(&fix.files[1]), sub.join("x.c")).unwrap();
-    fix.files[1] = "sub/x.c".to_owned();
+    fix.files = [&fix.files[0], "sub/x.c"].into_iter().collect();
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o311)).unwrap();
     let files = discovered(&fix, &fix.files, true);
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();

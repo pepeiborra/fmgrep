@@ -64,7 +64,7 @@ fn bytes(m: &Manifest) -> Vec<u8> {
 }
 
 fn read(b: &[u8]) -> Result<Manifest, String> {
-    decode(b, Path::new(AT))
+    decode(b.to_vec(), Path::new(AT))
 }
 
 fn put(b: &mut [u8], at: usize, v: u64) {

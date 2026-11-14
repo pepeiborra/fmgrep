@@ -46,7 +46,7 @@ use std::path::Path;
 use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use super::{Manifest, refuse_foreign};
+use super::{FileTable, Manifest, refuse_foreign};
 
 const MAGIC: [u8; 8] = *b"fmmanif\0";
 
@@ -186,15 +186,18 @@ fn truncated(path: &Path, len: usize, what: &str) -> String {
     )
 }
 
-/// Read `bytes`, the whole of the `manifest.bin` at `path`. A failure that
-/// the bytes show reads "error: `path` ...; re-run `index`". The checks of
-/// the values are the caller's ([`super::validate`]).
-pub fn decode(bytes: &[u8], path: &Path) -> Result<Manifest, String> {
+/// Read `bytes`, the whole of the `manifest.bin` at `path`. The path text
+/// ends the file: it moves to the front of the buffer, and the buffer
+/// becomes the text of [`FileTable`], so no new block holds it. A failure
+/// that the bytes show reads "error: `path` ...; re-run `index`". The
+/// checks of the values are the caller's ([`super::validate`]).
+pub fn decode(mut bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
     let bad = |why: String| refuse(path, why);
-    let short = |what: &str| truncated(path, bytes.len(), what);
+    let len = bytes.len();
+    let short = |what: &str| truncated(path, len, what);
 
-    check_prefix(bytes, path)?;
-    let Ok((head, rest)) = OnDisk::read_from_prefix(bytes) else {
+    check_prefix(&bytes, path)?;
+    let Ok((head, rest)) = OnDisk::read_from_prefix(&bytes) else {
         return Err(short("header"));
     };
     let flags = head.flags.get();
@@ -230,23 +233,36 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<Manifest, String> {
     let root = utf8(root, "a corpus_root")?;
     utf8(commit, "a served commit")?;
     let labels = utf8(labels, "a shard label")?;
-    let label_ends = cuts(labels, label_ends, "shard label").map_err(&bad)?;
-    let paths = utf8(paths, "a path")?;
-    let path_ends = cuts(paths, path_ends, "path").map_err(&bad)?;
+    let label_ends = with_zero(label_ends);
+    cuts(labels, &label_ends, "shard label").map_err(&bad)?;
+    let blobs = pieces(labels, &label_ends);
+    let corpus_root = (!root.is_empty()).then(|| root.to_owned());
+    let doc_lens = doc_lens.iter().map(|w| w.get()).collect();
+    let blob_lens = blob_lens.iter().map(|w| w.get()).collect();
+    let path_ends = with_zero(path_ends);
+    let paths_at = len - paths.len();
+
+    // The views of the bytes end here. The path text moves to the front of
+    // the buffer, and the buffer gives back the bytes it no longer holds.
+    bytes.drain(..paths_at);
+    bytes.shrink_to_fit();
+    let text =
+        String::from_utf8(bytes).map_err(|_| bad("holds a path that is not UTF-8".into()))?;
+    cuts(&text, &path_ends, "path").map_err(&bad)?;
     Ok(Manifest {
         format: head.prefix.format.get(),
         store_docs: flags & STORE_DOCS != 0,
-        num_docs: doc_lens.len(),
+        num_docs: path_ends.len() - 1,
         num_bytes: head.num_bytes.get(),
         bom_bytes: head.bom_bytes.get(),
         index_size_bytes: head.index_size_bytes.get(),
         build_time_us: head.build_time_us.get(),
         index_started_ns: head.index_started_ns.get(),
-        files: pieces(paths, &path_ends),
-        blobs: pieces(labels, &label_ends),
-        doc_lens: doc_lens.iter().map(|w| w.get()).collect(),
-        blob_lens: blob_lens.iter().map(|w| w.get()).collect(),
-        corpus_root: (!root.is_empty()).then(|| root.to_owned()),
+        files: FileTable::from_parts(text, path_ends),
+        blobs,
+        doc_lens,
+        blob_lens,
+        corpus_root,
     })
 }
 
@@ -279,15 +295,19 @@ fn last_end(ends: &[U64], what: &str) -> Result<u64, String> {
     Ok(last)
 }
 
-/// `ends` after a leading 0, once each is known to fall between two
-/// characters of `text`. Each end is at most the last one, which is
-/// `text.len()`, so it fits a usize.
-fn cuts(text: &str, ends: &[U64], what: &str) -> Result<Vec<usize>, String> {
-    let ends: Vec<usize> = std::iter::once(0)
+/// `ends` after a leading 0. Each end is at most the last one, which the
+/// caller has found to be the length of a text in memory, so it fits a
+/// usize.
+fn with_zero(ends: &[U64]) -> Vec<usize> {
+    std::iter::once(0)
         .chain(ends.iter().map(|w| w.get() as usize))
-        .collect();
+        .collect()
+}
+
+/// Every end of `ends` falls between two characters of `text`.
+fn cuts(text: &str, ends: &[usize], what: &str) -> Result<(), String> {
     match ends.iter().position(|&e| !text.is_char_boundary(e)) {
-        None => Ok(ends),
+        None => Ok(()),
         Some(i) => Err(format!(
             "cuts {what} {} inside a character",
             i.saturating_sub(1)

@@ -17,7 +17,7 @@ const ONCE: &str =
 /// The docs of a server of `index`, loaded as `serve` loads them.
 struct Served {
     docs: DocStore,
-    files: Vec<String>,
+    files: crate::manifest::FileTable,
 }
 
 fn serving(index: &Path) -> Served {

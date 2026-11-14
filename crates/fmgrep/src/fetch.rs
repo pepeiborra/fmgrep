@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::manifest::{DOCS_SHARD, Manifest, shard_offsets};
+use crate::manifest::{DOCS_SHARD, FileTable, Manifest, shard_offsets};
 use crate::source::{Files, Index, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
@@ -195,7 +195,7 @@ impl DocStore {
     }
 
     /// Joined before it returns: the stale set is known on return.
-    pub fn stat_all(&self, files: &[String]) {
+    pub fn stat_all(&self, files: &FileTable) {
         if let Source::Files(f) = &self.source {
             f.stat_all(files, &self.lens);
         }
@@ -204,7 +204,7 @@ impl DocStore {
     /// Re-check what watchman and the saved baseline name instead of
     /// [`Self::stat_all`] and discovery: false when watchman cannot say, or
     /// for stored docs.
-    pub fn replay(&self, files: &[String]) -> bool {
+    pub fn replay(&self, files: &FileTable) -> bool {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
             Source::Shard { .. } => false,
@@ -221,7 +221,7 @@ impl DocStore {
 
     /// Before a served query, re-check what watchman reports as changed
     /// since the last query; nothing for stored docs, or unless asked to.
-    pub fn recheck(&self, files: &[String]) {
+    pub fn recheck(&self, files: &FileTable) {
         if let Source::Files(f) = &self.source {
             f.recheck(files, &self.lens);
         }
@@ -229,7 +229,7 @@ impl DocStore {
 
     /// Once the stat pass and discovery, or the replay, are done: save the
     /// watchman token and what differs, once, in the user's cache.
-    pub fn checkpoint(&self, files: &[String]) {
+    pub fn checkpoint(&self, files: &FileTable) {
         if let Source::Files(f) = &self.source {
             f.checkpoint(files);
         }
@@ -237,7 +237,7 @@ impl DocStore {
 
     /// Register the text files under the root that ascending `files` does
     /// not list; nothing for stored docs.
-    pub fn discover(&self, files: &[String]) {
+    pub fn discover(&self, files: &FileTable) {
         if let Source::Files(f) = &self.source {
             f.discover(files, &self.lens);
         }
@@ -245,7 +245,7 @@ impl DocStore {
 
     /// Paths by doc id, added docs included, as of the last [`Self::begin`]
     /// or [`Self::screen`].
-    pub fn paths<'a>(&self, files: &'a [String]) -> Paths<'a> {
+    pub fn paths<'a>(&self, files: &'a FileTable) -> Paths<'a> {
         Paths {
             files,
             added: Arc::clone(&self.added),
@@ -362,7 +362,7 @@ impl Source {
     fn read(
         &self,
         worker: &mut FetchWorker,
-        files: &[String],
+        files: &FileTable,
         doc_idx: usize,
         lo: u64,
         len: usize,
@@ -439,14 +439,14 @@ fn store_or_pool(
 
 /// Doc paths by id: the manifest's, then the added docs'.
 pub struct Paths<'a> {
-    files: &'a [String],
+    files: &'a FileTable,
     added: Arc<[String]>,
 }
 
 impl Paths<'_> {
     pub fn path(&self, doc: usize) -> Option<&str> {
         match doc.checked_sub(self.files.len()) {
-            None => Some(self.files[doc].as_str()),
+            None => Some(&self.files[doc]),
             Some(slot) => self.added.get(slot).map(String::as_str),
         }
     }
@@ -481,7 +481,7 @@ type Emit<'a, T> = dyn FnMut(usize, &[u8], T) -> Result<(), String> + 'a;
 /// missing or short shard, or an `emit` error, aborts loudly.
 pub fn fetch_stream_parallel<T: Send>(
     docs: &mut DocStore,
-    files: &[String],
+    files: &FileTable,
     doc_ids: &[usize],
     max_threads: usize,
     map: &(dyn Fn(usize, &[u8]) -> T + Sync),

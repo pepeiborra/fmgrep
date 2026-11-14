@@ -19,7 +19,7 @@ use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
-use crate::manifest::Manifest;
+use crate::manifest::{FileTable, Manifest};
 use crate::matching::{self, DocSearch, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
@@ -611,7 +611,7 @@ pub fn answer_expr(
 /// Wall of reading `ids` as one batch, us.
 fn read_wall_us(
     docs: &mut DocStore,
-    files: &[String],
+    files: &FileTable,
     ids: &[usize],
     map: &(dyn Fn(usize, &[u8]) -> bool + Sync),
 ) -> Result<u64, String> {
