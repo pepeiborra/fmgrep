@@ -111,10 +111,10 @@ fn tree_of(found: &Located, manifest: &Manifest) -> Option<PathBuf> {
 
 /// A search: through `--server`; else of `--index`; else of the index found
 /// by walking up from the cwd, or through the server that `env`
-/// (`FMGREP_SERVER`) gives when none is found.
+/// (`FMGREP_SERVER`) gives when none is found. `env` is called only then.
 fn search(
     s: &Search,
-    env: Option<&str>,
+    env: Env,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
@@ -128,10 +128,11 @@ fn search(
         return serve::manage(addr, true, out);
     }
     if s.status {
-        let addr = (s.server.as_deref())
-            .or(env)
-            .ok_or("error: --status needs --server ADDR or FMGREP_SERVER")?;
-        return serve::manage(addr, false, out);
+        let addr = match &s.server {
+            Some(addr) => addr.clone(),
+            None => env()?.ok_or("error: --status needs --server ADDR or FMGREP_SERVER")?,
+        };
+        return serve::manage(&addr, false, out);
     }
     let mut p = s.params(input, printing, tty)?;
     let typed = s.paths()?;
@@ -141,13 +142,25 @@ fn search(
     if let Some(addr) = &s.server {
         return client(Server { addr, env: false }, p, &typed, s.json, out);
     }
-    if let (None, Some(addr)) = (&s.index, env) {
-        match locate(Path::new(".")) {
-            Ok(found) => warn(&format!(
-                "Using local index {}, not the server at {addr} (FMGREP_SERVER)",
-                found.index_dir.display()
-            )),
-            Err(_) => return client(Server { addr, env: true }, p, &typed, s.json, out),
+    if s.index.is_none() {
+        match env() {
+            Ok(None) => {}
+            Ok(Some(addr)) => match locate(Path::new(".")) {
+                Ok(found) => warn(&format!(
+                    "Using local index {}, not the server at {addr} (FMGREP_SERVER)",
+                    found.index_dir.display()
+                )),
+                Err(_) => {
+                    let server = Server {
+                        addr: &addr,
+                        env: true,
+                    };
+                    return client(server, p, &typed, s.json, out);
+                }
+            },
+            // A value that is not UTF-8 fails only a search that would use it.
+            Err(e) if locate(Path::new(".")).is_err() => return Err(e),
+            Err(_) => {}
         }
     }
     local(s.index.as_deref(), p, &typed, s.json, out)
@@ -249,7 +262,7 @@ pub fn dispatch_to(
     out: &mut dyn Write,
     tty: bool,
 ) -> Result<Outcome, String> {
-    dispatch_in(args, input, out, tty, true, None)
+    dispatch_in(args, input, out, tty, true, || Ok(None))
 }
 
 /// [`dispatch_to`] with empty input, discarded output, and a search with no
@@ -259,8 +272,11 @@ pub fn dispatch(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
 ) -> Result<Outcome, String> {
     let (mut input, mut out) = (std::io::empty(), std::io::sink());
-    dispatch_in(args, &mut input, &mut out, false, false, None)
+    dispatch_in(args, &mut input, &mut out, false, false, || Ok(None))
 }
+
+/// Reads `FMGREP_SERVER`, when a search needs it.
+type Env = fn() -> Result<Option<String>, String>;
 
 /// `FMGREP_SERVER`: unset when empty.
 fn server_env() -> Result<Option<String>, String> {
@@ -273,14 +289,14 @@ fn server_env() -> Result<Option<String>, String> {
     }
 }
 
-/// [`dispatch_to`], with `env` the value of `FMGREP_SERVER`.
+/// [`dispatch_to`], with `env` reading `FMGREP_SERVER`.
 fn dispatch_in(
     args: impl IntoIterator<Item = impl Into<OsString> + Clone>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     tty: bool,
     printing: bool,
-    env: Option<&str>,
+    env: Env,
 ) -> Result<Outcome, String> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -351,8 +367,7 @@ pub fn run() {
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut input = std::io::stdin().lock();
     let args = std::env::args_os().skip(1);
-    let dispatched = server_env()
-        .and_then(|env| dispatch_in(args, &mut input, &mut out, tty, true, env.as_deref()));
+    let dispatched = dispatch_in(args, &mut input, &mut out, tty, true, server_env);
     let mut result = dispatched.map(|o| match o {
         Outcome::Query(r) => r
             .queries
