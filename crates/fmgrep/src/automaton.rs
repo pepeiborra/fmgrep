@@ -409,11 +409,11 @@ fn any_capped<C: BackwardCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Opti
 /// Each hit locates a whole match, and every match contains one (the walk
 /// stops at the shortest accepting suffix), so the hits' documents are a
 /// superset of the matching documents.
-pub fn automaton_locate<C: LocatingCursor>(root: C, plan: &RegexPlan) -> Option<Vec<usize>> {
+pub fn automaton_locate<C: LocatingCursor>(root: C, plan: &RegexPlan) -> Option<Vec<C::Hit>> {
     locate_capped(root, plan, &CAPS)
 }
 
-fn locate_capped<C: LocatingCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Option<Vec<usize>> {
+fn locate_capped<C: LocatingCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Option<Vec<C::Hit>> {
     let mut hits = Vec::new();
     walk(root, plan, caps, |cursor| {
         cursor.locate(&mut |hit| hits.push(hit));

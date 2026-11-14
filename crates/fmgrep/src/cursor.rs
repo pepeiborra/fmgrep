@@ -16,9 +16,12 @@ pub trait BackwardCursor: Sized {
 /// A cursor whose occurrences can be placed in the indexed text, without
 /// re-searching the query.
 pub trait LocatingCursor: BackwardCursor {
-    /// Visit every occurrence of the current query, in any order, in the
-    /// structure's locate unit. Empty cursors visit nothing.
-    fn locate(&self, visit: &mut dyn FnMut(usize));
+    /// The structure's locate unit.
+    type Hit;
+
+    /// Visit every occurrence of the current query, in any order. Empty
+    /// cursors visit nothing.
+    fn locate(&self, visit: &mut impl FnMut(Self::Hit));
 }
 
 /// Naive cursor over a text: the walks' reference semantics.
@@ -60,7 +63,10 @@ impl BackwardCursor for ScanCursor<'_> {
 
 #[cfg(test)]
 impl LocatingCursor for ScanCursor<'_> {
-    fn locate(&self, visit: &mut dyn FnMut(usize)) {
+    /// A text offset.
+    type Hit = usize;
+
+    fn locate(&self, visit: &mut impl FnMut(usize)) {
         if self.query.is_empty() || self.text.len() < self.query.len() {
             return;
         }
