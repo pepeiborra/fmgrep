@@ -434,7 +434,7 @@ pub fn answer_expr(
         // Every path the expression may print is checked before its first
         // line.
         paths.check(root.yes.iter().chain(&root.maybe).copied())?;
-        let (files, bytes) = corpus(req, &paths)?;
+        let (files, bytes) = corpus(req, docs, &paths)?;
         sink.corpus(files, bytes)?;
         sink.term_start(&report.term)?;
     }

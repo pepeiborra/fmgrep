@@ -8,7 +8,7 @@ use crate::regex_pattern;
 
 use crate::blobs::BlobSlots;
 use crate::expr::Expr;
-use crate::fetch::{Ask, DocStore, Paths, fetch_stream_parallel, fetch_threads};
+use crate::fetch::{Ask, DocStore, Paths, Skip, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
 use crate::manifest::{Checked, FileTable, Manifest};
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
@@ -79,6 +79,11 @@ impl Loaded {
     /// Before a served query, re-check what changed since the last one.
     pub fn recheck(&self, files: Checked<'_>) {
         self.docs.recheck(files);
+    }
+
+    /// Leave out `skip`'s files until the next call.
+    pub fn skip(&mut self, skip: Skip) {
+        self.docs.set_skip(skip);
     }
 
     /// Indexed files missing at load.
@@ -315,23 +320,31 @@ fn printed<'a>(
     })
 }
 
-/// rg's files and bytes searched: the index's, BOMs left out as rg's
-/// searcher strips them. Under `--stats`, the indexed files that a PATH, a
-/// glob or the cwd keeps, and their bytes, BOMs included: the index does
-/// not record which file has one. That reads the path of every file the
-/// filter may keep.
-fn corpus(req: &QueryRequest<'_>, paths: &Paths<'_>) -> Result<(usize, u64), String> {
+/// rg's files and bytes searched: the index's less the skip list's files,
+/// BOMs left out as rg's searcher strips them where the output prints the
+/// bytes (rg's JSON summary, `--stats`). Under `--stats`, the indexed files
+/// that a PATH, a glob or the cwd keeps and the skip list does not hold,
+/// and their bytes, BOMs included: the index does not record which file
+/// has one. That reads the path of every file the filter may keep.
+fn corpus(
+    req: &QueryRequest<'_>,
+    docs: &DocStore,
+    paths: &Paths<'_>,
+) -> Result<(usize, u64), String> {
     let m = req.manifest;
-    let whole = (m.files.len(), m.num_bytes - m.bom_bytes);
-    let (Some(f), QueryOutput::Matches(matching::Print { stats: true, .. })) =
-        (&req.filter, req.output)
-    else {
+    let stats = matches!(
+        req.output,
+        QueryOutput::Matches(matching::Print { stats: true, .. })
+    );
+    let whole = docs.corpus(m, req.output.json() || stats)?;
+    let (Some(f), true) = (&req.filter, stats) else {
         return Ok(whole);
     };
     let ranges =
         (f.cover(&m.files)?).unwrap_or_else(|| std::iter::once(0..m.files.len()).collect());
+    let ids = ranges.into_iter().flatten().filter(|&id| !docs.skipped(id));
     let (mut failed, mut kept) = (None, (0, 0));
-    for id in f.kept(paths, ranges.into_iter().flatten(), &mut failed) {
+    for id in f.kept(paths, ids, &mut failed) {
         kept = (kept.0 + 1, kept.1 + m.doc_lens[id]);
     }
     match (failed, kept.0 == whole.0) {
@@ -479,7 +492,7 @@ fn answer_terms(
     debug_assert_eq!(answers.len(), terms.len());
 
     if emit {
-        let (files, bytes) = corpus(req, &docs.paths(&manifest.files))?;
+        let (files, bytes) = corpus(req, docs, &docs.paths(&manifest.files))?;
         sink.corpus(files, bytes)?;
     }
     let mut queries = Vec::with_capacity(terms.len());

@@ -194,6 +194,190 @@ fn a_pinned_query_is_scoped_by_its_paths_alone() {
     assert_eq!(text(2), "c.c\n");
 }
 
+/// A query's skip list leaves files out of every mode: of the matches, of
+/// the counts and of rg's corpus summary, whose bytes lose the skipped
+/// files' less their BOM. The list needs `commit` and `stream`.
+#[test]
+fn a_skip_list_leaves_files_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: [(&str, &[u8]); 4] = [
+        ("a.c", b"printk a\n"),
+        ("d/b.c", b"\xEF\xBB\xBFprintk b\n"),
+        ("d/c.c", b"printk c\n"),
+        ("e.c", b"printk e printk\n"),
+    ];
+    let folder = stage_corpus(tmp.path(), &files[..1]);
+    for (rel, bytes) in &files[1..] {
+        std::fs::create_dir_all(folder.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(folder.join(rel), bytes).unwrap();
+    }
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let ask = |mode: &str, skip: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"{mode}","commit":"{id}","stream":true,"skip":{skip}}}}}"#
+        )
+    };
+    let skip = r#"["d/","e.c"]"#;
+    let mut input = String::new();
+    for mode in ["counts", "files", "json_matches"] {
+        input.push_str(&ask(mode, skip));
+        input.push('\n');
+    }
+    let mut out = Vec::new();
+    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let counts: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let q = &counts["result"]["queries"][0];
+    assert_eq!(
+        (&q["total_matches"], &q["docs_matched"]),
+        (&1.into(), &1.into())
+    );
+    let docs: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix(r#"{"doc":""#))
+        .map(|l| l.split('"').next().unwrap())
+        .collect();
+    assert_eq!(docs, ["a.c", "a.c"], "{text}");
+    // One doc of 9 bytes is left of 4 docs of 9, 12 (a BOM), 9 and 16;
+    // only rg's JSON summary prints the bytes, so only it reads the BOMs.
+    let corpus: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with(r#"{"corpus""#))
+        .collect();
+    assert_eq!(corpus.last(), Some(&r#"{"corpus":[1,9]}"#), "{text}");
+
+    for (params, why) in [
+        (
+            r#""skip":["a.c"],"commit":"x""#,
+            "skip needs commit and stream",
+        ),
+        (
+            r#""skip":["a.c"],"stream":true"#,
+            "skip needs commit and stream",
+        ),
+    ] {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],{params}}}}}"#
+        );
+        let got = serve_stdio(&index, &[&line]);
+        assert_eq!(got[0]["error"]["code"], -32602, "{params}");
+        assert_eq!(
+            got[0]["error"]["message"],
+            format!("invalid params: {why}"),
+            "{params}"
+        );
+    }
+    let many: Vec<String> = (0..10_001).map(|i| format!("f{i}")).collect();
+    let line = ask("files", &serde_json::to_string(&many).unwrap());
+    let got = serve_stdio(&index, &[&line]);
+    assert_eq!(
+        got[0]["error"]["message"],
+        "invalid params: skip lists 10001 files; the limit is 10000"
+    );
+}
+
+/// Under `stats`, the corpus leaves out the skip list's files too: of the
+/// whole index, BOMs less, and of the files a glob keeps, BOMs counted.
+#[test]
+fn a_skip_list_leaves_files_out_of_the_stats_corpus() {
+    let tmp = tempfile::tempdir().unwrap();
+    let files: [(&str, &[u8]); 4] = [
+        ("a.c", b"printk a\n"),
+        ("d/b.c", b"\xEF\xBB\xBFprintk b\n"),
+        ("d/c.c", b"printk c\n"),
+        ("e.c", b"printk e printk\n"),
+    ];
+    let folder = stage_corpus(tmp.path(), &files[..1]);
+    for (rel, bytes) in &files[1..] {
+        std::fs::create_dir_all(folder.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(folder.join(rel), bytes).unwrap();
+    }
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    for (more, want) in [
+        (r#""skip":["d/","e.c"]"#, "[1,9]"),
+        (r#""skip":["e.c"]"#, "[3,27]"),
+        (r#""skip":["e.c"],"globs":["*.c"]"#, "[3,27]"),
+        (r#""skip":["e.c"],"globs":["!a.c"]"#, "[2,21]"),
+        (r#""skip":["d/c.c"],"globs":["d/*"]"#, "[1,12]"),
+    ] {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"lines","stats":true,"commit":"{id}","stream":true,{more}}}}}"#
+        );
+        let mut out = Vec::new();
+        let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+        dispatch_to(&words, &mut line.as_bytes(), &mut out, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let corpus = text.lines().find(|l| l.starts_with(r#"{"corpus""#));
+        assert_eq!(
+            corpus,
+            Some(format!(r#"{{"corpus":{want}}}"#).as_str()),
+            "{more}: {text}"
+        );
+    }
+}
+
+/// A skip list of every file, one of them with a BOM, leaves a corpus of
+/// no doc and no byte, in every mode.
+#[test]
+fn a_skip_list_of_every_file_leaves_no_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &[("a.c", b"\xEF\xBB\xBFprintk a\n")]);
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let mut input = String::new();
+    for mode in ["files", "json_matches"] {
+        input.push_str(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"{mode}","commit":"{id}","stream":true,"skip":["a.c"]}}}}"#
+        ));
+        input.push('\n');
+    }
+    let mut out = Vec::new();
+    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let corpus: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with(r#"{"corpus""#))
+        .collect();
+    assert_eq!(corpus, [r#"{"corpus":[0,0]}"#; 2], "{text}");
+}
+
+/// A skipped file's BOM that cannot be read, here from a cut `docs.shard`,
+/// fails the query, as a read of its text would: the corpus cannot be
+/// counted without it.
+#[test]
+fn a_skip_list_whose_bom_cannot_be_read_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &[("a.c", b"\xEF\xBB\xBFprintk a\n")]);
+    let index = tmp.path().join("idx");
+    index_it(&folder, &index, true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    let shard = index.join(crate::manifest::DOCS_SHARD);
+    std::fs::write(&shard, b"").unwrap();
+    let input = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{"terms":["printk"],"mode":"json_matches","commit":"{id}","stream":true,"skip":["a.c"]}}}}"#
+    );
+    let mut out = Vec::new();
+    let words = argv(&["serve", "--stdio", &index.display().to_string()]);
+    dispatch_to(&words, &mut input.as_bytes(), &mut out, false).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let want = format!("error: cannot read {}: ", shard.display());
+    let message = last["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with(&want), "{text}");
+    assert!(!text.contains(r#"{"corpus""#), "{text}");
+}
+
 /// A query pinned to another format or served commit is refused with
 /// -32001; one pinned to this server's is answered.
 #[test]
