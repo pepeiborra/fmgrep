@@ -267,12 +267,32 @@ impl Daemon {
     }
 
     /// Watches `root` itself, and returns once the daemon has read the
-    /// whole tree.
+    /// whole tree as a search sees it: a synced clock has a later tick
+    /// than the one before it, which a search needs to take a token.
+    /// During a crawl and its tail, synced clocks share the crawl's tick.
     pub(crate) fn watch(&self, root: &Path) {
         let root = std::fs::canonicalize(root).unwrap();
         self.call(&json!(["watch-project", root])).unwrap();
         let sync = json!(["clock", root, {"sync_timeout": 60_000}]);
-        self.call(&sync).unwrap();
+        let clock = || {
+            let reply = self.call(&sync).unwrap();
+            reply["clock"].as_str().unwrap().to_owned()
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last = clock();
+        loop {
+            let next = clock();
+            if ticked(&last, &next) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watchman still crawls {}: {next}",
+                root.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            last = next;
+        }
         self.sent();
     }
 
@@ -338,6 +358,19 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+}
+
+/// Whether clock `b` is of `a`'s instance with a later tick; a clock is
+/// `c:<start>:<pid>:<root number>:<tick>`. The rule by which a search
+/// takes a token (`ticked` in source/journal/watchman.rs), copied, as the
+/// command-line tests build this file too; a library test checks that
+/// both agree.
+pub(crate) fn ticked(a: &str, b: &str) -> bool {
+    let split = |c: &str| {
+        let (instance, tick) = c.rsplit_once(':')?;
+        Some((instance.to_owned(), tick.parse::<u64>().ok()?))
+    };
+    matches!((split(a), split(b)), (Some((ia, ta)), Some((ib, tb))) if ia == ib && tb > ta)
 }
 
 /// The connection number in a log line `... [client=<n>:...] ...`.
