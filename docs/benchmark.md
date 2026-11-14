@@ -188,9 +188,11 @@ Linux, so the default rows include elgrep only there; elsewhere
 ## Queries
 
 Each corpus's queries and pinned commit are in
-`crates/bench/queries/<corpus>.json`; `/.../` entries are regexes and
-`A AND B` entries intersections. To add a corpus, add a query file and name
-it in `crates/bench/src/corpus.rs`.
+`crates/bench/queries/<corpus>.json`; `/.../` entries are regexes,
+`A AND B` entries intersections, and `-i ...` entries an ASCII literal
+or intersection that every row searches with `-i` (see
+[BENCHMARKS.md, Method](../BENCHMARKS.md#method)). To add a corpus, add
+a query file and name it in `crates/bench/src/corpus.rs`.
 
 ## Comparing index configurations
 

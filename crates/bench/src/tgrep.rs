@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::rows::{Guard, LINES, Sampler, failure, run_measured, timed, unsampled};
 use crate::verify::Paths;
-use crate::{Query, Row, RowKind, leaves, with_warm_up};
+use crate::{Query, Row, RowKind, case_flag, leaves, with_warm_up};
 
 pub struct Tgrep {
     pub bin: PathBuf,
@@ -138,14 +138,15 @@ pub fn row(bin: &Path, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
         let what = format!("tgrep {term:?}");
         // The server's footprint and RSS leave the warm-up out.
         let paused = warm_up.then_some(&mut sampler);
-        let start = Instant::now();
+        let (start, case) = (Instant::now(), case_flag(term));
         let out = unsampled(paused, || match &leaves(term)[..] {
             [leaf] => {
                 let (fixed, e) = pattern(leaf);
-                let args: Vec<&str> = LINES.into_iter().chain(fixed).chain([&*e]).collect();
+                let args = LINES.into_iter().chain(case).chain(fixed);
+                let args: Vec<&str> = args.chain([&*e]).collect();
                 search(&mut tgrep(&args), &what)
             }
-            all => and(&tgrep, paths, all, &what),
+            all => and(&tgrep, paths, all, case, &what),
         })?;
         let latency = start.elapsed();
         let hits = paths.hits(&what, &out)?;
@@ -178,17 +179,20 @@ fn search(cmd: &mut Command, what: &str) -> Result<Output, String> {
     Ok(out)
 }
 
-/// `tgrep -l` per leaf, then `-n` over the shared files' base names, keeping only shared paths.
+/// `tgrep -l` per leaf, then `-n` over the shared files' base names, keeping
+/// only shared paths; `case` goes to every tgrep.
 fn and(
     tgrep: &impl Fn(&[&str]) -> Command,
     paths: &Paths,
     leaves: &[&str],
+    case: Option<&str>,
     what: &str,
 ) -> Result<Output, String> {
     let mut shared: Option<BTreeSet<u32>> = None;
     for leaf in leaves {
         let (fixed, e) = pattern(leaf);
-        let args: Vec<&str> = ["-l"].into_iter().chain(fixed).chain([&*e]).collect();
+        let args = ["-l"].into_iter().chain(case).chain(fixed);
+        let args: Vec<&str> = args.chain([&*e]).collect();
         let out = search(&mut tgrep(&args), what)?;
         let mut files: BTreeSet<u32> = paths.listed(what, &out)?.into_iter().collect();
         if let Some(shared) = &shared {
@@ -216,7 +220,7 @@ fn and(
     let names = names.into_iter().map(|n| format!("--type-add=and:{n}"));
     let args: Vec<String> = any.chain(names).collect();
     let args = args.iter().map(String::as_str).chain(["-t", "and"]);
-    let args: Vec<&str> = LINES.into_iter().chain(args).collect();
+    let args: Vec<&str> = LINES.into_iter().chain(case).chain(args).collect();
     let mut out = search(&mut tgrep(&args), what)?;
     let keep = |l: &&[u8]| paths.file_of(l).is_none_or(|f| shared.contains(&f));
     let lines = out.stdout.split_inclusive(|&b| b == b'\n').filter(keep);
@@ -335,13 +339,18 @@ pub mod tests {
         (dir, root)
     }
 
-    pub const TERMS: [&str; 5] = [
+    pub const TERMS: [&str; 7] = [
         "alpha AND beta",
         "/al+pha/ AND beta",
         "zzz AND alpha",
         "qqq AND alpha",
         "beta",
+        "-i ALPHA AND Beta",
+        "-i BETA",
     ];
+
+    /// Each of `TERMS`'s (lines, files) in `tree`.
+    pub const TALLIES: [(u64, usize); 7] = [(6, 4), (6, 4), (1, 1), (0, 0), (5, 5), (6, 4), (5, 5)];
 
     #[test]
     fn row_answers_intersections_as_rg_does() {
@@ -363,7 +372,7 @@ pub mod tests {
             .iter()
             .map(|q| (q.hits.lines(), q.hits.files()))
             .collect();
-        assert_eq!(got, [(6, 4), (6, 4), (1, 1), (0, 0), (5, 5)]);
+        assert_eq!(got, TALLIES);
         assert_eq!(row.searched, rg.searched);
         for (t, r) in row.queries.iter().zip(&rg.queries) {
             assert_eq!(t.hits.per_file, r.hits.per_file, "{}", t.term);

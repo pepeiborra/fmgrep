@@ -20,7 +20,7 @@ use crate::report::bytes;
 use crate::rows::{LINES, Peak, Sampler, and_pipe, failure, memory, timed};
 use crate::tgrep::dir_size;
 use crate::verify::Paths;
-use crate::{Query, Row, RowKind, leaves, with_warm_up};
+use crate::{Query, Row, RowKind, case_flag, leaves, with_warm_up};
 
 pub struct Elgrep {
     pub bin: PathBuf,
@@ -135,17 +135,19 @@ pub fn row(e: &Elgrep, paths: &Paths, root: &Path, terms: &[String]) -> Result<R
     let (prog, quoted) = (quote(&e.bin.to_string_lossy()), quoted.join(" "));
     let (mut scans, mut warm_up_scans) = (Scans::default(), Scans::default());
     for (term, warm_up) in with_warm_up(terms) {
+        let case = case_flag(term);
         let (mut cmd, stages) = match &leaves(term)[..] {
-            [_] => {
+            &[leaf] => {
                 let (pattern, fixed) =
-                    regex_pattern(term).map_or((term.as_str(), Some("-F")), |p| (p, None));
+                    regex_pattern(leaf).map_or((leaf, Some("-F")), |p| (p, None));
                 let mut cmd = eg(&["--debug", "--with-filename"]);
-                cmd.args(LINES).args(fixed).args(["-e", pattern, "--"]);
-                cmd.arg(root);
+                cmd.args(LINES).args(case).args(fixed);
+                cmd.args(["-e", pattern, "--"]).arg(root);
                 (cmd, 0)
             }
             all => {
-                let mut cmd = and_pipe(&prog, &quoted, root, all, Some(&stderr));
+                let flags = case.map_or(quoted.clone(), |c| format!("{quoted} {c}"));
+                let mut cmd = and_pipe(&prog, &flags, root, all, Some(&stderr));
                 env(&mut cmd, &runtime);
                 (cmd, all.len() + 1)
             }
@@ -511,14 +513,14 @@ mod tests {
             .iter()
             .map(|q| (q.hits.lines(), q.hits.files()))
             .collect();
-        assert_eq!(got, [(6, 4), (6, 4), (1, 1), (0, 0), (5, 5)]);
+        assert_eq!(got, crate::tgrep::tests::TALLIES);
         assert_eq!(row.searched, rg.searched);
         for (t, r) in row.queries.iter().zip(&rg.queries) {
             assert_eq!(t.hits.per_file, r.hits.per_file, "{}", t.term);
         }
         let scans = row.notes.last().unwrap();
         assert!(
-            scans.contains(" of 5 queries scanned without the index"),
+            scans.contains(" of 7 queries scanned without the index"),
             "{scans}"
         );
     }

@@ -38,8 +38,8 @@ pub struct Stamps {
 }
 
 const SUMMARY: &str = "\
-| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
+| row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | -i p50 | -i mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|";
 
 pub fn run(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
@@ -410,7 +410,7 @@ mod tests {
 
     const PIN: &str = "4cf7628aa66f56000c29aef93924b6b8515db8f7";
 
-    const TERMS: [&str; 3] = ["a", "/b/", "a AND b"];
+    const TERMS: [&str; 4] = ["a", "/b/", "a AND b", "-i a"];
 
     fn run_of(fixture: bool, revision: &str) -> (Run, Vec<Row>) {
         let notes = vec!["tgrep: not found on PATH".to_string()];
@@ -515,14 +515,14 @@ mod tests {
             &[
                 &format!(
                     "\n| rg | - | - | - |{} 1.00 MB | 2.00 MB | - | - |\n",
-                    " 2.00 ms |".repeat(8)
+                    " 2.00 ms |".repeat(10)
                 ),
                 "\n| fmgrep `--store-docs` | 2.00 s | - |",
-                "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | - | - | - | 1.00->4.50! |\n",
-                "\n- queries: 3 (1 literal, 1 regex, 1 intersection)\n",
+                "| 2.00 ms | 2.00 ms | - | - | 2.00 ms | 2.00 ms | 2.00 ms | 2.00 ms | - | - | - | 1.00->4.50! |\n",
+                "\n- queries: 4 (1 literal, 1 regex, 1 intersection, 1 -i)\n",
                 "\n- tgrep: not found on PATH\n",
                 " 1.00->4.50! |\n\n- rg: n\n\nLatency is",
-                "verify: OK, 2 rows agree on 3 queries",
+                "verify: OK, 2 rows agree on 4 queries",
             ],
         );
     }
@@ -551,14 +551,14 @@ mod tests {
             md.find(want)
                 .unwrap_or_else(|| panic!("{want:?} not in\n{md}"))
         };
-        let blocks = ["literal", "regex", "intersection"].map(|k| {
+        let blocks = ["literal", "regex", "intersection", "-i"].map(|k| {
             at(&format!(
                 "\n<details><summary>{k} queries (1)</summary>\n\n|"
             ))
         });
         assert!(blocks.is_sorted(), "{md}");
-        assert_eq!(md.matches("<details>").count(), 3, "{md}");
-        assert_eq!(md.matches("\n\n</details>\n").count(), 3, "{md}");
+        assert_eq!(md.matches("<details>").count(), 4, "{md}");
+        assert_eq!(md.matches("\n\n</details>\n").count(), 4, "{md}");
         let and = at("\n| `a AND b` | 1 | 1 | 2.00 ms | - | - |\n");
         assert!(and > blocks[2], "{md}");
 
@@ -576,6 +576,7 @@ mod tests {
 
         let trace = trace(&run, &rows, &found);
         for (term, kind) in [
+            ("-i a", "-i"),
             ("a AND b", "intersection"),
             ("/b/", "regex"),
             ("a", "literal"),
@@ -616,8 +617,8 @@ mod tests {
             &md,
             &[
                 "\n- files searched: rg 2, fmgrep `--store-docs` 1 (non-empty)\n",
-                "verify: OK, 2 rows agree on 3 queries\n\n\
-                 2 of 3 queries print lines from files some rows did not search (not failures):\n\n\
+                "verify: OK, 2 rows agree on 4 queries\n\n\
+                 2 of 4 queries print lines from files some rows did not search (not failures):\n\n\
                  - `a`: rg did not search symlink 1 (`a`); fmgrep `--store-docs` did not search \
                  hidden 1 (`.w`), binary 4 (`b`, `c`, `d`, …)\n\
                  - `/b/`: rg did not search ignored 1 (`b`)\n",
@@ -695,7 +696,7 @@ mod tests {
         let trace = trace(&run, &rows, &found);
         for name in ["fmgrep@a", "fmgrep@b"] {
             let want = format!(r#""index_name":"{name}""#);
-            assert_eq!(trace.matches(&want).count(), 4, "{trace}");
+            assert_eq!(trace.matches(&want).count(), 5, "{trace}");
         }
     }
 }
