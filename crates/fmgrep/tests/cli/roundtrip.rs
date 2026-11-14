@@ -496,6 +496,49 @@ fn verbose_prints_the_plan_on_stderr_and_leaves_stdout_alone() {
     }
 }
 
+/// Every output mode prints the same stdout and exits the same with and
+/// without `FMGREP_VERBOSE=1`, and prints nothing on stderr without it.
+#[test]
+fn verbose_leaves_stdout_and_the_exit_status_alone() {
+    const MODES: [&[&str]; 9] = [
+        &["printk"],
+        &["-l", "printk"],
+        &["-c", "printk"],
+        &["--count-matches", "printk"],
+        &["--json", "printk"],
+        &["--approx-counts", "printk", "hello"],
+        &["-C", "1", "printk"],
+        &["--expr", "printk AND hello"],
+        &["-c", "absent"],
+    ];
+    for store_docs in [false, true] {
+        let (_tmp, docs) = stage_files(&[
+            ("a.c", b"printk hello printk\n"),
+            ("b.c", b"int x;\nprintk(x);\nreturn;\n"),
+        ]);
+        let index = do_index(&docs, store_docs).display().to_string();
+        for args in MODES {
+            let search = |verbose: bool| {
+                let mut cmd = fmgrep();
+                cmd.arg("--index").arg(&index).args(args);
+                cmd.env_remove("FMGREP_VERBOSE");
+                if verbose {
+                    cmd.env("FMGREP_VERBOSE", "1");
+                }
+                cmd.output().expect("spawn fmgrep")
+            };
+            let (plain, verbose) = (search(false), search(true));
+            let what = format!("{store_docs} {args:?}");
+            let code = if args.contains(&"absent") { 1 } else { 0 };
+            assert_eq!(plain.status.code(), Some(code), "{what}");
+            assert_eq!(verbose.status.code(), Some(code), "{what}");
+            let stdout = |o: &Output| serve::timeless(&o.stdout);
+            assert_eq!(stdout(&plain), stdout(&verbose), "{what}");
+            assert_eq!(stderr(&plain), "", "{what}");
+        }
+    }
+}
+
 fn utf16(bom: [u8; 2], s: &str) -> Vec<u8> {
     let be = bom == [0xfe, 0xff];
     let units = s.encode_utf16();

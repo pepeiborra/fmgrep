@@ -49,6 +49,7 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
 /// The index found from `start` (else the cwd) and its manifest. A
 /// files-source dotdir reads the tree it sits in, not the manifest's.
 fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
+    let span = tracing::info_span!("locate").entered();
     let found = locate(start.unwrap_or(Path::new(".")))?;
     if !found.index_dir.join(BLOBS_SHARD).is_file() {
         return Err(format!(
@@ -56,7 +57,8 @@ fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
             found.index_dir.display()
         ));
     }
-    let manifest = read_manifest(&found.index_dir)?;
+    drop(span);
+    let manifest = tracing::info_span!("manifest").in_scope(|| read_manifest(&found.index_dir))?;
     Ok((found, manifest))
 }
 
@@ -128,6 +130,7 @@ fn search(
     if let Some(addr) = &s.server {
         return client(addr, p, &typed, s.json, out);
     }
+    let _span = tracing::info_span!("search").entered();
     let (found, manifest) = open_index(s.index.as_deref())?;
     let tree = tree_of(&found, &manifest);
     rebase(&mut p, &typed, tree.as_deref())?;
@@ -273,7 +276,7 @@ pub fn run() {
     });
     // Flush on every path: a failed run must still end on a whole line.
     // A closed pipe left the writer silent; nothing else may be.
-    if let Err(e) = out.flush()
+    if let Err(e) = tracing::info_span!("flush").in_scope(|| out.flush())
         && e.kind() != std::io::ErrorKind::BrokenPipe
         && result.is_ok()
     {

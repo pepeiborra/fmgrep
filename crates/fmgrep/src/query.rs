@@ -113,27 +113,38 @@ pub fn load(
     ask: Ask,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
+    let load = tracing::info_span!("load").entered();
+    let open = tracing::info_span!("open").entered();
     let docs = DocStore::open(index_dir, manifest, corpus_root, ask)?;
     let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
+    drop(open);
     let (files, docs_ref) = (&manifest.files, &docs);
     #[cfg(test)]
     let hooks = crate::tests::Hooks::here();
+    let load_id = load.id();
     // Plain threads: fixed blocking passes that overlap the load.
-    let index = std::thread::scope(|scope| {
+    let (index, wait) = std::thread::scope(|scope| {
         let fresh = scope.spawn(move || {
+            // A new thread is in no span: name the parent.
+            let check = tracing::info_span!(parent: load_id, "check");
+            let _span = check.enter();
             #[cfg(test)]
             hooks.apply();
             // A server that refuses to serve needs no stat pass.
             if docs_ref.replay(files) || docs_ref.refusal().is_some() {
                 return;
             }
-            scope.spawn(move || docs_ref.discover(files));
+            let check = check.clone();
+            scope.spawn(move || check.in_scope(|| docs_ref.discover(files)));
             docs_ref.stat_all(files);
         });
-        let index = DocfmIndex::load(&blobs, &manifest.doc_lens);
+        let index =
+            tracing::info_span!("index").in_scope(|| DocfmIndex::load(&blobs, &manifest.doc_lens));
+        let wait = tracing::info_span!("wait").entered();
         fresh.join().expect("the stat pass panicked");
-        index
+        (index, wait)
     });
+    drop(wait);
     let index = index.map_err(|e| format!("error: {e}"))?;
     let loaded = Loaded {
         docs,
@@ -164,7 +175,9 @@ fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
 /// [`load`] then [`answer`].
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
     let (index, mut loaded) = load(req.index_dir, req.manifest, req.corpus_root, Ask::Load)?;
-    answer(&index, &mut loaded, req, sink)
+    let report = answer(&index, &mut loaded, req, sink);
+    tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
+    report
 }
 
 /// Answer every term, or the expression, from `index` and `loaded`; then
@@ -175,6 +188,7 @@ pub fn answer(
     req: &QueryRequest<'_>,
     sink: &mut dyn MatchSink,
 ) -> Result<OutputReport, String> {
+    let query = tracing::info_span!("query").entered();
     let report = match req.expr {
         Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink)?,
         None => {
@@ -190,7 +204,8 @@ pub fn answer(
             answer_terms(index, loaded, req, &terms, sink)?
         }
     };
-    loaded.docs.checkpoint(&req.manifest.files);
+    drop(query);
+    tracing::info_span!("save").in_scope(|| loaded.docs.checkpoint(&req.manifest.files));
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter
         && !report.queries.iter().any(matched)
