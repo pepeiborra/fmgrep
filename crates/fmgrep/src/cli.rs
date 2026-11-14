@@ -176,6 +176,7 @@ fn local(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
+    crate::verbose::record_spans();
     let _span = tracing::info_span!("search").entered();
     let (found, manifest) = open_index(index)?;
     let tree = tree_of(&found, &manifest);
@@ -366,6 +367,7 @@ fn render(
 /// failure writing output, 2 bad argv / unreadable input / build refusal. A
 /// closed pipe is not a failure.
 pub fn run() {
+    crate::verbose::start_clock();
     let tty = std::io::stdout().is_terminal();
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let mut input = std::io::stdin().lock();
@@ -386,6 +388,7 @@ pub fn run() {
     {
         result = Err(format!("{WRITE_FAILED} output: {e}"));
     }
+    crate::verbose::print_spans();
     match result {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
