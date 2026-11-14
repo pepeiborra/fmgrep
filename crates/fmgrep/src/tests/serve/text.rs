@@ -227,39 +227,43 @@ fn streamed(params: &str) -> String {
     format!(r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{{params},"stream":true}}}}"#)
 }
 
+/// A streamed query sends one frame per output event: the corpus, the
+/// term, each matching file in path order with its printed bytes as they
+/// are (here not UTF-8), and the term's end; then a response that holds
+/// the report alone.
 #[test]
-fn streamed_output_is_framed_before_the_response() {
+fn streamed_output_is_one_frame_per_event_before_the_response() {
     let tmp = tempfile::tempdir().unwrap();
     let index = stage(tmp.path(), true);
-    let cases: [(&str, &[&str]); 3] = [
-        ("lines", &["-n", "--heading"]),
-        ("count", &["-c"]),
-        ("json_matches", &["--json", "--matches"]),
-    ];
-    let requests: Vec<String> = cases
+    let modes = ["lines", "count", "json_matches"];
+    let requests: Vec<String> = modes
         .iter()
-        .map(|(mode, _)| streamed(&format!(r#""terms":["printk"],"mode":"{mode}""#)))
+        .map(|mode| streamed(&format!(r#""terms":["printk"],"mode":"{mode}""#)))
         .chain([streamed(r#""terms":["printk"]"#)])
         .collect();
     let got = serve_frames(
         &index,
         &requests.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    for ((frames, response), (mode, flags)) in got.iter().zip(cases) {
-        let here = output(&local(&index, flags, &["printk"]), false).unwrap();
-        let served = frames.concat();
-        assert_eq!(
-            untimed(flags, &String::from_utf8_lossy(&served)),
-            untimed(flags, &String::from_utf8_lossy(&here)),
-            "{mode}"
-        );
-        if mode != "json_matches" {
-            assert_eq!(served, here, "{mode}");
-        }
+    for ((frames, response), mode) in got.iter().zip(modes) {
+        let heads: Vec<serde_json::Value> = frames
+            .iter()
+            .map(|f| {
+                let eol = f.iter().position(|&b| b == b'\n').unwrap();
+                serde_json::from_slice(&f[..eol]).unwrap()
+            })
+            .collect();
+        assert!(heads[0]["corpus"].is_array(), "{mode}: {}", heads[0]);
+        assert_eq!(heads[1], serde_json::json!({"term": "printk"}), "{mode}");
+        let (last, docs) = heads[2..].split_last().unwrap();
+        let docs: Vec<&str> = docs.iter().map(|d| d["doc"].as_str().unwrap()).collect();
+        assert_eq!(docs, ["a.c", "b.c", "c.c", "d.c"], "{mode}");
+        assert_eq!(last["end"]["term"], "printk", "{mode}");
         let result = response["result"].as_object().unwrap();
         assert_eq!(result.keys().collect::<Vec<_>>(), ["report"], "{mode}");
     }
-    assert!(std::str::from_utf8(&got[0].0.concat()).is_err());
+    let d = got[0].0[5].as_slice();
+    assert!(d.ends_with(b"\x80\x81 printk \xe9\n"), "{d:?}");
     let (frames, response) = &got[3];
     assert!(frames.is_empty());
     assert_eq!(
@@ -279,26 +283,6 @@ fn stage_big(tmp: &Path, n: usize) -> PathBuf {
     output
 }
 
-#[test]
-fn streamed_output_splits_into_bounded_frames() {
-    let tmp = tempfile::tempdir().unwrap();
-    let index = stage_big(tmp.path(), 16_000);
-    let here = output(&local(&index, &["-n", "--heading"], &["printk"]), false).unwrap();
-    let got = serve_frames(&index, &[&streamed(r#""terms":["printk"],"mode":"lines""#)]);
-    let frames = &got[0].0;
-    assert!(frames.len() > 10, "{}", frames.len());
-    assert!(frames.iter().all(|f| f.len() <= 64 << 10));
-    assert_eq!(frames.concat(), here);
-    let (addr, server) = spawn_server(&index, FIXED);
-    let served = output(&words(&["--server", &addr], &[], &["printk"]), false).unwrap();
-    assert_eq!(
-        served,
-        output(&local(&index, &[], &["printk"]), false).unwrap()
-    );
-    client(&addr, &["--shutdown"]).unwrap();
-    server.join().unwrap().unwrap();
-}
-
 /// A one-connection server that answers any request with `reply`.
 fn fake_server(reply: &[u8]) -> String {
     let reply = reply.to_vec();
@@ -315,20 +299,32 @@ fn fake_server(reply: &[u8]) -> String {
     addr
 }
 
+/// `payload` as one frame.
+fn frame(payload: &str) -> String {
+    format!("{}\n{payload}", payload.len())
+}
+
 #[test]
 fn a_server_error_after_output_keeps_the_output() {
+    let error =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n";
+    let sent = [
+        frame("{\"term\":\"printk\"}\n"),
+        frame("{\"doc\":\"a\",\"path\":\"a\",\"stats\":[1,1,6]}\nhello!"),
+        error.to_owned(),
+    ]
+    .concat();
+    let cut = [frame("{\"term\":\"printk\"}\n"), "60\n{\"doc\"".to_owned()].concat();
     for (reply, printed, error) in [
-        (
-            &b"5\nhello1\n!{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n"[..],
-            &b"hello!"[..],
-            "server: boom",
-        ),
-        (b"10\nabc", b"abc", "{addr}: connection closed mid-frame"),
+        (sent.as_bytes(), &b"hello!"[..], "server: boom"),
+        (cut.as_bytes(), b"", "{addr}: connection closed mid-frame"),
     ] {
         let addr = fake_server(reply);
         let mut out = Vec::new();
         let words = argv(&["--server", &addr, "printk"]);
-        let got = dispatch_to(&words, &mut &b""[..], &mut out, false).err().unwrap();
+        let got = dispatch_to(&words, &mut &b""[..], &mut out, false)
+            .err()
+            .unwrap();
         assert_eq!(got, format!("error: {}", error.replace("{addr}", &addr)));
         assert_eq!(out, printed);
     }
@@ -348,7 +344,7 @@ fn a_client_leaving_mid_stream_leaves_the_server_serving() {
     std::io::BufReader::new(&stream)
         .read_line(&mut header)
         .unwrap();
-    assert_eq!(header, format!("{}\n", 64 << 10));
+    assert!(header.trim_end().parse::<usize>().is_ok(), "{header:?}");
     drop(stream);
     let (_, counted) = client(&addr, &["-c", "--", "printk"]).unwrap();
     assert_eq!(counted, printed(&index, &["-c"], &["printk"]));

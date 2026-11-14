@@ -102,22 +102,42 @@ tree.
 ### Streamed output
 
 With `stream: true`, a rendering mode sends its output while the search
-runs, as frames before the response line. A frame is its length in ASCII
-decimal, `\n`, then that many bytes, at most 64 KiB; a response line starts
-with `{` instead. The frames concatenated are the local stdout, and the
-result is `{"report"}`. A search that fails after output started sends the
-frames so far, then the error. `counts` ignores `stream`. Connections are
-still served one at a time.
+runs, as frames before the response line: one frame per output event, so
+that the client prints each through its own writer, and can put files of
+its own between them in path order. A frame is its length in ASCII
+decimal, `\n`, then that many bytes; a response line starts with `{`
+instead. A frame's payload is one JSON line, then, for a file, its
+printed bytes:
+
+| event | payload |
+|---|---|
+| the corpus, once | `{"corpus":[docs,bytes]}`: what rg's `--json` summary counts as searched |
+| a term starts | `{"term":"<term>"}` |
+| a matching file | `{"doc":"<path from the root>","path":"<path as printed>","stats":[matches,matched_lines,bytes_printed]}`, a newline, then the file's printed bytes |
+| a term ends | `{"end":<QueryReport>}` |
+
+Files come in path order within each term. Banners, headings and `--`
+separators are not in the frames: the client adds them. A file's frame
+holds all that the file prints, however long. The result is
+`{"report"}`. A search that fails after output started sends the frames
+so far, then the error. `counts` ignores `stream`. Connections are still
+served one at a time.
 
 ```text
 > {"jsonrpc":"2.0","id":6,"method":"query","params":{"terms":["hello"],"mode":"lines","stream":true}}
-< 78
-< README.md
-< 3:Say hello with greet.
-<
-< src/Lib.hs
-< 4:greet name = "hello " ++ name
-< {"jsonrpc":"2.0","id":6,"result":{"report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":82,"total_matches":2,"docs_matched":2}]}}}
+< 18
+< {"corpus":[2,52]}
+< 17
+< {"term":"hello"}
+< 82
+< {"doc":"Lib.hs","path":"Lib.hs","stats":[1,1,32]}
+< 1:greet name = "hello " ++ name
+< 80
+< {"doc":"README.md","path":"README.md","stats":[1,1,24]}
+< 1:Say hello with greet.
+< 77
+< {"end":{"docs_matched":2,"latency_us":348,"term":"hello","total_matches":2}}
+< {"jsonrpc":"2.0","id":6,"result":{"report":{"index_time_us":171,"index_size_bytes":19494,"num_files_indexed":2,"queries":[{"term":"hello","latency_us":348,"total_matches":2,"docs_matched":2}]}}}
 ```
 
 ## Expressions
@@ -191,7 +211,8 @@ Serving continues after any error.
 
 `fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
 `--index` and prints what the local search prints. It sends one `query`
-(all terms, or the expression) with `stream: true`. `--json` alone and
+(all terms, or the expression) with `stream: true`, and prints each file
+through its own writer. `--json` alone and
 `--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
 headings follow the client's stdout, as in rg. `--status` prints the
 status object and `--shutdown` stops the server. An error response exits
