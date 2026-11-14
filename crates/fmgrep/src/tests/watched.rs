@@ -78,7 +78,7 @@ pub(super) fn indexed(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, P
 }
 
 /// [`indexed`], then the first search, which took a token.
-fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
+pub(super) fn watched(tmp: &Path, files: &[(&str, &[u8])]) -> Option<(PathBuf, PathBuf, Daemon)> {
     let (folder, output, daemon) = indexed(tmp, files)?;
     query_it(&output, false, &["printk"]);
     assert_eq!(notes(), [ONCE]);
@@ -190,7 +190,7 @@ fn a_first_search_that_gets_no_token_saves_nothing() {
 /// A stand-in watchman client at `<tmp>/bin/watchman`: it logs each run's
 /// arguments to `<tmp>/runs` and gives `sock`, as the real client does
 /// once the daemon it started listens.
-fn stand_in(tmp: &Path, sock: &Path) -> PathBuf {
+pub(super) fn stand_in(tmp: &Path, sock: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = tmp.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -215,7 +215,7 @@ fn stand_in(tmp: &Path, sock: &Path) -> PathBuf {
     program
 }
 
-fn runs(tmp: &Path) -> String {
+pub(super) fn runs(tmp: &Path) -> String {
     std::fs::read_to_string(tmp.join("runs")).unwrap_or_default()
 }
 
@@ -531,7 +531,7 @@ fn searches_at_once_leave_one_whole_record() {
 
 /// A mountinfo file in `tmp` that puts canonical `root` on a filesystem of
 /// type `fs`.
-fn mounted(tmp: &Path, root: &Path, fs: &str) -> PathBuf {
+pub(super) fn mounted(tmp: &Path, root: &Path, fs: &str) -> PathBuf {
     let file = tmp.join(format!("mountinfo-{fs}"));
     let root = root.display();
     let text =

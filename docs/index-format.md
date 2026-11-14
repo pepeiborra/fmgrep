@@ -61,6 +61,28 @@ same words and exit 2. The first line is always `a search here uses
 ...` (`a search in DIR uses ...` with a PATH), with the note a search
 warns, such as `, not the server at ADDR (FMGREP_SERVER)`.
 
+For a local index, the `changes:` line says how a search learns what
+changed since the index, and why it checks every file when it does:
+
+| line | when |
+|---|---|
+| `watchman can say what changed since the last search` | a record and its token serve |
+| `no record of an earlier search; the next search checks every file and takes a token, later ones ask watchman` | the first search of this index build |
+| `watchman is not running; the next search starts it and checks every file, later ones ask watchman` | no daemon answers, and `WATCHMAN_SOCK` is unset |
+| `watchman no longer watches DIR; the next search asks it to and checks every file` | the watch was removed |
+| `watchman does not watch DIR; the next search asks it to and checks every file` | no record, and watchman does not watch the tree |
+| `watchman cannot say what changed (WHY); the next search checks every file` | the next search takes a new token, with WHY as a search says it |
+| `watchman cannot say what changed (WHY); every search checks every file` | a cause that lasts: no watchman, a network filesystem, `WATCHMAN_SOCK` naming no daemon |
+| `more than N paths differed from the index at the last search; every search checks every file (re-run index)` | the record holds no baseline |
+| `more than N paths differ from the index; the next search checks every file (re-run index)` | watchman and the record name more paths than a search re-checks (N is an eighth of the files, at least 64) |
+| `fewer than 50000 files: every search checks every file, which is fast here` | a search does not ask watchman |
+| `none: the index holds the files; a search reads none of the tree` | `index --store-docs` |
+
+`status` changes nothing to say so: it takes no token, saves no record,
+asks watchman to watch nothing and starts no daemon (it runs the client
+with `--no-spawn`). Its question to watchman is synced, as a search's
+is, so watchman makes and removes a cookie file in the tree.
+
 `fmgrep status --json` prints one JSON object on one line. Keys may be
 added later, never renamed; `null` means not known, or does not apply:
 
@@ -69,6 +91,7 @@ added later, never renamed; `null` means not known, or does not apply:
 | `uses` | string | `"index"` or `"server"` |
 | `note` | string or null | what a search warns after `Using local index DIR` |
 | `index` | object or null | `{dir, manifest}`: the canonical index directory, and the manifest, with the fields above in that order |
+| `changes` | object or null | for a local files layout, `{watchman, why, record}`: whether watchman can say what changed, else the `changes:` line, and the record's path when one exists |
 | `server` | object or null | `{addr, env, status}`: the address, whether `FMGREP_SERVER` gave it, and the reply that `fmgrep --status` prints |
 
 A script reads the paths with

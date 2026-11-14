@@ -563,7 +563,7 @@ mod watchman_tests {
             path
         };
         let start = Instant::now();
-        let stalled = Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET);
+        let stalled = Watchman::detect(&script("stalls", "exec sleep 30"), BUDGET, true);
         assert!(
             start.elapsed() < BUDGET + SLACK,
             "took {:?}",
@@ -581,20 +581,29 @@ mod watchman_tests {
                 args.display()
             ),
         );
-        assert_eq!(Watchman::detect(&answers, BUDGET * 5), Ok("/s".into()));
-        let args = std::fs::read_to_string(&args).unwrap();
-        assert_eq!(args, "--no-pretty get-sockname\n", "may start the daemon");
+        assert_eq!(
+            Watchman::detect(&answers, BUDGET * 5, true),
+            Ok("/s".into())
+        );
+        let said = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(said, "--no-pretty get-sockname\n", "may start the daemon");
+        assert_eq!(
+            Watchman::detect(&answers, BUDGET * 5, false),
+            Ok("/s".into())
+        );
+        let said = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(said, "--no-spawn --no-pretty get-sockname\n", "starts none");
         // A daemon started by the client may keep its stdout open.
         let holds = script("holds", r#"echo '{"sockname": "/s"}'; sleep 5 &"#);
         let start = Instant::now();
-        assert_eq!(Watchman::detect(&holds, BUDGET * 5), Ok("/s".into()));
+        assert_eq!(Watchman::detect(&holds, BUDGET * 5, true), Ok("/s".into()));
         assert!(start.elapsed() < BUDGET, "took {:?}", start.elapsed());
-        let failed = Watchman::detect(&script("fails", "exit 1"), BUDGET).unwrap_err();
+        let failed = Watchman::detect(&script("fails", "exit 1"), BUDGET, true).unwrap_err();
         assert!(
             failed.starts_with("watchman get-sockname failed (exit status: 1"),
             "{failed}"
         );
-        let missing = Watchman::detect(&tmp.path().join("none"), BUDGET).unwrap_err();
+        let missing = Watchman::detect(&tmp.path().join("none"), BUDGET, true).unwrap_err();
         assert!(
             missing.starts_with("cannot run watchman (") && missing.ends_with("; install watchman"),
             "{missing}"

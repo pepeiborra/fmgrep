@@ -39,6 +39,9 @@ own `WATCHMAN_SOCK` names its socket. To keep fmgrep from watchman, set
 daemon, asks for no watch, uses no record of an earlier search and checks
 every file. `fmgrep serve` then refuses to start, unless given
 `--no-watch`. See [index-format.md](index-format.md#watchman).
+`fmgrep status` says, before a search, what that search would learn
+from watchman, and changes nothing
+([index-format.md](index-format.md#fmgrep-status)).
 
 ## Spans
 

@@ -146,6 +146,8 @@ struct Known {
     /// Whether a server asks watchman again before each query: its
     /// warnings then speak of queries, not searches.
     each_query: bool,
+    /// Whether nothing is said on stderr: `fmgrep status` looks.
+    quiet: bool,
 }
 
 impl Known {
@@ -190,7 +192,7 @@ impl Known {
     fn exclude(&self, id: usize, path: &Path, why: &str) {
         let first = self.settle(id, GONE)
             && self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0;
-        if first {
+        if first && !self.quiet {
             eprintln!("warning: excluding {}: {why}", path.display());
         }
     }
@@ -235,7 +237,7 @@ impl Known {
     fn stat_ids(&self, ids: &[usize], files: &FileTable, lens: &[u64], force: bool) {
         let gone = parallel(ids, |&id| self.stat(id, files, lens, force));
         let n = gone.iter().flatten().count();
-        if n * 2 > self.state.len() {
+        if n * 2 > self.state.len() && !self.quiet {
             eprintln!(
                 "warning: excluding {n} of {} indexed files, missing under {}",
                 self.state.len(),
@@ -372,7 +374,7 @@ impl Known {
             .unwrap_or_else(PoisonError::into_inner)
             .len();
         let n = changes.moved + new;
-        if n > 0 {
+        if n > 0 && !self.quiet {
             ignores_changed(n, self.each_query);
         }
         changes.scopes
@@ -435,6 +437,16 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
         return pool.install(|| items.par_iter().map(&f).collect());
     }
     items.iter().map(f).collect()
+}
+
+/// What [`Files::look`] found.
+pub struct Looked {
+    /// Whether watchman can say what changed.
+    pub watchman: bool,
+    /// What a search does to learn what changed, and why.
+    pub line: String,
+    /// The record of the tree and index, when one exists.
+    pub record: Option<PathBuf>,
 }
 
 /// What a load asks watchman with: [`Files::ready`].
@@ -506,6 +518,7 @@ impl Files {
                 new_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
                 each_query: false,
+                quiet: false,
             }),
             index: None,
             last: Mutex::default(),
@@ -542,6 +555,59 @@ impl Files {
             root,
             recorded,
         })
+    }
+
+    /// Say nothing on stderr: `fmgrep status` looks, a search does not
+    /// follow. Before any watch or discovery.
+    pub fn quiet(&mut self) {
+        let known = Arc::get_mut(&mut self.known).expect("quiet precedes sharing");
+        known.quiet = true;
+    }
+
+    /// What a search would learn from watchman, with nothing changed:
+    /// [`Self::ready`]'s checks, then [`journal::look`], then a re-check
+    /// of what watchman and the record name, as [`Self::replay`] makes it.
+    pub fn look(&self, files: &FileTable, lens: &[u64]) -> Looked {
+        let line = |line: String| Looked {
+            watchman: false,
+            line,
+            record: None,
+        };
+        let Ready {
+            index,
+            root,
+            recorded,
+        } = match self.ready(files) {
+            Ok(ready) => ready,
+            Err(Unready::NotDue) => {
+                return line(format!(
+                    "fewer than {} files: every search checks every file, which is fast here",
+                    journal::MIN_DOCS
+                ));
+            }
+            Err(Unready::Cannot(why)) => return line(journal::every(&why)),
+        };
+        let look = journal::look(&root, index, files.len());
+        let record = look.record;
+        let (watchman, line) = match look.paths {
+            None => (false, look.line),
+            Some(paths) => match self.known.replay(recorded, &paths, files, lens) {
+                Ok(_) => (true, look.line),
+                Err(()) => (
+                    false,
+                    format!(
+                        "more than {} paths differ from the index; the next search checks every \
+                         file (re-run index)",
+                        journal::named_cap(files.len())
+                    ),
+                ),
+            },
+        };
+        Looked {
+            watchman,
+            line,
+            record,
+        }
     }
 
     /// The canonical root and the walk's record to ask with, or why not.

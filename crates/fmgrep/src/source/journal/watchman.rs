@@ -80,27 +80,33 @@ impl Watchman {
     }
 
     /// [`Self::given`], else the socket that `watchman get-sockname` gives
-    /// within [`super::FIND_WAIT`]; calls get `budget` after that. Tests
-    /// run only the program they are given.
-    pub fn find(budget: Duration) -> Result<Self, String> {
+    /// within [`super::FIND_WAIT`]; calls get `budget` after that. The
+    /// client starts the daemon when none runs only if `spawn`. Tests run
+    /// only the program they are given.
+    pub fn find(budget: Duration, spawn: bool) -> Result<Self, String> {
         #[cfg(test)]
         let program = crate::tests::WATCHMAN_PROGRAM.with_borrow(Clone::clone);
         #[cfg(not(test))]
         let program = PathBuf::from("watchman");
         match Self::given() {
             Some(sock) => Ok(Self::at(sock, budget)),
-            None => Ok(Self::at(Self::detect(&program, super::FIND_WAIT)?, budget)),
+            None => {
+                let sock = Self::detect(&program, super::FIND_WAIT, spawn)?;
+                Ok(Self::at(sock, budget))
+            }
         }
     }
 
-    /// Asks `program` for the socket. Without `--no-spawn` the client
-    /// starts the daemon when none runs, and answers once it listens. The
-    /// reply is read on a helper thread, as a daemon could hold the pipe; a
-    /// child still running at the deadline is killed, and a daemon it
-    /// started keeps starting.
-    pub fn detect(program: &Path, budget: Duration) -> Result<PathBuf, String> {
+    /// Asks `program` for the socket. If `spawn`, the client starts the
+    /// daemon when none runs, and answers once it listens; else it passes
+    /// `--no-spawn` and answers from the client alone. The reply is read on
+    /// a helper thread, as a daemon could hold the pipe; a child still
+    /// running at the deadline is killed, and a daemon it started keeps
+    /// starting.
+    pub fn detect(program: &Path, budget: Duration, spawn: bool) -> Result<PathBuf, String> {
         let deadline = Instant::now() + budget;
         let mut child = Command::new(program)
+            .args((!spawn).then_some("--no-spawn"))
             .args(["--no-pretty", "get-sockname"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -144,10 +150,8 @@ impl Watchman {
     }
 
     /// The watch on `root` or the deepest above it, and `root` relative to
-    /// it. Without one, asks watchman to watch `root` and waits for the
-    /// answer, sent once the crawl ends, until the deadline only; the watch
-    /// stays either way.
-    pub fn watch(&self, root: &Path) -> Result<(String, String), String> {
+    /// it; `None` when no watch covers `root`. Changes nothing.
+    pub fn watched(&self, root: &Path) -> Result<Option<(String, String)>, String> {
         let list = self.call(&json!(["watch-list"]), root)?;
         let found = list
             .get("roots")
@@ -157,8 +161,15 @@ impl Watchman {
             .filter_map(Value::as_str)
             .filter_map(|w| Some((w, root.strip_prefix(w).ok()?.to_str()?)))
             .max_by_key(|(w, _)| w.len());
-        if let Some((watch, relative)) = found {
-            return Ok((watch.to_owned(), relative.to_owned()));
+        Ok(found.map(|(watch, relative)| (watch.to_owned(), relative.to_owned())))
+    }
+
+    /// [`Self::watched`]. Without a watch, asks watchman to watch `root`
+    /// and waits for the answer, sent once the crawl ends, until the
+    /// deadline only; the watch stays either way.
+    pub fn watch(&self, root: &Path) -> Result<(String, String), String> {
+        if let Some(found) = self.watched(root)? {
+            return Ok(found);
         }
         let project = match self.call(&json!(["watch-project", root]), root) {
             Err(_) if self.late() => return Err(asked(root, self.served)),
@@ -192,20 +203,25 @@ impl Watchman {
             .ok_or_else(|| "watchman sent no clock".to_owned())
     }
 
-    /// A token for now, of the watch covering `root`. Refused when an
-    /// `ignore_dirs` entry would hide changes under it, or when the two
-    /// clocks do not sync in time or share a tick (a crawl's).
-    pub fn mark(&self, root: &Path) -> Result<Token, String> {
-        let (watch, relative) = self.watch(root)?;
+    /// Refused when an `ignore_dirs` entry of `watch` would hide changes
+    /// under `root`, at `relative` in it.
+    pub fn hidden(&self, watch: &str, relative: &str, root: &Path) -> Result<(), String> {
         let config = self.call(&json!(["get-config", watch]), root)?;
-        if let Some(ignores) = config.pointer("/config/ignore_dirs")
-            && hides(ignores, &relative)
-        {
-            return Err(format!(
+        match config.pointer("/config/ignore_dirs") {
+            Some(ignores) if hides(ignores, relative) => Err(format!(
                 "watchman's ignore_dirs hide part of {}",
                 root.display()
-            ));
+            )),
+            _ => Ok(()),
         }
+    }
+
+    /// A token for now, of the watch covering `root`. Refused when
+    /// [`Self::hidden`] refuses, or when the two clocks do not sync in time
+    /// or share a tick (a crawl's).
+    pub fn mark(&self, root: &Path) -> Result<Token, String> {
+        let (watch, relative) = self.watch(root)?;
+        self.hidden(&watch, &relative, root)?;
         let first = self.clock(&watch, root)?;
         let clock = self.clock(&watch, root)?;
         if !ticked(&first, &clock) {
@@ -338,6 +354,11 @@ impl Watchman {
 /// Whether [`Watchman::find`] failed with `why` for want of time only.
 pub fn late_find(why: &str) -> bool {
     why.starts_with("watchman get-sockname did not answer within")
+}
+
+/// Whether a call failed with `why` because no daemon listens on the socket.
+pub fn absent(why: &str) -> bool {
+    why.starts_with("no watchman daemon answers on")
 }
 
 fn not_watching(root: &Path) -> String {

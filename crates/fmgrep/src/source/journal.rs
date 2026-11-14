@@ -24,7 +24,7 @@ mod watchman;
 
 const VERSION: u32 = 1;
 /// Below this many docs the stat pass beats asking.
-const MIN_DOCS: usize = 50_000;
+pub const MIN_DOCS: usize = 50_000;
 
 /// `watchman get-sockname`, a process start: 2-10 ms with a daemon or
 /// without one (`--no-spawn`), more when the client starts the daemon, and
@@ -61,7 +61,7 @@ pub fn request_watch(root: &Path, files: usize) {
     };
     let asked = local(&root).and_then(|()| {
         #[cfg(unix)]
-        return watchman::Watchman::find(ASK_WAIT).and_then(|w| w.watch(&root).map(drop));
+        return watchman::Watchman::find(ASK_WAIT, true).and_then(|w| w.watch(&root).map(drop));
         #[cfg(not(unix))]
         return Err("no change source on this platform".to_owned());
     });
@@ -206,6 +206,152 @@ pub struct Asked {
     pub lasting: Option<String>,
 }
 
+/// Why a search finds no record: the first search of an index.
+const NO_RECORD: &str = "no record of an earlier search";
+
+/// What `fmgrep status` learns of a tree, changing nothing: it takes no
+/// token, saves no record, asks for no watch and starts no daemon.
+#[derive(Debug)]
+pub struct Look {
+    /// What may differ from the index, unsorted, when watchman can say: the
+    /// record's paths plus what changed since its token.
+    pub paths: Option<Vec<String>>,
+    /// What the next search does to learn what changed, and why.
+    pub line: String,
+    /// The record of the tree and index, when one exists.
+    pub record: Option<PathBuf>,
+}
+
+/// [`Look::line`] when watchman can say.
+const CAN_SAY: &str = "watchman can say what changed since the last search";
+
+/// [`Look::line`] for a cause that every search meets again.
+pub fn every(why: &str) -> String {
+    format!("watchman cannot say what changed ({why}); every search checks every file")
+}
+
+/// [`Look::line`] for a cause that the next search's token mends.
+fn next(why: &str) -> String {
+    format!("watchman cannot say what changed ({why}); the next search checks every file")
+}
+
+/// What a search under canonical `root` of `index`, of `docs` docs,
+/// would learn from watchman: the checks of [`ask`], in its order, with
+/// [`watchman::Watchman::watched`] and [`watchman::Watchman::hidden`] for
+/// its token, then the token question on the record's token. The question
+/// is synced, so watchman makes and removes its cookie file in the tree,
+/// as for every search.
+pub fn look(root: &Path, index: &Index, docs: usize) -> Look {
+    let record = root
+        .to_str()
+        .zip(index.dir.to_str())
+        .and_then(|(root, dir)| path(root, dir))
+        .filter(|p| p.is_file());
+    let usable = match usable(root, index) {
+        Err(Unusable::Never(why)) => Err(Ok(every(&why))),
+        Err(Unusable::NoRecord(why)) => Err(Err(why)),
+        Ok(found) => Ok(found),
+    };
+    #[cfg(unix)]
+    let seen = usable.and_then(|found| {
+        let w = watchman::Watchman::at(found.token.sock.clone().into(), ASK_WAIT);
+        since_record(&w, &found, root, docs)
+    });
+    #[cfg(not(unix))]
+    let seen = usable.and_then(|_| -> Result<Vec<String>, _> {
+        unreachable!("unaskable refuses every root here: {docs}")
+    });
+    let line = match seen {
+        Ok(paths) => {
+            return Look {
+                paths: Some(paths),
+                line: CAN_SAY.to_owned(),
+                record,
+            };
+        }
+        Err(Ok(line)) => line,
+        #[cfg(unix)]
+        Err(Err(why)) => fresh(root, &why),
+        #[cfg(not(unix))]
+        Err(Err(why)) => every(&why),
+    };
+    Look {
+        paths: None,
+        line,
+        record,
+    }
+}
+
+/// [`look`] with `record`, on its daemon `w`: what may differ; else the
+/// line, or why the record's daemon cannot be used, as without a record.
+#[cfg(unix)]
+fn since_record(
+    w: &watchman::Watchman,
+    record: &Record,
+    root: &Path,
+    docs: usize,
+) -> Result<Vec<String>, Result<String, String>> {
+    let lasting = |why: String| match w.late() {
+        true => next(&why),
+        false => every(&why),
+    };
+    let (watch, relative) = match w.watched(root) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return Err(Ok(format!(
+                "watchman no longer watches {}; the next search asks it to and checks every file",
+                root.display()
+            )));
+        }
+        Err(why) if w.late() => return Err(Ok(next(&why))),
+        Err(why) => return Err(Err(why)),
+    };
+    w.hidden(&watch, &relative, root)
+        .map_err(|why| Ok(lasting(why)))?;
+    let Some(baseline) = &record.baseline else {
+        return Err(Ok(format!(
+            "more than {} paths differed from the index at the last search; every search checks every file (re-run index)",
+            named_cap(docs)
+        )));
+    };
+    let mut paths = w.since(&record.token, root).map_err(|why| Ok(next(&why)))?;
+    paths.extend(baseline.iter().cloned());
+    Ok(paths)
+}
+
+/// [`look`] without a record to use, for reason `why`: the daemon that a
+/// search would find, found without starting one.
+#[cfg(unix)]
+fn fresh(root: &Path, why: &str) -> String {
+    let w = match watchman::Watchman::find(ASK_WAIT, false) {
+        Ok(w) => w,
+        Err(e) if watchman::late_find(&e) => return next(&e),
+        Err(e) => return every(&e),
+    };
+    let lasting = |e: String| match w.late() {
+        true => next(&e),
+        false => every(&e),
+    };
+    match w.watched(root) {
+        Err(e) if watchman::absent(&e) && watchman::Watchman::given().is_none() => {
+            "watchman is not running; the next search starts it and checks every file, later ones ask watchman"
+                .to_owned()
+        }
+        Err(e) => lasting(e),
+        Ok(None) => format!(
+            "watchman does not watch {}; the next search asks it to and checks every file",
+            root.display()
+        ),
+        Ok(Some((watch, relative))) => match w.hidden(&watch, &relative, root) {
+            Err(e) => lasting(e),
+            Ok(()) if why == NO_RECORD => format!(
+                "{NO_RECORD}; the next search checks every file and takes a token, later ones ask watchman"
+            ),
+            Ok(()) => next(why),
+        },
+    }
+}
+
 /// What a server learned before one query.
 #[derive(Debug, Default)]
 pub struct Again {
@@ -257,7 +403,7 @@ impl Record {
         let dir = index.dir.to_str().ok_or("the index path is not UTF-8")?;
         let path = path(root, dir).ok_or("no cache directory")?;
         let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "no record of an earlier search".to_owned(),
+            std::io::ErrorKind::NotFound => NO_RECORD.to_owned(),
             _ => format!("cannot read {} ({e})", path.display()),
         })?;
         let record: Self = serde_json::from_slice(&bytes)
@@ -449,7 +595,7 @@ pub fn again(root: &Path, last: Option<&Token>) -> Again {
 /// the last token cannot answer, for reason `why`.
 #[cfg(unix)]
 fn renew(root: &Path, why: &str) -> Again {
-    match watchman::Watchman::find(ASK_WAIT).and_then(|w| w.served(true).mark(root)) {
+    match watchman::Watchman::find(ASK_WAIT, true).and_then(|w| w.served(true).mark(root)) {
         Ok(token) => Again {
             token: Some(token),
             why: Some(once(why, true)),
@@ -513,7 +659,7 @@ fn later(
 fn first(root: &Path, taken: Option<Token>, served: bool) -> Result<Token, (String, bool)> {
     match taken {
         Some(token) => Ok(token),
-        None => match watchman::Watchman::find(ASK_WAIT) {
+        None => match watchman::Watchman::find(ASK_WAIT, true) {
             Ok(w) => {
                 let w = w.served(served);
                 w.mark(root).map_err(|why| (why, w.late()))

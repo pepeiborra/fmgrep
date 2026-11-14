@@ -10,6 +10,8 @@ mod output;
 mod serve;
 #[cfg(unix)]
 mod served;
+#[cfg(unix)]
+mod status;
 pub(crate) mod support;
 #[cfg(unix)]
 mod watched;

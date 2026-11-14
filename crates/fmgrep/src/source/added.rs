@@ -85,7 +85,7 @@ impl super::Files {
         drop(span);
         known.complete.store(true, Ordering::Release);
         let n = known.added().live().count();
-        if n > 0 && crate::verbose::verbose() {
+        if n > 0 && crate::verbose::verbose() && !known.quiet {
             eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
         }
     }

@@ -293,12 +293,22 @@ fn status_prints_the_manifest_of_the_index() {
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         let text = String::from_utf8(out.stdout).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines.len(), 4, "{text}");
         let first = format!("a search here uses the local index {}", dotdir.display());
         assert_eq!(lines[0], first);
         assert!(index_line.is_match(lines[1]), "{text}");
         let tree = std::fs::canonicalize(&root).unwrap();
         assert_eq!(lines[2], format!("tree: {}", tree.display()));
+        let changes = match store_docs {
+            true => "none: the index holds the files; a search reads none of the tree",
+            false => "fewer than 50000 files: every search checks every file, which is fast here",
+        };
+        assert_eq!(lines[3], format!("changes: {changes}"));
+        let changes = &report["changes"];
+        match store_docs {
+            true => assert!(changes.is_null(), "{changes}"),
+            false => assert_eq!(changes["watchman"], false, "{changes}"),
+        }
 
         for args in [&["--", "status"][..], &["-l", "status"]] {
             let out = run_in(&root, args);

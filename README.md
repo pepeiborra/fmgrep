@@ -119,6 +119,7 @@ $ fmgrep status
 a search here uses the local index /home/me/ghc/.fmgrep
 index: format 8, built 2 d ago, 26787 files, 84.7 MiB of text, 73.2 MiB of index
 tree: /home/me/ghc
+changes: fewer than 50000 files: every search checks every file, which is fast here
 ```
 
 `fmgrep status [PATH]` names the index or the server that a search

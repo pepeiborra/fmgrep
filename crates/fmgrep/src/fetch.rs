@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{DOCS_SHARD, FileTable, Manifest, shard_offsets};
-use crate::source::{Files, Index, Recorded, Stamps};
+use crate::source::{Files, Index, Looked, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -122,6 +122,8 @@ pub enum Ask {
     EachQuery,
     /// A server's of a tree that does not change: never.
     Never,
+    /// `fmgrep status`'s: only through [`DocStore::look`], and quietly.
+    Look,
 }
 
 impl DocStore {
@@ -157,6 +159,9 @@ impl DocStore {
                 };
                 if ask != Ask::Never {
                     files.ask(index, ask == Ask::EachQuery);
+                }
+                if ask == Ask::Look {
+                    files.quiet();
                 }
                 Source::Files(Box::new(files))
             }
@@ -208,6 +213,15 @@ impl DocStore {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
             Source::Shard { .. } => false,
+        }
+    }
+
+    /// What a search would learn from watchman, with nothing changed;
+    /// `None` for stored docs.
+    pub fn look(&self, files: &FileTable) -> Option<Looked> {
+        match &self.source {
+            Source::Files(f) => Some(f.look(files, &self.lens)),
+            Source::Shard { .. } => None,
         }
     }
 

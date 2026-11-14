@@ -8,7 +8,9 @@ use serde::Serialize;
 
 use super::serve::{ServeStatus, status_on};
 use super::{Choice, Env, Reached, Server, choose, has_blobs, print, reach, served_tree, tree_of};
+use crate::fetch::{Ask, DocStore};
 use crate::manifest::{Manifest, read_manifest};
+use crate::source::Looked;
 
 /// `status --json`. Keys may be added, never renamed; `null` is "not
 /// known" or "does not apply".
@@ -19,8 +21,24 @@ struct Report<'a> {
     /// What a search warns after `Using local index DIR`.
     note: Option<String>,
     index: Option<IndexReport<'a>>,
+    /// How a search learns what changed; `null` for stored documents or a
+    /// server.
+    changes: Option<Changes>,
     server: Option<ServerReport>,
 }
+
+#[derive(Serialize)]
+struct Changes {
+    /// Whether watchman can say what changed.
+    watchman: bool,
+    /// Why not, and what a search does instead.
+    why: Option<String>,
+    /// The record that a search keeps for the next one, when it exists.
+    record: Option<String>,
+}
+
+/// The `changes:` line of an index that holds the files.
+const STORED: &str = "none: the index holds the files; a search reads none of the tree";
 
 #[derive(Serialize)]
 struct IndexReport<'a> {
@@ -67,6 +85,9 @@ pub fn run(
     has_blobs(&found)?;
     let manifest = read_manifest(&found.index_dir)?;
     let dir = canonical(&found.index_dir);
+    let root = found.root.as_deref().filter(|_| !manifest.store_docs);
+    let docs = DocStore::open(&found.index_dir, &manifest, root, Ask::Look)?;
+    let looked = docs.look(&manifest.files);
     if json {
         let report = Report {
             uses: "index",
@@ -74,6 +95,11 @@ pub fn run(
             index: Some(IndexReport {
                 dir,
                 manifest: &manifest,
+            }),
+            changes: looked.map(|l| Changes {
+                watchman: l.watchman,
+                why: (!l.watchman).then_some(l.line),
+                record: l.record.map(|r| r.display().to_string()),
             }),
             server: None,
         };
@@ -92,6 +118,8 @@ pub fn run(
         ),
     ];
     lines.extend(tree_of(&found, &manifest).map(|t| format!("tree: {}", canonical(&t))));
+    let changes = looked.as_ref().map_or(STORED, |l: &Looked| &l.line);
+    lines.push(format!("changes: {changes}"));
     lines.iter().try_for_each(|l| print::line(out, l))
 }
 
@@ -109,6 +137,7 @@ fn served(
             uses: "server",
             note: None,
             index: None,
+            changes: None,
             server: Some(ServerReport {
                 addr: server.addr,
                 env: server.env,
