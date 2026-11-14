@@ -19,7 +19,7 @@ fn ok(args: &[&str]) -> Output {
 }
 
 /// Stdout with every timing zeroed.
-fn timeless(stdout: &[u8]) -> String {
+pub(crate) fn timeless(stdout: &[u8]) -> String {
     let re = regex::Regex::new(
         r#""(latency_us|index_time_us|load_us|elapsed|elapsed_total)":(\d+|\{[^}]*\})"#,
     )
