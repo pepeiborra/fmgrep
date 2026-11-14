@@ -3,7 +3,9 @@
 One file per corpus: `{"repo_url", "commit", "queries"}`. `commit` is the
 revision the set is pinned to and `scripts/bench.sh` clones. A query spelled
 `/pattern/` is a regex, `A AND B` an intersection of two literals or regexes,
-anything else a literal; literals come first, intersections last.
+`-i Q`, where `Q` is a literal or an intersection, `Q` searched
+case-insensitively, anything else a literal; literals come first, then
+regexes, intersections, and the `-i` queries last.
 
 Queries are what a developer of that codebase would search for, each
 selective.

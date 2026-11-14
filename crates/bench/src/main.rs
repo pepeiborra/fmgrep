@@ -161,12 +161,22 @@ pub enum Kind {
     Literal,
     Regex,
     Intersection,
+    /// `-i TERM` or `-i A AND B`: case-insensitive.
+    IgnoreCase,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 3] = [Kind::Literal, Kind::Regex, Kind::Intersection];
+    pub const ALL: [Kind; 4] = [
+        Kind::Literal,
+        Kind::Regex,
+        Kind::Intersection,
+        Kind::IgnoreCase,
+    ];
 
     pub fn of(query: &str) -> Kind {
+        if case_flag(query).is_some() {
+            return Kind::IgnoreCase;
+        }
         match (leaves(query).len(), regex_pattern(query)) {
             (2.., _) => Kind::Intersection,
             (_, Some(_)) => Kind::Regex,
@@ -179,12 +189,20 @@ impl Kind {
             Kind::Literal => "literal",
             Kind::Regex => "regex",
             Kind::Intersection => "intersection",
+            Kind::IgnoreCase => "-i",
         }
     }
 }
 
-/// The sides of `A AND B [AND ..]`; the query itself otherwise.
+/// `-i` for a query spelled `-i ...`, which every row passes to its tool.
+pub fn case_flag(query: &str) -> Option<&'static str> {
+    query.starts_with("-i ").then_some("-i")
+}
+
+/// The sides of `A AND B [AND ..]`, after a leading `-i `; the query
+/// itself otherwise.
 pub fn leaves(query: &str) -> Vec<&str> {
+    let query = query.strip_prefix("-i ").unwrap_or(query);
     query.split(" AND ").collect()
 }
 
@@ -445,8 +463,14 @@ mod tests {
         ] {
             assert_eq!((Kind::of(q), &leaves(q)[..]), (Kind::Intersection, want));
         }
+        for (q, want) in [("-i a", &["a"][..]), ("-i a AND b", &["a", "b"])] {
+            let got = (Kind::of(q), &leaves(q)[..], case_flag(q));
+            assert_eq!(got, (Kind::IgnoreCase, want, Some("-i")));
+        }
+        assert_eq!(case_flag("-ia"), None);
+        assert_eq!(case_flag("a AND b"), None);
         let names = Kind::ALL.map(Kind::name);
-        assert_eq!(names, ["literal", "regex", "intersection"]);
+        assert_eq!(names, ["literal", "regex", "intersection", "-i"]);
     }
 
     #[test]

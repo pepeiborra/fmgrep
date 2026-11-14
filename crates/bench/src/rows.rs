@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use fmgrep::regex_pattern;
 
 use crate::verify::{Paths, rg as rg_cmd};
-use crate::{Query, Row, RowKind, Server, leaves, with_warm_up};
+use crate::{Query, Row, RowKind, Server, case_flag, leaves, with_warm_up};
 
 pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let mut row = Row::new(RowKind::Rg);
@@ -21,17 +21,18 @@ pub fn rg(paths: &Paths, root: &Path, terms: &[String]) -> Result<Row, String> {
     let (out, _, _) = timed(rg_cmd().args(["-l", "-e", "", "--"]).arg(root), None)?;
     row.searched = paths.listed("rg -l ''", &out)?;
     for (term, warm_up) in with_warm_up(terms) {
+        let case = case_flag(term);
         let mut cmd = match &leaves(term)[..] {
-            [_] => {
+            &[leaf] => {
                 let (pattern, fixed) =
-                    regex_pattern(term).map_or((term.as_str(), Some("-F")), |p| (p, None));
+                    regex_pattern(leaf).map_or((leaf, Some("-F")), |p| (p, None));
                 let mut cmd = rg_cmd();
-                cmd.args(LINES).arg("--with-filename");
+                cmd.args(LINES).arg("--with-filename").args(case);
                 cmd.args(fixed).args(["-e", pattern, "--"]).arg(root);
                 cmd
             }
             all => {
-                let mut cmd = and_pipe("rg", "", root, all, None);
+                let mut cmd = and_pipe("rg", case.unwrap_or(""), root, all, None);
                 cmd.env_remove("RIPGREP_CONFIG_PATH");
                 cmd
             }
@@ -116,6 +117,7 @@ fn clients(
         let mut cmd = Command::new(bin);
         let leaves = leaves(term);
         cmd.args(["--server", addr]).args(LINES);
+        cmd.args(case_flag(term));
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
         let paused = sampler.as_deref_mut().filter(|_| warm_up);
@@ -259,6 +261,7 @@ fn direct(
         let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
         cmd.current_dir(root).arg("--index").arg(index).args(LINES);
+        cmd.args(case_flag(term));
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
@@ -510,7 +513,7 @@ mod tests {
         output_retry_etxtbsy(&mut Command::new(&bin)).unwrap();
         std::fs::remove_file(&log).unwrap();
         let paths = Paths::from_lists(&root, b"", b"", &[]);
-        let terms = ["a", "b AND c"].map(String::from);
+        let terms = ["a", "b AND c", "-i d AND e"].map(String::from);
         let mut served = Row::new(RowKind::Fmgrep);
         clients(&bin, "h:1", &paths, &terms, &mut served, None).unwrap();
         let mut by_process = Row::new(RowKind::FmgrepDirect);
@@ -518,11 +521,11 @@ mod tests {
         direct(&bin, tree, Path::new("/i"), &terms, &mut by_process).unwrap();
         for row in [&served, &by_process] {
             let timed: Vec<_> = row.queries.iter().map(|q| q.term.as_str()).collect();
-            assert_eq!(timed, ["a", "b AND c"]);
+            assert_eq!(timed, ["a", "b AND c", "-i d AND e"]);
         }
         let runs = std::fs::read_to_string(&log).unwrap();
         let runs: Vec<_> = runs.lines().collect();
-        let each = ["-- a", "-- a", "--and -- b c"];
+        let each = ["-- a", "-- a", "--and -- b c", "-i --and -- d e"];
         let want: Vec<String> = ["--server h:1", "--index /i"]
             .iter()
             .flat_map(|how| each.map(|what| format!("{how} -n --no-heading --color never {what}")))
@@ -593,7 +596,14 @@ mod tests {
             std::fs::write(path, text).unwrap();
         }
         let paths = Paths::new(&root, &[]).unwrap();
-        let terms = ["alpha AND beta", "/al+pha/ AND beta", "alpha AND zzz"];
+        let terms = [
+            "alpha AND beta",
+            "/al+pha/ AND beta",
+            "alpha AND zzz",
+            "-i ALPHA AND Beta",
+            "-i ALPHA",
+            "ALPHA AND beta",
+        ];
         let row = rg(&paths, &root, &terms.map(String::from)).unwrap();
         assert_eq!(row.searched.len(), 4);
         let files = |q: &Query| {
@@ -608,6 +618,9 @@ mod tests {
         assert_eq!(files(&row.queries[0]), want);
         assert_eq!(files(&row.queries[1]), want);
         assert_eq!(files(&row.queries[2]), []);
+        assert_eq!(files(&row.queries[3]), want);
+        assert_eq!(row.queries[4].hits.files(), 3);
+        assert_eq!(files(&row.queries[5]), []);
         assert!(rg(&paths, &root, &["/(/ AND beta".to_string()]).is_err());
     }
 }
