@@ -11,7 +11,7 @@ use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::Ask;
-use crate::manifest::{DOCS_SHARD, Manifest};
+use crate::manifest::{Checked, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
@@ -135,6 +135,8 @@ struct Served<'m> {
     index: DocfmIndex,
     docs: Loaded,
     manifest: &'m Manifest,
+    /// The manifest's paths, checked once at start.
+    files: Checked<'m>,
     index_dir: &'m Path,
     root: PathBuf,
 }
@@ -148,7 +150,7 @@ impl Served<'_> {
                 code: QUERY_FAILED,
                 message,
             })?;
-        self.docs.recheck(self.manifest);
+        self.docs.recheck(self.files);
         let (index, loaded) = (&self.index, &mut self.docs);
         let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
         let answered = match p.mode {
@@ -386,6 +388,8 @@ fn docs_root(req: &ServeRequest<'_>) -> Result<PathBuf, String> {
 
 /// `req`'s index and documents; refused when over half the files are gone.
 fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
+    // A server refuses a damaged path at start, not at a query.
+    let files = req.manifest.files.checked()?;
     let root = docs_root(req)?;
     let root = std::fs::canonicalize(&root)
         .map_err(|e| format!("error: cannot resolve {}: {e}", root.display()))?;
@@ -393,7 +397,13 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         true => Ask::EachQuery,
         false => Ask::Never,
     };
-    let (index, mut docs) = load(req.index_dir, req.manifest, req.corpus_root, ask)?;
+    let (index, mut docs) = load(
+        req.index_dir,
+        req.manifest,
+        req.corpus_root,
+        ask,
+        Some(files),
+    )?;
     if let Some(cause) = docs.refusal() {
         return Err(format!(
             "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \
@@ -410,6 +420,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         index,
         docs,
         manifest: req.manifest,
+        files,
         index_dir: req.index_dir,
         root,
     })

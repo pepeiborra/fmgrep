@@ -54,7 +54,7 @@ fn mid() -> Manifest {
 
 /// Bytes of the path text.
 fn text_len(m: &Manifest) -> usize {
-    m.files.iter().map(|p| p.len()).sum()
+    m.files.checked().unwrap().iter().map(str::len).sum()
 }
 
 fn bytes(m: &Manifest) -> Vec<u8> {

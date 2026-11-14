@@ -249,7 +249,10 @@ pub fn answer_expr(
     loaded.docs.begin();
     let docs = &mut loaded.docs;
 
-    let cover = req.filter.as_ref().and_then(|f| f.cover(&manifest.files));
+    let cover = match &req.filter {
+        Some(f) => f.cover(&manifest.files)?,
+        None => None,
+    };
     let mut plan = demote::plan(index, expr, &leaves, cover.as_deref());
     let probed = |i: usize, plan: &demote::Plan| {
         !plan.demoted[i] && !matches!(leaves[i].probe, Probe::Never)
@@ -266,8 +269,8 @@ pub fn answer_expr(
             )?;
             if let Some(f) = &req.filter {
                 let candidates = a.candidates.get_or_insert_with(|| (0..num_docs).collect());
-                f.retain(&indexed, candidates, |&id| id);
-                f.retain(&indexed, &mut a.exact, |e| e.0);
+                f.retain(&indexed, candidates, |&id| id)?;
+                f.retain(&indexed, &mut a.exact, |e| e.0)?;
             }
             answers[i] = Some(a);
         }
@@ -334,7 +337,7 @@ pub fn answer_expr(
     let paths = docs.paths(&manifest.files);
     let mut stale = docs.stale().to_vec();
     if let Some(f) = &req.filter {
-        f.retain(&paths, &mut stale, |&id| id);
+        f.retain(&paths, &mut stale, |&id| id)?;
     }
     let mut tris = Vec::with_capacity(leaves.len());
     for (l, (exact, candidates)) in leaves.iter().zip(&hits) {
@@ -398,6 +401,9 @@ pub fn answer_expr(
         leaves: Vec::new(),
     };
     if emit {
+        // Every path the expression may print is checked before its first
+        // line.
+        paths.check(root.yes.iter().chain(&root.maybe).copied())?;
         sink.corpus(num_docs, manifest.num_bytes - manifest.bom_bytes)?;
         sink.term_start(&report.term)?;
     }

@@ -8,7 +8,7 @@ use super::super::tests::Fix;
 use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
-use crate::manifest::FileTable;
+use crate::manifest::{Checked, FileTable};
 #[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
 
@@ -53,7 +53,7 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     }
     let mut files = open_files(&fix);
     files.exclude(&root.join("idx"));
-    files.discover(&fix.files, &fix.lens);
+    files.discover(fix.paths(), &fix.lens);
     assert_eq!(live(&files), ["b.c", "new/deep/n.c"]);
     assert_eq!(
         files.snapshot().added[0],
@@ -73,7 +73,7 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     write(&fix.path, "x.c", b"printk");
     write(&fix.path, "y.c", b"printk");
     let files = open_files(&fix);
-    files.discover(&fix.files, &fix.lens);
+    files.discover(fix.paths(), &fix.lens);
     assert_eq!(files.snapshot().added, [1, 2]);
     let epoch = files.epoch();
     std::fs::write(fix.path.join("x.c"), b"printk\0").unwrap();
@@ -92,7 +92,7 @@ fn added_utf16_file_is_found_and_read_as_utf8() {
     write(&fix.path, "u.c", &crate::binary::utf16le("printk ü\r\n"));
     write(&fix.path, "z.c", &crate::binary::utf16le("printk\0"));
     let files = open_files(&fix);
-    files.discover(&fix.files, &fix.lens);
+    files.discover(fix.paths(), &fix.lens);
     assert_eq!(live(&files), ["u.c"]);
     assert_eq!(
         files.read_added(1).as_deref(),
@@ -114,7 +114,7 @@ fn stage_recorded(
         write(&fix.path, rel, bytes);
     }
     backdate(&fix.path);
-    let first = std::fs::metadata(fix.path.join(&fix.files[0])).unwrap();
+    let first = std::fs::metadata(fix.path.join(&fix.paths()[0])).unwrap();
     let t0 = crate::Stamp::of(&first).mtime_ns;
     super::super::write_stamps(dir, &vec![t0; docs.len()], &[]).unwrap();
     let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
@@ -124,7 +124,7 @@ fn stage_recorded(
 
 /// The fixture's files, with its record unless `walk_all`, after discovery.
 #[cfg(unix)]
-fn discovered(fix: &Fix, manifest: &FileTable, walk_all: bool) -> Files {
+fn discovered(fix: &Fix, manifest: Checked<'_>, walk_all: bool) -> Files {
     let mut files = open_files(fix);
     if !walk_all {
         let index = fix.path.parent().unwrap();
@@ -153,14 +153,14 @@ fn recorded_discovery_lists_only_changed_and_new_dirs() {
     std::fs::rename(root.join("keep/k.bin"), root.join("keep/planted.c")).unwrap();
     write(root, "keep/planted.c", b"printk");
     set_mtime(&root.join("keep"), T0);
-    std::fs::write(root.join(&fix.files[1]), b"z\0").unwrap();
+    std::fs::write(root.join(&fix.paths()[1]), b"z\0").unwrap();
     assert_eq!(
-        live(&discovered(&fix, &fix.files, false)),
+        live(&discovered(&fix, fix.paths(), false)),
         ["fresh/n/n.c", "old/new.c", "top.c"]
     );
     let all = ["fresh/n/n.c", "keep/planted.c", "old/new.c", "top.c"];
     assert_eq!(
-        live(&discovered(&fix, &fix.files, true)),
+        live(&discovered(&fix, fix.paths(), true)),
         all,
         "the full walk finds the planted file"
     );
@@ -178,7 +178,7 @@ fn recorded_discovery_walks_a_tree_copied_in_with_preserved_mtimes() {
     backdate(&tree);
     std::fs::rename(tree.join("t"), fix.path.join("sub/t")).unwrap();
     assert_eq!(
-        live(&discovered(&fix, &fix.files, false)),
+        live(&discovered(&fix, fix.paths(), false)),
         ["sub/t/deep/x.c", "sub/t/y.c"]
     );
 }
@@ -190,11 +190,13 @@ fn recorded_discovery_follows_a_renamed_dir() {
     let extra: &[(&str, &[u8])] = &[("mw/m.c", b"printk"), ("mw/in/i.c", b"printk")];
     let now = std::time::SystemTime::now();
     let fix = stage_recorded(tmp.path(), &[b"printk"], extra, now);
-    let manifest: FileTable = [&fix.files[0], "mw/in/i.c", "mw/m.c"].into_iter().collect();
-    assert!(live(&discovered(&fix, &manifest, false)).is_empty());
+    let manifest: FileTable = [&fix.paths()[0], "mw/in/i.c", "mw/m.c"]
+        .into_iter()
+        .collect();
+    assert!(live(&discovered(&fix, manifest.checked().unwrap(), false)).is_empty());
     std::fs::rename(fix.path.join("mw"), fix.path.join("mv2")).unwrap();
     assert_eq!(
-        live(&discovered(&fix, &manifest, false)),
+        live(&discovered(&fix, manifest.checked().unwrap(), false)),
         ["mv2/in/i.c", "mv2/m.c"]
     );
 }
@@ -207,23 +209,25 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     let fix = stage_recorded(tmp.path(), &[b"printk"], &[("kb/k.bin", b"printk\0")], now);
     let (root, k) = (&fix.path, fix.path.join("kb/k.bin"));
     std::fs::write(&k, b"printk now text").unwrap();
-    let files = discovered(&fix, &fix.files, false);
+    let files = discovered(&fix, fix.paths(), false);
     assert!(live(&files).is_empty(), "its unchanged dir is not listed");
     let recorded = files.known.recorded.clone().unwrap();
     let named = ["kb/k.bin".to_owned()];
     assert_eq!(
-        files.known.replay(&recorded, &named, &fix.files, &fix.lens),
+        files
+            .known
+            .replay(&recorded, &named, fix.paths(), &fix.lens),
         Ok(1)
     );
     assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");
     set_mtime(&root.join("kb"), T0 + Duration::from_secs(1));
     assert_eq!(
-        live(&discovered(&fix, &fix.files, false)),
+        live(&discovered(&fix, fix.paths(), false)),
         ["kb/k.bin"],
         "in a listed dir"
     );
     assert_eq!(
-        live(&discovered(&fix, &fix.files, true)),
+        live(&discovered(&fix, fix.paths(), true)),
         ["kb/k.bin"],
         "by the full walk"
     );
@@ -238,7 +242,7 @@ fn racy_dir_is_listed_on_every_load() {
     std::fs::rename(fix.path.join("sub/s.bin"), fix.path.join("sub/p.c")).unwrap();
     write(&fix.path, "sub/p.c", b"printk");
     set_mtime(&fix.path.join("sub"), T0);
-    assert_eq!(live(&discovered(&fix, &fix.files, false)), ["sub/p.c"]);
+    assert_eq!(live(&discovered(&fix, fix.paths(), false)), ["sub/p.c"]);
 }
 
 #[cfg(unix)]
@@ -251,8 +255,8 @@ fn dir_turned_symlink_is_not_followed() {
     std::fs::rename(fix.path.join("a"), &away).unwrap();
     std::os::unix::fs::symlink(&away, fix.path.join("a")).unwrap();
     std::fs::write(away.join("b/k.bin"), b"printk").unwrap();
-    assert!(live(&discovered(&fix, &fix.files, false)).is_empty());
-    assert!(live(&discovered(&fix, &fix.files, true)).is_empty());
+    assert!(live(&discovered(&fix, fix.paths(), false)).is_empty());
+    assert!(live(&discovered(&fix, fix.paths(), true)).is_empty());
 }
 
 #[cfg(unix)]
@@ -263,7 +267,7 @@ fn an_ignore_file_edited_in_place_rewalks_its_dir_at_load() {
     let extra: &[(&str, &[u8])] = &[(".ignore", b"u.c\n"), ("sub/u.c", b"printk")];
     let fix = stage_recorded(tmp.path(), &[b"printk", b"zz"], extra, now);
     std::fs::write(fix.path.join(".ignore"), b"d0001.c\n").unwrap();
-    let files = discovered(&fix, &fix.files, false);
+    let files = discovered(&fix, fix.paths(), false);
     assert_eq!(live(&files), ["sub/u.c"]);
     assert_eq!(files.snapshot().gone, [1]);
     assert_eq!(files.known.state[1].load(Ordering::Acquire) & WARNED, 0);
@@ -277,10 +281,11 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     let mut fix = stage_files(tmp.path(), &[b"printk", b"zz"]);
     let sub = fix.path.join("sub");
     std::fs::create_dir(&sub).unwrap();
-    std::fs::rename(fix.path.join(&fix.files[1]), sub.join("x.c")).unwrap();
-    fix.files = [&fix.files[0], "sub/x.c"].into_iter().collect();
+    std::fs::rename(fix.path.join(&fix.paths()[1]), sub.join("x.c")).unwrap();
+    let first = fix.paths()[0].to_owned();
+    fix.files = [first.as_str(), "sub/x.c"].into_iter().collect();
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o311)).unwrap();
-    let files = discovered(&fix, &fix.files, true);
+    let files = discovered(&fix, fix.paths(), true);
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(files.known.kind(1), IGNORED);
     assert!(files.snapshot().gone.is_empty());

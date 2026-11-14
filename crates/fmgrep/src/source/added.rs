@@ -9,7 +9,7 @@ use std::sync::{Arc, MutexGuard, PoisonError};
 
 use super::{IGNORED, Known, Recorded, parallel};
 use crate::binary::sniff_text;
-use crate::manifest::{FileTable, partition_ids};
+use crate::manifest::{Checked, partition_ids};
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
 #[derive(Default)]
@@ -75,7 +75,7 @@ impl super::Files {
     /// not list, and mark the indexed ones an ignore rule now skips; with a
     /// record, only changed and new directories are listed, and the dirs a
     /// changed ignore input affects.
-    pub fn discover(&self, files: &FileTable, lens: &[u64]) {
+    pub fn discover(&self, files: Checked<'_>, lens: &[u64]) {
         let known = &*self.known;
         let span = tracing::info_span!("discovery").entered();
         match &known.recorded {
@@ -103,10 +103,7 @@ fn seek<'a>(len: usize, path: impl Fn(usize) -> &'a str, from: usize, rel: &str)
 }
 
 /// Ids of ascending `files` at or under `rel`, `""` the root.
-pub(super) fn docs_under<'a>(
-    files: &'a FileTable,
-    rel: &'a str,
-) -> impl Iterator<Item = usize> + 'a {
+pub(super) fn docs_under<'a>(files: Checked<'a>, rel: &'a str) -> impl Iterator<Item = usize> + 'a {
     let exact = files.binary_search(rel).ok();
     let dir = format!("{rel}/");
     let lo = match rel {
@@ -119,7 +116,7 @@ pub(super) fn docs_under<'a>(
 }
 
 /// Ascending `walked` minus ascending `files`.
-pub(super) fn unlisted(walked: Vec<String>, files: &FileTable) -> Vec<String> {
+pub(super) fn unlisted(walked: Vec<String>, files: Checked<'_>) -> Vec<String> {
     let mut at = 0;
     walked
         .into_iter()
@@ -173,7 +170,7 @@ impl Known {
     /// Walk `under` (at or below `root`) and reconcile what it holds: an
     /// indexed doc the rule skips, or no longer a regular file, is ignored;
     /// one the walk missed or lists again is statted.
-    pub fn discover(&self, root: &Path, under: &Path, files: &FileTable, lens: &[u64]) {
+    pub fn discover(&self, root: &Path, under: &Path, files: Checked<'_>, lens: &[u64]) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
@@ -208,7 +205,7 @@ impl Known {
     /// [`Self::discover`] of the root, listing only the recorded dirs whose
     /// stamp moved and the new ones below them, then walking the dirs a
     /// changed ignore input affects.
-    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: &FileTable, lens: &[u64]) {
+    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: Checked<'_>, lens: &[u64]) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
         let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));

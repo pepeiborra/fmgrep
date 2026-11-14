@@ -341,7 +341,9 @@ fn the_cwd_of_a_search_without_paths_is_an_unnamed_path() {
 }
 
 fn cover(globs: &[&str], fold: bool, paths: &[&str], files: &[&str]) -> Option<Vec<Range<usize>>> {
-    filter(globs, &[], fold, paths).cover(&table(files))
+    filter(globs, &[], fold, paths)
+        .cover(&table(files))
+        .unwrap()
 }
 
 const ORDERED: [&str; 8] = [
@@ -382,7 +384,7 @@ fn unprefixed_folded_or_exclude_only_filters_are_unbounded() {
     assert_eq!(cover(&["p/**"], true, &[], &ORDERED), None);
     assert_eq!(cover(&["*.rs"], false, &["", "p"], &ORDERED), None);
     let iglob = PathFilter::new(&[], &strings(&["p/**"]), false, &[], "");
-    assert_eq!(iglob.unwrap().unwrap().cover(&table(&ORDERED)), None);
+    assert_eq!(iglob.unwrap().unwrap().cover(&table(&ORDERED)), Ok(None));
 }
 
 #[test]
@@ -445,10 +447,10 @@ fn the_cover_holds_every_kept_file() {
             let f = f.unwrap().unwrap();
             let mut keep = f.keeper();
             let ctx = format!("{globs:?} {cwd} {paths:?}");
-            let Some(cover) = f.cover(&files) else {
+            let Some(cover) = f.cover(&files).unwrap() else {
                 continue;
             };
-            for (id, path) in files.iter().enumerate() {
+            for (id, path) in files.checked().unwrap().iter().enumerate() {
                 if keep(path) {
                     assert!(cover.iter().any(|r| r.contains(&id)), "{ctx}: {path}");
                 }
@@ -461,7 +463,7 @@ fn the_cover_holds_every_kept_file() {
 fn a_cover_follows_the_path_the_globs_see() {
     let files = table(&FILES);
     let at = |cwd: &str, globs: &[&str], paths: &[(&str, &str)]| {
-        let cover = from(cwd, globs, paths).cover(&files);
+        let cover = from(cwd, globs, paths).cover(&files).unwrap();
         cover.map(|c| c.into_iter().map(|r| (r.start, r.end)).collect::<Vec<_>>())
     };
     assert_eq!(
@@ -483,4 +485,31 @@ fn a_cover_follows_the_path_the_globs_see() {
         Some(vec![(7, 9)])
     );
     assert_eq!(at("/r/sub", &[], &[("sub", "")]), Some(vec![(6, 9)]));
+}
+
+/// A path that cannot be read stops the filter that reads it, in the
+/// manifest's words: it is never counted as excluded.
+#[test]
+fn a_damaged_path_stops_the_filter() {
+    // "a.txt", "sub/\xFF.txt", "sub/c.txt".
+    let files = crate::manifest::damaged(&[5, 14, 23], b"a.txtsub/\xFF.txtsub/c.txt");
+    let why = "error: idx/manifest.bin holds a path that is not UTF-8; re-run `index`";
+    let paths = crate::fetch::Paths::of(&files);
+    let txt = filter(&["*.txt"], &[], false, &[]);
+    // Each binary search of the cover reads path 1 first.
+    let sub = filter(&[], &[], false, &["sub"]);
+    assert_eq!(sub.cover(&files), Err(why.to_owned()));
+    let sub = filter(&["sub/**"], &[], false, &[]);
+    assert_eq!(sub.cover(&files), Err(why.to_owned()));
+    let mut ids = vec![0, 1, 2];
+    assert_eq!(txt.retain(&paths, &mut ids, |&id| id), Err(why.to_owned()));
+    assert_eq!(ids, [0, 1, 2], "nothing dropped");
+    let mut ids = vec![0, 2];
+    assert_eq!(txt.retain(&paths, &mut ids, |&id| id), Ok(()));
+    assert_eq!(ids, [0, 2]);
+    let mut failed = None;
+    let kept: Vec<usize> = txt.kept(&paths, 0..3, &mut failed).collect();
+    assert_eq!((kept, failed.as_deref()), (vec![0], Some(why)));
+    let rs = filter(&["*.rs"], &[], false, &[]);
+    assert_eq!(rs.excludes_all(&paths, |_| false), Err(why.to_owned()));
 }
