@@ -34,6 +34,88 @@ impl Deref for Store {
     }
 }
 
+/// `doc_lens`: the manifest's table read in place where this host can read
+/// its words as `u64` (little-endian, 8-aligned), else a copy.
+#[derive(Clone)]
+pub struct Lens(LensOf);
+
+#[derive(Clone)]
+enum LensOf {
+    Owned(Vec<u64>),
+    /// `len` words at `at` in `store`.
+    Viewed {
+        store: Store,
+        at: usize,
+        len: usize,
+    },
+}
+
+impl Lens {
+    /// The `words` at `at` in `store`.
+    pub(super) fn of(store: &Store, at: usize, words: &[U64]) -> Self {
+        let len = words.len();
+        let viewed = cfg!(target_endian = "little")
+            && store
+                .get(at..)
+                .is_some_and(|b| <[u64]>::ref_from_prefix_with_elems(b, len).is_ok());
+        Self(match viewed {
+            true => LensOf::Viewed {
+                store: store.clone(),
+                at,
+                len,
+            },
+            false => LensOf::Owned(words.iter().map(|w| w.get()).collect()),
+        })
+    }
+}
+
+impl Deref for Lens {
+    type Target = [u64];
+
+    fn deref(&self) -> &[u64] {
+        match &self.0 {
+            LensOf::Owned(lens) => lens,
+            LensOf::Viewed { store, at, len } => store
+                .get(*at..)
+                .and_then(|b| <[u64]>::ref_from_prefix_with_elems(b, *len).ok())
+                .map_or(&[], |(lens, _)| lens),
+        }
+    }
+}
+
+impl From<Vec<u64>> for Lens {
+    fn from(lens: Vec<u64>) -> Self {
+        Self(LensOf::Owned(lens))
+    }
+}
+
+impl FromIterator<u64> for Lens {
+    fn from_iter<I: IntoIterator<Item = u64>>(lens: I) -> Self {
+        Vec::from_iter(lens).into()
+    }
+}
+
+impl PartialEq for Lens {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Lens {}
+
+impl fmt::Debug for Lens {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// A JSON list of numbers, as a `Vec<u64>` would be.
+impl Serialize for Lens {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        (**self).serialize(s)
+    }
+}
+
 /// Corpus-relative paths by doc id, held as one text: path `i` runs from
 /// the end of path `i - 1` (0 for the first) to its own end. The ends and
 /// the text are read where they lie in the manifest's bytes.
@@ -137,11 +219,6 @@ impl FileTable {
             }
         });
         failed.map_or(Ok(at), Err)
-    }
-
-    /// Ascending by bytes, which is the order of the strings.
-    pub fn is_sorted(&self) -> bool {
-        (0..self.len).map(|id| self.raw(id)).is_sorted()
     }
 
     fn refusal(&self, why: &str) -> String {
@@ -344,7 +421,7 @@ mod tests {
         assert_eq!(c.get(0), None);
         assert_eq!(c.iter().count(), 0);
         assert_eq!(c.binary_search("a"), Err(0));
-        assert!(t.is_sorted() && c.is_sorted());
+        assert!(c.is_sorted());
         assert_eq!(t, table(&[]));
         // An empty path is a path.
         let t = table(&[""]);
@@ -366,8 +443,8 @@ mod tests {
                 assert_eq!(t.partition_point(range.clone(), |p| p < key), Ok(want));
             }
         }
-        assert!(t.is_sorted() && c.is_sorted());
-        assert!(!table(&["b", "a"]).is_sorted());
+        assert!(c.is_sorted());
+        assert!(!table(&["b", "a"]).checked().unwrap().is_sorted());
     }
 
     #[test]
@@ -403,8 +480,6 @@ mod tests {
             Err(NOT_UTF8.to_owned())
         );
         assert_eq!(t.partition_point(2..3, |p| p < "z"), Ok(3));
-        // The order is the bytes', and needs no check.
-        assert!(t.is_sorted());
     }
 
     /// An end inside a character: the pieces on both sides are not UTF-8,

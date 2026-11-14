@@ -52,10 +52,12 @@ tree, because rg's searcher strips a leading BOM.
 
 `fmgrep status [PATH]` reads the manifest of the index at or above PATH
 (default: the current directory) as a search does, and refuses what a
-search refuses. It prints one `name: value` line per scalar field, plus
-`index` (the index directory) and `shards` (the number of blobs).
-`fmgrep status --json` prints the manifest itself: the fields above, in
-that order, on one line. A script reads the paths with
+search refuses at load. It reads no path, so it answers on an index whose
+path text is damaged ([checks](#checks)). It prints one `name: value`
+line per scalar field, plus `index` (the index directory) and `shards`
+(the number of blobs). `fmgrep status --json` prints the manifest itself:
+the fields above, in that order, on one line; it checks every path first.
+A script reads the paths with
 `fmgrep status --json | jq -r '.files[]'`.
 
 ### Layout
@@ -102,8 +104,8 @@ is UTF-8.
 
 ### Checks
 
-A load reads the header of `manifest.bin`, then, if the header names this
-format, the rest of the file into memory. It refuses, with exit 2:
+A load maps `manifest.bin` and reads its header, then its tables. It
+refuses, with exit 2:
 
 - a file that does not start with the magic;
 - a `format` other than 8, read before anything else, naming the remedy:
@@ -113,14 +115,31 @@ format, the rest of the file into memory. It refuses, with exit 2:
 - flag bits other than bit 0;
 - a file size other than the one the counts, the lengths and the last ends
   give (`is truncated`, or bytes past the last section). The counts are
-  checked against the file size before a buffer is sized from them;
-- path or label ends that go back, or that end inside a character;
-- a `corpus_root`, served commit, label or path that is not UTF-8;
+  checked against the file size before any table is read; the tables are
+  read ahead only once the magic and the format are known and the file
+  holds every table the header counts;
+- path or label ends that go back, or label ends inside a character;
+- a `corpus_root`, served commit or label that is not UTF-8;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
 - `bom_bytes > num_bytes`;
 - labels that do not partition `0..num_docs`, or a `blobs.shard` whose
   length is not the sum of `blob_lens`.
+
+The path text is not read at load: a search uses a few of its paths. A
+path is checked when it is read, and refused, with exit 2, if it is not
+UTF-8 or if an end cuts it inside a character; either way the refusal
+says the manifest "holds a path that is not UTF-8". A search checks every
+path a term may print before it prints the first line of that term, and
+every path a PATH or glob filter reads, even one it would not print. A
+search of several terms prints the terms before the one that reads the
+damaged path, then stops. What reads every path checks all of the text
+once, first: a search of the files layout, at load; `fmgrep serve`, at
+start; `fmgrep status --json`. That check says "holds a path that is not
+UTF-8", or names the first path an end "cuts inside a character". So a
+damaged path is refused by the first command that reads it; `fmgrep
+status` without `--json`, and a search of `--store-docs` that reads only
+other paths, answer.
 
 A refusal of the bytes names the file and ends with "re-run `index`".
 

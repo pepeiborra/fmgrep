@@ -219,8 +219,8 @@ fn empty_docs_index_and_query_exactly() {
         assert_eq!(manifest.num_docs, 4, "store_docs={store_docs}");
         // Discovery sorts by relative path: the empties land at slots 2-3.
         assert_eq!(
-            manifest.doc_lens,
-            vec![19, 12, 0, 0],
+            *manifest.doc_lens,
+            [19, 12, 0, 0],
             "store_docs={store_docs}"
         );
         assert_eq!(

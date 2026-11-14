@@ -35,18 +35,18 @@
 //! 8. the path text: the `files` paths, joined, by id.
 //!
 //! The file ends where the path text ends. The reader checks the magic,
-//! then the format, before anything else, and reads the rest of the file
-//! only then. zerocopy checks that each table fits in the bytes left
-//! before it makes the view, so no count sizes a buffer before the file
-//! is known to hold what it counts.
+//! then the format, before anything else. zerocopy checks that each table
+//! fits in the bytes left before it makes the view, so no count sizes a
+//! buffer before the file is known to hold what it counts. The path text
+//! is not read here: a path's UTF-8 is checked when the path is read.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 
 use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use super::files::Store;
+use super::files::{Bytes, Lens, Store};
 use super::{FileTable, Manifest, refuse_foreign};
 
 const MAGIC: [u8; 8] = *b"fmmanif\0";
@@ -156,18 +156,25 @@ fn ends_of<S: AsRef<[u8]>>(texts: impl Iterator<Item = S>) -> impl Iterator<Item
     })
 }
 
-/// Read the `manifest.bin` at `path` from `file`: the header first, then
-/// the rest of the file only if the header starts with the magic and this
-/// format. A file of another kind or format, of any size, costs one
-/// header of memory.
-pub fn read_file(mut file: impl Read, path: &Path) -> Result<Vec<u8>, String> {
-    let cannot = |e: io::Error| format!("error: cannot read {}: {e}", path.display());
-    let mut bytes = Vec::with_capacity(size_of::<OnDisk>());
-    let mut head = file.by_ref().take(size_of::<OnDisk>() as u64);
-    head.read_to_end(&mut bytes).map_err(cannot)?;
-    check_prefix(&bytes, path)?;
-    file.read_to_end(&mut bytes).map_err(cannot)?;
-    Ok(bytes)
+/// How many bytes from the start of `bytes` hold the header and the four
+/// tables, as the header counts them: what [`decode`] reads of a file
+/// before the text. 0 unless `bytes` start with the magic and this format
+/// and hold every table the header counts: a file of another kind or
+/// format, or one too short for its counts, is refused from its header
+/// alone, and no count of it sizes a read.
+pub fn tables_len(bytes: &[u8]) -> usize {
+    if check_prefix(bytes, Path::new("")).is_err() {
+        return 0;
+    }
+    let Ok((head, _)) = OnDisk::read_from_prefix(bytes) else {
+        return 0;
+    };
+    let words = head.num_docs.get().checked_add(head.num_shards.get());
+    let len = words
+        .and_then(|w| w.checked_mul(16))
+        .and_then(|b| b.checked_add(size_of::<OnDisk>() as u64))
+        .and_then(|len| usize::try_from(len).ok());
+    len.filter(|&len| len <= bytes.len()).unwrap_or(0)
 }
 
 /// Refuse `bytes` unless they start with the magic, then this format.
@@ -192,11 +199,13 @@ fn truncated(path: &Path, len: usize, what: &str) -> String {
     )
 }
 
-/// Read `bytes`, the whole of the `manifest.bin` at `path`. The path table
-/// views its ends and its text where they lie in `bytes`. A failure that
-/// the bytes show reads "error: `path` ...; re-run `index`". The checks of
-/// the values are the caller's ([`super::validate`]).
-pub fn decode(bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
+/// Read `bytes`, the whole of the `manifest.bin` at `path`: its map, or
+/// its bytes. The path table and `doc_lens` view their tables where they
+/// lie in `bytes`. Every check but that of the path text is made here:
+/// the header, the sizes, the ends ascending, the labels and the root. A
+/// failure that the bytes show reads "error: `path` ...; re-run `index`".
+/// The checks of the values are the caller's ([`super::validate`]).
+pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, String> {
     let store = Store::new(bytes);
     let bytes: &[u8] = &store;
     let bad = |why: String| refuse(path, why);
@@ -249,7 +258,7 @@ pub fn decode(bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
         path_ends.len(),
         path,
     );
-    files.checked()?;
+    let doc_lens = Lens::of(&store, offset(bytes, doc_lens.as_bytes()), doc_lens);
     Ok(Manifest {
         format: head.prefix.format.get(),
         store_docs: flags & STORE_DOCS != 0,
@@ -260,7 +269,7 @@ pub fn decode(bytes: Vec<u8>, path: &Path) -> Result<Manifest, String> {
         build_time_us: head.build_time_us.get(),
         index_started_ns: head.index_started_ns.get(),
         blobs: pieces(labels, &label_ends),
-        doc_lens: doc_lens.iter().map(|w| w.get()).collect(),
+        doc_lens,
         blob_lens: blob_lens.iter().map(|w| w.get()).collect(),
         corpus_root: (!root.is_empty()).then(|| root.to_owned()),
         files,

@@ -9,7 +9,7 @@ mod files;
 
 #[cfg(test)]
 pub(crate) use files::damaged;
-pub use files::{Checked, FileTable, partition_ids};
+pub use files::{Checked, FileTable, Lens, partition_ids};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
@@ -65,7 +65,7 @@ pub struct Manifest {
     /// Raw byte length per doc, parallel to `files`: sizes docs without
     /// reading them, slices [`DOCS_SHARD`], and is the files layout's size
     /// stamp.
-    pub doc_lens: Vec<u64>,
+    pub doc_lens: Lens,
     /// Raw byte length per blob, parallel to `blobs`: slices [`BLOBS_SHARD`],
     /// and its sum is the shard's expected byte count.
     pub blob_lens: Vec<u64>,
@@ -150,13 +150,13 @@ pub fn write_manifest(output: &Path, manifest: &Manifest) -> Result<(), String> 
 /// values stay unchecked against the shards — the query serves blobs
 /// verbatim — but every table length must be lockstep.
 ///
-/// The file is read into memory ([`bin::read_file`]), and [`bin::decode`]
-/// views its tables in place. This is the one place that chooses a read
-/// over a map. A map needs an unsafe block. On macOS, for a manifest of
-/// 460,000 paths, a map with read-ahead advice was about 0.7 ms faster
-/// with a warm cache, a map without the advice was slower, and with a
-/// cold cache a map with the advice took about twice as long as a read.
-/// The path table views the buffer of the read in place.
+/// The file is mapped, and [`bin::decode`] views its tables in place. A
+/// search reads a few paths of the manifest, so the path text is not read
+/// here: each path is checked when it is read ([`FileTable::path`]), and
+/// the users of every path check the whole text once
+/// ([`FileTable::checked`]). Everything else is checked here, before the
+/// manifest is used: the header, the file size against the counts, the
+/// path ends ascending, the labels, the root, and the values.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
     let path = dir.join(MANIFEST_BIN);
     let cannot = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
@@ -170,8 +170,21 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
         }
         open => open.map_err(cannot)?,
     };
-    let bytes = bin::read_file(file, &path)?;
-    let manifest = bin::decode(bytes, &path)?;
+    // SAFETY: an index directory is never rewritten in place (`index`
+    // refuses an existing output, and `manifest.bin` is renamed into place
+    // over a synced temporary file), and callers keep it unchanged while
+    // loaded; a truncated file would fault, not read stale bytes.
+    let map = unsafe { memmap2::Mmap::map(&file) }.map_err(cannot)?;
+    // The tables are read whole: with a cold cache, ask for them in large
+    // reads, not one fault per page. Not the text: a search reads a few
+    // paths. Nothing is asked for a file of another kind or format, or
+    // one too short for its counts: decode refuses it from its header.
+    // Advice changes no result, so a refusal of it is ignored.
+    #[cfg(unix)]
+    if let tables @ 1.. = bin::tables_len(&map) {
+        let _ = map.advise_range(memmap2::Advice::WillNeed, 0, tables);
+    }
+    let manifest = bin::decode(map, &path)?;
     validate(&manifest, &path)?;
     Ok(manifest)
 }
@@ -236,7 +249,6 @@ fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
             manifest.blob_lens.len(),
         ));
     }
-    debug_assert!(manifest.files.is_sorted());
     Ok(())
 }
 
@@ -373,7 +385,7 @@ mod tests {
             index_started_ns: 9,
             files: ["a/one.hs", "b/two.hs"].into_iter().collect(),
             blobs: vec!["shard-00000000-00000002.bin".into()],
-            doc_lens: vec![6, 4],
+            doc_lens: vec![6, 4].into(),
             blob_lens: vec![11],
             corpus_root: Some("/corpus".into()),
         };
@@ -441,7 +453,7 @@ mod tests {
         // A write that fails keeps the manifest there was, and leaves no
         // temporary file.
         let mut skewed = manifest.clone();
-        skewed.doc_lens.pop();
+        skewed.doc_lens = skewed.doc_lens[1..].to_vec().into();
         let err = write_manifest(&dir, &skewed).unwrap_err();
         assert!(
             err.contains("cannot write") && err.contains("skew"),
@@ -499,6 +511,25 @@ mod tests {
         assert!(
             err.starts_with("error: cannot read") && err.contains(MANIFEST_BIN),
             "{err}"
+        );
+    }
+
+    /// The file is mapped: an empty one is refused by where it ends, and a
+    /// large file of another kind by its first bytes.
+    #[test]
+    fn an_empty_or_foreign_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(MANIFEST_BIN);
+        let refused = |why: &str| format!("error: {} {why}; re-run `index`", path.display());
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            read_manifest(tmp.path()),
+            Err(refused("is truncated: its 0 byte(s) end inside its header"))
+        );
+        std::fs::write(&path, vec![0u8; 1 << 22]).unwrap();
+        assert_eq!(
+            read_manifest(tmp.path()),
+            Err(refused("is not an fmgrep manifest"))
         );
     }
 
@@ -626,7 +657,7 @@ mod tests {
 
         let dir = tmp.path().join("idx2");
         stage(&dir, &[b"hello world", b"bye"], &[b"aa", b"bb"]);
-        rewrite(&dir, |m| m.doc_lens = vec![u64::MAX, 1]);
+        rewrite(&dir, |m| m.doc_lens = vec![u64::MAX, 1].into());
         let err = load_index(&dir).unwrap_err();
         assert!(err.contains("skewed"), "overflowing doc_lens got: {err}");
     }

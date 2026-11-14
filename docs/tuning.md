@@ -86,11 +86,11 @@ with `--store-docs`, `check` holds no `watchman`, `stat` or `discovery`.
 |---|---|
 | `search` | the search of the local index: from the end of the argv parse or, when a local index answers in place of `--server` or `FMGREP_SERVER`, from just after the warning |
 | `locate` | find the index directory |
-| `manifest` | read and decode `manifest.bin` |
+| `manifest` | map and decode `manifest.bin`: its header and tables, not its path text |
 | `load` | `open`, `index` and `wait`, then note the files that changed |
 | `open` | open the documents and the shard files |
 | `index` | load each shard's FM-index |
-| `check` | check which files changed, on its own thread |
+| `check` | check which files changed, on its own thread; in the files layout, first check the UTF-8 of every path |
 | `watchman` | ask watchman what changed, and re-check what it names; at 50,000 files or more |
 | `stat` | stat every indexed file, when watchman cannot say |
 | `discovery` | find the files added since indexing, on its own thread, when watchman cannot say |
