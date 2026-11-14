@@ -503,20 +503,25 @@ fn a_restarted_watchman_or_a_lost_watch_makes_a_new_baseline() {
     assert!(lates.iter().all(|late| late == ab));
     let mut sent = daemon.sent();
     // The watch is added again by this search, or by a late try before it.
-    if sent.get(1).map(String::as_str) == Some("watch-project") {
+    let added = sent.get(1).map(String::as_str) == Some("watch-project");
+    if added {
         sent.remove(1);
-    } else {
-        assert!(!lates.is_empty(), "the watch is added again: {sent:?}");
     }
+    let added = added || !lates.is_empty();
     let got = notes();
-    if got != [once] {
+    if got == [once] {
+        assert!(added, "the watch is added again: {sent:?}");
+    } else {
         let root = std::fs::canonicalize(&folder).unwrap();
         let root = root.display();
         let crawling = cannot(&format!("watchman is still crawling {root}"));
         let watching = format!("fmgrep asked watchman to watch {root}; later searches ask it");
         let watching = cannot(&format!("{watching} once its crawl ends"));
+        // A search whose answer to watch-list came at the end of its 100 ms
+        // gives up before it sends watch-project, in the same words.
         assert!(
-            got == [crawling] && sent == TAKES || got == [watching] && sent == ["watch-list"],
+            added && got == [crawling] && sent == TAKES
+                || got == [watching] && sent == ["watch-list"],
             "{got:?} {sent:?}"
         );
         assert_eq!(record(tmp.path()), kept, "too early: the record is kept");
