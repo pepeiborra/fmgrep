@@ -77,7 +77,7 @@ fn stored_docs_index_writes_both_shards_and_tables() {
     index_it(&folder, &output, true);
     assert_eq!(
         root_files(&output),
-        [BLOBS_SHARD, DOCS_SHARD, "manifest.json"]
+        [BLOBS_SHARD, DOCS_SHARD, "manifest.bin"]
     );
     let (manifest, docs, blobs) = read_back(&output);
     assert_eq!(manifest.format, MANIFEST_FORMAT);
@@ -113,7 +113,7 @@ fn files_index_writes_blobs_stamps_walk_and_manifest_only() {
             "dirs.stamps",
             crate::source::DOCS_STAMPS,
             "ignores.stamps",
-            "manifest.json"
+            "manifest.bin"
         ]
     );
     let dirs = std::fs::read(output.join("dirs.stamps")).unwrap();
