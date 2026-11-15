@@ -37,7 +37,7 @@ struct Spread {
     busiest: u64,
     /// Occurrences per byte of those shards.
     per_byte: f64,
-    /// Whether the mode reads the files a locate finds.
+    /// Whether a locate is charged the kept files it may read.
     fetched: bool,
 }
 
@@ -105,7 +105,12 @@ pub fn read_instead(
             Spread {
                 busiest: a.counts.iter().map(|c| c.1).max().unwrap_or(0),
                 per_byte: total as f64 / bytes.max(1) as f64,
-                fetched: t.fetched,
+                // A walked term's located files are read too, but its
+                // density over whole shards says nothing of the kept files:
+                // a term common in code may be absent from the kept
+                // headers. Only its rows are charged, so it is read in
+                // place only when that costs less than its rows alone.
+                fetched: t.fetched && matches!(t.count, Count::Literal(_)),
             }
         })
         .collect();
