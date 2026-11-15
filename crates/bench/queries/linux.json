@@ -114,6 +114,14 @@
     "kvzalloc AND kmem_cache_create",
     "DWC_E12MP_PHY_X4_NS_X4_ AND BIFPLR",
     "regBIF_CFG_DEV0_EPF AND PERFCOUNTER",
-    "MARGINING AND PERFCOUNTER"
+    "MARGINING AND PERFCOUNTER",
+    "-i d_make_root",
+    "-i mutex_lock",
+    "-i deprecated",
+    "-i DEFINE_MUTEX AND static",
+    "-i return AND kvzalloc",
+    "-i static AND devm_platform_ioremap_resource",
+    "-i kvzalloc AND kmem_cache_create",
+    "-i devm_kmalloc AND mutex_lock"
   ]
 }

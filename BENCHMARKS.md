@@ -82,11 +82,11 @@ the index build's peak resident memory. `load1` is the 1-minute load
 average at the row's start and end (the harness marks 4 or more with
 `!`). MB and GB are 2^20 and 2^30 bytes.
 
-| corpus | commit | files | text | queries (literal / regex / intersection) |
+| corpus | commit | files | text | queries (literal / regex / intersection / -i) |
 |---|---|--:|--:|--:|
-| linux | `5878583` | 95926 | 1.53 GB | 113 (92 / 13 / 8) |
-| chromium | `e2c5a77` | 460698 | 2.84 GB | 46 (30 / 8 / 8) |
-| aosp | `android-17.0.0_r1` | 1253798 | 17.37 GB | 46 (30 / 8 / 8) |
+| linux | `5878583` | 95926 | 1.53 GB | 121 (92 / 13 / 8 / 8) |
+| chromium | `e2c5a77` | 460698 | 2.84 GB | 54 (30 / 8 / 8 / 8) |
+| aosp | `android-17.0.0_r1` | 1253798 | 17.37 GB | 54 (30 / 8 / 8 / 8) |
 
 aosp is the Android Open Source Project's platform source at release tag
 `android-17.0.0_r1`, assembled by the repo tool from the platform

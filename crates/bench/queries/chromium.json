@@ -47,6 +47,14 @@
     "blink::LocalFrame AND content::RenderFrameHost",
     "Win32_Foundation AND from_bytes_unchecked",
     "CurrencyDisplayname AND from_bytes_unchecked",
-    "CurrencyExtendedData AND UnitsDisplayNames"
+    "CurrencyExtendedData AND UnitsDisplayNames",
+    "-i blink::LocalFrame",
+    "-i NOTREACHED",
+    "-i WebContentsObserver",
+    "-i WebContentsObserver AND include",
+    "-i DCHECK AND net::URLRequest",
+    "-i std::vector AND net::URLRequest",
+    "-i CurrencyExtendedData AND UnitsDisplayNames",
+    "-i blink::LocalFrame AND content::RenderFrameHost"
   ]
 }

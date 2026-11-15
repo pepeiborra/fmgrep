@@ -91,10 +91,10 @@ mod tests {
     #[test]
     fn query_files_pin_a_commit_and_list_literals_first() {
         let counts = [
-            ("ghc", 30, 5, 5),
-            ("linux", 92, 13, 8),
-            ("chromium", 30, 8, 8),
-            ("aosp", 30, 8, 8),
+            ("ghc", 30, 5, 5, 4),
+            ("linux", 92, 13, 8, 8),
+            ("chromium", 30, 8, 8, 8),
+            ("aosp", 30, 8, 8, 8),
         ];
         let release_tag = |c: &str| {
             let rest = c.strip_prefix("android-").unwrap_or("");
@@ -106,7 +106,7 @@ mod tests {
             };
             numbers(version, 3) && numbers(r, 1)
         };
-        for (id, literals, regexes, intersections) in counts {
+        for (id, literals, regexes, intersections, ignore_case) in counts {
             let QuerySet {
                 repo_url,
                 commit,
@@ -123,6 +123,7 @@ mod tests {
                 vec![Kind::Literal; literals],
                 vec![Kind::Regex; regexes],
                 vec![Kind::Intersection; intersections],
+                vec![Kind::IgnoreCase; ignore_case],
             ];
             assert_eq!(kinds, want.concat(), "{id}");
             let mut sorted = queries.clone();
@@ -141,16 +142,29 @@ mod tests {
     fn intersection_literals_need_no_escaping() {
         for id in CORPORA {
             let set = query_set(id);
-            let ands = set
-                .queries
-                .iter()
-                .filter(|q| Kind::of(q) == Kind::Intersection);
+            let ands = set.queries.iter().filter(|q| leaves(q).len() > 1);
             for q in ands {
                 assert_eq!(leaves(q).len(), 2, "{id} {q:?}");
                 for l in leaves(q).into_iter().filter(|l| regex_pattern(l).is_none()) {
                     let plain = !l.contains(char::is_whitespace) && regex::escape(l) == l;
                     assert!(plain, "{id} {q:?}");
                 }
+            }
+        }
+    }
+
+    /// fmgrep and rg fold case alike; ASCII terms mean the same to tgrep and eg.
+    #[test]
+    fn ignore_case_queries_are_ascii_literals() {
+        for id in CORPORA {
+            let set = query_set(id);
+            let folded = set
+                .queries
+                .iter()
+                .filter(|q| Kind::of(q) == Kind::IgnoreCase);
+            for q in folded {
+                let plain = |l: &&str| l.is_ascii() && regex_pattern(l).is_none();
+                assert!(leaves(q).iter().all(plain), "{id} {q:?}");
             }
         }
     }

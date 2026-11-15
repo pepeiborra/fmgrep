@@ -47,6 +47,14 @@
     "ScopedObjectAccess AND REQUIRES_SHARED",
     "Instruction_ AND uLL",
     "MCK AND kInstruction",
-    "MCK_ AND C_Check"
+    "MCK_ AND C_Check",
+    "-i ScopedObjectAccess",
+    "-i ActivityManagerService",
+    "-i @nullable",
+    "-i ActivityManagerService AND clearCallingIdentity",
+    "-i ndk::ScopedAStatus AND android::base::unique_fd",
+    "-i apex_available AND rustlibs",
+    "-i ScopedObjectAccess AND REQUIRES_SHARED",
+    "-i @SystemApi AND @RequiresPermission"
   ]
 }

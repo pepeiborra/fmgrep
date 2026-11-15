@@ -114,7 +114,7 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         format!("{n} rows agree")
     };
     assert!(
-        md.contains(&format!("verify: OK, {agree} on 40 queries")),
+        md.contains(&format!("verify: OK, {agree} on 44 queries")),
         "{md}"
     );
     let searched = rows.split(',').map(|r| format!("{r} 1"));
@@ -126,7 +126,7 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), n * 41, "{trace}");
+    assert_eq!(lines.len(), n * 45, "{trace}");
     assert!(lines.iter().all(|v| v["fixture"] == true), "{trace}");
     for v in lines
         .iter()
@@ -144,6 +144,7 @@ fn fixture_run_agrees_and_writes_markdown_and_trace() {
         *kinds.entry(kind.unwrap()).or_insert(0) += 1;
     }
     let per_kind = [
+        ("-i", 4 * n),
         ("intersection", 5 * n),
         ("literal", 30 * n),
         ("regex", 5 * n),
@@ -214,7 +215,7 @@ fn in_place_run_lists_files_only_some_rows_searched() {
     assert_eq!(snapshot(&root), before);
     let wants = [
         "\n- files searched: rg 3, fmgrep 2 (non-empty)\n",
-        "verify: OK, 2 rows agree on 40 queries\n",
+        "verify: OK, 2 rows agree on 44 queries\n",
         "queries print lines from files some rows did not search (not failures):",
         ": fmgrep did not search binary 1 (`p.txt`)\n",
     ];
@@ -273,8 +274,8 @@ fn third_party_row_dropping_a_file_is_a_footnote_not_a_failure() {
     let (md, stderr) = (text(&out.stdout), text(&out.stderr));
     assert!(out.status.success(), "{md}\n{stderr}");
     let wants = [
-        "\n- elgrep: 1 of 40 queries differs from rg: `HscEnv`, 1 line missed in 1 file (`ghc.txt`)\n",
-        "\nverify: OK, fmgrep rows agree with rg on 40 queries; 1 third-party difference (see notes)\n",
+        "\n- elgrep: 1 of 44 queries differs from rg: `HscEnv`, 1 line missed in 1 file (`ghc.txt`)\n",
+        "\nverify: OK, fmgrep rows agree with rg on 44 queries; 1 third-party difference (see notes)\n",
     ];
     for want in wants {
         assert!(md.contains(want), "{want:?} not in\n{md}");
@@ -387,7 +388,7 @@ fn server_rows_query_running_servers_and_leave_them_up() {
         "\n| fmgrep@a | - | - | - |".to_string(),
         format!("\n| fmgrep@{addr} | - | - | - |"),
         format!("\n- files searched: rg 2, fmgrep@a 1, fmgrep@{addr} 1 (non-empty)\n"),
-        "verify: OK, 3 rows agree on 40 queries\n".to_string(),
+        "verify: OK, 3 rows agree on 44 queries\n".to_string(),
         "fmgrep@a did not search binary 1 (`p.txt`)".to_string(),
     ];
     for want in &wants {
