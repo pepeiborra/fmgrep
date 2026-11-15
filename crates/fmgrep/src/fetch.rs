@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::manifest::{Checked, DOCS_SHARD, FileTable, Lens, Manifest, shard_offsets};
-use crate::source::{Files, Index, Recorded, Stamps};
+use crate::source::{Files, Index, Learned, Recorded, Stamps};
 
 /// One positional `read` at `off`, leaving the handle's cursor untouched:
 /// `read_at` on Unix, `seek_read` on Windows, a cloned-handle seek+read
@@ -206,12 +206,12 @@ impl DocStore {
     }
 
     /// Re-check what watchman and the saved baseline name instead of
-    /// [`Self::stat_all`] and discovery: false when watchman cannot say, or
-    /// for stored docs.
-    pub fn replay(&self, files: Checked<'_>) -> bool {
+    /// [`Self::stat_all`] and discovery, when they can say; stored docs
+    /// need no check.
+    pub fn replay(&self, files: Checked<'_>) -> Learned {
         match &self.source {
             Source::Files(f) => f.replay(files, &self.lens),
-            Source::Shard { .. } => false,
+            Source::Shard { .. } => Learned::Stored,
         }
     }
 

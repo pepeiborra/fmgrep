@@ -5,6 +5,7 @@
 use super::drive::answers_like;
 use super::watchman::Daemon;
 use super::*;
+use crate::source::Learned;
 
 /// Whether a load of `index` re-checks only what watchman and the
 /// baseline name.
@@ -12,7 +13,8 @@ fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
     let docs =
         crate::fetch::DocStore::open(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
-    docs.replay(manifest.files.checked().unwrap())
+    let learned = docs.replay(manifest.files.checked().unwrap());
+    matches!(learned, Learned::Answered { .. })
 }
 
 /// The warnings given on this thread since the last call.
@@ -1071,17 +1073,19 @@ fn watchman_skips_the_stat_pass() {
     stamps[0] ^= 1;
     std::fs::write(output.join("docs.stamps"), stamps).unwrap();
     let manifest = read_manifest(&output).unwrap();
-    let ((mut docs, replayed), lates) = tried(&daemon, || {
+    let ((mut docs, learned), lates) = tried(&daemon, || {
         let ask = crate::fetch::Ask::Load;
         let docs = crate::fetch::DocStore::open(&output, &manifest, None, ask).unwrap();
-        let replayed = docs.replay(manifest.files.checked().unwrap());
-        (docs, replayed)
+        let learned = docs.replay(manifest.files.checked().unwrap());
+        (docs, learned)
     });
     assert!(
-        lates.iter().all(|(_, r)| !r),
+        lates
+            .iter()
+            .all(|(_, l)| !matches!(l, Learned::Answered { .. })),
         "a late load checks every file"
     );
-    assert!(replayed, "{:?}", notes());
+    assert!(matches!(learned, Learned::Answered { .. }), "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");
     docs.stat_all(manifest.files.checked().unwrap());
