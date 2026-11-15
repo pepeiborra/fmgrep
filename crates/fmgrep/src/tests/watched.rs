@@ -1134,3 +1134,75 @@ fn a_private_daemon_watches_logs_restarts_and_hangs() {
     daemon.unwatch(&root);
     assert!(daemon.roots().is_empty());
 }
+
+/// `status` of `index`, as the command line runs it: its stdout.
+fn status_of(index: &Path) -> String {
+    let (mut input, mut out) = (std::io::empty(), Vec::new());
+    let args = ["status".to_owned(), index.display().to_string()];
+    crate::cli::dispatch_to(args, &mut input, &mut out, false).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// [`status_of`], by [`tried`]: a late status says [`late`], as a late
+/// search does, and its stdout says so too.
+fn status_by(daemon: &Daemon, index: &Path) -> String {
+    tried(daemon, || status_of(index)).0
+}
+
+/// `status` runs a search's check as a search does: the first takes a
+/// token and saves the record, the second asks watchman since it, and a
+/// search after it asks watchman and checks no file.
+#[test]
+fn status_takes_a_token_then_asks_watchman_and_leaves_a_search_warm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((folder, output, daemon)) = indexed(tmp.path(), AB) else {
+        return;
+    };
+    std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
+    let first = status_by(&daemon, &output);
+    assert_eq!(daemon.sent(), TAKES);
+    assert_eq!(notes(), [ONCE], "{first}");
+    let saved = records(tmp.path());
+    assert_eq!(saved.len(), 1, "{first}");
+    for line in [
+        format!("changes: {ONCE}"),
+        "since the index: 1 stale, 0 added, 0 gone".to_owned(),
+        format!("record: {}", saved[0].display()),
+    ] {
+        assert!(first.contains(&line), "{line:?} in {first}");
+    }
+    let asked = ["watch-list", "get-config", "clock", "clock", "query"];
+    let second = status_by(&daemon, &output);
+    assert_eq!(daemon.sent(), asked, "the token question");
+    assert!(notes().is_empty(), "{second}");
+    let named = "changes: watchman and the baseline named 1 path(s), 1 kept";
+    assert!(second.contains(named), "{second}");
+    assert_eq!(found(&daemon, &output, &["-l"], &["printk"]), "a.c\nb.c\n");
+    assert_eq!(daemon.sent(), asked, "the search asks watchman");
+    assert!(notes().is_empty(), "and checks no file");
+}
+
+/// Where watchman cannot say what changed, `status` says why in the
+/// search's words, and saves no record.
+#[test]
+fn status_says_why_watchman_cannot_say() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    for (rel, bytes) in AB {
+        put(&folder, rel, bytes);
+    }
+    let dead = tmp.path().join("no-daemon.sock");
+    WATCHMAN.set(Some(dead.clone()));
+    ASK_FROM.set(Some(0));
+    CACHE.set(Some(tmp.path().join("cache")));
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, false);
+    let text = status_of(&output);
+    let why = format!(
+        "changes: watchman cannot say what changed (no watchman daemon answers on {} (",
+        dead.display()
+    );
+    assert!(text.contains(&why), "{text}");
+    assert!(text.contains("\nrecord: none saved\n"), "{text}");
+    assert!(records(tmp.path()).is_empty());
+}

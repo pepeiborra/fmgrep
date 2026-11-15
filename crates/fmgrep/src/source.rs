@@ -18,7 +18,7 @@ mod added;
 mod journal;
 mod recorded;
 
-pub use journal::{Index, request_watch};
+pub use journal::{Index, keep, kept, not_due, request_watch};
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
 
@@ -416,6 +416,11 @@ fn unrecorded<'a>(recorded: Option<&Recorded>, rel: &'a str) -> &'a str {
     }
 }
 
+/// What a search re-checked instead of every file, as it notes it.
+pub fn named(n: usize, kept: usize) -> String {
+    format!("watchman and the baseline named {n} path(s), {kept} kept")
+}
+
 /// Under `--verbose`: what a re-check took from watchman, and its cost,
 /// the ask from `asked` to `applied` and the re-check since.
 fn timed(what: std::fmt::Arguments<'_>, asked: std::time::Instant, applied: std::time::Instant) {
@@ -584,11 +589,7 @@ impl Files {
             }
         };
         let n = paths.len();
-        timed(
-            format_args!("watchman and the baseline named {n} path(s), {kept} kept"),
-            asked,
-            applied,
-        );
+        timed(format_args!("{}", named(n, kept)), asked, applied);
         if crate::verbose::verbose() {
             let n = self.known.added().live().count();
             if n > 0 {
@@ -687,13 +688,14 @@ impl Files {
 
     /// Once every doc is known, save the last token and what differs now
     /// (the baseline) in the user's cache: once per process, so a server
-    /// saves after its first query that has a token.
-    pub fn checkpoint(&self, files: &FileTable) -> Result<(), String> {
+    /// saves after its first query that has a token. The record's path,
+    /// when this call wrote it.
+    pub fn checkpoint(&self, files: &FileTable) -> Result<Option<PathBuf>, String> {
         let Some(index) = &self.index else {
-            return Ok(());
+            return Ok(None);
         };
         if self.saved.load(Ordering::Acquire) || !self.known.complete.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(None);
         }
         let token = self
             .last
@@ -701,7 +703,7 @@ impl Files {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let (Some(token), Ok(root)) = (token, self.known.root.canonicalize()) else {
-            return Ok(());
+            return Ok(None);
         };
         self.saved.store(true, Ordering::Release);
         let snap = self.snapshot();
@@ -725,8 +727,7 @@ impl Files {
         baseline.sort_unstable();
         baseline.dedup();
         let cap = journal::named_cap(files.len());
-        journal::save(&root, index, token, baseline, cap);
-        Ok(())
+        Ok(journal::save(&root, index, token, baseline, cap))
     }
 
     /// Never take `index_dir` for an added file. Before any watch or

@@ -9,6 +9,7 @@ mod locate;
 mod params;
 mod print;
 mod serve;
+mod status;
 
 use crate::events::JsonSink;
 use crate::filter::SearchPath;
@@ -35,11 +36,10 @@ pub enum Outcome {
 
 fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<Outcome, String> {
     let (found, manifest) = open_index(a.path.as_deref())?;
-    let root = found.root.filter(|_| !manifest.store_docs);
     let req = ServeRequest {
         index_dir: &found.index_dir,
         manifest: &manifest,
-        corpus_root: root.as_deref(),
+        corpus_root: root_of(&found, &manifest),
         listen: (!a.stdio).then_some(a.listen),
         watch: !a.no_watch,
     };
@@ -49,8 +49,8 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
 
 /// `status`: what a search started in PATH (else the cwd) uses, the index
 /// or server that [`choose`] and [`reach`] pick, with `--server` as a
-/// search's. Fails where that search fails before it searches, in its
-/// words.
+/// search's, and of an index what its check of what changed just did.
+/// Fails where that search fails before it searches, in its words.
 fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, String> {
     let start = a.path.as_deref().unwrap_or(Path::new("."));
     let here = match &a.path {
@@ -70,6 +70,7 @@ fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, Stri
         },
     };
     let (found, manifest) = open_index(Some(start))?;
+    let facts = status::check(&found.index_dir, &manifest, root_of(&found, &manifest))?;
     let dir = std::fs::canonicalize(&found.index_dir).unwrap_or(found.index_dir);
     let note = note.unwrap_or_default();
     let first = format!(
@@ -77,6 +78,9 @@ fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, Stri
         dir.display()
     );
     print::status(out, a.json, &first, &manifest)?;
+    if !a.json {
+        status::print(out, &facts)?;
+    }
     Ok(Outcome::Done)
 }
 
@@ -134,6 +138,12 @@ fn rebase(p: &mut QueryParams, typed: &[String], tree: Option<&Path>) -> Result<
         })
         .collect::<Result<_, String>>()?;
     Ok(())
+}
+
+/// The tree a load of `found` reads the files from, when it overrides the
+/// manifest's: none for stored documents.
+fn root_of<'a>(found: &'a Located, manifest: &Manifest) -> Option<&'a Path> {
+    found.root.as_deref().filter(|_| !manifest.store_docs)
 }
 
 /// The tree a manifest's paths are relative to.
@@ -276,8 +286,7 @@ fn local(
     let tree = tree_of(&found, &manifest);
     rebase(&mut p, typed, tree.as_deref())?;
     p.scope(tree.as_deref());
-    let root = found.root.filter(|_| !manifest.store_docs);
-    let req = p.request(&found.index_dir, &manifest, root.as_deref())?;
+    let req = p.request(&found.index_dir, &manifest, root_of(&found, &manifest))?;
     let report = render(&p, json, out, |sink| run_query(&req, sink));
     drop(req);
     // Off the exit path: dropping a large tree's paths costs milliseconds.
