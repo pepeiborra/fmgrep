@@ -122,21 +122,23 @@ pub struct Entry<'a> {
 
 /// The entries of `git ls-files -s -z` output, in its (path) order.
 pub fn entries(out: &[u8]) -> impl Iterator<Item = Result<Entry<'_>, String>> {
-    records(out).map(|r| {
-        let bad = || "git ls-files printed an entry it should not".to_owned();
-        let tab = r.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
-        let head = std::str::from_utf8(&r[..tab]).map_err(|_| bad())?;
-        let mut fields = head.split(' ');
-        let (Some(mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(bad());
-        };
-        Ok(Entry {
-            mode,
-            oid,
-            stage,
-            path: &r[tab + 1..],
-        })
+    records(out).map(entry)
+}
+
+/// One record of `git ls-files -s -z`: `<mode> <oid> <stage>\t<path>`.
+pub fn entry(r: &[u8]) -> Result<Entry<'_>, String> {
+    let bad = || "git ls-files printed an entry it should not".to_owned();
+    let tab = r.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
+    let head = std::str::from_utf8(&r[..tab]).map_err(|_| bad())?;
+    let mut fields = head.split(' ');
+    let (Some(mode), Some(oid), Some(stage)) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(bad());
+    };
+    Ok(Entry {
+        mode,
+        oid,
+        stage,
+        path: &r[tab + 1..],
     })
 }
 
