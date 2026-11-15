@@ -384,11 +384,18 @@ fn a_filtered_folded_literal_reads_or_locates_by_cost() {
         ("sub/c.c", common.as_bytes()),
         ("sub/z.h", b"nothing\n"),
     ];
-    crate::tests::SHARD_BYTES.set(Some(16));
+    // One shard: its 41 rows of `printk` cost more to locate than reading
+    // the 2 kept files.
     let all = dotted_tree(tmp.path(), "all", &files, true);
-    crate::tests::SHARD_BYTES.set(None);
-    // sub/z.h, the last document, cut off the shard: reading it fails.
-    let index = all.join(INDEX_DIR);
+    cut_the_last_document(&all);
+    let sub = ["-g", "sub/**", "-l", "-i"];
+    assert!(query(&all, &sub, &["PRINTK"]).is_err());
+    assert_eq!(printed(&all, &sub, &["ALPHA"]), "sub/c.c\n");
+}
+
+/// The last document cut off the documents shard: reading it fails.
+fn cut_the_last_document(tree: &Path) {
+    let index = tree.join(INDEX_DIR);
     let manifest = read_manifest(&index).unwrap();
     let offsets = crate::manifest::shard_offsets(&manifest.doc_lens).unwrap();
     let shard = std::fs::OpenOptions::new()
@@ -396,7 +403,34 @@ fn a_filtered_folded_literal_reads_or_locates_by_cost() {
         .open(index.join(DOCS_SHARD))
         .unwrap();
     shard.set_len(offsets[manifest.files.len() - 1]).unwrap();
+}
+
+#[test]
+fn a_filtered_folded_literal_common_only_elsewhere_is_located() {
+    // `printk` fills a.c, outside the filter, and is in none of the 5 kept
+    // files. Its 40 rows cost 28 µs to locate, less than reading the kept
+    // files at 10 µs each, so it is located, and sub/z.h is not read. Its
+    // density over the shard would guess that locating also reads most of
+    // the kept files.
+    let tmp = tempfile::tempdir().unwrap();
+    let dense = "Printk ".repeat(40) + "\n";
+    let files: [(&str, &[u8]); 6] = [
+        ("a.c", dense.as_bytes()),
+        ("sub/1.c", b"nothing here\n"),
+        ("sub/2.c", b"nothing here\n"),
+        ("sub/3.c", b"nothing here\n"),
+        ("sub/4.c", b"nothing here\n"),
+        ("sub/z.h", b"nothing\n"),
+    ];
+    let all = dotted_tree(tmp.path(), "all", &files, true);
+    cut_the_last_document(&all);
     let sub = ["-g", "sub/**", "-l", "-i"];
-    assert!(query(&all, &sub, &["PRINTK"]).is_err());
-    assert_eq!(printed(&all, &sub, &["ALPHA"]), "sub/c.c\n");
+    crate::tests::BAND.set(Some((10.0, 10.0)));
+    let located = query(&all, &sub, &["PRINTK"]);
+    // Free reads: the rows cost more, and the kept files are read.
+    crate::tests::BAND.set(Some((0.0, 0.0)));
+    let read = query(&all, &sub, &["PRINTK"]);
+    crate::tests::BAND.set(None);
+    assert!(located.is_ok(), "{:?}", located.err());
+    assert!(read.is_err());
 }
