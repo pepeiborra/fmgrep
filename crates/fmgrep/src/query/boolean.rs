@@ -23,7 +23,7 @@ use crate::manifest::{FileTable, Manifest};
 use crate::matching::{self, DocSearch, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
-use crate::sharded::DocfmIndex;
+use crate::sharded::{DocfmIndex, Walk};
 use crate::sink::{DocMatches, MatchSink};
 use crate::verify::{self, LeafSet};
 use crate::wire::{LeafReport, OutputReport, QueryReport};
@@ -257,7 +257,7 @@ pub fn answer_expr(
         Some(f) => f.cover(&manifest.files)?,
         None => None,
     };
-    let mut plan = demote::plan(index, expr, &leaves, cover.as_deref());
+    let (mut plan, walks) = demote::plan(index, expr, &leaves, cover.as_deref());
     let probed = |i: usize, plan: &demote::Plan| {
         !plan.demoted[i] && !matches!(leaves[i].probe, Probe::Never)
     };
@@ -283,7 +283,7 @@ pub fn answer_expr(
     let first: Vec<usize> = (0..leaves.len())
         .filter(|&i| probed(i, &plan) && !plan.candidate[i])
         .collect();
-    let got = index.probe_all(&queries(&leaves, &plan, &first), cover.as_deref());
+    let got = index.probe_all(&queries(&leaves, &plan, &walks, &first), cover.as_deref());
     store(&first, got, &mut answers)?;
     let mut sample_us = 0u64;
     if !plan.groups.is_empty() {
@@ -318,7 +318,7 @@ pub fn answer_expr(
         .filter(|&i| plan.candidate[i] && probed(i, &plan))
         .collect();
     if !second.is_empty() {
-        let got = index.probe_all(&queries(&leaves, &plan, &second), cover.as_deref());
+        let got = index.probe_all(&queries(&leaves, &plan, &walks, &second), cover.as_deref());
         store(&second, got, &mut answers)?;
     }
     let start = Instant::now();
@@ -680,14 +680,22 @@ pub fn demotable(lit: &[u8]) -> bool {
     !lit.contains(&UNIFIED_SEPARATOR) && !matches!(lit.first(), None | Some(0xEF | 0xBB | 0xBF))
 }
 
-/// The probes of leaves `ids`, each on its planned ranges.
-fn queries<'a>(leaves: &'a [Leaf<'_>], plan: &'a demote::Plan, ids: &[usize]) -> Vec<Query<'a>> {
+/// The probes of leaves `ids`, each on its planned ranges; a folded leaf
+/// the count pass walked is located from its `walks` entry.
+fn queries<'a>(
+    leaves: &'a [Leaf<'_>],
+    plan: &'a demote::Plan,
+    walks: &'a [Option<Walk<'a>>],
+    ids: &[usize],
+) -> Vec<Query<'a>> {
     ids.iter()
         .map(
             |&i| match (&leaves[i].probe, &leaves[i].prep, &plan.within[i]) {
                 (Probe::Literal(term), _, Some(within)) => Query::LiteralWithin { term, within },
                 (Probe::Literal(term), _, None) => Query::Literal(term),
-                (Probe::Fold | Probe::Regex, Some(p), _) => Query::Regex(p),
+                (Probe::Fold | Probe::Regex, Some(p), _) => {
+                    walks[i].as_ref().map_or(Query::Regex(p), Query::Walked)
+                }
                 (Probe::Fold | Probe::Regex, None, _) => {
                     unreachable!("a pattern leaf holds its pattern")
                 }

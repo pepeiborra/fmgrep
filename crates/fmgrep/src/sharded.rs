@@ -15,7 +15,7 @@ use crate::{Document, UNIFIED_SEPARATOR};
 
 use crate::blobs::{Blob, BlobSink, BlobSlots, labels_of, map_slots};
 use crate::docs::{Cut, Cuts};
-use crate::fold::fold_count;
+use crate::fold::{fold_intervals, locate_intervals, walked_count};
 use crate::pattern::PreparedPattern;
 use crate::plan::{plan_from_labels, shard_label, shard_text_bytes};
 use crate::probe::{Answer, Query};
@@ -135,6 +135,56 @@ pub struct DocfmIndex {
     total_docs: usize,
 }
 
+/// One shard's fold walk: the intervals of its matches, or the bound the
+/// walk gave up with.
+type ShardWalk<'a> = (
+    &'a ShardMeta,
+    &'a Structure,
+    Result<Vec<docfm::Cursor<'a>>, u64>,
+);
+
+/// A case-folded term walked once in each shard of a cover. It is counted,
+/// then maybe located, without a second walk.
+pub struct Walk<'a> {
+    shards: Vec<ShardWalk<'a>>,
+    /// The pattern's required literal: a shard whose walk gave up falls
+    /// back to it, as [`Query::Regex`] does.
+    anchor: Option<Vec<u8>>,
+    us: u64,
+}
+
+impl Walk<'_> {
+    /// The walk's wall time, µs.
+    pub fn us(&self) -> u64 {
+        self.us
+    }
+
+    /// Each walked shard's nonzero count, as [`Query::Count`] answers a
+    /// literal's.
+    pub fn counts(&self) -> Vec<(Range<usize>, u64)> {
+        (self.shards.iter())
+            .map(|(meta, _, walk)| (meta.docs.clone(), walked_count(walk)))
+            .filter(|&(_, n)| n > 0)
+            .collect()
+    }
+
+    /// [`Query::Regex`]'s candidates, located from the intervals, for the
+    /// walked shards overlapping `within`.
+    fn docs(&self, within: Option<&[Range<usize>]>) -> Vec<usize> {
+        let docs = |(meta, s, walk): &ShardWalk<'_>| match within.is_none_or(|w| meta.overlaps(w)) {
+            true => {
+                let hits = walk.as_ref().ok().map(|live| locate_intervals(live));
+                meta.docs_at(s, hits, self.anchor.as_deref())
+            }
+            false => Vec::new(),
+        };
+        match self.shards.len() <= 1 {
+            true => self.shards.iter().flat_map(docs).collect(),
+            false => self.shards.par_iter().flat_map_iter(docs).collect(),
+        }
+    }
+}
+
 impl DocfmIndex {
     /// Persist each shard and drop it: the documents, texts and FM-indexes of the shards in flight,
     /// never the corpus. `window` is the shards in flight; `None` derives it
@@ -245,6 +295,31 @@ impl DocfmIndex {
             .collect()
     }
 
+    /// `pattern`'s fold walk in each shard overlapping `within`, the shards
+    /// in parallel as a locate runs them; `None` without a fold plan.
+    pub fn walk(
+        &self,
+        pattern: &PreparedPattern,
+        within: Option<&[Range<usize>]>,
+    ) -> Option<Walk<'_>> {
+        let start = Instant::now();
+        let plan = pattern.fold()?;
+        let kept = |(_, m): &(&Structure, &ShardMeta)| within.is_none_or(|w| m.overlaps(w));
+        let shards = match self.shards.len() <= 1 {
+            true => (self.shards.iter().zip(&self.metas).filter(kept))
+                .map(|(s, m)| (m, s, fold_intervals(s.cursor(), plan)))
+                .collect(),
+            false => (self.shards.par_iter().zip(&self.metas).filter(kept))
+                .map(|(s, m)| (m, s, fold_intervals(s.cursor(), plan)))
+                .collect(),
+        };
+        let anchor = crate::pattern::anchor(pattern).map(<[u8]>::to_vec);
+        let us = start.elapsed().as_micros() as u64;
+        #[cfg(test)]
+        let us = crate::tests::WALK_US.get().unwrap_or(us);
+        Some(Walk { shards, anchor, us })
+    }
+
     /// Literal term: ascending `(doc, count)`, zero counts omitted. Complete:
     /// the FM-index answers every document, no fetch. An empty term or one
     /// holding the separator counts 0 everywhere. Counts are document-wide
@@ -297,11 +372,8 @@ impl DocfmIndex {
                         });
                         (Vec::new(), Some(Vec::new()))
                     }
-                    Query::CountFold(plan) => {
-                        counts = self.shard_counts(within, |s, _| fold_count(s.cursor(), plan));
-                        (Vec::new(), Some(Vec::new()))
-                    }
                     Query::Regex(pattern) => (Vec::new(), self.regex_candidates(pattern, within)),
+                    Query::Walked(walk) => (Vec::new(), Some(walk.docs(within))),
                 };
                 Answer {
                     exact,

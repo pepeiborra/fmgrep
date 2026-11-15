@@ -53,6 +53,8 @@ thread_local! {
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The warnings given by this thread's searches, every one.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
+    /// The wall time, µs, this thread's fold walks report over the clock's.
+    pub static WALK_US: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// This thread's watchman hooks, for a thread a load spawns.

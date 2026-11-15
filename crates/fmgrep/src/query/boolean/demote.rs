@@ -5,8 +5,9 @@ use std::ops::Range;
 
 use super::{Leaf, Probe, demotable};
 use crate::expr::Expr;
+use crate::pattern::PreparedPattern;
 use crate::probe::{Answer, Query};
-use crate::sharded::DocfmIndex;
+use crate::sharded::{DocfmIndex, Walk};
 
 /// Reference documents read to measure the read cost.
 pub const SAMPLE_DOCS: usize = 16;
@@ -153,20 +154,28 @@ pub struct Group {
     pub within: Vec<Range<usize>>,
 }
 
-/// The count pass; it probes nothing unless some AND can demote.
-pub fn plan(
-    index: &DocfmIndex,
+/// The count pass; it probes nothing unless some AND can demote. A counted
+/// folded leaf is counted by its walk, which is returned so that locating
+/// it later does not walk again.
+pub fn plan<'i>(
+    index: &'i DocfmIndex,
     expr: &Expr,
     leaves: &[Leaf<'_>],
     within: Option<&[Range<usize>]>,
-) -> Plan {
+) -> (Plan, Vec<Option<Walk<'i>>>) {
     let n = leaves.len();
     let terms: Vec<Option<Query<'_>>> = leaves
         .iter()
         .map(|l| match (&l.probe, &l.prep) {
             (Probe::Literal(lit), _) => Some(Query::Count(lit)),
-            (Probe::Fold, Some(p)) => p.fold().map(Query::CountFold),
             (Probe::Regex, Some(p)) => crate::pattern::anchor(p).map(Query::Count),
+            _ => None,
+        })
+        .collect();
+    let folded: Vec<Option<&PreparedPattern>> = leaves
+        .iter()
+        .map(|l| match (&l.probe, &l.prep) {
+            (Probe::Fold, Some(p)) if p.fold().is_some() => Some(p),
             _ => None,
         })
         .collect();
@@ -187,7 +196,9 @@ pub fn plan(
         .map(|l| matches!(l.probe, Probe::Literal(_)))
         .collect();
     let groups = and_groups(expr);
-    let countable: Vec<bool> = terms.iter().map(Option::is_some).collect();
+    let countable: Vec<bool> = (terms.iter().zip(&folded))
+        .map(|(t, f)| t.is_some() || f.is_some())
+        .collect();
     let counted = to_count(&groups, &countable, &demotable);
     let queries: Vec<Query<'_>> = terms
         .iter()
@@ -198,16 +209,25 @@ pub fn plan(
     let mut probe_us = 0;
     if !queries.is_empty() {
         for (i, a) in (0..n)
-            .filter(|&i| counted[i])
+            .filter(|&i| counted[i] && terms[i].is_some())
             .zip(index.probe_all(&queries, within))
         {
             probe_us += a.probe_us;
             counts[i] = a.counts;
         }
     }
+    let walks: Vec<Option<Walk<'i>>> = (folded.iter().zip(&counted))
+        .map(|(f, &c)| f.filter(|_| c).and_then(|p| index.walk(p, within)))
+        .collect();
+    for (i, w) in walks.iter().enumerate() {
+        if let Some(w) = w {
+            probe_us += w.us();
+            counts[i] = w.counts();
+        }
+    }
     let mut plan = arrange(&groups, counts, &counted, &demotable, &exact, &narrowed);
     plan.probe_us = probe_us;
-    plan
+    (plan, walks)
 }
 
 fn ranges(counts: &[(Range<usize>, u64)]) -> Vec<Range<usize>> {

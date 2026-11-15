@@ -323,6 +323,29 @@ fn reading_instead_of_locating_answers_alike() {
 }
 
 #[test]
+fn a_filtered_folded_literal_reports_its_walk() {
+    // Each -i term is walked to count it, then read or located from its
+    // walk: its latency holds the walk either way.
+    const WALK_US: u64 = 60_000_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let (all, _) = trees(tmp.path(), false);
+    crate::tests::WALK_US.set(Some(WALK_US));
+    let latencies = |band| {
+        crate::tests::BAND.set(Some(band));
+        let r = query(&all, &["-g", "sub/**", "-i"], &["PRINTK", "ALPHA"]);
+        crate::tests::BAND.set(None);
+        let r = r.unwrap().queries;
+        r.iter().map(|q| q.latency_us).collect::<Vec<_>>()
+    };
+    let located = latencies((f64::INFINITY, f64::INFINITY));
+    let read = latencies((0.0, 0.0));
+    crate::tests::WALK_US.set(None);
+    for (how, us) in [("located", located), ("read", read)] {
+        assert!(us.iter().all(|&us| us >= WALK_US), "{how} {us:?}");
+    }
+}
+
+#[test]
 fn a_filtered_literal_reads_or_locates_by_cost() {
     let tmp = tempfile::tempdir().unwrap();
     let common = "printk ".repeat(40) + "alpha\n";

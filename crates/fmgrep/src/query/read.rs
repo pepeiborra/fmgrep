@@ -5,7 +5,7 @@ use std::fmt::Write;
 use std::ops::{Range, RangeInclusive};
 
 use crate::probe::{Answer, Query};
-use crate::sharded::DocfmIndex;
+use crate::sharded::{DocfmIndex, Walk};
 use crate::verbose::{Us, plans, plural};
 
 /// Unmeasured µs per located occurrence.
@@ -41,12 +41,21 @@ struct Spread {
     fetched: bool,
 }
 
-/// A term that may be read instead: its count probe, its text, and whether
-/// its located files are read too.
+/// A term that may be read instead: how it is counted, its text, and
+/// whether its located files are read too.
 pub struct Readable<'a> {
-    pub count: Query<'a>,
+    pub count: Count<'a>,
     pub text: &'a [u8],
     pub fetched: bool,
+}
+
+/// How a [`Readable`] term is counted.
+#[derive(Clone, Copy)]
+pub enum Count<'a> {
+    /// By [`Query::Count`].
+    Literal(&'a [u8]),
+    /// By the counts of its fold walk, which a locate then reuses.
+    Walked(&'a Walk<'a>),
 }
 
 /// Per term, the answer that reads the ids `kept` yields, when that costs
@@ -60,11 +69,31 @@ pub fn read_instead(
     costs: Costs,
 ) -> Vec<Option<Answer>> {
     let none = || terms.iter().map(|_| None).collect();
-    let counts: Vec<Query<'_>> = terms.iter().flatten().map(|t| t.count).collect();
-    if counts.is_empty() {
+    if terms.iter().all(Option::is_none) {
         return none();
     }
-    let counted = index.probe_all(&counts, Some(cover));
+    let literals: Vec<Query<'_>> = (terms.iter().flatten())
+        .filter_map(|t| match t.count {
+            Count::Literal(l) => Some(Query::Count(l)),
+            Count::Walked(_) => None,
+        })
+        .collect();
+    let mut probed = match literals.is_empty() {
+        true => Vec::new(),
+        false => index.probe_all(&literals, Some(cover)),
+    }
+    .into_iter();
+    let counted: Vec<Answer> = (terms.iter().flatten())
+        .map(|t| match t.count {
+            Count::Literal(_) => probed.next().expect("probe_all answers every query"),
+            Count::Walked(walk) => Answer {
+                exact: Vec::new(),
+                candidates: Some(Vec::new()),
+                probe_us: walk.us(),
+                counts: walk.counts(),
+            },
+        })
+        .collect();
     let spreads: Vec<Spread> = (counted.iter().zip(terms.iter().flatten()))
         .map(|(a, t)| {
             let bytes: u64 = a

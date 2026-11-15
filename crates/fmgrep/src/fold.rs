@@ -154,17 +154,38 @@ fn fold_any_capped<C: BackwardCursor>(root: C, plan: &FoldPlan, cap: usize) -> O
     fold_walk(root, plan, cap).ok().map(|live| !live.is_empty())
 }
 
-/// The folded matches' count, an upper bound when the walk gives up; 0 only
+/// [`fold_walk`] under the live-interval cap: what a count reads and a
+/// locate places, so a term counted and then located walks once.
+pub fn fold_intervals<C: BackwardCursor>(root: C, plan: &FoldPlan) -> Result<Vec<C>, u64> {
+    fold_walk(root, plan, MAX_LIVE)
+}
+
+/// The folded matches a walk found, an upper bound when it gave up; 0 only
 /// when nothing matches.
-pub fn fold_count<C: BackwardCursor>(root: C, plan: &FoldPlan) -> u64 {
+pub fn walked_count<C: BackwardCursor>(walk: &Result<Vec<C>, u64>) -> u64 {
+    match walk {
+        Ok(live) => live.iter().map(BackwardCursor::count).sum(),
+        Err(bound) => *bound,
+    }
+}
+
+#[cfg(test)]
+fn fold_count<C: BackwardCursor>(root: C, plan: &FoldPlan) -> u64 {
     fold_count_capped(root, plan, MAX_LIVE)
 }
 
+#[cfg(test)]
 fn fold_count_capped<C: BackwardCursor>(root: C, plan: &FoldPlan, cap: usize) -> u64 {
-    match fold_walk(root, plan, cap) {
-        Ok(live) => live.iter().map(BackwardCursor::count).sum(),
-        Err(bound) => bound,
+    walked_count(&fold_walk(root, plan, cap))
+}
+
+/// Every occurrence of the intervals `live`.
+pub fn locate_intervals<C: LocatingCursor>(live: &[C]) -> Vec<C::Hit> {
+    let mut hits = Vec::new();
+    for cursor in live {
+        cursor.locate(&mut |hit| hits.push(hit));
     }
+    hits
 }
 
 /// Located folded matches, or `None` when the live-interval cap
@@ -180,11 +201,7 @@ fn fold_locate_capped<C: LocatingCursor>(
     cap: usize,
 ) -> Option<Vec<C::Hit>> {
     let live = fold_walk(root, plan, cap).ok()?;
-    let mut hits = Vec::new();
-    for cursor in &live {
-        cursor.locate(&mut |hit| hits.push(hit));
-    }
-    Some(hits)
+    Some(locate_intervals(&live))
 }
 
 #[cfg(test)]

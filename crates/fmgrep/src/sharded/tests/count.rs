@@ -145,9 +145,64 @@ fn fold_count_equals_located_fold_hits_per_shard() {
         assert_eq!(located, spelled, "cap={cap}");
         let dir = tempfile::tempdir().unwrap();
         for index in [round_trip(&built, dir.path(), &docs), built] {
-            let a = index.probe_all(&[Query::CountFold(plan)], None).remove(0);
-            assert!(a.exact.is_empty());
-            assert_eq!(a.counts, located, "cap={cap}");
+            let walk = index.walk(&pattern, None).expect("a fold plan");
+            assert_eq!(walk.counts(), located, "cap={cap}");
+        }
+    }
+}
+
+/// A term counted by its walk and then located from it gets the documents
+/// the regex probe walks again for, on every shard cut, within any range,
+/// and where the walk gives up.
+#[test]
+fn a_walked_term_locates_the_documents_the_regex_probe_does() {
+    let mut texts: Vec<String> = (0..40)
+        .map(|i| match i % 5 {
+            0 => String::new(),
+            1 => format!("printk {i} PRINTK"),
+            2 => format!("Print\u{212A} {i}"),
+            3 => "prINTk printk abcdefghi".to_string(),
+            _ => format!("doc {i}"),
+        })
+        .collect();
+    // Every spelling of `abcdefghi`: 512 live intervals, past the walk's cap.
+    texts.extend((0..512u32).map(|m| {
+        let spelled = "abcdefghi".chars().enumerate();
+        spelled
+            .map(|(k, c)| match m >> k & 1 {
+                1 => c.to_ascii_uppercase(),
+                _ => c,
+            })
+            .collect::<String>()
+    }));
+    let docs = docs_of(&texts.iter().map(String::as_bytes).collect::<Vec<_>>());
+    let n = docs.len();
+    let one = DocfmIndex::build_with_cap(&docs, 1 << 20);
+    let pattern = PreparedPattern::prepare_with("abcdefghi", ci()).unwrap();
+    let plan = pattern.fold().expect("plan");
+    assert_eq!(one.shards.len(), 1);
+    assert!(crate::fold::fold_locate(one.shards[0].cursor(), plan).is_none());
+    let spans: [Option<Vec<Range<usize>>>; 3] =
+        [None, Some(vec![0..9, 30..41]), Some(vec![500..520, 540..n])];
+    for term in ["printk", "abcdefghi", "missing"] {
+        let pattern = PreparedPattern::prepare_with(term, ci()).unwrap();
+        for cap in [40u64, 400, 1 << 20] {
+            let built = DocfmIndex::build_with_cap(&docs, cap);
+            let dir = tempfile::tempdir().unwrap();
+            for index in [round_trip(&built, dir.path(), &docs), built] {
+                for within in &spans {
+                    let walk = index
+                        .walk(&pattern, within.as_deref())
+                        .expect("a fold plan");
+                    let walked = index.probe_all(&[Query::Walked(&walk)], within.as_deref());
+                    let probed = index.probe_all(&[Query::Regex(&pattern)], within.as_deref());
+                    assert_eq!(
+                        walked[0].candidates, probed[0].candidates,
+                        "{term} cap={cap} {within:?}"
+                    );
+                    assert!(walked[0].exact.is_empty() && walked[0].counts.is_empty());
+                }
+            }
         }
     }
 }
