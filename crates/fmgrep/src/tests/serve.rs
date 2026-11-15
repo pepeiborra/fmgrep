@@ -258,6 +258,14 @@ fn client(addr: &str, words: &[&str]) -> Result<(Outcome, String), String> {
     Ok((outcome, String::from_utf8(out).unwrap()))
 }
 
+/// `status --server addr --json`: the server's reply.
+fn status_of(addr: &str) -> Result<(Outcome, String), String> {
+    let all = argv(&["status", "--server", addr, "--json"]);
+    let mut out = Vec::new();
+    let outcome = dispatch_to(&all, &mut &b""[..], &mut out, false)?;
+    Ok((outcome, String::from_utf8(out).unwrap()))
+}
+
 #[test]
 fn serve_tcp_round_trip() {
     for store_docs in LAYOUTS {
@@ -290,7 +298,7 @@ fn serve_tcp_round_trip() {
             "store_docs={store_docs}"
         );
 
-        let (outcome, status) = client(&addr, &["--status"]).unwrap();
+        let (outcome, status) = status_of(&addr).unwrap();
         assert!(matches!(outcome, Outcome::Done), "store_docs={store_docs}");
         let status: serde_json::Value = serde_json::from_str(status.trim_end()).unwrap();
         assert_eq!(status["files"], 2, "store_docs={store_docs}");
@@ -320,7 +328,7 @@ fn server_errors_surface_on_the_client() {
     server.join().unwrap().unwrap();
     // Tests run at once: another one's server can take the freed port, and
     // answer, or close while this client talks to it.
-    if let Err(gone) = client(&addr, &["--status"]) {
+    if let Err(gone) = status_of(&addr) {
         let refused = format!("error: cannot reach the server at {addr}: ");
         let reset = format!("error: {addr}: ");
         assert!(

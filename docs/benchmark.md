@@ -202,9 +202,9 @@ To compare index configurations, build and serve each index yourself and
 give the harness one `--server [LABEL=]HOST:PORT` per server. Each adds a
 row `fmgrep@LABEL` that runs the queries through `fmgrep --server` against
 that server and leaves it running; the harness first checks with
-`--status` that the server holds the checkout's files. Such a row prints
-`-` in the index and memory columns, and discard the first run after the
-servers start, which is cold:
+`fmgrep status --server` that the server holds the checkout's files.
+Such a row prints `-` in the index and memory columns, and discard the
+first run after the servers start, which is cold:
 
 ```sh
 cargo build --release -p fmgrep

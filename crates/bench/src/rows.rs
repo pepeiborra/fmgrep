@@ -132,16 +132,21 @@ fn clients(
 
 /// Refuses a server that does not serve the walk's `files` files of `root`.
 pub fn check_server(bin: &Path, addr: &str, root: &Path, files: usize) -> Result<(), String> {
-    let (out, _, _) = timed(Command::new(bin).args(["--server", addr, "--status"]), None)?;
+    let status = ["status", "--server", addr, "--json"];
+    let (out, _, _) = timed(Command::new(bin).args(status), None)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(stderr.trim().trim_start_matches("error: ").to_string());
     }
     let status: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("--status: {e}"))?;
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("status: {e}"))?;
+    // A server that cannot be reached leaves the local index to answer.
+    if status.get("uses").is_some() {
+        return Err(format!("cannot reach the server at {addr}"));
+    }
     let (served, at) = (status["files"].as_u64(), status["root"].as_str());
     let (Some(served), Some(at)) = (served, at) else {
-        return Err(format!("--status: no files or root in {status}"));
+        return Err(format!("status: no files or root in {status}"));
     };
     if status["store_docs"] != true && Path::new(at) != root {
         return Err(format!("serves {at}, not {}", root.display()));

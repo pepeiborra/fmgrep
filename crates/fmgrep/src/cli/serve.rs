@@ -455,8 +455,7 @@ pub fn run_serve(
 }
 
 /// `status` of a server: `first`, then one `name: value` line per field of
-/// its reply, in the reply's order; under `--json` the reply, as
-/// `--status` prints it.
+/// its reply, in the reply's order; under `--json` the reply.
 pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> Result<(), String> {
     if json {
         let reply = serde_json::to_string(s)
@@ -484,15 +483,9 @@ pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> 
     lines.iter().try_for_each(|l| print::line(out, l))
 }
 
-/// `--status` (printed) or `--shutdown`.
-pub fn manage(addr: &str, shutdown: bool, out: &mut dyn Write) -> Result<Outcome, String> {
-    if shutdown {
-        ask::<Value>(addr, "shutdown")?;
-    } else {
-        let status = serde_json::to_string(&status(addr)?)
-            .map_err(|e| format!("error: {addr}: unexpected result: {e}"))?;
-        print::line(out, &status)?;
-    }
+/// `--shutdown`.
+pub fn shutdown(addr: &str) -> Result<Outcome, String> {
+    ask::<Value>(addr, "shutdown")?;
     Ok(Outcome::Done)
 }
 
@@ -504,10 +497,6 @@ fn ask<T: serde::de::DeserializeOwned>(addr: &str, method: &str) -> Result<T, St
 fn ask_on<T: serde::de::DeserializeOwned>(conn: &mut Conn, method: &str) -> Result<T, String> {
     let result = conn.call(method, serde_json::json!({}), &mut |_| Ok(()))?;
     conn.decode(result)
-}
-
-pub fn status(addr: &str) -> Result<ServeStatus, String> {
-    ask(addr, "status")
 }
 
 /// `status`, on a connection that stays open.

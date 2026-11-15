@@ -179,13 +179,6 @@ pub struct Search {
         help_heading = "Server"
     )]
     pub server: Option<String>,
-    /// Report on the server (--server or FMGREP_SERVER), not the local index
-    #[arg(
-        long,
-        conflicts_with_all = ["shutdown", "index", "terms", "expr", "expr_json", "and", "or"],
-        help_heading = "Server"
-    )]
-    pub status: bool,
     /// Stop the server (--server only)
     #[arg(
         long,

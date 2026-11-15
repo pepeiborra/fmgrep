@@ -322,12 +322,8 @@ fn rejects_bad_argv() {
     for words in [
         &["serve", "--listen", "127.0.0.1:0", "--stdio"][..],
         &["--server="],
-        &["--status", "--index", "d"],
+        &["--server", "a:1", "--status"],
         &["--shutdown", "--index", "d"],
-        &["--server", "a:1", "--status", "x"],
-        &["--server", "a:1", "--status", "--shutdown"],
-        &["--server", "a:1", "--status", "--expr-json", AND_JSON],
-        &["--server", "a:1", "--status", "--and", "a", "b"],
         &["--server", "a:1", "--shutdown", "--or"],
         &["--server", "a:1", "--shutdown", "--expr", AND_TEXT],
         &["--server", "a:1", "--index", "d", "x"],
