@@ -26,7 +26,8 @@ row searches the checkout in place, and nothing is written under it:
 indexes and tool state go to temporary directories; watchman keeps
 watching it, as under [File monitor](#file-monitor). Every row first runs
 the set's first query once as a warm-up, neither timed, nor kept, nor
-counted in the query footprint or RSS, then times every query. Every row
+counted in the query footprint or RSS, then times every query; the
+`fmgrep-direct` row runs `fmgrep status` instead of that query. Every row
 prints each query's matching lines, and the harness exits 1 if an fmgrep
 row prints other lines than rg from a file both searched; a tgrep or
 elgrep row that does is noted under the table, and files only some rows
@@ -55,8 +56,9 @@ index. Each later load asks watchman what changed since that token. A smaller in
 watchman cannot answer, stats every indexed file
 ([Staleness](index-format.md#staleness)); while watchman crawls a big
 tree, every load of it stats every file. Each fmgrep row builds its own
-index, so its first load is the warm-up query: no timed query takes the
-first token.
+index, so its first load is the warm-up (for `fmgrep-direct`, `fmgrep
+status`, which runs that load's check of what changed and saves the
+record): no timed query takes the first token.
 
 Before the harness runs, `scripts/bench.sh` therefore passes the checkout
 to `scripts/fsmonitor.sh`, which has watchman watch it (`watchman

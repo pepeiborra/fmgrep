@@ -208,7 +208,8 @@ pub fn leaves(query: &str) -> Vec<&str> {
 
 /// The terms a row runs, as `(term, warm_up)`: the set's first term once as
 /// a warm-up, its output checked but neither timed nor kept, so that no row
-/// times the first query a client of it sends; then every term.
+/// times the first query a client of it sends; then every term. The
+/// `fmgrep-direct` row runs `fmgrep status` instead.
 pub fn with_warm_up(terms: &[String]) -> impl Iterator<Item = (&String, bool)> {
     let first = terms.first().map(|t| (t, true));
     first.into_iter().chain(terms.iter().map(|t| (t, false)))
