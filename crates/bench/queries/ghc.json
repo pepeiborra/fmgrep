@@ -41,6 +41,10 @@
     "the AND tcLookupGlobal",
     "module AND tcLookupGlobal",
     "/-- \\|/ AND simplifyTop",
-    "zonkTcType AND tcLookupGlobal"
+    "zonkTcType AND tcLookupGlobal",
+    "-i DynFlags",
+    "-i debugBelch",
+    "-i import AND zonkTcType",
+    "-i zonkTcType AND tcLookupGlobal"
   ]
 }

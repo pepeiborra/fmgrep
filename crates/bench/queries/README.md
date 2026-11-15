@@ -19,6 +19,10 @@ patterns rewritten to use `[ \t]` instead of `\s`; the regexes of
 `scripts/bench.sh` does not clone it: sync it as docs/benchmark.md says. Its
 queries are authored here.
 
+The `-i` queries are authored here: ASCII literals, single terms both rare
+and common, and intersections with the rare term first or second. Those
+of `aosp.json` use only terms its other queries use.
+
 The last three regexes and intersections of `linux.json`, `chromium.json`
 and `aosp.json` are authored worst cases for an FM-index: required literals
 with many occurrences packed into few files, or a short anchor whose walk
