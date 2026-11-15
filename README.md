@@ -59,8 +59,8 @@ answers. `fmgrep serve` needs it, unless given `--no-watch` or a
 
   | search | Linux kernel, 96k files | Chromium, 461k | AOSP, 1.25 M |
   |---|--:|--:|--:|
-  | asks watchman | 38 ms | 108 ms | 491 ms |
-  | checks every file | 112 ms | 142 ms | 1.09 s |
+  | asks watchman | 11.5 ms | 52 ms | 186 ms |
+  | checks every file | 78 ms | 134 ms | 860 ms |
 
   The second row is the first search after an index: it asks watchman
   for its clock, a few milliseconds, then checks every file. A search
@@ -193,8 +193,8 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 |---|--:|--:|--:|
 | index size | 1.11 GB / - | 2.22 GB / - | 12.00 GB / - |
 | files read per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
-| literal p50 | 3.83 / 114 ms | 23.6 / 510 ms | 10.2 / 1560 ms |
-| regex p50 | 8.31 / 116 ms | 30.1 / 496 ms | 14.3 / 1580 ms |
+| literal p50 | 4.99 / 114 ms | 26.8 / 510 ms | 11.3 / 1560 ms |
+| regex p50 | 10.7 / 116 ms | 32.6 / 496 ms | 16.4 / 1580 ms |
 
 aosp is Android's platform source: 17.4 GB of text in 1.25 M files from
 about a thousand repositories. AWS i4i.4xlarge, Linux; method and full

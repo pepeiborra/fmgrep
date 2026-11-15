@@ -114,9 +114,9 @@ elgrep 1.0.0, watchman v2026.11.09.00 (the prebuilt release). One run of
 every row on one instance with
 [scripts/ec2-bench.sh](scripts/ec2-bench.sh), measured 2026-11-13 (UTC),
 searching the checkout in place. The fmgrep rows come from a later run of
-`scripts/bench.sh` on an instance of the same type, on 2026-11-14, at the
-commit of pull request 42 that writes manifest.bin through a synced
-temporary file (rg, tgrep and elgrep do not use fmgrep's index).
+`scripts/bench.sh` on an instance of the same type, on 2026-11-15, at the
+commit of pull request 44 that checks the shards of an index in parallel
+(rg, tgrep and elgrep do not use fmgrep's index).
 
 ### Results
 
@@ -125,9 +125,9 @@ temporary file (rg, tgrep and elgrep do not use fmgrep's index).
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | rg | - | - | - | 114 ms | 115 ms | 116 ms | 118 ms | 125 ms | 239 ms | 115 ms | 124 ms | 10.15 MB | 16.07 MB | - | 6.16->7.45! |
-| fmgrep | 21.99 s | 1.11 GB | 71.0 ms | 3.83 ms | 4.74 ms | 8.31 ms | 17.0 ms | 8.42 ms | 12.1 ms | 4.15 ms | 6.67 ms | 193.04 MB | 1.26 GB | 5.94 GB | 7.56->8.55! |
-| fmgrep `--store-docs` | 21.26 s | 2.64 GB | 35.8 ms | 3.25 ms | 3.76 ms | 6.44 ms | 12.5 ms | 5.47 ms | 16.4 ms | 3.50 ms | 5.65 ms | 189.61 MB | 1.27 GB | 5.99 GB | 8.55->8.86! |
-| fmgrep, no server | 22.36 s | 1.11 GB | - | 38.5 ms | 39.6 ms | 42.8 ms | 53.6 ms | 43.8 ms | 47.4 ms | 38.6 ms | 41.8 ms | 192.77 MB | 933.14 MB | 6.00 GB | 8.86->8.74! |
+| fmgrep | 21.16 s | 1.11 GB | 108 ms | 4.99 ms | 6.01 ms | 10.7 ms | 19.3 ms | 9.90 ms | 14.4 ms | 5.55 ms | 8.14 ms | 190.03 MB | 1.26 GB | 6.80 GB | 5.12->7.07! |
+| fmgrep `--store-docs` | 24.84 s | 2.64 GB | 13.9 ms | 4.35 ms | 4.83 ms | 7.37 ms | 14.3 ms | 6.81 ms | 12.2 ms | 4.69 ms | 6.45 ms | 207.62 MB | 1.28 GB | 6.19 GB | 7.07->8.69! |
+| fmgrep, no server | 24.65 s | 1.11 GB | - | 18.8 ms | 20.3 ms | 23.8 ms | 34.5 ms | 20.6 ms | 27.7 ms | 19.3 ms | 22.5 ms | 193.45 MB | 932.25 MB | 6.64 GB | 8.69->8.79! |
 | tgrep | 14.67 s | 1.02 GB | 2.13 s | 23.1 ms | 30.8 ms | 44.8 ms | 66.1 ms | 130 ms | 634 ms | 25.9 ms | 77.5 ms | 2.21 GB | 2.27 GB | 284.12 MB | 9.78->7.97! |
 | elgrep | 31.42 s | 1.39 GB | 31.43 s | 9.88 ms | 11.3 ms | 23.8 ms | 23.2 ms | 40.8 ms | 1.23 s | 11.0 ms | 99.0 ms | 10.14 MB | 391.46 MB | 7.19 GB | 7.97->8.49! |
 
@@ -141,9 +141,9 @@ elgrep differed from rg on 1 intersection: `MARGINING AND PERFCOUNTER`
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | rg | - | - | - | 510 ms | 519 ms | 496 ms | 509 ms | 483 ms | 513 ms | 501 ms | 516 ms | 96.39 MB | 102.01 MB | - | 1.63->4.72! |
-| fmgrep | 42.62 s | 2.22 GB | 129 ms | 23.6 ms | 48.8 ms | 30.1 ms | 64.9 ms | 3.93 ms | 4.72 ms | 15.8 ms | 43.9 ms | 150.70 MB | 2.31 GB | 7.98 GB | 9.28->10.55! |
-| fmgrep `--store-docs` | 42.89 s | 5.06 GB | 95.7 ms | 16.0 ms | 31.2 ms | 22.5 ms | 41.2 ms | 4.80 ms | 5.48 ms | 10.2 ms | 28.5 ms | 194.75 MB | 2.36 GB | 8.61 GB | 10.55->10.96! |
-| fmgrep, no server | 40.17 s | 2.22 GB | - | 125 ms | 153 ms | 132 ms | 169 ms | 105 ms | 105 ms | 115 ms | 148 ms | 156.19 MB | 2.19 GB | 7.26 GB | 10.96->10.95! |
+| fmgrep | 40.14 s | 2.22 GB | 135 ms | 26.8 ms | 52.4 ms | 32.6 ms | 69.3 ms | 4.98 ms | 5.60 ms | 16.9 ms | 47.2 ms | 164.89 MB | 2.31 GB | 7.24 GB | 9.97->10.57! |
+| fmgrep `--store-docs` | 40.68 s | 5.06 GB | 48.9 ms | 16.5 ms | 32.6 ms | 22.5 ms | 42.5 ms | 5.31 ms | 6.48 ms | 12.0 ms | 29.8 ms | 205.69 MB | 2.37 GB | 7.91 GB | 10.57->12.41! |
+| fmgrep, no server | 36.08 s | 2.22 GB | - | 80.6 ms | 109 ms | 87.0 ms | 125 ms | 56.2 ms | 57.6 ms | 68.6 ms | 103 ms | 155.61 MB | 2.19 GB | 8.95 GB | 12.41->14.11! |
 | tgrep | 40.62 s | 2.77 GB | 13.24 s | 210 ms | 462 ms | 523 ms | 906 ms | 164 ms | 420 ms | 219 ms | 532 ms | 6.53 GB | 6.55 GB | 1.07 GB | 12.98->4.37! |
 | elgrep | 70.69 s | 3.24 GB | 70.70 s | 47.5 ms | 89.2 ms | 52.8 ms | 134 ms | 195 ms | 1.37 s | 54.8 ms | 320 ms | 67.56 MB | 604.49 MB | 16.46 GB | 4.37->7.16! |
 
@@ -159,9 +159,9 @@ UnitsDisplayNames` (2 in 1).
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | rg | - | - | - | 1.56 s | 1.56 s | 1.58 s | 1.61 s | 1.51 s | 1.51 s | 1.56 s | 1.56 s | 309.01 MB | 314.70 MB | - | 5.39->9.88! |
-| fmgrep | 202.92 s | 12.00 GB | 1.40 s | 10.2 ms | 34.0 ms | 14.3 ms | 74.3 ms | 14.2 ms | 20.1 ms | 10.8 ms | 38.6 ms | 871.43 MB | 10.38 GB | 11.82 GB | 9.65->12.48! |
-| fmgrep `--store-docs` | 202.93 s | 29.38 GB | 431 ms | 8.20 ms | 28.2 ms | 10.9 ms | 72.4 ms | 14.1 ms | 58.5 ms | 9.49 ms | 41.2 ms | 831.30 MB | 10.42 GB | 10.81 GB | 12.48->12.83! |
-| fmgrep, no server | 203.77 s | 12.00 GB | - | 477 ms | 501 ms | 477 ms | 540 ms | 482 ms | 487 ms | 478 ms | 505 ms | 800.10 MB | 8.24 GB | 11.33 GB | 12.83->9.13! |
+| fmgrep | 217.76 s | 12.00 GB | 1.10 s | 11.3 ms | 37.6 ms | 16.4 ms | 77.1 ms | 15.1 ms | 22.2 ms | 12.8 ms | 41.8 ms | 841.55 MB | 10.38 GB | 11.19 GB | 8.65->11.49! |
+| fmgrep `--store-docs` | 203.23 s | 29.38 GB | 146 ms | 9.28 ms | 31.3 ms | 12.3 ms | 74.5 ms | 17.6 ms | 59.5 ms | 10.7 ms | 43.7 ms | 839.56 MB | 10.46 GB | 10.13 GB | 11.49->13.39! |
+| fmgrep, no server | 199.16 s | 12.00 GB | - | 185 ms | 208 ms | 191 ms | 255 ms | 192 ms | 196 ms | 186 ms | 214 ms | 805.49 MB | 8.24 GB | 11.99 GB | 13.39->10.99! |
 | tgrep | 168.62 s | 9.87 GB | 37.63 s | 167 ms | 265 ms | 518 ms | 792 ms | 578 ms | 717 ms | 206 ms | 436 ms | 28.14 GB | 28.20 GB | 2.58 GB | 8.03->3.02! |
 | elgrep | - | 12.23 GB | - | 43.1 ms | 130 ms | 55.0 ms | 70.9 ms | 163 ms | 309 ms | 47.5 ms | 151 ms | 259.75 MB | 1019.23 MB | 60.95 GB | 3.02->9.52! |
 
