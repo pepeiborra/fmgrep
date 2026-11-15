@@ -272,6 +272,8 @@ impl Recorded {
             let now = crate::walk::stamp(&resolve(root, rel)).unwrap_or(ABSENT);
             now != self.ignores.rows[i].1
         });
+        let names = rows.iter().filter(|&&i| moved[i]);
+        let names = names.map(|&i| self.ignores.path(i).to_owned()).collect();
         let mut scopes: Vec<String> = rows
             .into_iter()
             .filter(|&i| moved[i])
@@ -304,7 +306,7 @@ impl Recorded {
         IgnoreScopes {
             scopes: outermost(scopes),
             found,
-            moved: moved.iter().filter(|&&m| m).count(),
+            moved: names,
         }
     }
 }
@@ -316,8 +318,8 @@ pub struct IgnoreScopes {
     pub scopes: Vec<String>,
     /// The ignore files in the changed dirs that the index did not record.
     pub found: Vec<String>,
-    /// How many recorded ignore inputs moved.
-    pub moved: usize,
+    /// The recorded ignore inputs that moved, as recorded.
+    pub moved: Vec<String>,
 }
 
 /// `rel` of an ignores row against `root`: `../` climbs, an absolute path is itself.

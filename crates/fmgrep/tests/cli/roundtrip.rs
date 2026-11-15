@@ -187,6 +187,7 @@ fn status_says_what_the_check_of_what_changed_did() {
         "changes: fewer than 50000 files: checked every file".to_owned(),
         format!("changes: {ignores}"),
         "since the index: 1 stale, 1 added, 1 gone".to_owned(),
+        "ignore files changed since the index: .ignore".to_owned(),
         "record: none saved".to_owned(),
     ];
     assert_eq!(facts, changes);
@@ -357,6 +358,7 @@ fn status_prints_the_manifest_of_the_index() {
             want.extend([
                 "changes: fewer than 50000 files: checked every file".into(),
                 "since the index: 0 stale, 0 added, 0 gone".into(),
+                "ignore files changed since the index: none".into(),
                 "record: none saved".into(),
             ]);
         } else {

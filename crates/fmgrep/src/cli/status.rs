@@ -19,6 +19,9 @@ pub struct Facts {
     pub stale: usize,
     pub added: usize,
     pub gone: usize,
+    /// The ignore files that moved or are new since the index; `None`
+    /// when the index recorded no walk.
+    pub ignores: Option<Vec<String>>,
     /// The record the check saved.
     pub record: Option<PathBuf>,
 }
@@ -41,12 +44,14 @@ pub fn check(index_dir: &Path, manifest: &Manifest, root: Option<&Path>) -> Resu
         stale,
         added: docs.stale().len() - stale,
         gone: docs.gone(),
+        ignores: docs.ignores(),
         record,
     })
 }
 
 /// One line per fact: how the check learned what changed, then what it
-/// warned, in the search's words; the counts; the record.
+/// warned, in the search's words; the counts; the ignore files that
+/// changed; the record.
 pub fn lines(facts: &Facts) -> Vec<String> {
     let Facts {
         learned,
@@ -54,6 +59,7 @@ pub fn lines(facts: &Facts) -> Vec<String> {
         stale,
         added,
         gone,
+        ignores,
         record,
     } = facts;
     let how = match learned {
@@ -72,6 +78,11 @@ pub fn lines(facts: &Facts) -> Vec<String> {
         lines.push(format!(
             "since the index: {stale} stale, {added} added, {gone} gone"
         ));
+        let names = ignores.as_ref().map(|n| match n.is_empty() {
+            true => "none".to_owned(),
+            false => n.join(", "),
+        });
+        lines.extend(names.map(|n| format!("ignore files changed since the index: {n}")));
         lines.push(match record {
             Some(path) => format!("record: {}", path.display()),
             None => "record: none saved".to_owned(),
@@ -110,6 +121,7 @@ mod tests {
                 stale: 11,
                 added: 12,
                 gone: 13,
+                ignores: Some(vec![".ignore".into(), "sub/.gitignore".into()]),
                 record: Some("/cache/r.json".into()),
             };
             let text = lines(&facts).join("\n");
@@ -124,6 +136,7 @@ mod tests {
             }
             if learned != Learned::Stored {
                 want.push("since the index: 11 stale, 12 added, 13 gone");
+                want.push("ignore files changed since the index: .ignore, sub/.gitignore");
                 want.push("record: /cache/r.json");
             }
             for line in want {
@@ -131,10 +144,19 @@ mod tests {
             }
             let quiet = Facts {
                 warned: vec![],
+                ignores: Some(vec![]),
                 record: None,
                 ..facts
             };
             let text = lines(&quiet).join("\n");
+            let none = text.contains("ignore files changed since the index: none");
+            assert_eq!(none, learned != Learned::Stored, "{text}");
+            let unrecorded = Facts {
+                ignores: None,
+                ..quiet
+            };
+            let names = lines(&unrecorded).join("\n");
+            assert!(!names.contains("ignore files"), "no walk record: {names}");
             let checked = text.contains("changes: checked every file");
             assert_eq!(checked, learned == Learned::Checked, "{text}");
             let none = text.contains("record: none saved");

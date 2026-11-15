@@ -65,12 +65,14 @@ changed ([staleness](#staleness), [watchman](#watchman)) as a search
 runs it, without the index load or a query, and prints what it did:
 one `changes:` line for how it learned what changed, and one for each
 line a search warns about it, in the same words (on stdout only);
-`since the index: N stale, N added, N gone`; and `record: PATH` for the
-record it saved, else `record: none saved`. The search's note on the
-stale files, and each file it finds missing, print on stderr, as in a
-search. The check reads every path, so a damaged path fails status as
-it fails a search. Of `--store-docs` status reads no path, and so
-answers on an index whose path text is damaged ([checks](#checks)).
+`since the index: N stale, N added, N gone`; `ignore files changed
+since the index:` and their names, or `none` (no line when the index
+recorded no walk); and `record: PATH` for the record it saved, else
+`record: none saved`. The search's note on the stale files, and each
+file it finds missing, print on stderr, as in a search. The check reads
+every path, so a damaged path fails status as it fails a search. Of
+`--store-docs` status reads no path, and so answers on an index whose
+path text is damaged ([checks](#checks)).
 
 Status does not load the index from the shards. What that load refuses
 fails a search, not status: labels that do not partition the documents,
