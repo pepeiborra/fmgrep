@@ -505,14 +505,23 @@ fn status_names_what_a_search_uses() {
     let uses_in = format!("a search in {} uses the local index", docs.display());
     assert!(first(&out).starts_with(&uses_in), "{}", first(&out));
 
-    // `--json` prints the manifest, whatever the variable holds.
+    // `--json` prints the manifest, whatever the variable holds, and the
+    // note.
     let json = run_in(&docs, &["status", "--json"]);
     let m: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(m["num_docs"], DOCS.len() + 1);
+    assert_eq!(
+        (&m["num_docs"], &m["note"]),
+        (&(DOCS.len() + 1).into(), &().into())
+    );
     for value in [addr.as_str(), "not an address", ""] {
         let out = run_env(&docs, value, &["status", "--json"]);
         assert_eq!(out.status.code(), Some(0), "{value}: {}", stderr(&out));
-        assert_eq!((&out.stdout, stderr(&out)), (&json.stdout, "".into()));
+        let mut got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let note = got["note"].take();
+        assert_eq!((got, stderr(&out)), (m.clone(), "".into()));
+        let want = format!(", not the server at {value} (FMGREP_SERVER)");
+        let want = (!value.is_empty()).then_some(want);
+        assert_eq!(note.as_str(), want.as_deref(), "{value}");
     }
 
     // With no index above, the server answers, which serves the index

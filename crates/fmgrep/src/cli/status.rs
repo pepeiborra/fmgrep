@@ -5,13 +5,16 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use super::print;
 use crate::fetch::Ask;
 use crate::manifest::Manifest;
 use crate::query::{self, check_changes, note_stale};
 use crate::source::{Learned, keep, kept, named, not_due};
 
-/// What the check did and found.
+/// What the check did and found, as `--json` prints it too.
+#[derive(Serialize)]
 pub struct Facts {
     pub learned: Learned,
     /// The lines the check warned, in the search's words.
@@ -93,6 +96,19 @@ pub fn lines(facts: &Facts) -> Vec<String> {
 
 pub fn print(out: &mut dyn Write, facts: &Facts) -> Result<(), String> {
     lines(facts).iter().try_for_each(|l| print::line(out, l))
+}
+
+/// `status --json`: the manifest's fields, then what status found.
+#[derive(Serialize)]
+pub struct Json<'a> {
+    #[serde(flatten)]
+    pub manifest: &'a Manifest,
+    /// The index directory a search uses.
+    pub uses: &'a Path,
+    /// What that search warns after `Using local index DIR`, if anything.
+    pub note: Option<&'a str>,
+    #[serde(flatten)]
+    pub facts: &'a Facts,
 }
 
 #[cfg(test)]

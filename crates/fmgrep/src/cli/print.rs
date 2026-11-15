@@ -37,15 +37,20 @@ pub fn index_summary(out: &mut dyn Write, json: bool, s: &IndexSummary) -> Resul
     )
 }
 
-/// `status` of an index: under `--json` the manifest as one JSON line, else
-/// `first`, then one `name: value` line per scalar, by the manifest's
-/// names, without the tables.
-pub fn status(out: &mut dyn Write, json: bool, first: &str, m: &Manifest) -> Result<(), String> {
-    if json {
+/// `status` of an index: under `--json` the `json` report, which holds
+/// the manifest, as one line, else `first`, then one `name: value` line
+/// per scalar, by the manifest's names, without the tables.
+pub fn status(
+    out: &mut dyn Write,
+    json: Option<impl serde::Serialize>,
+    first: &str,
+    m: &Manifest,
+) -> Result<(), String> {
+    if let Some(report) = json {
         // Every path is printed, and the encoding checks the path text
         // once. The paths are the only part of a manifest whose encoding
         // can fail: a damaged one is refused in the manifest's words.
-        let json = serde_json::to_string(m).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(&report).map_err(|e| e.to_string())?;
         return line(out, &json);
     }
     let mut lines = vec![
@@ -120,7 +125,7 @@ mod tests {
 
     fn status_json(m: &Manifest) -> Result<String, String> {
         let mut out = Vec::new();
-        status(&mut out, true, "idx", m)?;
+        status(&mut out, Some(m), "idx", m)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
