@@ -106,7 +106,8 @@ fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
 /// Each query through `fmgrep --server addr` from the corpus root, after the
 /// warm-up, which the server's `sampler`, if any, does not sample. From
 /// elsewhere in a git checkout, the client would scope a search to the
-/// cwd's place in that checkout.
+/// cwd's place in that checkout. With `--ignore-local-changes`, a query
+/// runs no git: the row times the server's answer alone.
 fn clients(
     bin: &Path,
     (addr, root): (&str, &Path),
@@ -121,7 +122,8 @@ fn clients(
     for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
-        cmd.current_dir(root).args(["--server", addr]).args(LINES);
+        cmd.current_dir(root).args(["--server", addr]);
+        cmd.arg("--ignore-local-changes").args(LINES);
         cmd.args(case_flag(term));
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
@@ -537,7 +539,7 @@ mod tests {
         let runs: Vec<_> = runs.lines().collect();
         let each = ["-- a", "-- a", "--and -- b c", "-i --and -- d e"];
         let from = root.display();
-        let want: Vec<String> = ["--server h:1", "--index /i"]
+        let want: Vec<String> = ["--server h:1 --ignore-local-changes", "--index /i"]
             .iter()
             .flat_map(|how| {
                 each.map(|what| format!("{from} {how} -n --no-heading --color never {what}"))

@@ -190,6 +190,13 @@ pub struct Search {
         help_heading = "Server"
     )]
     pub shutdown: bool,
+    /// Print the server's answer alone: no look for local changes, no warning
+    #[arg(
+        long,
+        conflicts_with_all = ["index", "status", "shutdown"],
+        help_heading = "Server"
+    )]
+    pub ignore_local_changes: bool,
 
     /// Count matching lines per file
     #[arg(short, long, overrides_with_all = MODES, help_heading = "Output")]

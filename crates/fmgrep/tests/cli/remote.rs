@@ -251,7 +251,10 @@ pub fn stdout(out: &Output) -> String {
 
 /// The one warning of a search whose local changes are ignored.
 pub fn ignored(why: &str) -> String {
-    format!("warning: local changes are ignored ({why}); these results are the server's alone\n")
+    format!(
+        "warning: local changes are ignored ({why}); these results are the server's alone; use \
+         --ignore-local-changes to avoid this warning\n"
+    )
 }
 
 /// Where the client cannot compare its checkout with the served commit,
@@ -312,6 +315,35 @@ fn a_search_that_cannot_compare_its_checkout_warns_once() {
     assert_eq!(
         (stdout(&out), r.warnings(&out)),
         (all.to_owned(), String::new())
+    );
+}
+
+/// `--ignore-local-changes` prints the server's answer alone, with no
+/// warning: what the fallback prints, outside a checkout, in another
+/// repository, and in a clone whose changes would be merged; from below
+/// the clone's top, PATHs and the cwd resolve against it, as in the
+/// fallback.
+#[test]
+fn ignore_local_changes_prints_the_servers_answer_alone() {
+    let r = Remote::new(&FILES);
+    let all = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let away = std::fs::canonicalize(r.s.path("home")).unwrap();
+    let other = r.s.repo("other", &[("x.c", "printk x\n")]);
+    r.s.write(&r.client, &[("a.c", "none\n"), ("new.c", "printk new\n")]);
+    for cwd in [&away, &other, &r.client] {
+        let out = r.search(cwd, &["--ignore-local-changes", "-l", "printk"]);
+        assert_eq!(
+            (stdout(&out), stderr(&out), out.status.code()),
+            (all.to_owned(), String::new(), Some(0)),
+            "{cwd:?}"
+        );
+    }
+    let dir = r.client.join("dir");
+    let args = ["--ignore-local-changes", "-l", "printk", "../a.c", "sub"];
+    let out = r.search(&dir, &args);
+    assert_eq!(
+        (stdout(&out), stderr(&out)),
+        ("../a.c\nsub/c.h\n".into(), String::new())
     );
 }
 
@@ -441,7 +473,8 @@ fn a_checkout_that_lacks_the_commit_keeps_its_cwd_and_paths() {
 
 /// A search whose globs keep it from every file fails as a local search
 /// does, and prints nothing on stdout, also with `--json`: from a clone of
-/// the served commit, and from a checkout that lacks it, after the warning.
+/// the served commit, also with `--ignore-local-changes`, and from a
+/// checkout that lacks it, after the warning.
 #[test]
 fn a_search_of_no_file_fails_as_a_local_one() {
     let r = Remote::new(&FILES);
@@ -453,6 +486,14 @@ fn a_search_of_no_file_fails_as_a_local_one() {
         assert_eq!((stdout(&out), out.status.code()), (String::new(), Some(2)));
         assert_eq!(stderr(&out).lines().last(), Some(error), "{}", stderr(&out));
         assert!(!stderr(&out).contains("ignored"), "{}", stderr(&out));
+        let out = r.search(
+            &r.client,
+            &[&["--ignore-local-changes"], &args(mode)[..]].concat(),
+        );
+        assert_eq!(
+            (stdout(&out), stderr(&out), out.status.code()),
+            (String::new(), format!("{error}\n"), Some(2))
+        );
     }
 
     r.s.write(&r.origin, &[("a.c", "printk a2\n")]);

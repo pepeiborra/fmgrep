@@ -23,6 +23,9 @@ pub enum Plan {
     Degraded(String),
     /// The checkout at `top` holds the served commit `commit`.
     Checkout { top: PathBuf, commit: String },
+    /// The server's answer alone, with no warning: `--ignore-local-changes`
+    /// asks for it, and nothing about the checkout is looked at but its top.
+    Ignored,
 }
 
 /// The top of the work tree that holds `dir`: the nearest directory at or
@@ -453,6 +456,7 @@ pub struct Local {
 /// The one warning of a search whose local changes are ignored.
 pub fn degraded(why: &str) {
     super::warn(&format!(
-        "local changes are ignored ({why}); these results are the server's alone"
+        "local changes are ignored ({why}); these results are the server's alone; use \
+         --ignore-local-changes to avoid this warning"
     ));
 }

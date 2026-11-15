@@ -159,13 +159,15 @@ fn search(
     p.cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let ignore = s.ignore_local_changes;
     if let Some(addr) = &s.server {
-        return client(Server { addr, env: false }, p, &typed, s.json, out);
+        return client(Server { addr, env: false }, ignore, p, &typed, s.json, out);
     }
     if s.index.is_none() {
         match env() {
             Ok(None) => {}
             Ok(Some(addr)) => match locate(Path::new(".")) {
+                Ok(found) if ignore => return Err(local_index_answers(&found, &addr)),
                 Ok(found) => warn(&format!(
                     "Using local index {}, not the server at {addr} (FMGREP_SERVER)",
                     found.index_dir.display()
@@ -175,7 +177,7 @@ fn search(
                         addr: &addr,
                         env: true,
                     };
-                    return client(server, p, &typed, s.json, out);
+                    return client(server, ignore, p, &typed, s.json, out);
                 }
             },
             // A value that is not UTF-8 fails only a search that would use it.
@@ -183,7 +185,23 @@ fn search(
             Err(_) => {}
         }
     }
+    if ignore {
+        return Err(
+            "error: --ignore-local-changes needs --server ADDR or FMGREP_SERVER".to_owned(),
+        );
+    }
     local(s.index.as_deref(), p, &typed, s.json, out)
+}
+
+/// Why a search with `--ignore-local-changes` fails when the local index
+/// `found` wins over the server at `addr`: the flag asks for that server's
+/// answer alone, and a local index searches the checkout as it is.
+fn local_index_answers(found: &Located, addr: &str) -> String {
+    format!(
+        "error: the local index {} wins over the server at {addr} (FMGREP_SERVER), and \
+         --ignore-local-changes needs the server's answer; pass --server {addr} to search it",
+        found.index_dir.display()
+    )
 }
 
 /// A search of the index at or above `index`, else above the cwd.
@@ -232,9 +250,12 @@ impl std::fmt::Display for Server<'_> {
 
 /// A search through `server`: one connection; PATHs resolve against the
 /// served tree. When `--server` gives a server that cannot be reached, an
-/// index found by walking up answers, with a warning.
+/// index found by walking up answers, with a warning, unless `ignore`
+/// (`--ignore-local-changes`): then the server's answer alone, and no look
+/// at the checkout's changes.
 fn client(
     server: Server<'_>,
+    ignore: bool,
     mut p: QueryParams,
     typed: &[String],
     json: bool,
@@ -245,6 +266,7 @@ fn client(
         Err(e) => {
             // With `FMGREP_SERVER`, such an index has already won.
             if !server.env
+                && !ignore
                 && let Ok(found) = locate(Path::new("."))
             {
                 warn(&format!(
@@ -260,7 +282,11 @@ fn client(
     same_format(server, status.format)?;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
     let mut ours = None;
-    match checkout::plan(server, &status, &cwd) {
+    let plan = match ignore {
+        true => checkout::Plan::Ignored,
+        false => checkout::plan(server, &status, &cwd),
+    };
+    match plan {
         // The checkout holds the served commit: PATHs and the cwd are
         // resolved here, against its top, and its changes searched here.
         checkout::Plan::Checkout { top, commit } => {
@@ -278,6 +304,7 @@ fn client(
                     checkout::degraded(&why);
                     checkout::top(&cwd).zip(status.commit.as_ref())
                 }
+                checkout::Plan::Ignored => checkout::top(&cwd).zip(status.commit.as_ref()),
                 _ => None,
             };
             match pinned {
