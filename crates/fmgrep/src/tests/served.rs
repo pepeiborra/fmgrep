@@ -8,6 +8,7 @@ use super::watched::{
 use super::watchman::Daemon;
 use super::*;
 use crate::fetch::DocStore;
+use crate::source::Learned;
 
 /// The requests of an ask with a token: a new token, the token question.
 const ASKS: [&str; 5] = ["watch-list", "get-config", "clock", "clock", "query"];
@@ -42,7 +43,7 @@ fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
     let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
     let files = manifest.files.checked().unwrap();
-    if !docs.replay(files) {
+    if !matches!(docs.replay(files), Learned::Answered { .. }) {
         docs.discover(files);
         docs.stat_all(files);
     }

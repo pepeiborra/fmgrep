@@ -437,6 +437,22 @@ fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>
     items.iter().map(f).collect()
 }
 
+/// How a load's check learned what changed since the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Learned {
+    /// The index holds the files: there is nothing to check.
+    Stored,
+    /// No ask was due (below 50,000 docs, or a server that does not
+    /// watch): every file is checked.
+    NotDue,
+    /// Watchman and the baseline named `named` paths, and `kept` of them
+    /// were re-checked instead of every file.
+    Answered { named: usize, kept: usize },
+    /// Watchman could not say, and the load warned why: every file is
+    /// checked.
+    Checked,
+}
+
 /// Docs a query treats apart from the index's answer, each ascending.
 #[derive(Debug, Default, PartialEq)]
 pub struct Snapshot {
@@ -525,26 +541,26 @@ impl Files {
     }
 
     /// Re-check what may differ (what watchman names, plus the saved
-    /// baseline) instead of [`Self::stat_all`] and discovery: false when no
+    /// baseline) instead of [`Self::stat_all`] and discovery, unless no
     /// ask is due (a server's always is), or, saying why on stderr, when
     /// watchman cannot say.
-    pub fn replay(&self, files: Checked<'_>, lens: &[u64]) -> bool {
+    pub fn replay(&self, files: Checked<'_>, lens: &[u64]) -> Learned {
         let Some(index) = &self.index else {
-            return false;
+            return Learned::NotDue;
         };
         if !self.known.each_query && !journal::due(files.len()) {
-            return false;
+            return Learned::NotDue;
         }
         let _span = tracing::info_span!("watchman").entered();
         let (root, recorded) = match self.askable(files) {
             Ok(askable) => askable,
             Err(why) if self.known.each_query => {
                 *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
-                return false;
+                return Learned::Checked;
             }
             Err(why) => {
                 journal::cannot_answer(&why);
-                return false;
+                return Learned::Checked;
             }
         };
         let asked = std::time::Instant::now();
@@ -557,14 +573,14 @@ impl Files {
         }
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) = answer.token;
         let Some(paths) = answer.paths else {
-            return false;
+            return Learned::Checked;
         };
         let applied = std::time::Instant::now();
         let kept = match self.known.replay(recorded, &paths, files, lens) {
             Ok(kept) => kept,
             Err(()) => {
                 journal::over(journal::named_cap(files.len()));
-                return false;
+                return Learned::Checked;
             }
         };
         let n = paths.len();
@@ -581,7 +597,7 @@ impl Files {
                 );
             }
         }
-        true
+        Learned::Answered { named: n, kept }
     }
 
     /// Why a server cannot use watchman at all, as its start found: not

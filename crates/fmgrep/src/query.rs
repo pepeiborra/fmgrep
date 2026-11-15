@@ -16,6 +16,7 @@ use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::{DocfmIndex, Walk};
 use crate::sink::{DocMatches, MatchSink};
+use crate::source::Learned;
 use crate::wire::{OutputReport, QueryReport};
 
 /// What a search answers. The manifest is read once by the dispatcher and
@@ -142,7 +143,8 @@ pub fn load(
                 None => files.checked()?,
             };
             // A server that refuses to serve needs no stat pass.
-            if docs_ref.replay(files) || docs_ref.refusal().is_some() {
+            let learned = docs_ref.replay(files);
+            if matches!(learned, Learned::Answered { .. }) || docs_ref.refusal().is_some() {
                 return Ok(());
             }
             let check = check.clone();
