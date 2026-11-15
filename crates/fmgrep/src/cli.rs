@@ -77,7 +77,13 @@ fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, Stri
         "a search {here} uses the local index {}{note}",
         dir.display()
     );
-    print::status(out, a.json, &first, &manifest)?;
+    let json = a.json.then(|| status::Json {
+        manifest: &manifest,
+        uses: &dir,
+        note: Some(note.as_str()).filter(|n| !n.is_empty()),
+        facts: &facts,
+    });
+    print::status(out, json, &first, &manifest)?;
     if !a.json {
         status::print(out, &facts)?;
     }

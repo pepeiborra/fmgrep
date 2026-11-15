@@ -307,7 +307,21 @@ fn status_prints_the_manifest_of_the_index() {
         if !store_docs {
             want_keys.push("corpus_root");
         }
+        // Then what a search uses, and what its check did.
+        let facts = [
+            "uses", "note", "learned", "warned", "stale", "added", "gone", "ignores", "record",
+        ];
+        want_keys.extend(facts);
         assert_eq!(m.as_object().unwrap().len(), want_keys.len(), "{text}");
+        assert_eq!(m["uses"], dotdir.to_str().unwrap());
+        let learned = if store_docs { "stored" } else { "not_due" };
+        assert_eq!((&m["learned"], &m["note"]), (&learned.into(), &().into()));
+        let ignores = if store_docs {
+            ().into()
+        } else {
+            serde_json::json!([])
+        };
+        assert_eq!((&m["ignores"], &m["record"]), (&ignores, &().into()));
         let at: Vec<usize> = want_keys
             .iter()
             .map(|k| text.find(&format!("\"{k}\":")).unwrap())

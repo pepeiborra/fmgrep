@@ -79,8 +79,12 @@ fails a search, not status: labels that do not partition the documents,
 a shard whose bytes are damaged, an index that covers another number of
 files than the manifest records.
 
-`fmgrep status --json` prints the manifest itself: the fields above, in
-that order, on one line; it checks every path first. A script reads the
+`fmgrep status --json` prints one JSON object on one line: the fields
+above, in that order, then what status found: `uses` (the index
+directory), `note`, `learned` (`"stored"`, `"not_due"`, `"checked"`, or
+`{"answered": {"named": N, "kept": N}}`), `warned` (the lines),
+`stale`, `added`, `gone`, `ignores` (the names, or null) and `record`
+(the path, or null). It checks every path first. A script reads the
 paths with `fmgrep status --json | jq -r '.files[]'`.
 
 ### Layout
