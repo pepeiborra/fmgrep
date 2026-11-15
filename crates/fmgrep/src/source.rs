@@ -141,6 +141,8 @@ struct Known {
     /// baseline keeps them, so later loads walk their dirs again. A set: a
     /// server finds the same ones again at each query that walks there.
     new_ignores: Mutex<std::collections::BTreeSet<String>>,
+    /// Recorded ignore inputs seen moved by this load.
+    moved_ignores: Mutex<std::collections::BTreeSet<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
     /// Whether a server asks watchman again before each query: its
@@ -371,10 +373,12 @@ impl Known {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .len();
-        let n = changes.moved + new;
+        let n = changes.moved.len() + new;
         if n > 0 {
             ignores_changed(n, self.each_query);
         }
+        let mut moved = (self.moved_ignores.lock()).unwrap_or_else(PoisonError::into_inner);
+        moved.extend(changes.moved);
         changes.scopes
     }
 
@@ -509,6 +513,7 @@ impl Files {
                 recorded: None,
                 rules: Mutex::default(),
                 new_ignores: Mutex::default(),
+                moved_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
                 each_query: false,
             }),
@@ -748,6 +753,19 @@ impl Files {
     pub fn stat_all(&self, files: Checked<'_>, lens: &[u64]) {
         let _span = tracing::info_span!("stat").entered();
         self.known.stat_all(files, lens, false);
+    }
+
+    /// The ignore files seen moved or new since the index, ascending;
+    /// `None` when the index recorded no walk.
+    pub fn ignores(&self) -> Option<Vec<String>> {
+        let known = &*self.known;
+        known.recorded.as_ref()?;
+        let names = |set: &Mutex<std::collections::BTreeSet<String>>| {
+            set.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        };
+        let mut all = names(&known.moved_ignores);
+        all.extend(names(&known.new_ignores));
+        Some(all.into_iter().collect())
     }
 
     /// Whether any doc is stale or gone.

@@ -130,6 +130,7 @@ shards: 1
 corpus_root: /home/me/ghc
 changes: fewer than 50000 files: checked every file
 since the index: 2 stale, 1 added, 0 gone
+ignore files changed since the index: none
 record: none saved
 ```
 

@@ -241,6 +241,15 @@ impl DocStore {
         }
     }
 
+    /// The ignore files seen moved or new since the index; `None` for
+    /// stored docs, or an index that recorded no walk.
+    pub fn ignores(&self) -> Option<Vec<String>> {
+        match &self.source {
+            Source::Files(f) => f.ignores(),
+            Source::Shard { .. } => None,
+        }
+    }
+
     /// Whether the documents are read from `docs.shard`.
     pub fn stored(&self) -> bool {
         matches!(self.source, Source::Shard { .. })
