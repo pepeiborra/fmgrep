@@ -392,7 +392,8 @@ fn run() -> Result<(), Fail> {
             (RowKind::FmgrepServer, Some(bin), ..) => {
                 let server = servers.iter().find(|s| s.name == name);
                 let server = server.expect("server rows come from --server");
-                rows::server(bin, &paths, &docs, server, terms)
+                let tree = (&paths, root.as_path(), docs.as_slice());
+                rows::server(bin, tree, server, terms)
             }
             (
                 kind @ (RowKind::Fmgrep | RowKind::FmgrepStoreDocs | RowKind::FmgrepDirect),

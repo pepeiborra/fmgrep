@@ -103,20 +103,25 @@ fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
     searched
 }
 
-/// Each query through `fmgrep --server addr`, after the warm-up, which the
-/// server's `sampler`, if any, does not sample.
+/// Each query through `fmgrep --server addr` from the corpus root, after the
+/// warm-up, which the server's `sampler`, if any, does not sample. From
+/// elsewhere in a git checkout, the client would scope a search to the
+/// cwd's place in that checkout.
 fn clients(
     bin: &Path,
-    addr: &str,
+    (addr, root): (&str, &Path),
     paths: &Paths,
     terms: &[String],
     row: &mut Row,
     mut sampler: Option<&mut Sampler>,
 ) -> Result<(), String> {
+    let bin = bin
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
     for (term, warm_up) in with_warm_up(terms) {
-        let mut cmd = Command::new(bin);
+        let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
-        cmd.args(["--server", addr]).args(LINES);
+        cmd.current_dir(root).args(["--server", addr]).args(LINES);
         cmd.args(case_flag(term));
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
@@ -156,14 +161,14 @@ pub fn check_server(bin: &Path, addr: &str, root: &Path, files: usize) -> Result
 /// stops, and so does not measure.
 pub fn server(
     bin: &Path,
-    paths: &Paths,
-    docs: &[fmgrep::DocMeta],
+    (paths, root, docs): (&Paths, &Path, &[fmgrep::DocMeta]),
     server: &Server,
     terms: &[String],
 ) -> Result<Row, String> {
     let mut row = Row::new(server.name);
     row.searched = searched(paths, docs);
-    clients(bin, &server.addr, paths, terms, &mut row, None)?;
+    let to = (server.addr.as_str(), root);
+    clients(bin, to, paths, terms, &mut row, None)?;
     Ok(row)
 }
 
@@ -227,7 +232,8 @@ pub fn fmgrep(
     row.ready = Some(start.elapsed());
     std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
 
-    clients(bin, &addr, paths, terms, &mut row, Some(&mut sampler))?;
+    let to = (addr.as_str(), root);
+    clients(bin, to, paths, terms, &mut row, Some(&mut sampler))?;
     let mut shutdown = Command::new(bin);
     let (out, _, _) = timed(shutdown.args(["--server", &addr, "--shutdown"]), None)?;
     if !out.status.success() {
@@ -508,14 +514,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let (bin, log) = (root.join("fmgrep"), root.join("log"));
-        let script = format!("#!/bin/sh\necho \"$*\" >>'{}'\nexit 1\n", log.display());
+        let script = format!(
+            "#!/bin/sh\necho \"$(pwd -P) $*\" >>'{}'\nexit 1\n",
+            log.display()
+        );
         crate::fake_bin::write(&bin, &script);
         output_retry_etxtbsy(&mut Command::new(&bin)).unwrap();
         std::fs::remove_file(&log).unwrap();
         let paths = Paths::from_lists(&root, b"", b"", &[]);
         let terms = ["a", "b AND c", "-i d AND e"].map(String::from);
         let mut served = Row::new(RowKind::Fmgrep);
-        clients(&bin, "h:1", &paths, &terms, &mut served, None).unwrap();
+        let to = ("h:1", root.as_path());
+        clients(&bin, to, &paths, &terms, &mut served, None).unwrap();
         let mut by_process = Row::new(RowKind::FmgrepDirect);
         let tree = (&paths, root.as_path());
         direct(&bin, tree, Path::new("/i"), &terms, &mut by_process).unwrap();
@@ -526,9 +536,12 @@ mod tests {
         let runs = std::fs::read_to_string(&log).unwrap();
         let runs: Vec<_> = runs.lines().collect();
         let each = ["-- a", "-- a", "--and -- b c", "-i --and -- d e"];
+        let from = root.display();
         let want: Vec<String> = ["--server h:1", "--index /i"]
             .iter()
-            .flat_map(|how| each.map(|what| format!("{how} -n --no-heading --color never {what}")))
+            .flat_map(|how| {
+                each.map(|what| format!("{from} {how} -n --no-heading --color never {what}"))
+            })
             .collect();
         assert_eq!(runs, want);
     }

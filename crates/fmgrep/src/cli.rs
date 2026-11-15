@@ -24,7 +24,7 @@ use crate::wire::{IndexSummary, OutputReport};
 use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
-use serve::{ServeRequest, run_client, run_serve};
+use serve::{ServeRequest, run_serve};
 
 /// What a successful dispatch produced.
 pub enum Outcome {
@@ -76,6 +76,16 @@ fn open_index(start: Option<&Path>) -> Result<(Located, Manifest), String> {
 
 /// `typed`, resolved from the cwd, as `p`'s PATHs into the indexed `tree`.
 fn rebase(p: &mut QueryParams, typed: &[String], tree: Option<&Path>) -> Result<(), String> {
+    rebase_into(p, typed, tree, "indexed tree")
+}
+
+/// [`rebase`] into `tree`, which errors call `what`.
+fn rebase_into(
+    p: &mut QueryParams,
+    typed: &[String],
+    tree: Option<&Path>,
+    what: &str,
+) -> Result<(), String> {
     if typed.is_empty() {
         return Ok(());
     }
@@ -94,12 +104,7 @@ fn rebase(p: &mut QueryParams, typed: &[String], tree: Option<&Path>) -> Result<
                 (_, Some(name)) => resolve(Path::new("."))?.join(name),
                 _ => resolve(path)?,
             };
-            let outside = || {
-                format!(
-                    "error: {t} is outside the indexed tree at {}",
-                    root.display()
-                )
-            };
+            let outside = || format!("error: {t} is outside the {what} at {}", root.display());
             let rel = abs.strip_prefix(&root).map_err(|_| outside())?;
             let parts: Option<Vec<&str>> =
                 rel.components().map(|c| c.as_os_str().to_str()).collect();
@@ -252,17 +257,61 @@ fn client(
     let status = serve::status_on(&mut conn)?;
     same_format(server, status.format)?;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
-    if let checkout::Plan::Degraded(why) = checkout::plan(server, &status, &cwd) {
-        checkout::degraded(&why);
-    }
-    if !typed.is_empty() {
-        let root = Path::new(&status.root);
-        rebase(&mut p, typed, served_tree(root, status.store_docs))?;
+    match checkout::plan(server, &status, &cwd) {
+        // The checkout holds the served commit: PATHs and the cwd are
+        // resolved here, against its top.
+        checkout::Plan::Checkout { top, commit } => {
+            rebase_into(&mut p, typed, Some(&top), "checkout")?;
+            p.scope(Some(&top));
+            p.commit = Some(commit);
+        }
+        plan => {
+            let pinned = match plan {
+                checkout::Plan::Degraded(why) => {
+                    checkout::degraded(&why);
+                    checkout::top(&cwd).zip(status.commit.as_ref())
+                }
+                _ => None,
+            };
+            match pinned {
+                // A checkout that lacks the served commit, or where git
+                // cannot run, is still where the developer is: PATHs and
+                // the cwd resolve against its top, and the commit pins the
+                // query, which the server then scopes by its PATHs alone.
+                // A server that serves no commit gives no sign that the
+                // checkout is of its tree.
+                Some((top, commit)) => {
+                    rebase_into(&mut p, typed, Some(&top), "checkout")?;
+                    p.scope(Some(&top));
+                    p.commit = Some(commit.id.clone());
+                }
+                None => {
+                    let root = Path::new(&status.root);
+                    rebase(&mut p, typed, served_tree(root, status.store_docs))?;
+                }
+            }
+        }
     }
     p.stream = true;
     p.format = Some(MANIFEST_FORMAT);
-    let answered = run_client(&mut conn, &p, json, out);
-    answered.map_err(|e| moved(server, conn.code(), e))
+    let answered = render(&p, json, out, |sink| {
+        serve::remote(&mut conn, &p, sink).and_then(|report| searched(report, &p))
+    });
+    answered
+        .map(Outcome::Query)
+        .map_err(|e| moved(server, conn.code(), e))
+}
+
+/// `report`, unless the filter of `p` kept the search from every file:
+/// then the error of a local search that searched none, before anything
+/// is printed.
+fn searched(report: OutputReport, p: &QueryParams) -> Result<OutputReport, String> {
+    if report.none_searched
+        && let Some(filter) = p.filter()?
+    {
+        return Err(crate::query::none_searched(&filter));
+    }
+    Ok(report)
 }
 
 /// Refuse a server whose index format is not this fmgrep's, or that
