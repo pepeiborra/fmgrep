@@ -279,7 +279,10 @@ fn status_prints_the_manifest_of_the_index() {
         let out = run_in(&root, &["status"]);
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         let text = String::from_utf8(out.stdout).unwrap();
-        let mut want = vec![format!("index: {}", dotdir.display())];
+        let mut want = vec![format!(
+            "a search here uses the local index {}",
+            dotdir.display()
+        )];
         for key in [
             "format",
             "store_docs",

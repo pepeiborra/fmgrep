@@ -454,6 +454,36 @@ pub fn run_serve(
     }
 }
 
+/// `status` of a server: `first`, then one `name: value` line per field of
+/// its reply, in the reply's order; under `--json` the reply, as
+/// `--status` prints it.
+pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> Result<(), String> {
+    if json {
+        let reply = serde_json::to_string(s)
+            .map_err(|e| format!("error: failed to encode the status reply: {e}"))?;
+        return print::line(out, &reply);
+    }
+    // No `..`: a new field of the reply does not compile until it prints.
+    let ServeStatus {
+        store_docs,
+        files,
+        num_bytes,
+        index_size_bytes,
+        load_us,
+        root,
+    } = s;
+    let lines = [
+        first.to_owned(),
+        format!("store_docs: {store_docs}"),
+        format!("files: {files}"),
+        format!("num_bytes: {num_bytes}"),
+        format!("index_size_bytes: {index_size_bytes}"),
+        format!("load_us: {load_us}"),
+        format!("root: {root}"),
+    ];
+    lines.iter().try_for_each(|l| print::line(out, l))
+}
+
 /// `--status` (printed) or `--shutdown`.
 pub fn manage(addr: &str, shutdown: bool, out: &mut dyn Write) -> Result<Outcome, String> {
     if shutdown {

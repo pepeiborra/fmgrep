@@ -230,12 +230,16 @@ fn only_the_first_word_selects_a_subcommand() {
         cli(&["status"]).command,
         Some(Command::Status(StatusArgs {
             path: None,
-            json: false
+            json: false,
+            server: None,
         }))
     ));
-    match cli(&["status", "idx", "--json"]).command {
-        Some(Command::Status(a)) => assert_eq!((a.path, a.json), (Some("idx".into()), true)),
-        _ => panic!("status idx --json is the command"),
+    match cli(&["status", "idx", "--json", "--server", "h:1"]).command {
+        Some(Command::Status(a)) => assert_eq!(
+            (a.path, a.json, a.server),
+            (Some("idx".into()), true, Some("h:1".into()))
+        ),
+        _ => panic!("status idx --json --server h:1 is the command"),
     }
     for (words, terms) in [
         (&["--", "index"][..], &["index"][..]),

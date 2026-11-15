@@ -2,7 +2,6 @@
 //! `--json` reports.
 
 use std::io::Write;
-use std::path::Path;
 
 use crate::manifest::Manifest;
 use crate::output::WRITE_FAILED;
@@ -38,10 +37,10 @@ pub fn index_summary(out: &mut dyn Write, json: bool, s: &IndexSummary) -> Resul
     )
 }
 
-/// `status`: under `--json` the manifest as one JSON line, else one
-/// `name: value` line per scalar, by the manifest's names, without the
-/// tables.
-pub fn status(out: &mut dyn Write, json: bool, dir: &Path, m: &Manifest) -> Result<(), String> {
+/// `status` of an index: under `--json` the manifest as one JSON line, else
+/// `first`, then one `name: value` line per scalar, by the manifest's
+/// names, without the tables.
+pub fn status(out: &mut dyn Write, json: bool, first: &str, m: &Manifest) -> Result<(), String> {
     if json {
         // Every path is printed, and the encoding checks the path text
         // once. The paths are the only part of a manifest whose encoding
@@ -50,7 +49,7 @@ pub fn status(out: &mut dyn Write, json: bool, dir: &Path, m: &Manifest) -> Resu
         return line(out, &json);
     }
     let mut lines = vec![
-        format!("index: {}", dir.display()),
+        first.to_owned(),
         format!("format: {}", m.format),
         format!("store_docs: {}", m.store_docs),
         format!("num_docs: {}", m.num_docs),
@@ -121,7 +120,7 @@ mod tests {
 
     fn status_json(m: &Manifest) -> Result<String, String> {
         let mut out = Vec::new();
-        status(&mut out, true, Path::new("idx"), m)?;
+        status(&mut out, true, "idx", m)?;
         Ok(String::from_utf8(out).unwrap())
     }
 

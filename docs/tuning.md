@@ -29,7 +29,7 @@ empty is the default, and any other value that does not parse is an error.
 
 | variable | default | trades |
 |---|---|---|
-| `FMGREP_SERVER` | unset | `HOST:PORT` of a `fmgrep serve`. A search with no `--server` and no `--index` goes there when no `.fmgrep` is found by walking up from the cwd. An index found wins, with a warning that starts `Using local index`. `--status` reads it; `--shutdown` needs `--server`; `fmgrep status` (the local index) does not read it. Empty is unset. |
+| `FMGREP_SERVER` | unset | `HOST:PORT` of a `fmgrep serve`. A search with no `--server` and no `--index` goes there when no `.fmgrep` is found by walking up from the cwd. An index found wins, with a warning that starts `Using local index`. `--status` reads it; `--shutdown` needs `--server`; `fmgrep status` reads it as a search does. Empty is unset. |
 
 A search asks watchman what changed when the tree holds
 50,000 files or more, starting the daemon and adding the watch when they

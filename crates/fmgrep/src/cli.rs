@@ -47,12 +47,36 @@ fn serve(a: &ServeArgs, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<
     Ok(Outcome::Done)
 }
 
-/// `status`: the manifest of the index at or above PATH, as a search
-/// reads it.
-fn status(a: &StatusArgs, out: &mut dyn Write) -> Result<Outcome, String> {
-    let (found, manifest) = open_index(a.path.as_deref())?;
+/// `status`: what a search started in PATH (else the cwd) uses, the index
+/// or server that [`choose`] and [`reach`] pick, with `--server` as a
+/// search's. Fails where that search fails before it searches, in its
+/// words.
+fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, String> {
+    let start = a.path.as_deref().unwrap_or(Path::new("."));
+    let here = match &a.path {
+        Some(path) => format!("in {}", path.display()),
+        None => "here".to_owned(),
+    };
+    let note = match choose(None, a.server.as_deref(), env, start)? {
+        Choice::Index { note, .. } => note,
+        Choice::Server(server) => match reach(&server, start)? {
+            Reached::Conn(mut conn) => {
+                let reply = serve::status_on(&mut conn)?;
+                let first = format!("a search {here} uses {server}");
+                serve::report(out, a.json, &first, &reply)?;
+                return Ok(Outcome::Done);
+            }
+            Reached::Index { note, .. } => Some(note),
+        },
+    };
+    let (found, manifest) = open_index(Some(start))?;
     let dir = std::fs::canonicalize(&found.index_dir).unwrap_or(found.index_dir);
-    print::status(out, a.json, &dir, &manifest)?;
+    let note = note.unwrap_or_default();
+    let first = format!(
+        "a search {here} uses the local index {}{note}",
+        dir.display()
+    );
+    print::status(out, a.json, &first, &manifest)?;
     Ok(Outcome::Done)
 }
 
@@ -375,7 +399,7 @@ fn dispatch_in(
             Ok(Outcome::Index(summary))
         }
         Some(Command::Serve(a)) => serve(a, input, out),
-        Some(Command::Status(a)) => status(a, out),
+        Some(Command::Status(a)) => status(a, env, out),
         None => search(&cli.search, env, input, out, tty, printing),
     }
 }
