@@ -113,6 +113,48 @@ fn serve_stdio_ends_at_eof() {
     assert_eq!(got[0]["result"]["queries"][0]["total_matches"], 4);
 }
 
+/// A lines search reports its matched lines; with `stats`, rg's matches.
+#[test]
+fn a_lines_report_counts_matched_lines_unless_stats() {
+    let request =
+        |params: &str| format!(r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{params}}}"#);
+    let cases = [
+        (r#""terms":["printk"],"mode":"lines""#, (3, 4)),
+        (
+            r#""terms":["printk"],"mode":"lines","color":"always""#,
+            (3, 4),
+        ),
+        (
+            r#""terms":["one\nnothing"],"regex":true,"multiline":true,"mode":"lines""#,
+            (2, 1),
+        ),
+        (
+            r#""expr":{"and":[{"term":"printk"},{"term":"one"}]},"mode":"lines""#,
+            (2, 4),
+        ),
+        (r#""terms":["printk"],"mode":"only""#, (4, 4)),
+    ];
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = staged(tmp.path(), store_docs);
+        for (params, (lines, matches)) in cases {
+            let got = serve_stdio(
+                &index,
+                &[
+                    &request(&format!("{{{params}}}")),
+                    &request(&format!(r#"{{{params},"stats":true}}"#)),
+                ],
+            );
+            let total = |i: usize| &got[i]["result"]["report"]["queries"][0]["total_matches"];
+            assert_eq!(
+                (total(0), total(1)),
+                (&lines.into(), &matches.into()),
+                "store_docs={store_docs} {params}"
+            );
+        }
+    }
+}
+
 #[test]
 fn malformed_requests_are_refused_and_serving_continues() {
     let tmp = tempfile::tempdir().unwrap();

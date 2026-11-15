@@ -135,23 +135,33 @@ fn count_lines_prints_rgs_line_counts() {
 #[test]
 fn the_wire_report_carries_counts_only() {
     // The human path writes as it streams; the report it returns keeps the
-    // counting numbers and nothing per file.
+    // counting numbers and nothing per file: matched lines, or rg's
+    // matches with --stats and under -o.
+    let stats = QueryOutput::Matches(Print {
+        stats: true,
+        ..match MATCHES {
+            QueryOutput::Matches(p) => p,
+            _ => unreachable!(),
+        }
+    });
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
         let manifest = read_manifest(&index).unwrap();
         let terms = vec!["printk".to_string()];
-        let req = request(&index, &manifest, &terms, MATCHES);
-        let mut buf: Vec<u8> = Vec::new();
-        let mut writer = MatchWriter::new(&mut buf, cfg(Format::Lines));
-        let out = run_query(&req, &mut writer).unwrap();
-        writer.finish().unwrap();
-        assert!(!buf.is_empty(), "store_docs={store_docs}");
-        assert_eq!(
-            (out.queries[0].total_matches, out.queries[0].docs_matched),
-            (4, 2),
-            "store_docs={store_docs}"
-        );
+        for (output, want) in [(MATCHES, (3, 2)), (stats, (4, 2)), (ONLY, (4, 2))] {
+            let req = request(&index, &manifest, &terms, output);
+            let mut buf: Vec<u8> = Vec::new();
+            let mut writer = MatchWriter::new(&mut buf, cfg(Format::Lines));
+            let out = run_query(&req, &mut writer).unwrap();
+            writer.finish().unwrap();
+            assert!(!buf.is_empty(), "store_docs={store_docs}");
+            assert_eq!(
+                (out.queries[0].total_matches, out.queries[0].docs_matched),
+                want,
+                "store_docs={store_docs} {output:?}"
+            );
+        }
     }
 }
 

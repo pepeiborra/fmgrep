@@ -15,8 +15,9 @@ pub struct IndexSummary {
 /// One per-term result line, mirroring the harness's per-term metrics.
 ///
 /// `total_matches` / `docs_matched` are rg's numbers in every mode that runs
-/// the matching pass; in counts mode they are the FM-index's document-wide
-/// numbers, and `counts_exact` says whether the two coincide.
+/// the matching pass: matches, or matched lines under `-c` and in a lines
+/// search without `--stats`. In counts mode they are the FM-index's
+/// document-wide numbers, and `counts_exact` says whether the two coincide.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryReport {
     pub term: String,

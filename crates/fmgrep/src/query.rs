@@ -566,7 +566,7 @@ fn answer_terms(
                 let Some((path, f)) = found else {
                     return Ok(());
                 };
-                counts.add(f.stats.matches().max(1));
+                counts.add(f.count.max(1));
                 sink.doc(DocMatches {
                     path: &path,
                     printed: &f.printed,

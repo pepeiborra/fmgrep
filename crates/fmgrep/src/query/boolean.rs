@@ -585,7 +585,7 @@ pub fn answer_expr(
                 let mut counts = Vec::with_capacity(counters.len());
                 for c in &counters {
                     let found = c.as_ref().map(|c| c.doc("", bytes)).transpose()?.flatten();
-                    counts.push(found.map_or(0, |f| f.stats.matches()));
+                    counts.push(found.map_or(0, |f| f.count));
                 }
                 Ok(Some((found, counts)))
             };
@@ -600,7 +600,7 @@ pub fn answer_expr(
                         return Ok(());
                     };
                     docs_matched += 1;
-                    report.total_matches += f.stats.matches().max(1);
+                    report.total_matches += f.count.max(1);
                     leaf_totals
                         .iter_mut()
                         .zip(counts)
