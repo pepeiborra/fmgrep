@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 
+use super::super::read::{self, BYTE_NS};
 use super::{Leaf, Probe, demotable};
 use crate::expr::Expr;
 use crate::pattern::PreparedPattern;
@@ -11,6 +12,16 @@ use crate::sharded::{DocfmIndex, Walk};
 
 /// Reference documents read to measure the read cost.
 pub const SAMPLE_DOCS: usize = 16;
+
+/// Nanoseconds per byte of a large document a walked candidate's check
+/// reads: 1 ns. A measurement supports the value: on a Mac, checking a
+/// -i pattern over large documents cost 1.0 to 1.1 ns a byte at the
+/// median, 0.4 ns at the tenth percentile and 1.7 ns at the ninetieth.
+/// Half or twice it changes few plans. It is written as [`BYTE_NS`], a
+/// plain read, times the default band's ceiling over its floor only
+/// because that product is 1 ns; the band says nothing of the cost of the
+/// fold matcher.
+pub const LARGE_BYTE_NS: f64 = BYTE_NS * ReadBand::DEFAULT.max_us / ReadBand::DEFAULT.min_us;
 
 /// A regex reference, or an AND under an OR, demotes a sibling counted over
 /// this many times the rarest.
@@ -107,12 +118,21 @@ pub enum Why {
         total: u64,
         min: u64,
     },
-    /// Judged by [`decide`]: locating against reading `docs` at `read_us`.
+    /// Judged by [`decide`]: locating against reading `docs` at `read_us`
+    /// each, `read_all_us` in all. A walked candidate's `rows` are its
+    /// busiest shard's and their µs each; `held` is the share of the
+    /// documents that hold the candidates, which only a sample measures,
+    /// and that locating reads too; `large` counts its large documents and
+    /// their µs at [`LARGE_BYTE_NS`], which `read_us` does not price.
     Cost {
         reference: usize,
         locate_us: f64,
+        rows: Option<(u64, f64)>,
         docs: usize,
         read_us: f64,
+        read_all_us: f64,
+        held: Option<f64>,
+        large: Option<(usize, f64)>,
         read: Read,
     },
 }
@@ -126,6 +146,12 @@ pub enum Read {
     Sampled(usize),
     /// The sample failed; the ceiling stood in.
     Failed,
+    /// Not sampled: reading the `docs` a sample takes may cost `us`, at the
+    /// band ceiling, no less than demoting saves.
+    Unsampled {
+        docs: usize,
+        us: f64,
+    },
 }
 
 /// Which leaves are located, where, and what their exact counts may miss.
@@ -319,18 +345,58 @@ pub fn arrange(
     plan
 }
 
+/// What [`decide`] prices a walked candidate with: a folded literal the
+/// count pass walked has only its rows left to locate.
+pub struct Walked<'a> {
+    /// Per leaf, whether the count pass walked it.
+    pub leaves: &'a [bool],
+    /// Per leaf, once a walked one is located, the longest one shard took.
+    pub located_us: &'a [Option<f64>],
+    /// µs per located row: the index's measured cost, or its default.
+    pub row_us: f64,
+    pub doc_lens: &'a [u64],
+}
+
+/// A read sample: µs per document, and the share of the documents that
+/// hold every candidate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sample {
+    pub us: f64,
+    pub held: f64,
+}
+
 /// Demote a candidate when its locate estimate exceeds reading the
 /// reference's documents in [`Group::within`]: the band floor keeps it, the
 /// ceiling demotes it, in between one read sample of [`SAMPLE_DOCS`] decides
-/// (a failed one counts as the ceiling). `read_us` times reads of the given
-/// documents, per document.
+/// (a failed one counts as the ceiling). `read_us` reads the given
+/// documents.
+///
+/// A literal candidate's locate is the reference's probe time scaled by
+/// their occurrences. A walked candidate's is its busiest shard's rows (the
+/// shards locate in parallel) at the reference's time per row of its own
+/// busiest shard, clamped as a measured row cost is, and at most
+/// `walked.row_us`: for a walked reference, the time of its slowest shard,
+/// since a reference of few rows probes in mostly the fixed cost of
+/// starting a probe, which scaling would multiply.
+///
+/// For a walked candidate only the documents that lack the candidates
+/// count: a folded leaf decides no document by itself, so locating it still
+/// reads the others. A sample measures that share, so the band floor no
+/// longer decides alone. The band prices a document of the usual size; a
+/// large one, whose plain read at [`BYTE_NS`] already costs more than the
+/// band ceiling, costs its bytes at [`LARGE_BYTE_NS`], is not sampled, and
+/// counts as lacking the candidates. Below the ceiling, a walked candidate
+/// is sampled unless the sample may cost, at the ceiling, as much as
+/// demoting can save: locating it, less reading the large documents.
 pub fn decide(
     plan: &mut Plan,
     band: ReadBand,
     stage1: &[Option<&Answer>],
-    read_us: &mut dyn FnMut(&[usize]) -> Result<f64, String>,
+    walked: &Walked<'_>,
+    read_us: &mut dyn FnMut(&[usize]) -> Result<Sample, String>,
 ) {
     let mut sampled = None;
+    let large = |d: usize| walked.doc_lens[d] as f64 * BYTE_NS / 1000.0 > band.max_us;
     for g in std::mem::take(&mut plan.groups) {
         let a = stage1[g.reference].expect("a reference is probed before its candidates");
         let located = a.exact.iter().filter(|e| e.1 > 0).map(|e| e.0);
@@ -338,28 +404,80 @@ pub fn decide(
             .filter(|&d| contains(&g.within, d))
             .collect();
         let occ_m = occurrences(&plan.counts[g.reference], &g.within);
+        let reference_us = (walked.located_us[g.reference]).unwrap_or(a.probe_us.max(1) as f64);
+        let per_row = reference_us / busiest(&plan.counts[g.reference]).max(1) as f64;
+        let row_us = read::locate_us(Some(per_row)).min(walked.row_us);
+        // For a walked candidate, the documents of the usual size, and the
+        // large ones at their bytes.
+        let (usual, big): (Vec<usize>, Vec<usize>) =
+            match g.candidates.iter().any(|&i| walked.leaves[i]) {
+                true => docs.iter().copied().partition(|&d| !large(d)),
+                false => (docs.clone(), Vec::new()),
+            };
+        let big_us: f64 = (big.iter())
+            .map(|&d| walked.doc_lens[d] as f64 * LARGE_BYTE_NS / 1000.0)
+            .sum();
+        let ids = spread(&usual, SAMPLE_DOCS);
         for &i in &g.candidates {
+            let walk = walked.leaves[i];
             let occ_i = occurrences(&plan.counts[i], &g.within);
-            let cost = |read| demote_by_cost(a.probe_us, occ_m, docs.len(), occ_i, read);
-            let (demote, us, read) = match (cost(band.min_us), cost(band.max_us)) {
-                (false, _) => (false, band.min_us, Read::Floor),
-                (true, true) => (true, band.max_us, Read::Ceiling),
-                (true, false) => {
-                    let (us, read) = *sampled.get_or_insert_with(|| {
-                        let ids = spread(&docs, SAMPLE_DOCS);
-                        match read_us(&ids) {
-                            Ok(us) => (us, Read::Sampled(ids.len())),
-                            Err(_) => (band.max_us, Read::Failed),
-                        }
-                    });
-                    (cost(us), us, read)
+            let (locate_us, rows) = match walk {
+                true => {
+                    let rows = busiest(&plan.counts[i]);
+                    (rows as f64 * row_us, Some((rows, row_us)))
                 }
+                false => (locate_est_us(a.probe_us, occ_m, occ_i), None),
+            };
+            // Reading at `us` a usual document, but for the share `held`
+            // that locating reads too, and the large ones.
+            let read_total = |us: f64, held: f64| match walk {
+                true => usual.len() as f64 * us * (1.0 - held) + big_us,
+                false => docs.len() as f64 * us,
+            };
+            let cost = |us, held| match walk {
+                true => docs.is_empty() || locate_us > read_total(us, held),
+                false => demote_by_cost(a.probe_us, occ_m, docs.len(), occ_i, us),
+            };
+            let ceiling = cost(band.max_us, 0.0);
+            // What a sample may cost a walked candidate, when that is no
+            // less than demoting can save.
+            let unsampled = (walk && !ceiling && sampled.is_none())
+                .then_some(ids.len() as f64 * band.max_us)
+                .filter(|&us| locate_us - big_us <= us);
+            let (demote, us, held, read) = match unsampled {
+                Some(us) => {
+                    let read = Read::Unsampled {
+                        docs: ids.len(),
+                        us,
+                    };
+                    (false, band.max_us, 0.0, read)
+                }
+                None => match (walk || cost(band.min_us, 0.0), ceiling) {
+                    (false, _) => (false, band.min_us, 0.0, Read::Floor),
+                    (true, true) => (true, band.max_us, 0.0, Read::Ceiling),
+                    (true, false) => {
+                        let (us, held, read, of) =
+                            *sampled.get_or_insert_with(|| match read_us(&ids) {
+                                Ok(Sample { us, held }) => {
+                                    (us, held, Read::Sampled(ids.len()), g.reference)
+                                }
+                                Err(_) => (band.max_us, 0.0, Read::Failed, g.reference),
+                            });
+                        // Another group's documents say nothing of this one's.
+                        let held = if of == g.reference { held } else { 0.0 };
+                        (cost(us, held), us, held, read)
+                    }
+                },
             };
             plan.why[i] = Why::Cost {
                 reference: g.reference,
-                locate_us: locate_est_us(a.probe_us, occ_m, occ_i),
+                locate_us,
+                rows,
                 docs: docs.len(),
                 read_us: us,
+                read_all_us: read_total(us, 0.0),
+                held: walk.then_some(held),
+                large: walk.then_some((big.len(), big_us)),
                 read,
             };
             if demote {
@@ -380,6 +498,11 @@ pub fn demote_by_cost(t_m_us: u64, occ_m: u64, docs_m: usize, occ_i: u64, read_u
 /// Locating `occ_i` occurrences costs `t_m_us` per `occ_m`, linearly.
 pub fn locate_est_us(t_m_us: u64, occ_m: u64, occ_i: u64) -> f64 {
     t_m_us.max(1) as f64 * occ_i as f64 / occ_m.max(1) as f64
+}
+
+/// The most occurrences one shard counts.
+fn busiest(counts: &[(Range<usize>, u64)]) -> u64 {
+    counts.iter().map(|c| c.1).max().unwrap_or(0)
 }
 
 /// The occurrences counted in ranges that meet `within`.

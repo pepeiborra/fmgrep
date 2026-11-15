@@ -13,7 +13,7 @@ const LOCATE_US: f64 = 0.7;
 /// Bounds on a measured locate cost.
 const LOCATE_RANGE: RangeInclusive<f64> = 0.02..=20.0;
 /// Nanoseconds per byte read.
-const BYTE_NS: f64 = 0.15;
+pub const BYTE_NS: f64 = 0.15;
 
 /// µs per occurrence a shard locates: `measured` clamped, else the default.
 pub fn locate_us(measured: Option<f64>) -> f64 {

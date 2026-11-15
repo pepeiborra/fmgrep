@@ -3,7 +3,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use super::demote::{FALLBACK_RATIO, Plan, Read, Why};
+use super::demote::{FALLBACK_RATIO, LARGE_BYTE_NS, Plan, Read, Why};
 use super::{Hits, Leaf, Probe, Tri};
 use crate::expr::Expr;
 use crate::matching::QueryOutput;
@@ -155,22 +155,68 @@ impl fmt::Display for Reason {
             Why::Cost {
                 reference,
                 locate_us,
+                rows,
                 docs,
                 read_us,
+                read_all_us,
+                held,
+                large,
                 read,
             } => {
                 let (verdict, op) = match self.demoted {
                     true => ("demoted", ">"),
                     false => ("located", "<="),
                 };
+                write!(f, "{verdict}: locate est {}", Us(locate_us))?;
+                if let Some((rows, row_us)) = rows {
+                    write!(f, " (busiest shard {rows} x {})", Row(row_us))?;
+                }
+                let (big, big_us) = large.unwrap_or((0, 0.0));
+                let s = plural(big);
+                if let Read::Unsampled { docs: n, us } = read {
+                    write!(f, " {op} {}", Us(us + big_us))?;
+                    if n > 0 {
+                        write!(
+                            f,
+                            ", a read sample of {n} of the {docs} docs of leaf {reference} at the band ceiling"
+                        )?;
+                    }
+                    return match (big, n) {
+                        (0, _) => Ok(()),
+                        (_, 0) => write!(
+                            f,
+                            ", the {big} large doc{s} of leaf {reference} at {LARGE_BYTE_NS:.2} ns a byte, none to sample"
+                        ),
+                        _ => write!(
+                            f,
+                            ", and its {big} large doc{s} at {LARGE_BYTE_NS:.2} ns a byte"
+                        ),
+                    };
+                }
                 write!(
                     f,
-                    "{verdict}: locate est {} {op} read {docs} doc{} of leaf {reference} x {} = {}",
-                    Us(locate_us),
-                    plural(docs),
-                    Us(read_us),
-                    Us(docs as f64 * read_us)
+                    " {op} read {docs} doc{} of leaf {reference}",
+                    plural(docs)
                 )?;
+                match big {
+                    0 => write!(f, " x {}", Us(read_us))?,
+                    _ => write!(
+                        f,
+                        ": {} x {} and {big} large at {LARGE_BYTE_NS:.2} ns a byte",
+                        docs - big,
+                        Us(read_us)
+                    )?,
+                }
+                write!(f, " = {}", Us(read_all_us))?;
+                if let (Some(held), Read::Sampled(n)) = (held, read) {
+                    let of = (held * n as f64).round();
+                    let rest = (read_all_us - big_us) * (1.0 - held) + big_us;
+                    write!(
+                        f,
+                        ", less the {of} of {n} sampled that hold the candidates: {}",
+                        Us(rest)
+                    )?;
+                }
                 match read {
                     Read::Floor => f.write_str(" at the band floor"),
                     Read::Ceiling => f.write_str(" at the band ceiling"),
@@ -178,9 +224,24 @@ impl fmt::Display for Reason {
                         write!(f, ", the read cost sampled over {n} doc{}", plural(n))
                     }
                     Read::Failed => f.write_str(" at the band ceiling, the read sample failed"),
+                    Read::Unsampled { .. } => unreachable!("written above"),
                 }
             }
         }
+    }
+}
+
+/// µs per row, to three significant digits.
+pub(super) struct Row(pub f64);
+
+impl fmt::Display for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let us = self.0;
+        let digits = match us > 0.0 && us.is_finite() {
+            true => (2 - us.log10().floor() as i32).max(0) as usize,
+            false => 0,
+        };
+        write!(f, "{us:.digits$} µs")
     }
 }
 
