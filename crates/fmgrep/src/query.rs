@@ -10,7 +10,7 @@ use crate::blobs::BlobSlots;
 use crate::expr::Expr;
 use crate::fetch::{Ask, DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
-use crate::manifest::{Checked, Manifest};
+use crate::manifest::{Checked, FileTable, Manifest};
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
@@ -117,10 +117,8 @@ pub fn load(
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
     let load = tracing::info_span!("load").entered();
-    let open = tracing::info_span!("open").entered();
-    let docs = DocStore::open(index_dir, manifest, corpus_root, ask)?;
-    let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
-    drop(open);
+    let (docs, blobs) =
+        tracing::info_span!("open").in_scope(|| open(index_dir, manifest, corpus_root, ask))?;
     let (files, docs_ref) = (&manifest.files, &docs);
     #[cfg(test)]
     let hooks = crate::tests::Hooks::here();
@@ -133,24 +131,7 @@ pub fn load(
             let _span = check.enter();
             #[cfg(test)]
             hooks.apply();
-            // Stored docs need no path here.
-            if docs_ref.stored() {
-                return Ok(());
-            }
-            // The files layout reads every path: one check of them all.
-            let files = match checked {
-                Some(files) => files,
-                None => files.checked()?,
-            };
-            // A server that refuses to serve needs no stat pass.
-            let learned = docs_ref.replay(files);
-            if matches!(learned, Learned::Answered { .. }) || docs_ref.refusal().is_some() {
-                return Ok(());
-            }
-            let check = check.clone();
-            scope.spawn(move || check.in_scope(|| docs_ref.discover(files)));
-            docs_ref.stat_all(files);
-            Ok::<_, String>(())
+            check_changes(scope, &check, docs_ref, files, checked)
         });
         let index =
             tracing::info_span!("index").in_scope(|| DocfmIndex::load(&blobs, &manifest.doc_lens));
@@ -161,30 +142,74 @@ pub fn load(
     drop(wait);
     fresh?;
     let index = index.map_err(|e| format!("error: {e}"))?;
-    let loaded = Loaded {
+    let mut loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
         band: boolean::ReadBand::DEFAULT,
         locate_us: read::locate_us(None),
     };
-    let loaded = finish(loaded, manifest);
+    note_stale(&mut loaded.docs, &manifest.files);
     covers(index.num_files_indexed(), manifest)?;
     Ok((index, loaded))
 }
 
-/// `loaded` once its stale docs are noted.
-fn finish(mut loaded: Loaded, manifest: &Manifest) -> Loaded {
-    loaded.docs.begin();
-    let stale = loaded
-        .docs
-        .stale()
-        .partition_point(|&id| id < manifest.files.len());
+/// The check of what changed since the index, as [`load`] runs it beside
+/// the index load: the re-check of what watchman names, else the stat
+/// pass, with discovery on a thread of `scope`, in `span`. `checked` is
+/// the manifest's paths when the caller has checked them already.
+pub fn check_changes<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    span: &tracing::Span,
+    docs: &'env DocStore,
+    files: &'env FileTable,
+    checked: Option<Checked<'env>>,
+) -> Result<Learned, String> {
+    // Stored docs need no path here.
+    if docs.stored() {
+        return Ok(Learned::Stored);
+    }
+    // The files layout reads every path: one check of them all.
+    let files = match checked {
+        Some(files) => files,
+        None => files.checked()?,
+    };
+    // A server that refuses to serve needs no stat pass.
+    let learned = docs.replay(files);
+    if matches!(learned, Learned::Answered { .. }) || docs.refusal().is_some() {
+        return Ok(learned);
+    }
+    let span = span.clone();
+    scope.spawn(move || span.in_scope(|| docs.discover(files)));
+    docs.stat_all(files);
+    Ok(learned)
+}
+
+/// Open the documents and the blobs of the index at `index_dir`, as
+/// [`load`] opens them before the index loads: what a search refuses
+/// there is refused here.
+pub fn open<'m>(
+    index_dir: &Path,
+    manifest: &'m Manifest,
+    corpus_root: Option<&Path>,
+    ask: Ask,
+) -> Result<(DocStore, BlobSlots<'m>), String> {
+    let docs = DocStore::open(index_dir, manifest, corpus_root, ask)?;
+    let blobs = BlobSlots::open(index_dir, &manifest.blobs, &manifest.blob_lens)?;
+    Ok((docs, blobs))
+}
+
+/// After the check of what changed, as [`load`] ends: begin the first
+/// query of `docs` and note its stale docs. How many of the indexed
+/// `files` are stale.
+pub fn note_stale(docs: &mut DocStore, files: &FileTable) -> usize {
+    docs.begin();
+    let stale = docs.stale().partition_point(|&id| id < files.len());
     if stale > 0 {
         eprintln!(
             "note: {stale} file(s) changed since indexing are scanned in full by every query; re-run index"
         );
     }
-    loaded
+    stale
 }
 
 /// [`load`] then [`answer`].
