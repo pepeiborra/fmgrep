@@ -112,7 +112,11 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         if r.starts_with("# ") {
             continue;
         }
+        // An ordinary change's third field says whether it is a submodule.
         let path = vcs::status_path(r).ok_or_else(|| format!("git status printed {r:?}"))?;
+        if r.starts_with('1') && r.split(' ').nth(2).is_some_and(|s| s.starts_with('S')) {
+            return Err(format!("the checkout holds a submodule ({path})"));
+        }
         skip.push(path.to_owned());
     }
     match head.as_deref() {
@@ -122,6 +126,8 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
         }
         Some(_) => {}
     }
+    hidden(top)?;
+    converts(top)?;
     if let Some(p) = skip
         .iter()
         .find(|p| crate::walk::ignore_file_dir(p).is_some())
@@ -130,6 +136,7 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
             "an ignore file differs from the served commit ({p})"
         ));
     }
+    outer_ignores(top)?;
     // Tracked files that the client's own excludes ignore are left out of
     // its part when it resolves the list, as its index would leave them.
     skip.extend(excluded(top)?);
@@ -147,6 +154,162 @@ pub fn over(n: usize, commit: &str) -> String {
         "{n} files differ from the served commit {}; the limit is {MAX_SKIP}",
         short(commit)
     )
+}
+
+/// Refuse a checkout whose index hides changes from git status
+/// (assume-unchanged or skip-worktree entries), or that holds a submodule.
+fn hidden(top: &Path) -> Result<(), String> {
+    let listed = vcs::git(top, &["ls-files", "-z", "-s", "-v"])?;
+    let mut hidden = 0;
+    for r in vcs::records(&listed) {
+        // `<tag> <mode> <oid> <stage>\t<path>`: `S` is skip-worktree, a
+        // lowercase tag assume-unchanged.
+        let (tag, rest) = r.split_at(r.iter().position(|&b| b == b' ').unwrap_or(0));
+        if tag == b"S" || tag.first().is_some_and(u8::is_ascii_lowercase) {
+            hidden += 1;
+        }
+        let entry = vcs::entry(rest.get(1..).unwrap_or_default())?;
+        if entry.mode == "160000" {
+            let path = String::from_utf8_lossy(entry.path);
+            return Err(format!("the checkout holds a submodule ({path})"));
+        }
+    }
+    match hidden {
+        0 => Ok(()),
+        n => Err(format!(
+            "git hides changes to {n} file{} (assume-unchanged or skip-worktree)",
+            crate::verbose::plural(n)
+        )),
+    }
+}
+
+/// Refuse a checkout whose files git converts between the work tree and
+/// the index (line endings, `ident`, an encoding, a filter that cleans or
+/// smudges), so that they can differ from their blobs when git status says
+/// they do not; or a sparse one. Git says what applies: the value of a
+/// setting that wins, and the attributes of the tracked files, from every
+/// attributes file.
+fn converts(top: &Path) -> Result<(), String> {
+    // The value that wins: `true`, `false` (also when unset) or a string.
+    let get = |key: &str| {
+        let args = [
+            "config",
+            "--type=bool-or-str",
+            "--default=false",
+            "--get",
+            key,
+        ];
+        vcs::line(vcs::git(top, &args)?)
+    };
+    if get("core.sparseCheckout")? == "true" {
+        return Err("the checkout is sparse (core.sparseCheckout)".to_owned());
+    }
+    let converts = |what: String| Err(format!("git converts files ({what})"));
+    // `input` converts a file only on its way to the index: a file changed
+    // to CRLF line endings can still match its blob for git status.
+    if let v @ ("true" | "input") = get("core.autocrlf")?.as_str() {
+        return converts(format!("core.autocrlf={v}"));
+    }
+    let config = vcs::git(
+        top,
+        &[
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ],
+    );
+    // `git config --get-regexp` fails when nothing matches.
+    let config = config.unwrap_or_default();
+    for r in vcs::records(&config) {
+        let r = String::from_utf8_lossy(r);
+        let key = r.split_once('\n').map_or(&*r, |(key, _)| key);
+        if let Some(name) = key
+            .strip_prefix("filter.")
+            .and_then(|k| k.rsplit_once('.'))
+            .map(|(name, _)| name)
+        {
+            let spec = format!(":(attr:filter={name})");
+            let files = vcs::git(top, &["ls-files", "-z", "--", &spec])?;
+            let n = vcs::records(&files).count();
+            if n > 0 {
+                return converts(format!(
+                    "the filter {name} applies to {n} file{}",
+                    crate::verbose::plural(n)
+                ));
+            }
+        }
+    }
+    // The first tracked file with one of these attributes. `core.eol`
+    // converts only a file with `text`, and `eol` sets `text`.
+    let first = |specs: &[&str]| {
+        let mut args = vec!["ls-files", "-z", "--"];
+        args.extend(specs);
+        let out = vcs::git(top, &args)?;
+        let path = vcs::records(&out).next();
+        Ok::<_, String>(path.map(|p| String::from_utf8_lossy(p).into_owned()))
+    };
+    let text = [
+        ":(attr:text)",
+        ":(attr:text=auto)",
+        ":(attr:eol=lf)",
+        ":(attr:eol=crlf)",
+        ":(attr:ident)",
+    ];
+    // Any value of `working-tree-encoding`: every file but those where it
+    // is unspecified.
+    let found = match first(&text)? {
+        Some(path) => Some(path),
+        None => first(&[":(exclude,attr:!working-tree-encoding)"])?,
+    };
+    match found {
+        Some(path) => converts(format!(
+            "the attribute {} applies to {path}",
+            attribute(top, &path)?
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The first attribute by which git converts the tracked file `path`, as
+/// an attributes file writes it: `ident`, `text=auto`.
+fn attribute(top: &Path, path: &str) -> Result<String, String> {
+    let names = ["text", "eol", "ident", "working-tree-encoding"];
+    let mut args = vec!["check-attr", "-z"];
+    args.extend(names);
+    args.extend(["--", path]);
+    let out = vcs::git(top, &args)?;
+    let fields: Vec<_> = vcs::records(&out).map(String::from_utf8_lossy).collect();
+    // `<path>`, `<attribute>`, `<value>`, for each attribute.
+    for field in fields.chunks(3) {
+        match field {
+            [_, _, value] if value == "unspecified" || value == "unset" => {}
+            [_, name, value] if value == "set" => return Ok(name.to_string()),
+            [_, name, value] => return Ok(format!("{name}={value}")),
+            _ => {}
+        }
+    }
+    Ok(names.join(" or "))
+}
+
+/// Refuse a checkout that the ignore files of its ancestors apply to,
+/// when one holds a pattern that can reach a file of it. rg and git stop reading `.gitignore` and
+/// `info/exclude` at the top of a repository, which `top` is, so those of
+/// a repository around it are no rule here; `.ignore` and `.rgignore`
+/// are read all the way up.
+fn outer_ignores(top: &Path) -> Result<(), String> {
+    for dir in top.ancestors().skip(1) {
+        for name in [".ignore", ".rgignore"] {
+            let path = dir.join(name);
+            if vcs::served::reaches(&path, top) {
+                return Err(format!(
+                    "an ignore file above the checkout applies ({})",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The tracked files that rules the served commit does not carry ignore:

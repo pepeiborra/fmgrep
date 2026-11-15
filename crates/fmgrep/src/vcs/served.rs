@@ -263,16 +263,58 @@ fn no_submodule(entry: &Entry<'_>) -> Result<(), String> {
     }
 }
 
-/// Whether the ignore file at `path` exists and holds a line that is
-/// neither blank nor a comment. Leading blanks belong to a pattern: ` #a`
-/// is one.
+/// The patterns of an ignore file's `text`: the lines that are neither
+/// blank nor a comment. Leading blanks belong to a pattern: ` #a` is one.
+fn patterns(text: &[u8]) -> impl Iterator<Item = &[u8]> {
+    text.split(|&b| b == b'\n')
+        .map(<[u8]>::trim_ascii_end)
+        .filter(|l| !l.is_empty() && !l.starts_with(b"#"))
+}
+
+/// Whether the ignore file at `path` exists and holds a pattern.
 pub fn has_pattern(path: &Path) -> bool {
-    std::fs::read(path).is_ok_and(|text| {
-        text.split(|&b| b == b'\n').any(|l| {
-            let l = l.trim_ascii_end();
-            !l.is_empty() && !l.starts_with(b"#")
-        })
+    std::fs::read(path).is_ok_and(|text| patterns(&text).next().is_some())
+}
+
+/// Whether the `.ignore` or `.rgignore` file at `path`, in a directory
+/// above `root`, holds a pattern that can change what a walk of `root`
+/// lists. rg tests neither the root nor what lies above it, so a pattern
+/// that names one path (anchored, no glob character: `/clone/`,
+/// `!/clone/`) matches no entry of the walk unless that path is below the
+/// root.
+pub fn reaches(path: &Path, root: &Path) -> bool {
+    let Ok(text) = std::fs::read(path) else {
+        return false;
+    };
+    let dir = path.parent().and_then(|d| std::fs::canonicalize(d).ok());
+    let root = std::fs::canonicalize(root).ok();
+    patterns(&text).any(|p| match (&dir, &root) {
+        (Some(dir), Some(root)) => names_below(p, dir, root),
+        _ => true,
     })
+}
+
+/// Whether the pattern `p`, of an ignore file in `dir`, may match an
+/// entry below `root`: unless it is anchored, without glob characters (`*?[`,
+/// `{` for an alternation, and the escape `\`), and names `root` or a path
+/// that is not below it.
+fn names_below(p: &[u8], dir: &Path, root: &Path) -> bool {
+    let Ok(p) = std::str::from_utf8(p) else {
+        return true;
+    };
+    let p = p.strip_prefix('!').unwrap_or(p);
+    let p = p.strip_suffix('/').unwrap_or(p);
+    let anchored = p.strip_prefix('/').or(p.contains('/').then_some(p));
+    match anchored {
+        Some(rel)
+            if !rel.contains(['*', '?', '[', '{', '\\'])
+                && rel.split('/').all(|c| !matches!(c, "" | "." | "..")) =>
+        {
+            let named = dir.join(rel);
+            named != root && named.starts_with(root)
+        }
+        _ => true,
+    }
 }
 
 /// Whether each stored document is the text of its blob, as the index
