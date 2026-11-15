@@ -141,20 +141,28 @@ pub struct Entry<'a> {
 /// The entries of `git ls-tree -r -z` output, in its (path) order.
 pub fn entries(out: &[u8]) -> impl Iterator<Item = Result<Entry<'_>, String>> {
     records(out).map(|r| {
-        let bad = || "git ls-tree printed an entry it should not".to_owned();
-        let tab = r.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
-        let head = std::str::from_utf8(&r[..tab]).map_err(|_| bad())?;
-        let mut fields = head.split(' ');
-        let (Some(mode), Some(_type), Some(oid)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(bad());
-        };
-        Ok(Entry {
-            mode,
-            oid,
-            path: &r[tab + 1..],
-        })
+        let ([mode, _type, oid], path) = fields(r, "ls-tree")?;
+        Ok(Entry { mode, oid, path })
     })
+}
+
+/// One record of `git ls-files -s -z`: `<mode> <oid> <stage>\t<path>`.
+pub fn entry(r: &[u8]) -> Result<Entry<'_>, String> {
+    let ([mode, oid, _stage], path) = fields(r, "ls-files")?;
+    Ok(Entry { mode, oid, path })
+}
+
+/// The three fields of record `r` before its tab, and its path; `what`
+/// is the git command that printed it.
+fn fields<'a>(r: &'a [u8], what: &str) -> Result<([&'a str; 3], &'a [u8]), String> {
+    let bad = || format!("git {what} printed an entry it should not");
+    let tab = r.iter().position(|&b| b == b'\t').ok_or_else(bad)?;
+    let head = std::str::from_utf8(&r[..tab]).map_err(|_| bad())?;
+    let mut fields = head.split(' ');
+    let (Some(a), Some(b), Some(c)) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(bad());
+    };
+    Ok(([a, b, c], &r[tab + 1..]))
 }
 
 /// Why reading blobs stopped.

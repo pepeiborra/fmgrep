@@ -311,7 +311,7 @@ type Unsound = (Change, &'static str);
 fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
     let r = Remote::new(&FILES);
     let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
-    let cases: [Unsound; 2] = [
+    let cases: [Unsound; 13] = [
         (
             |r, c| {
                 r.s.write(c, &[("a.c", "printk top\n")]);
@@ -321,17 +321,288 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
             "HEAD is not the served commit {short}",
         ),
         (
+            |r, c| {
+                r.s.git(c, &["update-index", "--assume-unchanged", "z.c"]);
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["update-index", "--skip-worktree", "z.c"]);
+            },
+            "git hides changes to 1 file (assume-unchanged or skip-worktree)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "core.sparseCheckout", "true"]);
+            },
+            "the checkout is sparse (core.sparseCheckout)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "core.autocrlf", "true"]);
+            },
+            "git converts files (core.autocrlf=true)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "core.autocrlf", "input"]);
+            },
+            "git converts files (core.autocrlf=input)",
+        ),
+        (
+            |r, c| r.s.write(c, &[(".git/info/attributes", "*.c text=auto\n")]),
+            "git converts files (the attribute text=auto applies to .hidden.c)",
+        ),
+        (
+            |r, _| {
+                r.s.write(&r.s.path("config"), &[("git/attributes", "*.h eol=crlf\n")])
+            },
+            "git converts files (the attribute eol=crlf applies to dir/sub/c.h)",
+        ),
+        (
+            |r, c| {
+                let file = r.s.path("attributes");
+                r.s.write(&file, &[("x", "*.h working-tree-encoding=UTF-16\n")]);
+                let path = file.join("x").display().to_string();
+                r.s.git(c, &["config", "core.attributesFile", &path]);
+            },
+            "git converts files (the attribute working-tree-encoding=UTF-16 applies to dir/sub/c.h)",
+        ),
+        (
+            |r, c| {
+                r.s.git(c, &["config", "filter.up.smudge", "cat"]);
+                r.s.write(c, &[(".git/info/attributes", "*.c filter=up\n")]);
+            },
+            "git converts files (the filter up applies to 5 files)",
+        ),
+        (
+            |r, c| {
+                let info = format!("160000,{},sub", r.commit);
+                r.s.git(c, &["update-index", "--add", "--cacheinfo", &info]);
+                std::fs::create_dir(c.join("sub")).unwrap();
+            },
+            "the checkout holds a submodule (sub)",
+        ),
+        (
+            |r, _| r.s.write(r.s.tmp.path(), &[(".ignore", "*.h\n")]),
+            "an ignore file above the checkout applies ({tmp}/.ignore)",
+        ),
+        (
             |r, c| r.s.write(c, &[(".gitignore", "*.log\n*.h\n")]),
             "an ignore file differs from the served commit (.gitignore)",
         ),
     ];
+    let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
     for (change, why) in cases {
         reset(&r);
+        let _ = std::fs::remove_file(r.s.tmp.path().join(".ignore"));
+        for args in [
+            &["config", "--unset", "core.sparseCheckout"][..],
+            &["config", "--unset", "core.autocrlf"],
+            &["config", "--unset", "core.attributesFile"],
+            &["config", "--remove-section", "filter.up"],
+            &[
+                "update-index",
+                "--no-skip-worktree",
+                "--no-assume-unchanged",
+                "z.c",
+            ],
+        ] {
+            let _ = r.s.git_output(&r.client, args);
+        }
+        let _ = std::fs::remove_file(r.client.join(".git/info/attributes"));
+        let _ = std::fs::remove_file(r.s.path("config/git/attributes"));
+        let _ = std::fs::remove_file(r.client.join(".git/info/exclude"));
         r.s.write(&r.client, &[("a.c", "none\n")]);
         change(&r, &r.client);
         let out = r.search(&r.client, &["-l", "printk"]);
-        let why = why.replace("{short}", &r.commit[..7]);
+        let why = why
+            .replace("{tmp}", &tmp.display().to_string())
+            .replace("{client}", &r.client.display().to_string())
+            .replace("{short}", &r.commit[..7]);
         assert_eq!(stderr(&out), crate::remote::ignored(&why));
         assert_eq!(stdout(&out), served, "{why}");
+    }
+    // A filter that applies to no file converts nothing.
+    reset(&r);
+    let _ = std::fs::remove_file(r.client.join(".git/info/exclude"));
+    let _ = std::fs::remove_file(r.s.tmp.path().join(".ignore"));
+    r.s.git(&r.client, &["config", "filter.up.smudge", "cat"]);
+    r.same("", &["-l", "printk"]);
+}
+
+/// A checkout inside another directory or repository: rg and git stop at
+/// the top of the repository, so a `.gitignore` above it, in a repository
+/// or not, and the `info/exclude` of the repository around it are no rule
+/// for it, while `.ignore` and `.rgignore` are, all the way up. The edit
+/// of `a.c` is found; but under a pattern of the second kind the client
+/// says so and gives the server's answer.
+#[test]
+fn a_checkout_nested_in_a_repository_ignores_only_its_ignore_files() {
+    let r = Remote::new(&FILES);
+    let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
+    let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let found = "dir/b.c\ndir/sub/c.h\ne.c\nz.c\n";
+    r.s.write(&r.client, &[("a.c", "none\n"), ("z.c", "printk z\n")]);
+    for what in ["a plain directory", "a repository"] {
+        r.s.write(&tmp, &[(".gitignore", "*.c\n*.h\n")]);
+        r.same("", &["-l", "printk"]);
+        let out = r.search(&r.client, &["-l", "printk"]);
+        assert_eq!(stderr(&out), "", "{what}");
+        assert_eq!(stdout(&out), found, "{what}");
+        r.s.git(&tmp, &["init", "-q"]);
+        r.s.write(&tmp, &[(".git/info/exclude", "*.c\n")]);
+    }
+    for name in [".ignore", ".rgignore"] {
+        r.s.write(&tmp, &[(name, "*.h\n")]);
+        let out = r.search(&r.client, &["-l", "printk"]);
+        let why = format!(
+            "an ignore file above the checkout applies ({}/{name})",
+            tmp.display()
+        );
+        assert_eq!(stderr(&out), crate::remote::ignored(&why));
+        assert_eq!(stdout(&out), served, "{name}");
+        std::fs::remove_file(tmp.join(name)).unwrap();
+    }
+}
+
+/// A pattern of an `.ignore` above the checkout that names one path
+/// outside it (anchored, no glob character), the checkout itself among
+/// them, matches nothing in it, as rg tests neither the root of a walk nor
+/// what lies above it: the edit of `a.c` is found, with no warning. A
+/// pattern that can match below the root (a name anywhere, a glob, an
+/// alternation, a path inside) is a rule, and the client says so.
+#[test]
+fn a_pattern_naming_a_path_outside_the_checkout_is_no_rule() {
+    let r = Remote::new(&FILES);
+    let tmp = std::fs::canonicalize(r.s.tmp.path()).unwrap();
+    let name = r.client.strip_prefix(&tmp).unwrap().display().to_string();
+    let served = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let found = "dir/b.c\ndir/sub/c.h\ne.c\nz.c\n";
+    r.s.write(&r.client, &[("a.c", "none\n"), ("z.c", "printk z\n")]);
+    let why = format!(
+        "an ignore file above the checkout applies ({}/.ignore)",
+        tmp.display()
+    );
+    for pattern in [
+        format!("/{name}/"),
+        format!("!/{name}/"),
+        format!("/{name}"),
+        "/other/dir".to_owned(),
+        "/origin/a.c".to_owned(),
+    ] {
+        r.s.write(&tmp, &[(".ignore", &format!("# a comment\n{pattern}\n"))]);
+        let out = r.search(&r.client, &["-l", "printk"]);
+        assert_eq!(stderr(&out), "", "{pattern}");
+        assert_eq!(stdout(&out), found, "{pattern}");
+    }
+    for pattern in [
+        format!("/{name}/dir/"),
+        format!("!/{name}/a.c"),
+        format!("{name}/*.h"),
+        format!("/{name}/../other"),
+        name.clone(),
+        "/**/dir".to_owned(),
+        "dir/".to_owned(),
+        format!("/{{{name}}}/a.c"),
+        format!("{{{name},zz}}/dir/"),
+        format!("/{name}/{{dir}}/e.c"),
+    ] {
+        r.s.write(&tmp, &[(".ignore", &format!("{pattern}\n"))]);
+        let out = r.search(&r.client, &["-l", "printk"]);
+        assert_eq!(stderr(&out), crate::remote::ignored(&why), "{pattern}");
+        assert_eq!(stdout(&out), served, "{pattern}");
+    }
+}
+
+/// A filter with a clean command alone: git status compares the cleaned
+/// file with its blob, so an edit that the filter drops is not listed.
+/// The client ignores local changes and says why.
+#[test]
+fn a_clean_only_filter_ignores_local_changes() {
+    let files = [
+        (".gitattributes", "*.txt filter=strip\n"),
+        ("a.c", "printk a\n"),
+        ("notes.txt", "printk notes\n"),
+    ];
+    let r = Remote::new(&files);
+    let c = &r.client;
+    r.s.git(c, &["config", "filter.strip.clean", "grep -v SECRET"]);
+    r.s.write(c, &[("notes.txt", "printk notes\nSECRET printk\n")]);
+    r.s.git(c, &["add", "notes.txt"]);
+    let out = r.search(c, &["printk"]);
+    let why = "git converts files (the filter strip applies to 1 file)";
+    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(stdout(&out), "a.c:printk a\nnotes.txt:printk notes\n");
+}
+
+/// An unchanged `.gitattributes` with `ident`: a clean clone holds
+/// `$Id: <blob id> $` where the served file holds `$Id$`, and git status
+/// shows no change. The client ignores local changes and says why.
+#[test]
+fn an_attribute_of_the_tree_that_converts_ignores_local_changes() {
+    let files = [
+        (".gitattributes", "*.c ident\n"),
+        ("a.c", "printk a $Id$\n"),
+        ("e.c", "printk e\n"),
+    ];
+    let r = Remote::new(&files);
+    assert!(stdout(&r.oracle("", &["-l", "Id:"])).contains("a.c"));
+    let out = r.search(&r.client, &["-l", "Id:"]);
+    let why = "git converts files (the attribute ident applies to a.c)";
+    assert_eq!(stderr(&out), crate::remote::ignored(why));
+    assert_eq!(stdout(&out), "");
+}
+
+/// A setting or an attribute that converts no tracked file: a value that a
+/// later one overrides, `core.eol` with no `text` attribute, attributes
+/// that convert nothing or that apply to no tracked file. The client
+/// merges its changes.
+#[test]
+fn what_converts_no_tracked_file_merges_local_changes() {
+    let r = Remote::new(&FILES);
+    let cases: [Change; 6] = [
+        |r, c| {
+            r.s.git(c, &["config", "--global", "core.autocrlf", "true"]);
+            r.s.git(c, &["config", "core.autocrlf", "false"]);
+        },
+        |r, c| {
+            r.s.git(c, &["config", "--global", "core.sparseCheckout", "true"]);
+            r.s.git(c, &["config", "core.sparseCheckout", "false"]);
+        },
+        |r, c| {
+            r.s.git(c, &["config", "core.eol", "crlf"]);
+        },
+        |r, c| r.s.write(c, &[(".git/info/attributes", "*.c diff=cpp\n")]),
+        |r, c| {
+            let file = r.s.path("attributes");
+            r.s.write(&file, &[("x", "*.dat binary\n*.c -text\n")]);
+            let path = file.join("x").display().to_string();
+            r.s.git(c, &["config", "core.attributesFile", &path]);
+        },
+        |r, _| {
+            r.s.write(
+                &r.s.path("config"),
+                &[("git/attributes", "*.md text eol=crlf\n")],
+            )
+        },
+    ];
+    for change in cases {
+        reset(&r);
+        for args in [
+            &["config", "--global", "--remove-section", "core"][..],
+            &["config", "--unset", "core.autocrlf"],
+            &["config", "--unset", "core.sparseCheckout"],
+            &["config", "--unset", "core.eol"],
+            &["config", "--unset", "core.attributesFile"],
+        ] {
+            let _ = r.s.git_output(&r.client, args);
+        }
+        let _ = std::fs::remove_file(r.client.join(".git/info/attributes"));
+        let _ = std::fs::remove_file(r.s.path("config/git/attributes"));
+        r.s.write(&r.client, &[("a.c", "none\n"), ("n.c", "printk n\n")]);
+        change(&r, &r.client);
+        r.same("", &["-l", "printk"]);
     }
 }
