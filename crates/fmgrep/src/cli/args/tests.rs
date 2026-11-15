@@ -176,6 +176,49 @@ fn params_pick_the_mode() {
     assert!(p.multiline);
 }
 
+/// `--stats` reaches the request where it prints: after lines and `-o`.
+#[test]
+fn stats_is_for_the_printed_lines() {
+    for (words, want) in [
+        (&["--stats", "x"][..], true),
+        (&["--stats", "-o", "x"], true),
+        (&["--stats", "-C1", "x"], true),
+        (&["x"], false),
+        (&["-c", "-o", "--stats", "x"], true),
+        (&["--stats", "--json", "--matches", "x"], false),
+        (&["--stats", "--json", "x"], false),
+        (&["--stats", "--approx-counts", "x"], false),
+    ] {
+        let p = params(words);
+        assert_eq!(
+            (p.stats, p.output_config().stats),
+            (want, want),
+            "{words:?}"
+        );
+    }
+}
+
+/// rg prints its block under -c, --count-matches and -l too; fmgrep
+/// refuses `--stats` there rather than print less than rg.
+#[test]
+fn stats_refuses_the_counting_modes() {
+    for (words, flag) in [
+        (&["--stats", "-c", "x"][..], "--count"),
+        (&["-c", "--stats", "x"], "--count"),
+        (&["--stats", "--count-matches", "x"], "--count-matches"),
+        (&["--stats", "-l", "x"], "--files-with-matches"),
+        (&["-o", "-l", "--stats", "x"], "--files-with-matches"),
+    ] {
+        let e = err(words);
+        assert!(
+            e.contains("cannot be used with")
+                && e.contains("'--stats'")
+                && e.contains(&format!("'{flag}'")),
+            "{words:?}: {e}"
+        );
+    }
+}
+
 #[test]
 fn context_flags_follow_rg_precedence() {
     let ctx = |words: &[&str]| {

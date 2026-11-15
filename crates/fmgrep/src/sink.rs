@@ -17,8 +17,9 @@ pub struct DocMatches<'a> {
 /// and `term_end`. Never called in [`crate::matching::QueryOutput::Counts`];
 /// an error aborts the query.
 pub trait MatchSink {
-    /// The shape of a full scan of this index: document count and total
-    /// document bytes. rg-style stats need it even when nothing matches.
+    /// The shape of a full scan of this index, or under `--stats` of the
+    /// files the filter keeps: document count and total document bytes.
+    /// rg-style stats need it even when nothing matches.
     fn corpus(&mut self, docs: usize, bytes: u64) -> Result<(), String> {
         let (_, _) = (docs, bytes);
         Ok(())

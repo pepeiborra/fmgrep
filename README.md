@@ -107,7 +107,13 @@ compiler/GHC/Driver/Main/Hsc.hs
   `-g` globs match relative to the cwd, as in rg; from outside the indexed
   tree the whole tree is searched, relative to its root. PATH arguments are
   rg's: relative to the cwd, and their files print as rg prints them.
-* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, PATH arguments); `fmgrep --help` lists them.
+* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, `--stats`, PATH arguments); `fmgrep --help` lists them.
+* `--stats` prints rg's statistics after the matched lines of each TERM.
+  Files and bytes searched count the indexed files that the PATHs, globs
+  and cwd keep; a narrowed search also counts their UTF-8 byte-order marks,
+  which rg leaves out. The total time runs from the start of the query, not
+  of the process. `-c`, `--count-matches` and `-l` refuse `--stats`; with
+  `--json` it prints nothing more.
 * `index`, `serve` and `status` are commands when they are the first word.
   To search for one of these words, put `--` or any flag first:
   `fmgrep -- status`, `fmgrep -n status`.

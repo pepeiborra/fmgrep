@@ -2,10 +2,12 @@
 //! headings, file separators, and the count and `-l` lines.
 
 use std::io::Write;
+use std::time::Instant;
 
 pub mod writer;
 
 use crate::sink::{DocMatches, MatchSink};
+use crate::wire::QueryReport;
 use writer::Pipe;
 
 /// Prefix of every IO failure raised while printing, so [`crate::run`] keeps
@@ -34,6 +36,8 @@ pub struct OutputConfig {
     pub banner: bool,
     /// False: rg's one file PATH, printed without its path but under `-l`.
     pub filename: bool,
+    /// rg `--stats`: its statistics after each term's lines.
+    pub stats: bool,
 }
 
 /// `path` in rg's path colour.
@@ -55,6 +59,21 @@ pub struct MatchWriter<W: Write> {
     wrote: bool,
     terms: usize,
     field: Vec<u8>,
+    /// `(searches, bytes_searched)`: the files the search keeps.
+    corpus: (u64, u64),
+    tally: Tally,
+    /// When the query started, for rg's total time.
+    started: Instant,
+}
+
+/// One term's numbers for `--stats`, counted as rg counts them.
+#[derive(Default)]
+struct Tally {
+    matches: u64,
+    matched_lines: u64,
+    docs: u64,
+    /// Every byte printed for the term but colour codes and the banner.
+    bytes_printed: u64,
 }
 
 impl<W: Write> MatchWriter<W> {
@@ -65,6 +84,9 @@ impl<W: Write> MatchWriter<W> {
             wrote: false,
             terms: 0,
             field: Vec::new(),
+            corpus: (0, 0),
+            tally: Tally::default(),
+            started: Instant::now(),
         }
     }
 
@@ -81,8 +103,14 @@ impl<W: Write> MatchWriter<W> {
 }
 
 impl<W: Write> MatchSink for MatchWriter<W> {
+    fn corpus(&mut self, docs: usize, bytes: u64) -> Result<(), String> {
+        self.corpus = (docs as u64, bytes);
+        Ok(())
+    }
+
     fn term_start(&mut self, term: &str) -> Result<(), String> {
         self.wrote = false;
+        self.tally = Tally::default();
         if self.cfg.banner {
             if self.terms > 0 {
                 self.pipe.raw(b"\n")?;
@@ -101,14 +129,45 @@ impl<W: Write> MatchSink for MatchWriter<W> {
             Format::Lines if self.cfg.heading && self.cfg.filename => {
                 if self.wrote {
                     self.pipe.raw(b"\n")?;
+                    self.tally.bytes_printed += 1;
                 }
                 self.path(m.path, b"\n")?;
+                self.tally.bytes_printed += m.path.len() as u64 + 1;
             }
-            Format::Lines if self.cfg.context && self.wrote => self.pipe.raw(b"--\n")?,
+            Format::Lines if self.cfg.context && self.wrote => {
+                self.pipe.raw(b"--\n")?;
+                self.tally.bytes_printed += 3;
+            }
             Format::Lines => {}
         }
         self.wrote = true;
+        self.tally.matches += m.stats.matches();
+        self.tally.matched_lines += m.stats.matched_lines();
+        self.tally.docs += 1;
+        self.tally.bytes_printed += m.stats.bytes_printed();
         self.pipe.raw(m.printed)
+    }
+
+    /// Under `--stats`, rg's statistics. Files and bytes searched are the
+    /// indexed files the search keeps; the total time runs from the start
+    /// of the query.
+    fn term_end(&mut self, report: &QueryReport) -> Result<(), String> {
+        if !self.cfg.stats {
+            return Ok(());
+        }
+        let t = &self.tally;
+        let block = format!(
+            "\n{} matches\n{} matched lines\n{} files contained matches\n{} files searched\n{} bytes printed\n{} bytes searched\n{:.6} seconds spent searching\n{:.6} seconds total\n",
+            t.matches,
+            t.matched_lines,
+            t.docs,
+            self.corpus.0,
+            t.bytes_printed,
+            self.corpus.1,
+            report.latency_us as f64 / 1e6,
+            self.started.elapsed().as_secs_f64(),
+        );
+        self.pipe.raw(block.as_bytes())
     }
 }
 

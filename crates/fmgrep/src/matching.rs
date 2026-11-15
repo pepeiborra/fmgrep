@@ -74,6 +74,8 @@ pub struct Print {
     pub path: bool,
     /// rg `--json`.
     pub json: bool,
+    /// rg `--stats`.
+    pub stats: bool,
 }
 
 /// rg's matcher for `pattern`, else for the literal; `None` for the empty
@@ -214,8 +216,13 @@ impl DocSearch {
                     sep: &slot.sep,
                 };
                 searcher.search_slice(m, doc, &mut sink)?;
-                let (matched, stats) = (sink.inner.has_match(), sink.inner.stats().cloned());
-                (matched, stats, p.get_mut().take())
+                let (matched, mut stats) = (sink.inner.has_match(), sink.inner.stats().cloned());
+                let w = p.get_mut();
+                // rg's bytes printed hold the path on each line.
+                if let Some(s) = &mut stats {
+                    s.add_bytes_printed(std::mem::take(&mut w.prefixed));
+                }
+                (matched, stats, w.take())
             }
             Printer::Json(p) => {
                 let mut sink = p.sink_with_path(m, path);
@@ -255,9 +262,13 @@ fn counted(printed: &[u8]) -> Option<Stats> {
 struct Prefixed {
     buf: Buffer,
     path: Vec<u8>,
+    /// The path's bytes without colour codes.
+    path_len: usize,
     /// `:` on matched lines, `-` on context lines, 0 on a `--`.
     sep: Arc<AtomicU8>,
     fresh: bool,
+    /// Bytes of the paths and separators written, without colour codes.
+    prefixed: u64,
 }
 
 impl Prefixed {
@@ -269,17 +280,21 @@ impl Prefixed {
                 Buffer::no_color()
             },
             path: Vec::new(),
+            path_len: 0,
             sep,
             fresh: true,
+            prefixed: 0,
         }
     }
 
     fn start(&mut self, path: Option<&str>) {
         self.path.clear();
+        self.path_len = path.map_or(0, str::len);
         if let Some(p) = path {
             path_field(&mut self.path, p, self.buf.supports_color());
         }
         self.fresh = true;
+        self.prefixed = 0;
     }
 
     fn take(&mut self) -> Vec<u8> {
@@ -295,6 +310,7 @@ impl Prefixed {
         match self.sep.load(Relaxed) {
             0 => Ok(()),
             sep => {
+                self.prefixed += self.path_len as u64 + 1;
                 self.buf.write_all(&self.path)?;
                 self.buf.write_all(&[sep])
             }

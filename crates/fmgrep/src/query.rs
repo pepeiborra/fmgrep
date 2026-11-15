@@ -315,6 +315,32 @@ fn printed<'a>(
     })
 }
 
+/// rg's files and bytes searched: the index's, BOMs left out as rg's
+/// searcher strips them. Under `--stats`, the indexed files that a PATH, a
+/// glob or the cwd keeps, and their bytes, BOMs included: the index does
+/// not record which file has one. That reads the path of every file the
+/// filter may keep.
+fn corpus(req: &QueryRequest<'_>, paths: &Paths<'_>) -> Result<(usize, u64), String> {
+    let m = req.manifest;
+    let whole = (m.files.len(), m.num_bytes - m.bom_bytes);
+    let (Some(f), QueryOutput::Matches(matching::Print { stats: true, .. })) =
+        (&req.filter, req.output)
+    else {
+        return Ok(whole);
+    };
+    let ranges =
+        (f.cover(&m.files)?).unwrap_or_else(|| std::iter::once(0..m.files.len()).collect());
+    let (mut failed, mut kept) = (None, (0, 0));
+    for id in f.kept(paths, ranges.into_iter().flatten(), &mut failed) {
+        kept = (kept.0 + 1, kept.1 + m.doc_lens[id]);
+    }
+    match (failed, kept.0 == whole.0) {
+        (Some(e), _) => Err(e),
+        (None, true) => Ok(whole),
+        (None, false) => Ok(kept),
+    }
+}
+
 /// `doc` searched by `s`, with the path it prints under when it matches.
 fn searched<'a>(
     s: &DocSearch,
@@ -453,11 +479,8 @@ fn answer_terms(
     debug_assert_eq!(answers.len(), terms.len());
 
     if emit {
-        // rg's bytes_searched excludes the BOMs its searcher strips.
-        sink.corpus(
-            manifest.files.len(),
-            manifest.num_bytes - manifest.bom_bytes,
-        )?;
+        let (files, bytes) = corpus(req, &docs.paths(&manifest.files))?;
+        sink.corpus(files, bytes)?;
     }
     let mut queries = Vec::with_capacity(terms.len());
     let filter = req.filter.as_ref();

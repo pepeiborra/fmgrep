@@ -14,7 +14,7 @@ use std::time::Instant;
 use grep_printer::Stats;
 use grep_regex::RegexMatcher;
 
-use super::{Loaded, QueryRequest, in_index, prepare, printed, searched};
+use super::{Loaded, QueryRequest, corpus, in_index, prepare, printed, searched};
 use crate::UNIFIED_SEPARATOR;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
@@ -434,7 +434,8 @@ pub fn answer_expr(
         // Every path the expression may print is checked before its first
         // line.
         paths.check(root.yes.iter().chain(&root.maybe).copied())?;
-        sink.corpus(num_docs, manifest.num_bytes - manifest.bom_bytes)?;
+        let (files, bytes) = corpus(req, &paths)?;
+        sink.corpus(files, bytes)?;
         sink.term_start(&report.term)?;
     }
     let filter = req.filter.as_ref();

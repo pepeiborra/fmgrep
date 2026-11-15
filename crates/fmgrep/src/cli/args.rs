@@ -240,6 +240,13 @@ pub struct Search {
         help_heading = "Output"
     )]
     pub color: ColorChoice,
+    /// Print rg's statistics after the matched lines
+    #[arg(
+        long,
+        conflicts_with_all = ["count", "count_matches", "files_with_matches"],
+        help_heading = "Output"
+    )]
+    pub stats: bool,
 
     /// rg's JSON events, or a counts report
     #[arg(long, help_heading = "Protocol (unstable)")]
@@ -325,6 +332,9 @@ impl Search {
                 (ColorChoice::Always, _) | (ColorChoice::Auto, true) => Color::Always,
                 _ => Color::Never,
             };
+            // -c, --count-matches and -l refuse --stats; --json and
+            // --approx-counts print what they print without it.
+            p.stats = self.stats && matches!(mode, Mode::Lines | Mode::Only);
         }
         Ok(p)
     }
