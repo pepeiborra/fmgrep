@@ -63,7 +63,7 @@ fn status(a: &StatusArgs, env: Env, out: &mut dyn Write) -> Result<Outcome, Stri
     };
     let note = match choose(None, a.server.as_deref(), env, start)? {
         Choice::Index { note, .. } => note,
-        Choice::Server(server) => match reach(&server, start)? {
+        Choice::Server(server) => match reach(&server, Some(start))? {
             Reached::Conn(mut conn) => {
                 let reply = serve::status_on(&mut conn)?;
                 let first = format!("a search {here} uses {server}");
@@ -219,15 +219,15 @@ enum Reached {
 }
 
 /// Connect to `server`. When `--server` gave it and it cannot be reached,
-/// an index found by walking up from `start` answers instead; with
-/// `FMGREP_SERVER`, such an index has already won.
-fn reach(server: &Server, start: &Path) -> Result<Reached, String> {
+/// an index found by walking up from `start`, if given, answers instead;
+/// with `FMGREP_SERVER`, such an index has already won.
+fn reach(server: &Server, start: Option<&Path>) -> Result<Reached, String> {
     let e = match Conn::connect(&server.addr) {
         Ok(conn) => return Ok(Reached::Conn(conn)),
         Err(e) => e,
     };
     if !server.env
-        && let Ok(found) = locate(start)
+        && let Some(Ok(found)) = start.map(locate)
     {
         let note = format!(": cannot reach {server} ({e})");
         return Ok(Reached::Index { found, note });
@@ -256,20 +256,31 @@ fn search(
     p.cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let ignore = s.ignore_local_changes;
     let cwd = Path::new(".");
     let choice = match choose(s.index.as_deref(), s.server.as_deref(), env, cwd) {
         Ok(choice) => choice,
         Err(e) if s.index.is_none() && env().is_err() => return Err(e),
+        Err(_) if ignore => return Err(NEEDS_SERVER.to_owned()),
         // No index: `local` fails to find it again, inside its spans.
         Err(_) => return local(s.index.as_deref(), p, &typed, s.json, out),
     };
+    // With `ignore`, a server that cannot be reached is an error.
+    let fallback = (!ignore).then_some(cwd);
     let (found, note) = match choice {
         Choice::Index { found, note } => (found, note),
-        Choice::Server(server) => match reach(&server, cwd)? {
-            Reached::Conn(conn) => return client(&server, conn, p, &typed, s.json, out),
+        Choice::Server(server) => match reach(&server, fallback)? {
+            Reached::Conn(conn) => return client(&server, conn, ignore, p, &typed, s.json, out),
             Reached::Index { found, note } => (found, Some(note)),
         },
     };
+    if ignore {
+        // A note here says that the index won over `FMGREP_SERVER`.
+        return Err(match (note, env()) {
+            (Some(_), Ok(Some(addr))) => local_index_answers(&found, &addr),
+            _ => NEEDS_SERVER.to_owned(),
+        });
+    }
     if let Some(note) = note {
         warn(&format!(
             "Using local index {}{note}",
@@ -278,6 +289,20 @@ fn search(
     }
     // `local` finds the index again, inside its spans.
     local(s.index.as_deref(), p, &typed, s.json, out)
+}
+
+/// Why a search with `--ignore-local-changes` fails that no server answers.
+const NEEDS_SERVER: &str = "error: --ignore-local-changes needs --server ADDR or FMGREP_SERVER";
+
+/// Why a search with `--ignore-local-changes` fails when the local index
+/// `found` wins over the server at `addr`: the flag asks for that server's
+/// answer alone, and a local index searches the checkout as it is.
+fn local_index_answers(found: &Located, addr: &str) -> String {
+    format!(
+        "error: the local index {} wins over the server at {addr} (FMGREP_SERVER), and \
+         --ignore-local-changes needs the server's answer; pass --server {addr} to search it",
+        found.index_dir.display()
+    )
 }
 
 /// A search of the index at or above `index`, else above the cwd.
@@ -323,10 +348,12 @@ impl std::fmt::Display for Server {
 }
 
 /// A search through `server`, on `conn`; PATHs resolve against the served
-/// tree.
+/// tree. With `ignore` (`--ignore-local-changes`), the server's answer
+/// alone, and no look at the checkout's changes.
 fn client(
     server: &Server,
     mut conn: Conn,
+    ignore: bool,
     mut p: QueryParams,
     typed: &[String],
     json: bool,
@@ -336,7 +363,11 @@ fn client(
     same_format(server, status.format)?;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
     let mut ours = None;
-    match checkout::plan(server, &status, &cwd) {
+    let plan = match ignore {
+        true => checkout::Plan::Ignored,
+        false => checkout::plan(server, &status, &cwd),
+    };
+    match plan {
         // The checkout holds the served commit: PATHs and the cwd are
         // resolved here, against its top, and its changes searched here.
         checkout::Plan::Checkout { top, commit } => {
@@ -354,6 +385,7 @@ fn client(
                     checkout::degraded(&why);
                     checkout::top(&cwd).zip(status.commit.as_ref())
                 }
+                checkout::Plan::Ignored => checkout::top(&cwd).zip(status.commit.as_ref()),
                 _ => None,
             };
             match pinned {

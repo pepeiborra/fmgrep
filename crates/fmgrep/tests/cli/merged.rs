@@ -528,6 +528,11 @@ fn past_the_limit_the_answer_is_the_servers_alone() {
     );
     assert_eq!(stderr(&out), crate::remote::ignored(&why));
     assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
+    let quiet = r.search(&r.client, &["--ignore-local-changes", "-l", "printk"]);
+    assert_eq!(
+        (stderr(&quiet), stdout(&quiet)),
+        (String::new(), stdout(&out))
+    );
     // Untracked, they are one path, `many/`: the walk of it stops at the
     // 10,001st file, before any is read.
     r.s.git(&r.client, &["reset", "-q"]);
@@ -649,6 +654,13 @@ fn each_unsound_checkout_gets_the_servers_answer_and_the_reason() {
             .replace("{client}", &r.client.display().to_string());
         assert_eq!(stderr(&out), crate::remote::ignored(&why));
         assert_eq!(stdout(&out), served, "{why}");
+        // The same answer, asked for: no warning.
+        let quiet = r.search(&r.client, &["--ignore-local-changes", "-l", "printk"]);
+        assert_eq!(
+            (stderr(&quiet), stdout(&quiet)),
+            (String::new(), served.into()),
+            "{why}"
+        );
     }
     // A filter that applies to no file converts nothing.
     reset(&r);

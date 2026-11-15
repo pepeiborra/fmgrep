@@ -422,6 +422,55 @@ fn fmgrep_server_gives_the_server() {
     assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
 }
 
+/// `--ignore-local-changes` asks for a server's answer alone: a search
+/// that a local index would answer fails instead, and says why; an
+/// unreachable server is an error even with a local index.
+#[test]
+fn ignore_local_changes_needs_a_server() {
+    let (tmp, docs) = stage();
+    let index = do_index(&docs, false).display().to_string();
+    let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
+    let addr = server.addr();
+    ok(&["index", &docs.display().to_string()]);
+    let words = ["--ignore-local-changes", "-l", "printk"];
+    let dotdir = std::fs::canonicalize(&docs).unwrap().join(".fmgrep");
+    let flag = format!("--server {addr}");
+    let closed = closed_port();
+    let unreachable = format!("error: cannot reach the server at {closed}: ");
+    let wins = format!(
+        "error: the local index {} wins over the server at {addr} (FMGREP_SERVER), and \
+         --ignore-local-changes needs the server's answer; pass {flag} to search it\n",
+        dotdir.display()
+    );
+    let none = "error: --ignore-local-changes needs --server ADDR or FMGREP_SERVER\n";
+    for (cwd, env, args, want) in [
+        (docs.as_path(), None, &[][..], none.to_owned()),
+        (tmp.path(), None, &[], none.to_owned()),
+        (docs.as_path(), Some(&addr), &[], wins),
+        (
+            docs.as_path(),
+            None,
+            &["--server", &closed][..],
+            unreachable,
+        ),
+    ] {
+        let mut cmd = fmgrep();
+        cmd.current_dir(cwd).args(args).args(words);
+        if let Some(addr) = env {
+            cmd.env("FMGREP_SERVER", addr);
+        }
+        let out = cmd.output().expect("spawn fmgrep");
+        assert_eq!(out.status.code(), Some(2), "{cwd:?} {args:?}");
+        assert!(out.stdout.is_empty());
+        assert!(stderr(&out).starts_with(&want), "{}", stderr(&out));
+    }
+    // With --server, the server answers from the indexed tree too.
+    let out = run_in(&docs, &[&["--server", &addr][..], &words].concat());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.bin\nb.bin\n");
+    assert_eq!(stderr(&out), "");
+    shutdown(&mut server, &addr);
+}
+
 /// Bare `fmgrep` prints the help with `FMGREP_SERVER` set too: the
 /// variable is not an argument.
 #[test]

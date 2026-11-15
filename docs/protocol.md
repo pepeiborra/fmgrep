@@ -274,7 +274,20 @@ client warns so because it cannot compare at all (a checkout that lacks
 the served commit), PATH arguments and the cwd still resolve against the
 top of the cwd's checkout, and the query carries the served commit.
 Otherwise (no checkout, a server that serves no commit, or the served
-tree itself) they resolve against the served tree.
+tree itself) they resolve against the served tree. Each search that must
+fall back finds that out again, by the same checks, and warns again; the
+warning ends `use --ignore-local-changes to avoid this warning`.
+
+With `--ignore-local-changes` the client prints the server's answer
+alone, and no warning about local changes: it runs no git and asks no
+watchman. PATH arguments and the cwd resolve as in the fallback. A
+search with the flag that a local index would answer fails, with exit 2:
+with no server, `error: --ignore-local-changes needs --server ADDR or
+FMGREP_SERVER`; when a local index wins over `FMGREP_SERVER`, with an
+error that names the index and says to pass `--server`; and a server
+that cannot be reached is an error, `error: cannot reach the server at
+ADDR: <cause>`, even when a local index is found. It conflicts with
+`--index` and `--shutdown`; `fmgrep status` does not take it.
 
 When the client searches files itself, counts, rg's JSON summary and
 the `--stats` block cover its files and the server's.

@@ -80,6 +80,28 @@ fn logged_env(
     (out, runs.lines().map(str::to_owned).collect())
 }
 
+/// `--ignore-local-changes` runs no git, and asks nothing of watchman:
+/// the server's answer alone, with an edit that a merged answer would
+/// show, and no line about git or watchman.
+#[test]
+fn ignore_local_changes_runs_no_git() {
+    let r = Remote::new(&FILES);
+    let (log, path) = logging_git(&r);
+    r.s.write(&r.client, &[("a.c", "none\n")]);
+    let args = ["--ignore-local-changes", "-l", "printk"];
+    for _ in 0..2 {
+        let (out, runs) = logged(&r, &log, &path, &args);
+        assert_eq!(
+            (stdout(&out), stderr(&out), runs),
+            (
+                "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n".to_owned(),
+                String::new(),
+                Vec::<String>::new()
+            )
+        );
+    }
+}
+
 /// With watchman, the first search asks git, the later ones do not, and
 /// every one answers as a local index of the checkout: an edit, a
 /// directory moved in from outside, one renamed, one deleted.
