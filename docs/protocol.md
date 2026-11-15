@@ -57,7 +57,7 @@ response line each, after any [frames](#streamed-output).
 | `context` | `{before, after}` | 0, 0 | `-B`, `-A` |
 | `line_numbers` | bool | true | false: `-N` |
 | `heading` | bool | true | false: `--no-heading` |
-| `color` | string | `never` | `always`: `--color always` |
+| `color` | string | `never` | `always`: `--color always`; a file's matches past its first 1,000 matched lines print without colour, except under `only` |
 | `globs` | [string] | [] | `-g`, in order; `!` excludes |
 | `iglobs` | [string] | [] | `--iglob`, after `globs` |
 | `glob_case_insensitive` | bool | false | `--glob-case-insensitive` |
