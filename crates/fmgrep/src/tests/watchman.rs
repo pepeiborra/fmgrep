@@ -174,9 +174,75 @@ impl Daemon {
 
     /// Stops the daemon and starts it again on the same files: it watches
     /// again what it watched, and reads each of those trees again.
+    ///
+    /// The daemon writes its state file from a thread of its own, some
+    /// time after a watch is added or removed: it empties the file, then
+    /// writes it. [`Self::stop`] kills the daemon, so a kill before the
+    /// save, or in the middle of it, would start a daemon that watches
+    /// nothing. So the restart first waits for a whole save that names
+    /// what the daemon watches, and puts that save back after the kill if
+    /// a later save of the same watches was cut short.
     pub(crate) fn restart(&mut self) {
+        let saved = if self.child.get_mut().is_some() {
+            self.saved()
+        } else {
+            None
+        };
         self.stop();
+        if let Some(saved) = saved {
+            let state = self.file("state");
+            if std::fs::read(&state).ok().as_ref() != Some(&saved) {
+                std::fs::write(&state, &saved).unwrap();
+                // Past the test harness's capture, so that a run's log
+                // counts them.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "watchman was killed while it saved its state: its last whole save is put back"
+                );
+            }
+        }
         self.spawn();
+    }
+
+    /// The state file, once it is whole and names the roots that the
+    /// daemon watches; `None` if it watches none and never saved.
+    fn saved(&self) -> Option<Vec<u8>> {
+        let list = self.call(&json!(["watch-list"])).unwrap();
+        let mut listed: Vec<&str> = list["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        listed.sort_unstable();
+        let roots = |text: &[u8]| -> Option<Vec<String>> {
+            let state: Value = serde_json::from_slice(text).ok()?;
+            let mut paths: Vec<String> = state["watched"]
+                .as_array()?
+                .iter()
+                .map(|w| w["path"].as_str().map(str::to_owned))
+                .collect::<Option<_>>()?;
+            paths.sort_unstable();
+            Some(paths)
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let text = match std::fs::read(self.file("state")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && listed.is_empty() => {
+                    return None;
+                }
+                read => read.unwrap_or_default(),
+            };
+            let saved = roots(&text);
+            if saved.as_ref().is_some_and(|saved| *saved == listed) {
+                return Some(text);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watchman did not save its watches {listed:?}: its state file has {saved:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn signal(&self, signal: &str) {
