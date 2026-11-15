@@ -373,3 +373,31 @@ fn a_client_leaving_mid_stream_leaves_the_server_serving() {
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
 }
+
+/// Past a file's first matched lines in colour, the served text is the
+/// local text, and -o and --json keep each match.
+#[test]
+fn colour_past_the_bound_is_the_same_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    let n = crate::matching::COLORED_LINES as usize + 3;
+    let index = stage_big(tmp.path(), n);
+    let (addr, server) = spawn_server(&index, FIXED);
+    let colored = |text: &[u8]| {
+        String::from_utf8_lossy(text)
+            .matches("\x1b[1m\x1b[31m")
+            .count()
+    };
+    for (flags, want) in [
+        (&["--color", "always", "-n"][..], n - 3),
+        (&["--color", "always", "--no-heading", "-C1"], n - 3),
+        (&["--color", "always", "-o"], n),
+        (&["--color", "always", "--stats"], n - 3),
+        (&["--color", "always", "--json", "--matches"], 0),
+    ] {
+        let (here, served) = both(&index, &addr, flags, &["printk"]);
+        assert_eq!(served, here, "{flags:?}");
+        assert_eq!(colored(&here), want, "{flags:?}");
+    }
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}

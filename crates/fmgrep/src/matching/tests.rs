@@ -78,6 +78,177 @@ fn a_reused_printer_separates_nothing_itself() {
     }
 }
 
+/// rg's colours: the line number, a match.
+const LINE: &str = "\x1b[0m\x1b[32m";
+const MATCH: &str = "\x1b[0m\x1b[1m\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+/// A file of `n` lines `hit <i>`, and between them, when `gaps`, a line
+/// `-` that does not match.
+fn hits(n: u64, gaps: bool) -> Vec<u8> {
+    let gap = if gaps { "-\n" } else { "" };
+    (1..=n)
+        .map(|i| format!("hit {i}\n{gap}"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+fn found(term: &str, output: QueryOutput, mode: MatchMode, doc: &[u8]) -> Found {
+    let m = matcher(term, None, mode).unwrap().unwrap();
+    DocSearch::new(m, output, mode)
+        .doc("", doc)
+        .unwrap()
+        .unwrap()
+}
+
+fn colored(print: Print) -> QueryOutput {
+    QueryOutput::Matches(Print {
+        line_numbers: true,
+        color: true,
+        ..print
+    })
+}
+
+#[test]
+fn matches_past_the_first_colored_lines_print_without_colour() {
+    let n = COLORED_LINES + 3;
+    let line = |i: u64| match i <= COLORED_LINES {
+        true => format!("{LINE}{i}{RESET}:{MATCH}hit{RESET} {i}\n"),
+        false => format!("{LINE}{i}{RESET}:hit {i}\n"),
+    };
+    let want: String = (1..=n).map(line).collect();
+    let got = found(
+        "hit",
+        colored(Print::default()),
+        MatchMode::default(),
+        &hits(n, false),
+    );
+    assert_eq!(String::from_utf8(got.printed).unwrap(), want);
+    assert_eq!(got.count, n);
+    // With --stats: the same bytes, and every match counted.
+    let print = Print {
+        stats: true,
+        ..Print::default()
+    };
+    let got = found("hit", colored(print), MatchMode::default(), &hits(n, false));
+    assert_eq!(String::from_utf8(got.printed).unwrap(), want);
+    assert_eq!((got.count, got.stats.matched_lines()), (n, n));
+    // Exactly the bound: every match in colour.
+    let got = found(
+        "hit",
+        colored(Print::default()),
+        MatchMode::default(),
+        &hits(COLORED_LINES, false),
+    );
+    assert_eq!(
+        String::from_utf8(got.printed).unwrap(),
+        (1..=COLORED_LINES).map(line).collect::<String>()
+    );
+}
+
+#[test]
+fn context_lines_and_breaks_print_alike_past_the_bound() {
+    // -A1 over hit / - lines: every `-` is context, no `--` break; -B0 -A0
+    // over the same file breaks nothing either. Past the bound only the
+    // match colour goes.
+    let n = COLORED_LINES + 2;
+    let line = |i: u64| {
+        let hit = match i <= COLORED_LINES {
+            true => format!("{MATCH}hit{RESET}"),
+            false => "hit".to_string(),
+        };
+        format!(
+            "{LINE}{}{RESET}:{hit} {i}\n{LINE}{}{RESET}--\n",
+            2 * i - 1,
+            2 * i
+        )
+    };
+    let print = Print {
+        after: 1,
+        ..Print::default()
+    };
+    let got = found("hit", colored(print), MatchMode::default(), &hits(n, true));
+    assert_eq!(
+        String::from_utf8(got.printed).unwrap(),
+        (1..=n).map(line).collect::<String>()
+    );
+    // Without context, a `--` between the groups of matched lines.
+    let doc: Vec<u8> = (1..=n)
+        .flat_map(|i| format!("hit {i}\n\n\n").into_bytes())
+        .collect();
+    let print = Print {
+        after: 0,
+        before: 0,
+        ..Print::default()
+    };
+    let got = String::from_utf8(found("hit", colored(print), MatchMode::default(), &doc).printed)
+        .unwrap();
+    assert_eq!(got.lines().count() as u64, n);
+    assert_eq!(got.matches(MATCH).count() as u64, COLORED_LINES);
+}
+
+#[test]
+fn only_matching_and_no_colour_are_unbounded() {
+    let n = COLORED_LINES + 3;
+    // -o colours every match: each is found to be printed.
+    let print = Print {
+        only_matching: true,
+        ..Print::default()
+    };
+    let got = found("hit", colored(print), MatchMode::default(), &hits(n, false));
+    let got = String::from_utf8(got.printed).unwrap();
+    assert_eq!(got.matches(MATCH).count() as u64, n);
+    // Without colour nothing changes at the bound.
+    let plain = QueryOutput::Matches(Print {
+        line_numbers: true,
+        ..Print::default()
+    });
+    let got = found("hit", plain, MatchMode::default(), &hits(n, false));
+    assert_eq!(
+        String::from_utf8(got.printed).unwrap(),
+        (1..=n)
+            .map(|i| format!("{i}:hit {i}\n"))
+            .collect::<String>()
+    );
+}
+
+#[test]
+fn a_multiline_match_counts_its_lines_toward_the_bound() {
+    // -U: each match `hit <i>\n-` spans two lines, and a blank line keeps
+    // the matches apart (adjacent ones print as one block). The block that
+    // starts below the bound keeps its colour.
+    let mode = MatchMode {
+        multiline: true,
+        ..MatchMode::default()
+    };
+    let n = COLORED_LINES / 2 + 2;
+    let doc: String = (1..=n).map(|i| format!("hit {i}\n-\n\n")).collect();
+    let m = matcher("", Some(r"hit \d+\n-"), mode).unwrap().unwrap();
+    let got = DocSearch::new(m, colored(Print::default()), mode)
+        .doc("", doc.as_bytes())
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(got.printed).unwrap();
+    // Two coloured pieces a match (one per line), for the first
+    // COLORED_LINES / 2 matches.
+    assert_eq!(text.matches(MATCH).count() as u64, COLORED_LINES);
+    assert_eq!(got.count, 2 * n);
+    assert!(
+        text.ends_with(&format!("{LINE}{}{RESET}:-\n", 3 * n - 1)),
+        "{text}"
+    );
+    // Matches on adjacent lines print as one block, which starts at line
+    // 1: it keeps its colour whole.
+    let n = COLORED_LINES + 3;
+    let m = matcher("", Some(r"\d+$"), mode).unwrap().unwrap();
+    let got = DocSearch::new(m, colored(Print::default()), mode)
+        .doc("", &hits(n, false))
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8(got.printed).unwrap();
+    assert_eq!(text.matches(MATCH).count() as u64, n);
+}
+
 #[test]
 fn literal_exactness_predicate() {
     for term in [&b""[..], b"\n", b"a\nb", b"aa", b"abab"] {

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use grep_matcher::Matcher;
 use grep_printer::{
     ColorSpecs, JSON, JSONBuilder, Standard, StandardBuilder, Stats, Summary, SummaryBuilder,
-    SummaryKind,
+    SummaryKind, UserColorSpec, default_color_specs,
 };
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{
@@ -141,10 +141,21 @@ struct Slot {
 }
 
 enum Printer {
-    Lines(Standard<Prefixed>),
+    /// The second printer, when the first colours each match, prints a
+    /// file's matched lines past its first [`COLORED_LINES`], and the lines
+    /// after them, with no colour on the matches.
+    Lines(Standard<Prefixed>, Option<Box<Standard<Prefixed>>>),
     Json(JSON<Vec<u8>>),
     Summary(Summary<Buffer>),
 }
+
+/// The matched lines of a file whose matches print in colour. To colour a
+/// line, grep-printer finds each of its matches again, on the one thread
+/// that searches the file: 0.1 to 0.5 µs a line on an Apple M5, measured on
+/// files of 46,000 to 97,000 matched lines. So 1,000 lines cost a file under
+/// a millisecond. Terminals keep 1,000 to 10,000 lines by default (xterm,
+/// iTerm2, tmux, GNOME Terminal); past these, colour is not what anyone reads.
+pub(crate) const COLORED_LINES: u64 = 1_000;
 
 impl DocSearch {
     pub fn new(matcher: RegexMatcher, output: QueryOutput, mode: MatchMode) -> Self {
@@ -179,16 +190,23 @@ impl DocSearch {
             QueryOutput::Matches(p) if p.json => {
                 Printer::Json(JSONBuilder::new().build(Vec::new()))
             }
-            QueryOutput::Matches(p) => Printer::Lines(
-                StandardBuilder::new()
-                    .color_specs(ColorSpecs::default_with_color())
-                    .path(false)
-                    .only_matching(p.only_matching)
-                    // These counts find each match of each line again;
-                    // `-o` finds them anyway.
-                    .stats(p.stats || p.only_matching)
-                    .build(Prefixed::new(p.color, Arc::clone(&sep))),
-            ),
+            QueryOutput::Matches(p) => {
+                let lines = |colors: &[UserColorSpec]| {
+                    StandardBuilder::new()
+                        .color_specs(ColorSpecs::new(colors))
+                        .path(false)
+                        .only_matching(p.only_matching)
+                        // These counts find each match of each line again;
+                        // `-o` finds them anyway.
+                        .stats(p.stats || p.only_matching)
+                        .build(Prefixed::new(p.color, Arc::clone(&sep)))
+                };
+                let mut colors = default_color_specs();
+                let first = lines(&colors);
+                colors.push("match:none".parse().expect("a valid colour spec"));
+                let rest = (p.color && !p.only_matching).then(|| Box::new(lines(&colors)));
+                Printer::Lines(first, rest)
+            }
             QueryOutput::CountLines => summary(SummaryKind::Count),
             QueryOutput::CountMatches => summary(SummaryKind::CountMatches),
             QueryOutput::FilesWithMatches => summary(SummaryKind::QuietWithMatch),
@@ -215,24 +233,45 @@ impl DocSearch {
     fn search(&self, slot: &mut Slot, path: &str, doc: &[u8]) -> io::Result<Option<Found>> {
         let (m, searcher) = (&slot.matcher, &mut slot.searcher);
         let (matched, stats, printed, count) = match &mut slot.printer {
-            Printer::Lines(p) => {
+            Printer::Lines(p, rest) => {
                 let named = matches!(self.output, QueryOutput::Matches(Print { path: true, .. }));
-                p.get_mut().start(named.then_some(path));
+                let path = named.then_some(path);
+                p.get_mut().start(path);
+                let rest_sink = rest.as_mut().map(|r| {
+                    r.get_mut().start(path);
+                    r.sink(m)
+                });
                 let mut sink = Tagged {
                     inner: p.sink(m),
+                    rest: rest_sink,
                     sep: &slot.sep,
                     multi_line: searcher.multi_line_with_matcher(m),
                     lines: 0,
                 };
                 searcher.search_slice(m, doc, &mut sink)?;
-                let (matched, mut stats) = (sink.inner.has_match(), sink.inner.stats().cloned());
+                let (mut matched, mut stats) =
+                    (sink.inner.has_match(), sink.inner.stats().cloned());
+                if let Some(r) = &sink.rest {
+                    matched |= r.has_match();
+                    if let (Some(s), Some(more)) = (&mut stats, r.stats()) {
+                        *s += more;
+                    }
+                }
                 let count = stats.as_ref().map_or(sink.lines, Stats::matches);
+                drop(sink);
                 let w = p.get_mut();
+                let (mut printed, mut prefixed) = (w.take(), std::mem::take(&mut w.prefixed));
+                if let Some(r) = rest {
+                    let w = r.get_mut();
+                    printed.extend_from_slice(w.buf.as_slice());
+                    w.buf.clear();
+                    prefixed += std::mem::take(&mut w.prefixed);
+                }
                 // rg's bytes printed hold the path on each line.
                 if let Some(s) = &mut stats {
-                    s.add_bytes_printed(std::mem::take(&mut w.prefixed));
+                    s.add_bytes_printed(prefixed);
                 }
-                (matched, stats, w.take(), count)
+                (matched, stats, printed, count)
             }
             Printer::Json(p) => {
                 let mut sink = p.sink_with_path(m, path);
@@ -363,13 +402,24 @@ impl WriteColor for Prefixed {
 }
 
 /// Tells [`Prefixed`] what kind of line each call prints, and counts the
-/// matched lines.
+/// matched lines. Past [`COLORED_LINES`] of them, `rest` prints, if any.
 struct Tagged<'a, S> {
     inner: S,
+    rest: Option<S>,
     sep: &'a AtomicU8,
     /// A call may hold several matched lines.
     multi_line: bool,
     lines: u64,
+}
+
+impl<S> Tagged<'_, S> {
+    /// The sink that prints now: `rest` once it took over, for good.
+    fn now(&mut self) -> &mut S {
+        match &mut self.rest {
+            Some(rest) if self.lines >= COLORED_LINES => rest,
+            _ => &mut self.inner,
+        }
+    }
 }
 
 impl<S: Sink<Error = io::Error>> Sink for Tagged<'_, S> {
@@ -377,28 +427,34 @@ impl<S: Sink<Error = io::Error>> Sink for Tagged<'_, S> {
 
     fn matched(&mut self, s: &Searcher, m: &SinkMatch<'_>) -> io::Result<bool> {
         self.sep.store(b':', Relaxed);
-        self.lines += match self.multi_line {
+        let lines = match self.multi_line {
             true => m.lines().count() as u64,
             false => 1,
         };
-        self.inner.matched(s, m)
+        let printed = self.now().matched(s, m);
+        self.lines += lines;
+        printed
     }
 
     fn context(&mut self, s: &Searcher, c: &SinkContext<'_>) -> io::Result<bool> {
         self.sep.store(b'-', Relaxed);
-        self.inner.context(s, c)
+        self.now().context(s, c)
     }
 
     fn context_break(&mut self, s: &Searcher) -> io::Result<bool> {
         self.sep.store(0, Relaxed);
-        self.inner.context_break(s)
+        self.now().context_break(s)
     }
 
     fn begin(&mut self, s: &Searcher) -> io::Result<bool> {
-        self.inner.begin(s)
+        let rest = self.rest.as_mut().map_or(Ok(true), |r| r.begin(s))?;
+        Ok(self.inner.begin(s)? && rest)
     }
 
     fn finish(&mut self, s: &Searcher, f: &SinkFinish) -> io::Result<()> {
+        if let Some(r) = &mut self.rest {
+            r.finish(s, f)?;
+        }
         self.inner.finish(s, f)
     }
 }

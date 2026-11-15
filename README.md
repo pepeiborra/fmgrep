@@ -114,6 +114,11 @@ compiler/GHC/Driver/Main/Hsc.hs
   which rg leaves out. The total time runs from the start of the query, not
   of the process. `-c`, `--count-matches` and `-l` refuse `--stats`; with
   `--json` it prints nothing more.
+* In colour, the matches of a file's first 1,000 matched lines are
+  coloured, as rg colours them; past those, lines print with their path
+  and line number in colour and their matches plain. `-o` colours every
+  match. Under `-U`, adjacent matched lines print as one block, and a
+  block that starts in the first 1,000 matched lines is coloured whole.
 * `index`, `serve` and `status` are commands when they are the first word.
   To search for one of these words, put `--` or any flag first:
   `fmgrep -- status`, `fmgrep -n status`.
