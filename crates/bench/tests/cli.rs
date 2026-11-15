@@ -407,7 +407,7 @@ fn server_rows_query_running_servers_and_leave_them_up() {
     ];
     assert_eq!(names, want.into());
     let status = Command::new(&fmgrep)
-        .args(["--server", addr, "--status"])
+        .args(["status", "--server", addr, "--json"])
         .output();
     assert!(status.unwrap().status.success());
 }

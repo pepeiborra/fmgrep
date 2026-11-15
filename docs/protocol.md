@@ -184,9 +184,10 @@ Serving continues after any error.
 `--index` and prints what the local search prints. It sends one `query`
 (all terms, or the expression) with `stream: true`. `--json` alone and
 `--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
-headings follow the client's stdout, as in rg. `--status` prints the
-status object and `--shutdown` stops the server. An error response exits
-2, as `error: server: <message>`, after any output already received. When
+headings follow the client's stdout, as in rg. `--shutdown` stops the
+server; `fmgrep status --server ADDR --json` prints the status object.
+An error response exits 2, as `error: server: <message>`, after any
+output already received. When
 the server cannot be reached, a `.fmgrep` found by walking up from the cwd
 answers, and stderr says `warning: Using local index <dir>: cannot reach
 the server at ADDR (<cause>)`; with none, the search exits 2, as `error:
@@ -196,11 +197,11 @@ cannot reach the server at ADDR: <cause>`.
 neither `--server` nor `--index` and finds no `.fmgrep` by walking up from
 the cwd. When it finds one, that index answers, and stderr says
 `warning: Using local index <dir>, not the server at ADDR
-(FMGREP_SERVER)`. `--status` reads the variable; `--shutdown` needs
-`--server`. An empty value is unset. The command `fmgrep status` (no
-dashes) reads it as a search does: where the server answers, status
-prints the `status` reply, one `name: value` line per field (`--json`:
-the reply). `fmgrep status --server ADDR` is the search's `--server`.
+(FMGREP_SERVER)`. `--shutdown` needs `--server`. An empty value is
+unset. The command `fmgrep status` reads it as a search does: where the
+server answers, status prints the `status` reply, one `name: value`
+line per field (`--json`: the reply). `fmgrep status --server ADDR` is
+the search's `--server`.
 
 ## CLI --json
 

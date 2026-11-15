@@ -30,7 +30,7 @@ pub enum Outcome {
     Index(#[cfg_attr(not(test), allow(dead_code))] IndexSummary),
     Query(OutputReport),
     /// `serve` ended, help or the version printed, `status` printed, or
-    /// `--status|--shutdown` answered.
+    /// `--shutdown` answered.
     Done,
 }
 
@@ -240,14 +240,7 @@ fn search(
             .server
             .as_deref()
             .ok_or("error: --shutdown needs --server ADDR; FMGREP_SERVER does not stop a server")?;
-        return serve::manage(addr, true, out);
-    }
-    if s.status {
-        let addr = match &s.server {
-            Some(addr) => addr.clone(),
-            None => env()?.ok_or("error: --status needs --server ADDR or FMGREP_SERVER")?,
-        };
-        return serve::manage(&addr, false, out);
+        return serve::shutdown(addr);
     }
     let mut p = s.params(input, printing, tty)?;
     let typed = s.paths()?;
