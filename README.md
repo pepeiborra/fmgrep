@@ -112,8 +112,8 @@ compiler/GHC/Driver/Main/Hsc.hs
   To search for one of these words, put `--` or any flag first:
   `fmgrep -- status`, `fmgrep -n status`.
 
-To see which index or server a search here uses, and what that index
-holds:
+To see which index or server a search here uses, what that index holds,
+and what changed since it was built:
 
 ```console
 $ fmgrep status
@@ -128,7 +128,19 @@ build_time_us: 1997204
 index_started_ns: 1763061773123456789
 shards: 1
 corpus_root: /home/me/ghc
+changes: fewer than 50000 files: checked every file
+since the index: 2 stale, 1 added, 0 gone
+record: none saved
 ```
+
+Status runs the check of what changed that a search runs, as a search
+runs it, and prints what that check did, in the search's words: on a
+tree of 50,000 files or more it may take a watchman token, start
+watchman, ask it to watch the tree and save the record of the search
+([watchman](docs/index-format.md#watchman)); where watchman cannot say,
+it checks every file. The lines a search warns about it print once, on
+stdout. Status does not load the index's shards, so it does not find a
+damaged shard; a search does.
 
 `fmgrep status --json` prints the manifest as one JSON line, with the file
 list ([fields](docs/index-format.md#manifestbin)). `fmgrep status` chooses

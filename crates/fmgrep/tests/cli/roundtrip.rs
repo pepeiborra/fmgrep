@@ -158,6 +158,59 @@ fn a_new_ignore_file_is_applied_and_warned_once() {
     assert_eq!(counts(&out.stdout), [(2, 1), (1, 1)]);
 }
 
+/// `status` runs a search's check of what changed and prints what it
+/// found: the counts, and the lines that check warns, on stdout only,
+/// where a search warns them on stderr.
+#[test]
+fn status_says_what_the_check_of_what_changed_did() {
+    let (_tmp, docs) = stage();
+    let out = run_in(&docs, &["index"]);
+    assert!(out.status.success(), "index: {}", stderr(&out));
+    std::fs::write(docs.join("a.bin"), b"printk edited\n").unwrap();
+    std::fs::write(docs.join("e.bin"), b"printk added\n").unwrap();
+    std::fs::remove_file(docs.join("c.bin")).unwrap();
+    // Older than 2 s, so that the index's stamp of the dir tells it apart.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
+    let file = std::fs::File::create(docs.join(".ignore")).unwrap();
+    std::io::Write::write_all(&mut &file, b"nothing.bin\n").unwrap();
+    file.set_modified(old).unwrap();
+    let ignores = "1 ignore file changed since the index; each search reads its directory \
+                   again (re-run index to make searches fast again)";
+    let out = run_in(&docs, &["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let facts: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.starts_with("changes"))
+        .collect();
+    let changes = [
+        "changes: fewer than 50000 files: checked every file".to_owned(),
+        format!("changes: {ignores}"),
+        "since the index: 1 stale, 1 added, 1 gone".to_owned(),
+        "record: none saved".to_owned(),
+    ];
+    assert_eq!(facts, changes);
+    let c = std::fs::canonicalize(&docs).unwrap().join("c.bin");
+    let gone = format!("warning: excluding {}: is missing", c.display());
+    let note = "note: 1 file(s) changed since indexing are scanned in full by every query; \
+                re-run index";
+    // The search's notes, and not the ignore line a second time.
+    let lines = |out: &std::process::Output| {
+        let mut lines: Vec<String> = stderr(out).lines().map(str::to_owned).collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(lines(&out), [note, gone.as_str()]);
+    let search = run_in(&docs, &["-l", "printk"]);
+    assert_eq!(
+        String::from_utf8_lossy(&search.stdout),
+        "a.bin\nb.bin\ne.bin\n"
+    );
+    // The stat pass and discovery warn from two threads, in either order.
+    let ignored = format!("warning: {ignores}");
+    assert_eq!(lines(&search), [note, ignored.as_str(), gone.as_str()]);
+}
+
 /// `index` with no `--output` writes `.fmgrep`, which a search finds from
 /// any directory below, searching that directory's subtree as rg does.
 #[test]
@@ -301,6 +354,13 @@ fn status_prints_the_manifest_of_the_index() {
                 "corpus_root: {}",
                 m["corpus_root"].as_str().unwrap()
             ));
+            want.extend([
+                "changes: fewer than 50000 files: checked every file".into(),
+                "since the index: 0 stale, 0 added, 0 gone".into(),
+                "record: none saved".into(),
+            ]);
+        } else {
+            want.push("changes: none: the index holds the files".into());
         }
         assert_eq!(text.lines().collect::<Vec<_>>(), want, "{store_docs}");
 
@@ -315,7 +375,9 @@ fn status_prints_the_manifest_of_the_index() {
     }
 }
 
-/// `status` refuses what a search refuses, with the same words.
+/// `status` refuses what a search refuses before the index loads, with
+/// the same words: a manifest of another format; in either layout, a
+/// `blobs.shard` longer than the manifest's blob lengths.
 #[test]
 fn status_of_a_refused_index_fails_as_a_search() {
     let (_tmp, docs) = stage();
@@ -324,24 +386,32 @@ fn status_of_a_refused_index_fails_as_a_search() {
     let mut raw = std::fs::read(&path).unwrap();
     raw[8..12].copy_from_slice(&12u32.to_le_bytes());
     std::fs::write(&path, raw).unwrap();
-    let index = index_dir.display().to_string();
-    let search = run(&["--index", &index, "printk"]);
-    let status = run(&["status", &index]);
-    assert_eq!(status.status.code(), Some(2));
-    assert!(status.stdout.is_empty());
-    assert!(
-        stderr(&status).contains("unsupported manifest format 12"),
-        "{}",
-        stderr(&status)
-    );
-    assert_eq!(stderr(&status), stderr(&search));
+    let refused = |index_dir: &Path, words: &str| {
+        let index = index_dir.display().to_string();
+        let search = run(&["--index", &index, "printk"]);
+        let status = run(&["status", &index]);
+        assert_eq!(status.status.code(), Some(2));
+        assert!(status.stdout.is_empty());
+        assert!(stderr(&status).contains(words), "{}", stderr(&status));
+        assert_eq!(stderr(&status), stderr(&search));
+    };
+    refused(&index_dir, "unsupported manifest format 12");
+    for store_docs in [true, false] {
+        let (_tmp, docs) = stage();
+        let index_dir = do_index(&docs, store_docs);
+        let shard = index_dir.join("blobs.shard");
+        let mut raw = std::fs::read(&shard).unwrap();
+        raw.push(0);
+        std::fs::write(&shard, raw).unwrap();
+        refused(&index_dir, "refusing a tampered index");
+    }
 }
 
 /// A damaged path in the manifest is refused by what reads it, in the
 /// manifest's words: a search that prints it, before any line of that
-/// term; `status --json`; a files-layout search, which reads every path;
-/// a server, at start. What reads no damaged path answers as on the whole
-/// index.
+/// term; `status --json`; a files-layout search and status, which read
+/// every path; a server, at start. What reads no damaged path answers as
+/// on the whole index.
 #[test]
 fn a_damaged_path_is_refused_by_what_reads_it() {
     let files: [(&str, &[u8]); 3] = [("a.c", b"printk"), ("b.c", b"zz"), ("c.c", b"printk zz")];
@@ -370,9 +440,13 @@ fn a_damaged_path_is_refused_by_what_reads_it() {
             assert_eq!(stderr(&out), words, "{args:?}");
         };
         refused(&["status", "--json", &index]);
-        let status = run(&["status", &index]);
-        assert!(status.status.success(), "{}", stderr(&status));
-        assert!(String::from_utf8_lossy(&status.stdout).contains("num_docs: 3"));
+        if store_docs {
+            let status = run(&["status", &index]);
+            assert!(status.status.success(), "{}", stderr(&status));
+            assert!(String::from_utf8_lossy(&status.stdout).contains("num_docs: 3"));
+        } else {
+            refused(&["status", &index]);
+        }
         let served = fmgrep()
             .args(["serve", &index, "--stdio", "--no-watch"])
             .stdin(std::process::Stdio::null())

@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,14 +36,26 @@ const FIND_WAIT: Duration = Duration::from_millis(500);
 /// the tree.
 const ASK_WAIT: Duration = Duration::from_millis(100);
 
+/// The fewest docs at which a load asks watchman; under test, never
+/// unless a test sets it.
+fn ask_from() -> Option<usize> {
+    #[cfg(test)]
+    return crate::tests::ASK_FROM.get();
+    #[cfg(not(test))]
+    return Some(MIN_DOCS);
+}
+
 /// Whether a load of `docs` docs asks watchman.
 pub fn due(docs: usize) -> bool {
-    #[cfg(test)]
-    return crate::tests::ASK_FROM
-        .get()
-        .is_some_and(|from| docs >= from);
-    #[cfg(not(test))]
-    return docs >= MIN_DOCS;
+    ask_from().is_some_and(|from| docs >= from)
+}
+
+/// Why a load that is not [`due`] checks every file.
+pub fn not_due() -> String {
+    match ask_from() {
+        Some(from) => format!("fewer than {from} files: checked every file"),
+        None => "checked every file".to_owned(),
+    }
 }
 
 /// Once the index walk of `root` has listed `files` files, before it reads
@@ -276,12 +289,14 @@ impl Record {
     }
 
     /// Atomic: a crash leaves the old file or the new one, and two writers
-    /// leave one of theirs. Says why it could not, once per process.
-    fn write(&self) {
+    /// leave one of theirs. Says why it could not, once per process; else
+    /// where it wrote.
+    fn write(&self) -> Option<PathBuf> {
         let Some(path) = path(&self.root, &self.index) else {
-            return cannot_save(format_args!(
+            cannot_save(format_args!(
                 "the watchman token (no cache directory: set XDG_CACHE_HOME or HOME)"
             ));
+            return None;
         };
         static WRITES: AtomicUsize = AtomicUsize::new(0);
         let n = WRITES.fetch_add(1, Ordering::Relaxed);
@@ -299,7 +314,9 @@ impl Record {
         if let Err(e) = wrote {
             let _ = std::fs::remove_file(&tmp);
             cannot_save(format_args!("{} ({e})", path.display()));
+            return None;
         }
+        Some(path)
     }
 }
 
@@ -500,10 +517,18 @@ fn first(root: &Path, taken: Option<Token>, served: bool) -> Result<Token, (Stri
 }
 
 /// Save `token` and `baseline` (ascending, deduped) as what differs from
-/// `index` under canonical `root` at it, after the search answered.
-pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap: usize) {
+/// `index` under canonical `root` at it, after the search answered: the
+/// record's path, once written.
+pub fn save(
+    root: &Path,
+    index: &Index,
+    token: Token,
+    baseline: Vec<String>,
+    cap: usize,
+) -> Option<PathBuf> {
     let (Some(root), Some(dir)) = (root.to_str(), index.dir.to_str()) else {
-        return cannot_save(format_args!("the record (the index path is not UTF-8)"));
+        cannot_save(format_args!("the record (the index path is not UTF-8)"));
+        return None;
     };
     let record = Record {
         v: VERSION,
@@ -513,16 +538,43 @@ pub fn save(root: &Path, index: &Index, token: Token, baseline: Vec<String>, cap
         token,
         baseline: (baseline.len() <= cap).then_some(baseline),
     };
-    record.write();
+    record.write()
 }
 
-/// `line` on stderr, once per process for each `seen`.
+/// Whether [`warn`] keeps its lines for [`kept`] instead of printing them.
+static KEEP: AtomicBool = AtomicBool::new(false);
+static KEPT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// `line` on stderr, once per process for each `seen`; kept instead once
+/// [`keep`] was called.
 pub(super) fn warn(seen: &AtomicBool, line: &str) {
     #[cfg(test)]
     crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
-    if !seen.swap(true, Ordering::Relaxed) {
-        eprintln!("warning: {line}");
+    if seen.swap(true, Ordering::Relaxed) {
+        return;
     }
+    match KEEP.load(Ordering::Relaxed) {
+        true => KEPT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(line.to_owned()),
+        false => eprintln!("warning: {line}"),
+    }
+}
+
+/// From now on, keep the lines [`warn`] would print: `status` prints them
+/// itself, once.
+pub fn keep() {
+    KEEP.store(true, Ordering::Relaxed);
+}
+
+/// The lines kept since [`keep`], in order; under test, this thread's
+/// warnings, left for the test to read as a search's.
+pub fn kept() -> Vec<String> {
+    #[cfg(test)]
+    return crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().clone());
+    #[cfg(not(test))]
+    std::mem::take(&mut *KEPT.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// `line` on stderr, as a warning, every time: a server's.

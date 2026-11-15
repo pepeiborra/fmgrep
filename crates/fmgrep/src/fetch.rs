@@ -232,11 +232,12 @@ impl DocStore {
     }
 
     /// Once the stat pass and discovery, or the replay, are done: save the
-    /// watchman token and what differs, once, in the user's cache.
-    pub fn checkpoint(&self, files: &FileTable) -> Result<(), String> {
+    /// watchman token and what differs, once, in the user's cache: where,
+    /// when this call saved it.
+    pub fn checkpoint(&self, files: &FileTable) -> Result<Option<PathBuf>, String> {
         match &self.source {
             Source::Files(f) => f.checkpoint(files),
-            Source::Shard { .. } => Ok(()),
+            Source::Shard { .. } => Ok(None),
         }
     }
 

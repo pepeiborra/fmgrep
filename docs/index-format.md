@@ -55,10 +55,28 @@ in PATH (default: the current directory) does, and fails where that
 search fails before it searches, with its words. Its first line names
 what the search uses: `a search here uses the local index DIR`, with
 the note that the search warns when it passes over a server. For an
-index, it reads the manifest as a search does, and refuses what a
-search refuses at load. It reads no path, so it answers on an index
-whose path text is damaged ([checks](#checks)). It prints one `name:
-value` line per scalar field, plus `shards` (the number of blobs).
+index, it reads the manifest and opens the index as a search does, and
+refuses what a search refuses there, a `blobs.shard` of the wrong
+length included. It prints one `name: value` line per scalar field,
+plus `shards` (the number of blobs).
+
+Of the files layout, status then runs the search's check of what
+changed ([staleness](#staleness), [watchman](#watchman)) as a search
+runs it, without the index load or a query, and prints what it did:
+one `changes:` line for how it learned what changed, and one for each
+line a search warns about it, in the same words (on stdout only);
+`since the index: N stale, N added, N gone`; and `record: PATH` for the
+record it saved, else `record: none saved`. The search's note on the
+stale files, and each file it finds missing, print on stderr, as in a
+search. The check reads every path, so a damaged path fails status as
+it fails a search. Of `--store-docs` status reads no path, and so
+answers on an index whose path text is damaged ([checks](#checks)).
+
+Status does not load the index from the shards. What that load refuses
+fails a search, not status: labels that do not partition the documents,
+a shard whose bytes are damaged, an index that covers another number of
+files than the manifest records.
+
 `fmgrep status --json` prints the manifest itself: the fields above, in
 that order, on one line; it checks every path first. A script reads the
 paths with `fmgrep status --json | jq -r '.files[]'`.
@@ -137,12 +155,12 @@ path a term may print before it prints the first line of that term, and
 every path a PATH or glob filter reads, even one it would not print. A
 search of several terms prints the terms before the one that reads the
 damaged path, then stops. What reads every path checks all of the text
-once, first: a search of the files layout, at load; `fmgrep serve`, at
-start; `fmgrep status --json`. That check says "holds a path that is not
-UTF-8", or names the first path an end "cuts inside a character". So a
-damaged path is refused by the first command that reads it; `fmgrep
-status` without `--json`, and a search of `--store-docs` that reads only
-other paths, answer.
+once, first: a search or `fmgrep status` of the files layout, at load;
+`fmgrep serve`, at start; `fmgrep status --json`. That check says "holds
+a path that is not UTF-8", or names the first path an end "cuts inside a
+character". So a damaged path is refused by the first command that reads
+it; `fmgrep status` of `--store-docs` without `--json`, and a search of
+`--store-docs` that reads only other paths, answer.
 
 A refusal of the bytes names the file and ends with "re-run `index`".
 
