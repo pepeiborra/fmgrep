@@ -60,6 +60,9 @@ pub struct QueryParams {
     /// Rendering modes: send the output as byte frames before the response.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
+    /// `lines` and `only`: print rg's statistics after each term's output.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stats: bool,
 }
 
 /// What a request produces: the report (`counts`) or the
@@ -139,6 +142,7 @@ impl Default for QueryParams {
             cwd: String::new(),
             filename: true,
             stream: false,
+            stats: false,
         }
     }
 }
@@ -215,6 +219,7 @@ impl QueryParams {
                 color: self.color == Color::Always,
                 path: self.filename && !self.heading,
                 json: self.mode == Mode::JsonMatches,
+                stats: self.stats,
             }),
             Mode::Files => QueryOutput::FilesWithMatches,
             Mode::Count => QueryOutput::CountLines,
@@ -235,6 +240,7 @@ impl QueryParams {
             color: self.color == Color::Always,
             banner: self.terms.len() > 1,
             filename: self.filename,
+            stats: self.stats && matches!(self.mode, Mode::Lines | Mode::Only),
         }
     }
 }

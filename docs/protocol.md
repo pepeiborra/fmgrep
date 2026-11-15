@@ -65,6 +65,7 @@ response line each, after any [frames](#streamed-output).
 | `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 | `stream` | bool | false | send the output as [frames](#streamed-output) |
+| `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 

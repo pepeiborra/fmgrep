@@ -20,6 +20,7 @@ const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     color: false,
     path: false,
     json: true,
+    stats: false,
 });
 
 /// The stream with every wall clock blanked: `elapsed_total` emptied, each

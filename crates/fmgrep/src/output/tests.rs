@@ -22,6 +22,7 @@ const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     color: false,
     path: false,
     json: false,
+    stats: false,
 });
 
 fn cfg(format: Format) -> OutputConfig {
@@ -32,6 +33,7 @@ fn cfg(format: Format) -> OutputConfig {
         color: false,
         banner: false,
         filename: true,
+        stats: false,
     }
 }
 
@@ -48,12 +50,15 @@ fn render_in(
         QueryOutput::Matches(p) => QueryOutput::Matches(Print {
             color: cfg.color,
             path: cfg.filename && !cfg.heading,
+            stats: cfg.stats,
             ..p
         }),
         o => o,
     };
     let mut buf: Vec<u8> = Vec::new();
     let mut w = MatchWriter::new(&mut buf, cfg);
+    let bytes = docs.iter().map(|(_, raw)| raw.len() as u64).sum();
+    w.corpus(docs.len(), bytes).unwrap();
     for term in terms {
         w.term_start(term).unwrap();
         let s = search(term, output, mode);
@@ -68,6 +73,15 @@ fn render_in(
                 .unwrap();
             }
         }
+        let report = QueryReport {
+            term: term.to_string(),
+            latency_us: 0,
+            total_matches: 0,
+            docs_matched: 0,
+            counts_exact: true,
+            leaves: Vec::new(),
+        };
+        w.term_end(&report).unwrap();
     }
     w.finish().unwrap();
     buf
@@ -291,6 +305,57 @@ fn color_palette_is_rgs() {
         alpha(c, QueryOutput::FilesWithMatches),
         "\x1b[0m\x1b[35ma.txt\x1b[0m\n\x1b[0m\x1b[35msub/b.txt\x1b[0m\n"
     );
+}
+
+#[test]
+fn stats_are_rgs() {
+    // rg --stats, without its two lines of times.
+    let timeless = |c: OutputConfig, output| {
+        let c = OutputConfig { stats: true, ..c };
+        (alpha(c, output).lines())
+            .filter(|l| !l.ends_with(" seconds spent searching") && !l.ends_with(" seconds total"))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+    };
+    let block = |bytes_printed| {
+        format!(
+            "\n5 matches\n4 matched lines\n2 files contained matches\n2 files searched\n\
+             {bytes_printed} bytes printed\n89 bytes searched\n"
+        )
+    };
+    // rg --heading -n --stats alpha
+    assert_eq!(
+        timeless(cfg(Format::Lines), MATCHES),
+        alpha(cfg(Format::Lines), MATCHES) + &block(74)
+    );
+    // rg --no-heading -n -o --stats alpha
+    let no_heading = OutputConfig {
+        heading: false,
+        ..cfg(Format::Lines)
+    };
+    assert_eq!(
+        timeless(no_heading, only(MATCHES)),
+        alpha(no_heading, only(MATCHES)) + &block(74)
+    );
+    // rg --no-heading -n -C1 --color always --stats alpha: no colour code
+    // counts, the `--` between files does.
+    let c = OutputConfig {
+        color: true,
+        ..with_context(Format::Lines, false, true)
+    };
+    assert_eq!(
+        timeless(c, context(1, 1)),
+        alpha(c, context(1, 1)) + &block(179)
+    );
+    // The times are the last two lines.
+    let c = OutputConfig {
+        stats: true,
+        ..cfg(Format::Lines)
+    };
+    let got = alpha(c, MATCHES);
+    let times: Vec<&str> = got.lines().rev().take(2).collect();
+    assert!(times[0].ends_with(" seconds total"), "{got}");
+    assert!(times[1].ends_with(" seconds spent searching"), "{got}");
 }
 
 #[test]

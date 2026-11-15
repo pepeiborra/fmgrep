@@ -13,6 +13,7 @@ fn cfg(format: Format) -> OutputConfig {
         color: false,
         banner: false,
         filename: true,
+        stats: false,
     }
 }
 
@@ -36,6 +37,7 @@ const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     color: false,
     path: true,
     json: false,
+    stats: false,
 });
 
 const ONLY: QueryOutput = QueryOutput::Matches(Print {
@@ -150,5 +152,65 @@ fn the_wire_report_carries_counts_only() {
             (4, 2),
             "store_docs={store_docs}"
         );
+    }
+}
+
+#[test]
+fn stats_follow_the_lines() {
+    // rg --no-heading --stats printk, without its two lines of times.
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = staged(tmp.path(), store_docs);
+        let got = printed(&index, &["--stats", "--no-heading"], &["printk"]);
+        let timeless: String = (got.lines())
+            .filter(|l| !l.ends_with(" seconds spent searching") && !l.ends_with(" seconds total"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            timeless,
+            "a.c:printk one\na.c:printk two printk\nb.c:tail printk\n\n\
+             4 matches\n3 matched lines\n2 files contained matches\n2 files searched\n\
+             53 bytes printed\n53 bytes searched\n",
+            "store_docs={store_docs}"
+        );
+    }
+}
+
+#[test]
+fn stats_count_the_files_a_glob_keeps() {
+    // As rg -g counts them, but for d.c's BOM: the index does not record
+    // which file holds one, so a narrowed search counts it (rg: 18 bytes).
+    let files: [(&str, &[u8]); 3] = [
+        ("a.c", b"printk one\n"),
+        ("b.c", b"tail printk\n"),
+        ("d.c", b"\xef\xbb\xbfprintk\n"),
+    ];
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = stage_corpus(tmp.path(), &files);
+        let index = tmp.path().join("idx");
+        index_it(&folder, &index, store_docs);
+        for (flags, terms, want) in [
+            (&["--stats"][..], &["printk"][..], (3, 30)),
+            (&["--stats", "-g", "*.c"], &["printk"], (3, 30)),
+            (&["--stats", "-g", "b.c"], &["printk"], (1, 12)),
+            (&["--stats", "-g", "!b.c"], &["printk"], (2, 21)),
+            (
+                &["--stats", "-g", "b.c", "--expr", "printk AND tail"],
+                &[],
+                (1, 12),
+            ),
+        ] {
+            let got = printed(&index, flags, terms);
+            let number = |what: &str| -> u64 {
+                let line = got.lines().find(|l| l.ends_with(what)).unwrap();
+                line.split(' ').next().unwrap().parse().unwrap()
+            };
+            assert_eq!(
+                (number(" files searched"), number(" bytes searched")),
+                want,
+                "{flags:?} store_docs={store_docs}"
+            );
+        }
     }
 }

@@ -29,6 +29,17 @@ fn local(index: &Path, flags: &[&str], terms: &[&str]) -> Vec<String> {
 fn both(index: &Path, addr: &str, flags: &[&str], terms: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let here = output(&local(index, flags, terms), false).unwrap();
     let served = output(&words(&["--server", addr], flags, terms), false).unwrap();
+    if flags.contains(&"--stats") {
+        let timeless = |b: Vec<u8>| -> Vec<u8> {
+            (b.split_inclusive(|&c| c == b'\n'))
+                .filter(|l| !l.ends_with(b" seconds spent searching\n"))
+                .filter(|l| !l.ends_with(b" seconds total\n"))
+                .flatten()
+                .copied()
+                .collect()
+        };
+        return (timeless(here), timeless(served));
+    }
     if !flags.contains(&"--json") {
         return (here, served);
     }
@@ -74,6 +85,13 @@ const CASES: &[(&[&str], &[&str])] = &[
     ),
     (&["--json"], &["printk", "/pr[i1]ntk/"]),
     (&["--approx-counts"], &["printk"]),
+    (&["--stats"], &["printk", "absent"]),
+    (
+        &["--stats", "-o", "--no-heading", "--color", "always"],
+        &["printk"],
+    ),
+    (&["--stats", "-C1", "--expr", "printk AND one"], &[]),
+    (&["--stats", "-g", "b.c"], &["printk"]),
 ];
 
 #[test]

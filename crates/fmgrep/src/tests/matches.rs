@@ -15,6 +15,7 @@ const MATCHES: QueryOutput = QueryOutput::Matches(Print {
     color: false,
     path: false,
     json: true,
+    stats: false,
 });
 
 /// One `doc` call: the document, its counts, and `(line, match columns,
