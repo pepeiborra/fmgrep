@@ -65,7 +65,7 @@ response line each, after any [frames](#streamed-output).
 | `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 | `stream` | bool | false | send the output as [frames](#streamed-output) |
-| `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output |
+| `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output, and `lines` reports matches (below) |
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
@@ -146,7 +146,7 @@ caps nesting at 60.
 |---|---|
 | `term` | the term as given, or the expression's text form |
 | `latency_us` | this term's probe and fetch |
-| `total_matches` | matches, or matched lines under `-c` (see below) |
+| `total_matches` | matches, or matched lines under `-c` and in `lines` without `stats` (see below) |
 | `docs_matched` | documents matched |
 | `counts_exact` | present, as `false`, only when the counts may differ from rg's |
 | `leaves` | expressions only, in counting modes: `[{term, total_matches}]` per leaf |
@@ -162,6 +162,12 @@ Counting semantics:
   membership only, so its `counts_exact` is false.
 - **`-c`** reports in `total_matches` the sum of the counts it prints:
   matched lines, as `rg -c` counts them.
+- **`lines`** reports in `total_matches` the lines it printed as matched,
+  which it counts as it prints them: rg's matched lines of `--stats`.
+  They equal the `-c` count except under `-U`, where `rg -c` counts a match
+  over several lines once. With `stats` it finds each match of
+  every printed line again and reports rg's matches, as `json_matches`
+  and `only` always do.
 - **An expression** has an exact `docs_matched`. Its `total_matches` is
   the sum of the leaves' counts within those documents, exact only for
   plain literals that cannot overlap.

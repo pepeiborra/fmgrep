@@ -74,7 +74,7 @@ pub struct Print {
     pub path: bool,
     /// rg `--json`.
     pub json: bool,
-    /// rg `--stats`.
+    /// rg `--stats`: count each match of every printed line.
     pub stats: bool,
 }
 
@@ -110,10 +110,15 @@ pub fn line_scan(m: &RegexMatcher, mode: MatchMode) -> bool {
     !mode.multiline || m.non_matching_bytes().is_some_and(|b| b.contains(b'\n'))
 }
 
-/// A matching document's printed bytes and rg's stats for it.
+/// A matching document's printed bytes and the stats its printer kept.
 pub struct Found {
     pub printed: Vec<u8>,
+    /// rg's stats; none from the lines printer without `--stats` or `-o`.
     pub stats: Stats,
+    /// What the report counts for it: rg's matches, the number `-c` or
+    /// `--count-matches` printed, or the matched lines of a lines search
+    /// without `--stats`; 0 under `-l`.
+    pub count: u64,
 }
 
 /// One matcher searched over documents and printed as `output` asks, from
@@ -179,7 +184,9 @@ impl DocSearch {
                     .color_specs(ColorSpecs::default_with_color())
                     .path(false)
                     .only_matching(p.only_matching)
-                    .stats(true)
+                    // These counts find each match of each line again;
+                    // `-o` finds them anyway.
+                    .stats(p.stats || p.only_matching)
                     .build(Prefixed::new(p.color, Arc::clone(&sep))),
             ),
             QueryOutput::CountLines => summary(SummaryKind::Count),
@@ -207,28 +214,32 @@ impl DocSearch {
 
     fn search(&self, slot: &mut Slot, path: &str, doc: &[u8]) -> io::Result<Option<Found>> {
         let (m, searcher) = (&slot.matcher, &mut slot.searcher);
-        let (matched, stats, printed) = match &mut slot.printer {
+        let (matched, stats, printed, count) = match &mut slot.printer {
             Printer::Lines(p) => {
                 let named = matches!(self.output, QueryOutput::Matches(Print { path: true, .. }));
                 p.get_mut().start(named.then_some(path));
                 let mut sink = Tagged {
                     inner: p.sink(m),
                     sep: &slot.sep,
+                    multi_line: searcher.multi_line_with_matcher(m),
+                    lines: 0,
                 };
                 searcher.search_slice(m, doc, &mut sink)?;
                 let (matched, mut stats) = (sink.inner.has_match(), sink.inner.stats().cloned());
+                let count = stats.as_ref().map_or(sink.lines, Stats::matches);
                 let w = p.get_mut();
                 // rg's bytes printed hold the path on each line.
                 if let Some(s) = &mut stats {
                     s.add_bytes_printed(std::mem::take(&mut w.prefixed));
                 }
-                (matched, stats, w.take())
+                (matched, stats, w.take(), count)
             }
             Printer::Json(p) => {
                 let mut sink = p.sink_with_path(m, path);
                 searcher.search_slice(m, doc, &mut sink)?;
-                let (matched, stats) = (sink.has_match(), Some(sink.stats().clone()));
-                (matched, stats, std::mem::take(p.get_mut()))
+                let (matched, stats) = (sink.has_match(), sink.stats().clone());
+                let count = stats.matches();
+                (matched, Some(stats), std::mem::take(p.get_mut()), count)
             }
             Printer::Summary(p) => {
                 let mut sink = p.sink(m);
@@ -237,12 +248,15 @@ impl DocSearch {
                 let buf = p.get_mut();
                 let printed = buf.as_slice().to_vec();
                 buf.clear();
-                (matched, stats.or_else(|| counted(&printed)), printed)
+                let stats = stats.or_else(|| counted(&printed));
+                let count = stats.as_ref().map_or(0, Stats::matches);
+                (matched, stats, printed, count)
             }
         };
         Ok(matched.then(|| Found {
             printed,
             stats: stats.unwrap_or_default(),
+            count,
         }))
     }
 }
@@ -348,10 +362,14 @@ impl WriteColor for Prefixed {
     }
 }
 
-/// Tells [`Prefixed`] what kind of line each call prints.
+/// Tells [`Prefixed`] what kind of line each call prints, and counts the
+/// matched lines.
 struct Tagged<'a, S> {
     inner: S,
     sep: &'a AtomicU8,
+    /// A call may hold several matched lines.
+    multi_line: bool,
+    lines: u64,
 }
 
 impl<S: Sink<Error = io::Error>> Sink for Tagged<'_, S> {
@@ -359,6 +377,10 @@ impl<S: Sink<Error = io::Error>> Sink for Tagged<'_, S> {
 
     fn matched(&mut self, s: &Searcher, m: &SinkMatch<'_>) -> io::Result<bool> {
         self.sep.store(b':', Relaxed);
+        self.lines += match self.multi_line {
+            true => m.lines().count() as u64,
+            false => 1,
+        };
         self.inner.matched(s, m)
     }
 
