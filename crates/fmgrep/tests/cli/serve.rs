@@ -451,22 +451,15 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
         (hits.into(), "".into())
     );
 
-    // `status` reads the local index and never the variable.
+    // `status` reports on that index; the value is not looked at.
     let local = run_in(&docs, &["status", "--json"]);
     assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
     let out = run_bad(&docs, &["status", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
-    let out = run_bad(&away, &["status"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        stderr(&out).contains("no .fmgrep index"),
-        "{}",
-        stderr(&out)
-    );
 
-    // A search or `--status` that would reach the server fails.
-    for argv in [&words[..], &["--status"]] {
+    // A search, `status` or `--status` that would reach the server fails.
+    for argv in [&words[..], &["status"], &["--status"]] {
         let out = run_bad(&away, argv);
         assert_eq!(out.status.code(), Some(2));
         assert!(out.stdout.is_empty());
@@ -477,11 +470,12 @@ fn a_malformed_fmgrep_server_fails_only_a_search_that_uses_it() {
     }
 }
 
-/// `fmgrep status` reports on the local index whatever `FMGREP_SERVER`
-/// holds; `fmgrep --status` reports on the server; `fmgrep -- status`
-/// searches for the word.
+/// `fmgrep status` names the index or server a search in the same place
+/// uses, with the note that search warns, and fails where it fails, in
+/// its words; `status --server` is a search's `--server`. `fmgrep --
+/// status` searches for the word.
 #[test]
-fn status_reads_the_local_index_and_dash_dash_status_the_server() {
+fn status_names_what_a_search_uses() {
     let (tmp, docs) = stage();
     let index = do_index(&docs, false).display().to_string();
     let mut server = Server::spawn(&["serve", &index, "--no-watch"]);
@@ -490,30 +484,64 @@ fn status_reads_the_local_index_and_dash_dash_status_the_server() {
     ok(&["index", &docs.display().to_string()]);
     let away = tmp.path().join("away");
     std::fs::create_dir(&away).unwrap();
+    let dotdir = std::fs::canonicalize(&docs).unwrap().join(".fmgrep");
+    let closed = closed_port();
+    let first = |out: &Output| {
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(out));
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines().next().unwrap_or_default().to_owned()
+    };
 
-    let local = run_in(&docs, &["status", "--json"]);
-    assert_eq!(local.status.code(), Some(0), "{}", stderr(&local));
-    let m: serde_json::Value = serde_json::from_slice(&local.stdout).unwrap();
+    let local = run_in(&docs, &["status"]);
+    let uses = format!("a search here uses the local index {}", dotdir.display());
+    assert_eq!(first(&local), uses);
+    let out = run_env(&docs, &addr, &["status"]);
+    let not = format!("{uses}, not the server at {addr} (FMGREP_SERVER)");
+    assert_eq!((first(&out), stderr(&out)), (not, "".into()));
+    let out = run_in(&docs, &["status", "--server", &closed]);
+    let down = format!("{uses}: cannot reach the server at {closed} (");
+    assert!(first(&out).starts_with(&down), "{}", first(&out));
+    let out = run_in(&away, &["status", &docs.display().to_string()]);
+    let uses_in = format!("a search in {} uses the local index", docs.display());
+    assert!(first(&out).starts_with(&uses_in), "{}", first(&out));
+
+    // `--json` prints the manifest, whatever the variable holds.
+    let json = run_in(&docs, &["status", "--json"]);
+    let m: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(m["num_docs"], DOCS.len() + 1);
     for value in [addr.as_str(), "not an address", ""] {
         let out = run_env(&docs, value, &["status", "--json"]);
         assert_eq!(out.status.code(), Some(0), "{value}: {}", stderr(&out));
-        assert_eq!((&out.stdout, stderr(&out)), (&local.stdout, "".into()));
+        assert_eq!((&out.stdout, stderr(&out)), (&json.stdout, "".into()));
+    }
+
+    // With no index above, the server answers, which serves the index
+    // without s.txt; under `--json` its reply, as `--status` prints it.
+    let reply = run_env(&docs, &addr, &["--status"]);
+    let served: serde_json::Value = serde_json::from_slice(&reply.stdout).unwrap();
+    assert_eq!(served["files"], DOCS.len());
+    let out = run_env(&away, &addr, &["status"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let uses = format!("a search here uses the server at {addr} (FMGREP_SERVER)");
+    assert_eq!(lines[..3], [&uses, "store_docs: false", "files: 3"]);
+    for argv in [
+        &["status", "--json"][..],
+        &["status", "--server", &addr, "--json"],
+    ] {
+        let out = run_env(&away, &addr, argv);
+        assert_eq!(out.status.code(), Some(0), "{argv:?}: {}", stderr(&out));
+        assert_eq!(out.stdout, reply.stdout, "{argv:?}");
+    }
+
+    // Where a search fails before it searches, status fails with its words.
+    for value in [closed.as_str(), "not an address", ""] {
+        let search = run_env(&away, value, &["printk"]);
         let out = run_env(&away, value, &["status"]);
         assert_eq!(out.status.code(), Some(2), "{value}");
         assert!(out.stdout.is_empty(), "{value}");
-        assert!(
-            stderr(&out).contains("no .fmgrep index"),
-            "{}",
-            stderr(&out)
-        );
+        assert_eq!(stderr(&out), stderr(&search), "{value}");
     }
-
-    // `--status` asks the server, which serves the index without s.txt.
-    let out = run_env(&docs, &addr, &["--status"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    let served: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(served["files"], DOCS.len());
 
     // `-- status` is a search: through the server from away, of the local
     // index (with the warning) under docs.

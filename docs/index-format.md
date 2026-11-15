@@ -50,15 +50,18 @@ JSON object on one line, in this order.
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
 
-`fmgrep status [PATH]` reads the manifest of the index at or above PATH
-(default: the current directory) as a search does, and refuses what a
-search refuses at load. It reads no path, so it answers on an index whose
-path text is damaged ([checks](#checks)). It prints one `name: value`
-line per scalar field, plus `index` (the index directory) and `shards`
-(the number of blobs). `fmgrep status --json` prints the manifest itself:
-the fields above, in that order, on one line; it checks every path first.
-A script reads the paths with
-`fmgrep status --json | jq -r '.files[]'`.
+`fmgrep status [PATH]` chooses the index or server as a search started
+in PATH (default: the current directory) does, and fails where that
+search fails before it searches, with its words. Its first line names
+what the search uses: `a search here uses the local index DIR`, with
+the note that the search warns when it passes over a server. For an
+index, it reads the manifest as a search does, and refuses what a
+search refuses at load. It reads no path, so it answers on an index
+whose path text is damaged ([checks](#checks)). It prints one `name:
+value` line per scalar field, plus `shards` (the number of blobs).
+`fmgrep status --json` prints the manifest itself: the fields above, in
+that order, on one line; it checks every path first. A script reads the
+paths with `fmgrep status --json | jq -r '.files[]'`.
 
 ### Layout
 

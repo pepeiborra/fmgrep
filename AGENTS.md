@@ -45,8 +45,8 @@ fmgrep --server 127.0.0.1:7777 --shutdown
   holding both, and then prints the lines of either. `AND` and `OR` must be
   capitals.
 - Put `--` first to search for a term named `index`, `serve` or `status`.
-  `fmgrep status` reports on the local index; `--json` prints its manifest.
-  `fmgrep --status` reports on a server.
+  `fmgrep status` names the index or server a search here uses; `--json`
+  prints the index's manifest, or the server's reply.
 
 ## Freshness
 

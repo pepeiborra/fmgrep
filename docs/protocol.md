@@ -198,7 +198,9 @@ the cwd. When it finds one, that index answers, and stderr says
 `warning: Using local index <dir>, not the server at ADDR
 (FMGREP_SERVER)`. `--status` reads the variable; `--shutdown` needs
 `--server`. An empty value is unset. The command `fmgrep status` (no
-dashes) never reads it: it reports on the local index.
+dashes) reads it as a search does: where the server answers, status
+prints the `status` reply, one `name: value` line per field (`--json`:
+the reply). `fmgrep status --server ADDR` is the search's `--server`.
 
 ## CLI --json
 
