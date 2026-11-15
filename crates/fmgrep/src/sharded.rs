@@ -7,6 +7,7 @@ mod shard;
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -151,12 +152,23 @@ pub struct Walk<'a> {
     /// back to it, as [`Query::Regex`] does.
     anchor: Option<Vec<u8>>,
     us: u64,
+    /// The longest one shard took to locate, ns; 0 until located.
+    slowest_ns: AtomicU64,
 }
 
 impl Walk<'_> {
     /// The walk's wall time, µs.
     pub fn us(&self) -> u64 {
         self.us
+    }
+
+    /// Once located, the longest one shard took, µs: the locate's wall
+    /// time without the cost of starting it.
+    pub fn slowest_us(&self) -> Option<f64> {
+        match self.slowest_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(ns as f64 / 1000.0),
+        }
     }
 
     /// Each walked shard's nonzero count, as [`Query::Count`] answers a
@@ -173,8 +185,12 @@ impl Walk<'_> {
     fn docs(&self, within: Option<&[Range<usize>]>) -> Vec<usize> {
         let docs = |(meta, s, walk): &ShardWalk<'_>| match within.is_none_or(|w| meta.overlaps(w)) {
             true => {
+                let start = Instant::now();
                 let hits = walk.as_ref().ok().map(|live| locate_intervals(live));
-                meta.docs_at(s, hits, self.anchor.as_deref())
+                let docs = meta.docs_at(s, hits, self.anchor.as_deref());
+                let ns = start.elapsed().as_nanos().max(1) as u64;
+                self.slowest_ns.fetch_max(ns, Ordering::Relaxed);
+                docs
             }
             false => Vec::new(),
         };
@@ -317,7 +333,12 @@ impl DocfmIndex {
         let us = start.elapsed().as_micros() as u64;
         #[cfg(test)]
         let us = crate::tests::WALK_US.get().unwrap_or(us);
-        Some(Walk { shards, anchor, us })
+        Some(Walk {
+            shards,
+            anchor,
+            us,
+            slowest_ns: AtomicU64::new(0),
+        })
     }
 
     /// Literal term: ascending `(doc, count)`, zero counts omitted. Complete:

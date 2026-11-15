@@ -306,13 +306,27 @@ pub fn answer_expr(
         let map = |_: usize, raw: &[u8]| {
             finders.iter().all(|f| f.find(raw).is_some()) && folds.iter().all(|p| p.is_match(raw))
         };
-        let mut read_us = |ids: &[usize]| -> Result<f64, String> {
-            let us = read_wall_us(docs, &manifest.files, ids, &map)?;
+        let mut read_us = |ids: &[usize]| -> Result<demote::Sample, String> {
+            let (us, held) = read_wall_us(docs, &manifest.files, ids, &map)?;
             sample_us += us;
-            Ok(us as f64 / ids.len().max(1) as f64)
+            let n = ids.len().max(1) as f64;
+            Ok(demote::Sample {
+                us: us as f64 / n,
+                held: held as f64 / n,
+            })
         };
         let stage1: Vec<Option<&Answer>> = answers.iter().map(Option::as_ref).collect();
-        demote::decide(&mut plan, band, &stage1, &mut read_us);
+        let is_walked: Vec<bool> = walks.iter().map(Option::is_some).collect();
+        let located_us: Vec<Option<f64>> = (walks.iter())
+            .map(|w| w.as_ref().and_then(Walk::slowest_us))
+            .collect();
+        let walked = demote::Walked {
+            leaves: &is_walked,
+            located_us: &located_us,
+            row_us: loaded.locate_us,
+            doc_lens: &manifest.doc_lens,
+        };
+        demote::decide(&mut plan, band, &stage1, &walked, &mut read_us);
     }
     let second: Vec<usize> = (0..leaves.len())
         .filter(|&i| plan.candidate[i] && probed(i, &plan))
@@ -630,23 +644,20 @@ pub fn answer_expr(
     })
 }
 
-/// Wall of reading `ids` as one batch, us.
+/// Wall of reading `ids` as one batch, us, and how many `map` holds.
 fn read_wall_us(
     docs: &mut DocStore,
     files: &FileTable,
     ids: &[usize],
     map: &(dyn Fn(usize, &[u8]) -> bool + Sync),
-) -> Result<u64, String> {
+) -> Result<(u64, usize), String> {
     let start = Instant::now();
-    fetch_stream_parallel(
-        docs,
-        files,
-        ids,
-        fetch_threads(),
-        map,
-        &mut |_, _, _| Ok(()),
-    )?;
-    Ok(start.elapsed().as_micros() as u64)
+    let mut held = 0;
+    fetch_stream_parallel(docs, files, ids, fetch_threads(), map, &mut |_, _, h| {
+        held += usize::from(h);
+        Ok(())
+    })?;
+    Ok((start.elapsed().as_micros() as u64, held))
 }
 
 /// The band around the least of 3 warm per-document reads of spread fresh
@@ -664,7 +675,7 @@ pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
     let mut warm = u64::MAX;
     for pass in 0..4 {
         docs.begin();
-        let Ok(us) = read_wall_us(docs, &manifest.files, &ids, &map) else {
+        let Ok((us, _)) = read_wall_us(docs, &manifest.files, &ids, &map) else {
             return ReadBand::DEFAULT;
         };
         if pass > 0 {

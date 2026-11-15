@@ -344,12 +344,46 @@ fn decided(
     let stage1: Vec<Option<&Answer>> = (0..plan.demoted.len())
         .map(|i| (i == reference).then_some(&a))
         .collect();
+    let walked = unwalked(plan.demoted.len());
     let mut samples = Vec::new();
-    demote::decide(plan, band, &stage1, &mut |ids| {
+    demote::decide(plan, band, &stage1, &walked.of(), &mut |ids| {
         samples.push(ids.to_vec());
-        Ok(read)
+        Ok(sample(read, 0.0))
     });
     (plan.demoted.clone(), samples)
+}
+
+fn sample(us: f64, held: f64) -> demote::Sample {
+    demote::Sample { us, held }
+}
+
+/// [`demote::Walked`]'s inputs, owned.
+struct Walks {
+    leaves: Vec<bool>,
+    located_us: Vec<Option<f64>>,
+    row_us: f64,
+    doc_lens: Vec<u64>,
+}
+
+impl Walks {
+    fn of(&self) -> demote::Walked<'_> {
+        demote::Walked {
+            leaves: &self.leaves,
+            located_us: &self.located_us,
+            row_us: self.row_us,
+            doc_lens: &self.doc_lens,
+        }
+    }
+}
+
+/// No leaf of `n` walked.
+fn unwalked(n: usize) -> Walks {
+    Walks {
+        leaves: vec![false; n],
+        located_us: vec![None; n],
+        row_us: 0.7,
+        doc_lens: Vec::new(),
+    }
 }
 
 #[test]
@@ -512,8 +546,12 @@ fn decide_records_the_edge_or_sample_that_decided() {
     let cost = |locate_us, read_us, read| Why::Cost {
         reference: 0,
         locate_us,
+        rows: None,
         docs: 20,
         read_us,
+        read_all_us: 20.0 * read_us,
+        held: None,
+        large: None,
         read,
     };
     let (_, mut plan) = arranged(&e, counts());
@@ -531,9 +569,14 @@ fn decide_records_the_edge_or_sample_that_decided() {
     let (_, mut plan) = arranged(&e, counts());
     let a = answer(exact, 100);
     let stage1: Vec<Option<&Answer>> = (0..5).map(|i| (i == 0).then_some(&a)).collect();
-    demote::decide(&mut plan, band(10.0, 100.0), &stage1, &mut |_| {
-        Err("gone".into())
-    });
+    let walked = unwalked(5);
+    demote::decide(
+        &mut plan,
+        band(10.0, 100.0),
+        &stage1,
+        &walked.of(),
+        &mut |_| Err("gone".into()),
+    );
     assert_eq!(plan.why[2], cost(600.0, 100.0, Read::Failed));
     assert_eq!(plan.demoted, [false, false, false, false, true]);
 }
@@ -649,12 +692,237 @@ fn decide_reads_a_folded_reference_from_its_candidates() {
     };
     let stage1 = [Some(&a), None];
     let mut samples = Vec::new();
-    demote::decide(&mut plan, band(0.0, f64::INFINITY), &stage1, &mut |ids| {
-        samples.push(ids.to_vec());
-        Ok(1.0)
-    });
+    let walked = unwalked(2);
+    demote::decide(
+        &mut plan,
+        band(0.0, f64::INFINITY),
+        &stage1,
+        &walked.of(),
+        &mut |ids| {
+            samples.push(ids.to_vec());
+            Ok(sample(1.0, 0.0))
+        },
+    );
     assert_eq!(samples, [vec![2, 5]]);
     assert!(matches!(plan.why[1], demote::Why::Cost { docs: 2, .. }));
+}
+
+#[test]
+fn decide_prices_a_walked_candidate_by_its_rows_bytes_and_sample() {
+    use demote::{LARGE_BYTE_NS, Read, Why};
+    // The reference counts 4 in its busiest shard and probes in 40 µs: 10
+    // µs a row, capped at `row_us`. The walked candidate's busiest shard
+    // holds 3000 rows. The reference's 40 documents of 1000 bytes, but for
+    // those `big` sizes, are sampled 16 at a time.
+    let e = Expr::And(vec![t("a"), t("f")]);
+    let counts = || {
+        vec![
+            vec![(0..20, 4), (20..40, 2)],
+            vec![(0..20, 3000), (20..40, 1000)],
+        ]
+    };
+    let exact: Vec<(usize, u64)> = (0..40).map(|d| (d, 2)).collect();
+    let run_located = |band: ReadBand,
+                       row_us: f64,
+                       big: &[(usize, u64)],
+                       (us, held): (f64, f64),
+                       located: Option<f64>| {
+        let (_, mut plan) = arranged_with(&e, counts(), &[1]);
+        let mut doc_lens = vec![1000; 40];
+        big.iter().for_each(|&(d, len)| doc_lens[d] = len);
+        let walks = Walks {
+            leaves: vec![false, true],
+            located_us: vec![located, None],
+            row_us,
+            doc_lens,
+        };
+        let a = answer(exact.clone(), 40);
+        let stage1 = [Some(&a), None];
+        let mut samples = Vec::new();
+        demote::decide(&mut plan, band, &stage1, &walks.of(), &mut |ids| {
+            samples.push(ids.to_vec());
+            Ok(sample(us, held))
+        });
+        (plan.demoted[1], plan.why[1], samples)
+    };
+    let run = |band, row_us, big, sampled| {
+        let (demoted, why, samples) = run_located(band, row_us, big, sampled, None);
+        (demoted, why, samples.len())
+    };
+    let cost = |locate_us, row_us, read_us, read_all_us, held, large, read| Why::Cost {
+        reference: 0,
+        locate_us,
+        rows: Some((3000, row_us)),
+        docs: 40,
+        read_us,
+        read_all_us,
+        held: Some(held),
+        large: Some(large),
+        read,
+    };
+    // 3000 rows x 0.5 µs = 1.5 ms: more than reading 40 docs at the ceiling.
+    let ceiling = cost(1500.0, 0.5, 30.0, 1200.0, 0.0, (0, 0.0), Read::Ceiling);
+    assert_eq!(
+        run(band(10.0, 30.0), 0.5, &[], (0.0, 0.0)),
+        (true, ceiling, 0)
+    );
+    // Under a larger `row_us` the reference's own 10 µs a row stands, and
+    // locating costs no more than 16 docs may cost to sample: no sample.
+    let unsampled = |docs, us| Read::Unsampled { docs, us };
+    let cheap = cost(
+        30_000.0,
+        10.0,
+        1e4,
+        4e5,
+        0.0,
+        (0, 0.0),
+        unsampled(16, 1.6e5),
+    );
+    assert_eq!(
+        run(band(1e3, 1e4), 50.0, &[], (0.0, 0.0)),
+        (false, cheap, 0)
+    );
+    // A document of 300 KB reads at 0.15 ns a byte in more than the 30 µs
+    // ceiling: it is large, and costs 300 µs at 1 ns a byte. Locating still
+    // costs more than the whole read.
+    assert_eq!(LARGE_BYTE_NS, 1.0);
+    let some = cost(
+        1500.0,
+        0.5,
+        30.0,
+        39.0 * 30.0 + 300.0,
+        0.0,
+        (1, 300.0),
+        Read::Ceiling,
+    );
+    assert_eq!(
+        run(band(10.0, 30.0), 0.5, &[(12, 300_000)], (0.0, 0.0)),
+        (true, some, 0)
+    );
+    // Ten such documents: at a plain read they would cost 450 µs, and
+    // locating more than the whole read. Checked at 1 ns a byte they cost
+    // 3 ms, more than demoting can save: no sample.
+    let ten: Vec<(usize, u64)> = (0..10).map(|d| (d, 300_000)).collect();
+    let dear = cost(
+        1500.0,
+        0.5,
+        30.0,
+        30.0 * 30.0 + 3000.0,
+        0.0,
+        (10, 3000.0),
+        unsampled(16, 16.0 * 30.0),
+    );
+    assert_eq!(
+        run(band(10.0, 30.0), 0.5, &ten, (0.0, 0.0)),
+        (false, dear, 0)
+    );
+    // A document of 100 MB costs 100 ms: more than locating, so demoting
+    // saves nothing whatever a sample finds. No sample.
+    let big = cost(
+        1500.0,
+        0.5,
+        30.0,
+        39.0 * 30.0 + 1e5,
+        0.0,
+        (1, 1e5),
+        unsampled(16, 16.0 * 30.0),
+    );
+    assert_eq!(
+        run(band(10.0, 30.0), 0.5, &[(12, 100_000_000)], (0.0, 0.0)),
+        (false, big, 0)
+    );
+    // Every document large: none to sample, and their bytes keep the
+    // candidate located.
+    let every: Vec<(usize, u64)> = (0..40).map(|d| (d, 1_000_000)).collect();
+    let large = cost(1500.0, 0.5, 30.0, 4e4, 0.0, (40, 4e4), unsampled(0, 0.0));
+    assert_eq!(
+        run(band(10.0, 30.0), 0.5, &every, (0.0, 0.0)),
+        (false, large, 0)
+    );
+    // Inside the band the sample decides: locating saves nothing where every
+    // sampled document holds the candidate, and the whole read where none
+    // does.
+    let all = cost(1500.0, 0.5, 40.0, 1600.0, 1.0, (0, 0.0), Read::Sampled(16));
+    assert_eq!(run(band(10.0, 40.0), 0.5, &[], (40.0, 1.0)), (true, all, 1));
+    let none = cost(1500.0, 0.5, 40.0, 1600.0, 0.0, (0, 0.0), Read::Sampled(16));
+    assert_eq!(
+        run(band(10.0, 40.0), 0.5, &[], (40.0, 0.0)),
+        (false, none, 1)
+    );
+    // A large document of 400 KB is not sampled and counts as lacking the
+    // candidate, whatever the sample of the others finds.
+    let (demoted, why, samples) =
+        run_located(band(10.0, 40.0), 0.5, &[(12, 400_000)], (40.0, 1.0), None);
+    let held = cost(
+        1500.0,
+        0.5,
+        40.0,
+        39.0 * 40.0 + 400.0,
+        1.0,
+        (1, 400.0),
+        Read::Sampled(16),
+    );
+    assert_eq!((demoted, why), (true, held));
+    let usual: Vec<usize> = (0..40).filter(|&d| d != 12).collect();
+    assert_eq!(samples, [demote::spread(&usual, demote::SAMPLE_DOCS)]);
+    // A located walked reference's slowest shard, 1 µs for its 4 rows,
+    // prices a row at 0.25 µs.
+    let slowest = cost(750.0, 0.25, 30.0, 1200.0, 1.0, (0, 0.0), Read::Sampled(16));
+    let (demoted, why, samples) = run_located(band(10.0, 40.0), 0.5, &[], (30.0, 1.0), Some(1.0));
+    assert_eq!((demoted, why, samples.len()), (true, slowest, 1));
+    // 0.04 µs for 4 rows is 0.01 µs a row, below the 0.02 µs a measured row
+    // cost is clamped to.
+    let clamped = cost(
+        60.0,
+        0.02,
+        40.0,
+        1600.0,
+        0.0,
+        (0, 0.0),
+        unsampled(16, 640.0),
+    );
+    let (demoted, why, samples) = run_located(band(10.0, 40.0), 0.5, &[], (30.0, 1.0), Some(0.04));
+    assert_eq!((demoted, why, samples.len()), (false, clamped, 0));
+}
+
+#[test]
+fn a_sample_discounts_only_its_own_group() {
+    // Two ANDs, each with a walked candidate. The inner one is decided
+    // first, by a sample of its documents; that sample says nothing of the
+    // outer one's documents.
+    let e = Expr::And(vec![t("a"), t("f"), Expr::And(vec![t("b"), t("g")])]);
+    let counts = vec![
+        vec![(0..20, 4)],
+        vec![(0..40, 3000)],
+        vec![(20..40, 4)],
+        vec![(0..40, 3000)],
+    ];
+    let (_, mut plan) = arranged_with(&e, counts, &[1, 3]);
+    let refs: Vec<usize> = plan.groups.iter().map(|g| g.reference).collect();
+    assert_eq!(refs, [2, 0]);
+    let walks = Walks {
+        leaves: vec![false, true, false, true],
+        located_us: vec![None; 4],
+        row_us: 0.5,
+        doc_lens: vec![1000; 40],
+    };
+    let a = answer((0..20).map(|d| (d, 2)).collect(), 40);
+    let b = answer((20..40).map(|d| (d, 2)).collect(), 40);
+    let stage1 = [Some(&a), None, Some(&b), None];
+    let mut samples = Vec::new();
+    demote::decide(
+        &mut plan,
+        band(10.0, 90.0),
+        &stage1,
+        &walks.of(),
+        &mut |ids| {
+            samples.push(ids.to_vec());
+            Ok(sample(90.0, 1.0))
+        },
+    );
+    let inner: Vec<usize> = (20..40).collect();
+    assert_eq!(samples, [demote::spread(&inner, demote::SAMPLE_DOCS)]);
+    assert_eq!(plan.demoted, [false, false, false, true]);
 }
 
 #[test]
@@ -678,8 +946,12 @@ fn the_plan_states_each_decision_and_its_numbers() {
     let cost = |docs, read| Why::Cost {
         reference: 1,
         locate_us: 82_000.0,
+        rows: None,
         docs,
         read_us: 9.8,
+        read_all_us: docs as f64 * 9.8,
+        held: None,
+        large: None,
         read,
     };
     for (why, demoted, counted, regex, want) in [
@@ -744,6 +1016,62 @@ fn the_plan_states_each_decision_and_its_numbers() {
     ] {
         assert_eq!(said(why, demoted, counted, regex), want);
     }
+    let walked = |read_all_us, held, large, read| Why::Cost {
+        reference: 0,
+        locate_us: 1500.0,
+        rows: Some((3000, 0.5)),
+        docs: 3,
+        read_us: 10.0,
+        read_all_us,
+        held: Some(held),
+        large: Some(large),
+        read,
+    };
+    let unsampled = |docs, us| Read::Unsampled { docs, us };
+    for (why, demoted, want) in [
+        (
+            walked(30.0, 0.0, (0, 0.0), Read::Ceiling),
+            false,
+            "located: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) <= read 3 docs of leaf 0 x 10 µs = 30 µs at the band ceiling",
+        ),
+        (
+            walked(15_020.0, 0.0, (1, 15_000.0), Read::Ceiling),
+            false,
+            "located: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) <= read 3 docs of leaf 0: 2 x 10 µs and 1 large at 1.00 ns a byte = 15.0 ms at the band ceiling",
+        ),
+        (
+            walked(30.0, 0.0, (0, 0.0), unsampled(3, 30.0)),
+            false,
+            "located: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) <= 30 µs, a read sample of 3 of the 3 docs of leaf 0 at the band ceiling",
+        ),
+        (
+            walked(15_020.0, 0.0, (1, 15_000.0), unsampled(2, 20.0)),
+            false,
+            "located: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) <= 15.0 ms, a read sample of 2 of the 3 docs of leaf 0 at the band ceiling, and its 1 large doc at 1.00 ns a byte",
+        ),
+        (
+            walked(15_000.0, 0.0, (3, 15_000.0), unsampled(0, 0.0)),
+            false,
+            "located: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) <= 15.0 ms, the 3 large docs of leaf 0 at 1.00 ns a byte, none to sample",
+        ),
+        (
+            walked(30.0, 1.0, (0, 0.0), Read::Sampled(3)),
+            true,
+            "demoted: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) > read 3 docs of leaf 0 x 10 µs = 30 µs, less the 3 of 3 sampled that hold the candidates: 0 µs, the read cost sampled over 3 docs",
+        ),
+        (
+            walked(420.0, 1.0, (1, 400.0), Read::Sampled(2)),
+            true,
+            "demoted: locate est 1.5 ms (busiest shard 3000 x 0.500 µs) > read 3 docs of leaf 0: 2 x 10 µs and 1 large at 1.00 ns a byte = 420 µs, less the 2 of 2 sampled that hold the candidates: 400 µs, the read cost sampled over 2 docs",
+        ),
+    ] {
+        assert_eq!(said(why, demoted, true, false), want);
+    }
+    let row = |us| explain::Row(us).to_string();
+    assert_eq!(
+        [row(0.7), row(0.0067), row(12.345), row(250.0)],
+        ["0.700 µs", "0.00670 µs", "12.3 µs", "250 µs"]
+    );
     let runs = |r: &[Range<usize>]| Runs(r.iter().cloned()).to_string();
     assert_eq!(runs(&[]), "[]");
     assert_eq!(runs(&[0..10, 10..12, 20..30]), "[0..12) [20..30)");
