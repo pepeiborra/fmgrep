@@ -564,7 +564,9 @@ fn a_folded_leaf_is_counted_and_the_plan_names_it() {
     assert!(matches!(leaves[0].probe, Probe::Fold));
     assert!(matches!(&leaves[1].probe, Probe::Literal(l) if l == b"123"));
     assert!(matches!(leaves[2].probe, Probe::Regex));
-    let plan = demote::plan(&fm, &expr, &leaves, None);
+    let (plan, walks) = demote::plan(&fm, &expr, &leaves, None);
+    let walked: Vec<bool> = walks.iter().map(Option::is_some).collect();
+    assert_eq!(walked, [true, false, false]);
     assert_eq!(plan.counted, [true, true, false]);
     assert_eq!(plan.counts[0], [(0..3, 3)]);
     assert_eq!(plan.why[0], demote::Why::Reference);

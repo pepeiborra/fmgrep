@@ -14,7 +14,7 @@ use crate::manifest::{Checked, Manifest};
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
 use crate::pattern::{PreparedPattern, count_overlapping};
 use crate::probe::{Answer, Query, candidate_docs};
-use crate::sharded::DocfmIndex;
+use crate::sharded::{DocfmIndex, Walk};
 use crate::sink::{DocMatches, MatchSink};
 use crate::wire::{OutputReport, QueryReport};
 
@@ -355,26 +355,32 @@ fn answer_terms(
         Some(f) => f.cover(&manifest.files)?,
         None => None,
     };
+    // A filtered folded term is counted by its walk, which a locate reuses.
+    let walks: Vec<Option<Walk<'_>>> = (probes.iter().zip(terms))
+        .map(|(q, t)| match (*q, cover.as_deref()) {
+            (Query::Regex(p), Some(c)) if folded(t, req) && boolean::demotable(t.literal) => {
+                index.walk(p, Some(c))
+            }
+            _ => None,
+        })
+        .collect();
     let reads = match (&req.filter, cover.as_deref()) {
         (Some(f), Some(c)) => {
-            let readable: Vec<Option<read::Readable<'_>>> = probes
-                .iter()
-                .zip(terms)
-                .map(|(q, t)| match *q {
-                    Query::Literal(l) if t.pattern.is_none() && boolean::demotable(l) => {
+            let readable: Vec<Option<read::Readable<'_>>> = (probes.iter().zip(terms))
+                .zip(&walks)
+                .map(|((q, t), w)| match (*q, w) {
+                    (Query::Literal(l), _) if t.pattern.is_none() && boolean::demotable(l) => {
                         Some(read::Readable {
-                            count: Query::Count(l),
+                            count: read::Count::Literal(l),
                             text: l,
                             fetched: reads_exact(req.output, l),
                         })
                     }
-                    Query::Regex(p) if folded(t, req) && boolean::demotable(t.literal) => {
-                        p.fold().map(|plan| read::Readable {
-                            count: Query::CountFold(plan),
-                            text: t.literal,
-                            fetched: true,
-                        })
-                    }
+                    (_, Some(walk)) => Some(read::Readable {
+                        count: read::Count::Walked(walk),
+                        text: t.literal,
+                        fetched: true,
+                    }),
                     _ => None,
                 })
                 .collect();
@@ -396,9 +402,9 @@ fn answer_terms(
         }
         _ => probes.iter().map(|_| None).collect(),
     };
-    let located: Vec<Query<'_>> = (probes.iter().zip(&reads))
-        .filter(|(_, r)| r.is_none())
-        .map(|(q, _)| *q)
+    let located: Vec<Query<'_>> = (probes.iter().zip(&reads).zip(&walks))
+        .filter(|((_, r), _)| r.is_none())
+        .map(|((q, _), w)| w.as_ref().map_or(*q, Query::Walked))
         .collect();
     let mut got = match located.is_empty() {
         true => Vec::new(),
@@ -406,10 +412,14 @@ fn answer_terms(
     }
     .into_iter();
     let reading: Vec<bool> = reads.iter().map(Option::is_some).collect();
-    let answers: Vec<Answer> = (reads.into_iter())
-        .map(|r| {
-            r.or_else(|| got.next())
-                .expect("probe_all answers every query")
+    // A term located from its walk took the walk's time too.
+    let answers: Vec<Answer> = (reads.into_iter().zip(&walks))
+        .map(|(r, w)| {
+            r.unwrap_or_else(|| {
+                let mut a = got.next().expect("probe_all answers every query");
+                a.probe_us += w.as_ref().map_or(0, Walk::us);
+                a
+            })
         })
         .collect();
     drop(probes);

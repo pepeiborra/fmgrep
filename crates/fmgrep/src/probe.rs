@@ -2,8 +2,8 @@
 
 use std::ops::Range;
 
-use crate::fold::FoldPlan;
 use crate::pattern::PreparedPattern;
+use crate::sharded::Walk;
 
 /// [`Answer::candidates`] with `None` expanded against the corpus size.
 pub fn candidate_docs(candidates: Option<Vec<usize>>, num_docs: usize) -> Vec<usize> {
@@ -16,9 +16,6 @@ pub enum Query<'a> {
     Literal(&'a [u8]),
     /// A literal's per-shard counts, no locate: [`Answer::counts`].
     Count(&'a [u8]),
-    /// [`Query::Count`] of a case-folded literal: every variant, an upper
-    /// bound where its walk gives up.
-    CountFold(&'a FoldPlan),
     /// [`Query::Literal`], exact on at least the docs of ascending disjoint
     /// `within`.
     LiteralWithin {
@@ -26,6 +23,9 @@ pub enum Query<'a> {
         within: &'a [Range<usize>],
     },
     Regex(&'a PreparedPattern),
+    /// [`Query::Regex`] of a case-folded literal already walked: located
+    /// from the walk's intervals.
+    Walked(&'a Walk<'a>),
 }
 
 /// The index's answer for one query: the counts the FM-index settles, plus
