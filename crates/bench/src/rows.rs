@@ -244,8 +244,9 @@ pub fn fmgrep(
 }
 
 /// Each query as its own `fmgrep --index` from the corpus root, as an agent
-/// without a server runs it, after the warm-up; the footprint and RSS are
-/// the largest timed query's.
+/// without a server runs it, after `fmgrep status`, which takes the first
+/// token and saves the record as the first search would; the footprint and
+/// RSS are the largest timed query's.
 fn direct(
     bin: &Path,
     (paths, root): (&Paths, &Path),
@@ -256,8 +257,13 @@ fn direct(
     let bin = bin
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
+    let mut status = Command::new(&bin);
+    let (out, _, _) = timed(status.current_dir(root).arg("status").arg(index), None)?;
+    if !out.status.success() {
+        return Err(failure("fmgrep status", &out));
+    }
     let mut largest = None;
-    for (term, warm_up) in with_warm_up(terms) {
+    for term in terms {
         let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
         cmd.current_dir(root).arg("--index").arg(index).args(LINES);
@@ -266,9 +272,6 @@ fn direct(
         cmd.arg("--").args(leaves);
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let hits = paths.hits(&format!("fmgrep --index {term:?}"), &out)?;
-        if warm_up {
-            continue;
-        }
         row.queries.push(Query::new(term, latency, hits));
         largest = Peak::max(largest, peak);
     }
@@ -504,11 +507,14 @@ mod tests {
     }
 
     #[test]
-    fn fmgrep_clients_send_the_first_query_once_untimed_before_the_timed_ones() {
+    fn a_client_sends_the_first_query_untimed_and_a_process_row_runs_status_first() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let (bin, log) = (root.join("fmgrep"), root.join("log"));
-        let script = format!("#!/bin/sh\necho \"$*\" >>'{}'\nexit 1\n", log.display());
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >>'{}'\n[ \"$1\" = status ] && exit 0\nexit 1\n",
+            log.display()
+        );
         crate::fake_bin::write(&bin, &script);
         output_retry_etxtbsy(&mut Command::new(&bin)).unwrap();
         std::fs::remove_file(&log).unwrap();
@@ -525,11 +531,17 @@ mod tests {
         }
         let runs = std::fs::read_to_string(&log).unwrap();
         let runs: Vec<_> = runs.lines().collect();
-        let each = ["-- a", "-- a", "--and -- b c", "-i --and -- d e"];
-        let want: Vec<String> = ["--server h:1", "--index /i"]
-            .iter()
-            .flat_map(|how| each.map(|what| format!("{how} -n --no-heading --color never {what}")))
-            .collect();
+        let query = |how, what| format!("{how} -n --no-heading --color never {what}");
+        let want = [
+            query("--server h:1", "-- a"),
+            query("--server h:1", "-- a"),
+            query("--server h:1", "--and -- b c"),
+            query("--server h:1", "-i --and -- d e"),
+            "status /i".to_owned(),
+            query("--index /i", "-- a"),
+            query("--index /i", "--and -- b c"),
+            query("--index /i", "-i --and -- d e"),
+        ];
         assert_eq!(runs, want);
     }
 
