@@ -51,8 +51,8 @@ listed under the run's results, not failures.
   build`, with the probes and the 200 ms pauses between them: 0.4 s
   between the last three). fmgrep's and tgrep's `ready` start after
   their index is built, so elgrep's `ready` minus its `index build` is
-  the number to compare with theirs: on aosp 33.76 s, against 940 ms for
-  fmgrep and 35.92 s for tgrep. Then one
+  the number to compare with theirs: on aosp 31.81 s, against 932 ms for
+  fmgrep and 35.40 s for tgrep. Then one
   `eg -n --no-heading` process per query reads the index itself, after the
   daemon vouches that the tree has not changed. Every query runs with
   `--debug`, which names any query eg scanned without the index; a note
@@ -129,8 +129,10 @@ hold both.
 AWS i4i.4xlarge spot instance (16 vCPUs, Intel Xeon Platinum 8375C at 2.90
 GHz, 123 GiB, local NVMe formatted ext4), Ubuntu 24.04, kernel 7.0 with its
 default inotify limits. fmgrep 0.1.0 (release build, with the lines search
-that counts each match only under `--stats`), ripgrep 15.2.0, tgrep 1.0.8,
-elgrep 1.0.0, watchman v2026.11.09.00 (the prebuilt release). Every row of
+that counts each match only under `--stats`, and the regex walk that, when
+it gives up after walking its anchor, locates its last whole frontier),
+ripgrep 15.2.0, tgrep 1.0.8, elgrep 1.0.0, watchman v2026.11.09.00 (the
+prebuilt release). Every row of
 the three tables comes from one run of `scripts/bench.sh` per tree, all on
 one instance, measured 2026-11-16 (UTC), searching the checkout in place.
 The page cache was dropped before each tree and the tree read once.
@@ -143,50 +145,49 @@ an instance.
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | -i p50 | -i mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 114 ms | 115 ms | 119 ms | 119 ms | 119 ms | 228 ms | 134 ms | 181 ms | 115 ms | 127 ms | 10.18 MB | 15.64 MB | - | 3.73->4.68! |
-| fmgrep | 17.90 s | 1.11 GB | 97.0 ms | 3.91 ms | 4.88 ms | 8.26 ms | 17.4 ms | 6.81 ms | 11.6 ms | 17.6 ms | 18.7 ms | 4.59 ms | 7.58 ms | 196.50 MB | 1.27 GB | 6.61 GB | 4.68->7.12! |
-| fmgrep `--store-docs` | 21.16 s | 2.64 GB | 9.83 ms | 3.30 ms | 3.90 ms | 6.62 ms | 12.7 ms | 5.40 ms | 15.5 ms | 12.1 ms | 12.8 ms | 3.83 ms | 6.20 ms | 203.02 MB | 1.28 GB | 5.89 GB | 7.12->8.16! |
-| fmgrep, no server | 17.49 s | 1.11 GB | - | 13.1 ms | 14.2 ms | 18.1 ms | 28.3 ms | 15.8 ms | 21.9 ms | 29.1 ms | 29.9 ms | 13.1 ms | 17.3 ms | 187.55 MB | 1.03 GB | 7.14 GB | 8.16->10.94! |
-| tgrep | 14.31 s | 1.02 GB | 1.89 s | 20.7 ms | 27.5 ms | 41.0 ms | 58.9 ms | 125 ms | 595 ms | 145 ms | 498 ms | 25.4 ms | 99.5 ms | 2.21 GB | 2.27 GB | 295.34 MB | 10.94->8.33! |
-| elgrep | 27.61 s | 1.39 GB | 28.03 s | 9.78 ms | 10.7 ms | 23.7 ms | 22.5 ms | 39.7 ms | 1.23 s | 53.6 ms | 918 ms | 10.8 ms | 152 ms | 10.45 MB | 394.91 MB | 7.05 GB | 8.33->6.84! |
+| rg | - | - | - | 114 ms | 115 ms | 118 ms | 118 ms | 121 ms | 229 ms | 133 ms | 181 ms | 114 ms | 127 ms | 10.20 MB | 15.69 MB | - | 8.09->9.12! |
+| fmgrep | 21.55 s | 1.11 GB | 99.8 ms | 3.97 ms | 4.95 ms | 8.49 ms | 14.8 ms | 6.65 ms | 11.6 ms | 18.3 ms | 19.1 ms | 4.75 ms | 7.38 ms | 192.69 MB | 1.27 GB | 6.25 GB | 9.12->10.74! |
+| fmgrep `--store-docs` | 21.56 s | 2.64 GB | 10.6 ms | 3.41 ms | 4.03 ms | 6.84 ms | 11.0 ms | 5.55 ms | 16.3 ms | 12.6 ms | 12.8 ms | 3.96 ms | 6.17 ms | 185.22 MB | 1.27 GB | 6.56 GB | 10.74->11.22! |
+| fmgrep, no server | 17.72 s | 1.11 GB | - | 13.2 ms | 14.5 ms | 18.3 ms | 26.2 ms | 16.9 ms | 22.2 ms | 28.0 ms | 31.1 ms | 14.1 ms | 17.4 ms | 187.61 MB | 1.03 GB | 6.75 GB | 11.22->12.39! |
+| tgrep | 14.62 s | 1.02 GB | 1.99 s | 22.4 ms | 28.8 ms | 41.9 ms | 63.1 ms | 114 ms | 609 ms | 146 ms | 515 ms | 27.2 ms | 103 ms | 2.21 GB | 2.26 GB | 296.06 MB | 12.39->9.24! |
+| elgrep | 27.86 s | 1.39 GB | 28.28 s | 9.82 ms | 11.1 ms | 23.7 ms | 23.1 ms | 41.8 ms | 1.22 s | 54.7 ms | 915 ms | 10.9 ms | 152 ms | 10.45 MB | 398.17 MB | 7.03 GB | 9.24->9.12! |
 
 tgrep printed the same lines as rg on all 121 queries.
 
 elgrep answered 7 of the 121 queries by scanning: its index refuses a
 pattern that selects over 30% of the files.
 
-elgrep differed from rg on 6 intersections, missing lines in files that
-hold both sides: `-i static AND devm_platform_ioremap_resource` (48629
-lines missed in 1371 files), `-i return AND kvzalloc` (22126 in 237),
-`int AND kmem_cache_create` (8662 in 72), `return AND kvzalloc` (275 in
-1), `MARGINING AND PERFCOUNTER` (197 in 1) and `static AND
-devm_platform_ioremap_resource` (189 in 4). Which intersections it misses,
-and how much, changes from run to run.
+elgrep differed from rg on 5 intersections, missing lines in files that
+hold both sides: `-i return AND kvzalloc` (17018 lines missed in 194
+files), `return AND kvzalloc` (11783 in 156), `-i static AND
+devm_platform_ioremap_resource` (3314 in 97), `include AND
+alloc_pages_node` (594 in 29) and `MARGINING AND PERFCOUNTER` (197 in 1).
+Which intersections it misses, and how much, changes from run to run.
 
 ### chromium
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | -i p50 | -i mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 492 ms | 504 ms | 487 ms | 505 ms | 482 ms | 506 ms | 512 ms | 527 ms | 495 ms | 508 ms | 99.06 MB | 104.50 MB | - | 7.66->10.75! |
-| fmgrep | 37.33 s | 2.22 GB | 110 ms | 24.1 ms | 48.8 ms | 29.0 ms | 64.5 ms | 4.19 ms | 4.89 ms | 9.76 ms | 15.0 ms | 13.7 ms | 39.6 ms | 120.24 MB | 2.32 GB | 8.07 GB | 10.75->15.97! |
-| fmgrep `--store-docs` | 37.97 s | 5.06 GB | 24.0 ms | 15.7 ms | 31.7 ms | 22.1 ms | 40.7 ms | 5.32 ms | 5.78 ms | 8.20 ms | 10.9 ms | 9.59 ms | 26.1 ms | 153.12 MB | 2.37 GB | 8.08 GB | 15.97->15.51! |
-| fmgrep, no server | 35.16 s | 2.22 GB | - | 50.3 ms | 78.2 ms | 54.6 ms | 91.4 ms | 28.4 ms | 29.2 ms | 35.1 ms | 40.1 ms | 38.9 ms | 67.3 ms | 111.88 MB | 2.19 GB | 8.75 GB | 15.51->16.51! |
-| tgrep | 39.32 s | 2.77 GB | 12.13 s | 195 ms | 435 ms | 521 ms | 869 ms | 155 ms | 404 ms | 143 ms | 585 ms | 201 ms | 517 ms | 6.54 GB | 6.56 GB | 1.07 GB | 16.51->4.45! |
-| elgrep | 61.78 s | 3.24 GB | 62.21 s | 48.4 ms | 89.4 ms | 52.7 ms | 134 ms | 190 ms | 1.34 s | 79.1 ms | 882 ms | 55.8 ms | 399 ms | 67.50 MB | 607.44 MB | 16.51 GB | 4.45->6.82! |
+| rg | - | - | - | 494 ms | 506 ms | 492 ms | 508 ms | 485 ms | 516 ms | 515 ms | 525 ms | 497 ms | 511 ms | 77.93 MB | 83.31 MB | - | 9.52->10.39! |
+| fmgrep | 39.03 s | 2.22 GB | 101 ms | 24.6 ms | 49.5 ms | 29.8 ms | 64.3 ms | 4.50 ms | 5.30 ms | 9.76 ms | 15.1 ms | 14.2 ms | 40.0 ms | 114.73 MB | 2.32 GB | 8.86 GB | 10.39->12.32! |
+| fmgrep `--store-docs` | 43.18 s | 5.06 GB | 21.9 ms | 16.0 ms | 32.0 ms | 22.2 ms | 42.0 ms | 5.17 ms | 5.86 ms | 8.88 ms | 11.3 ms | 9.84 ms | 26.6 ms | 152.86 MB | 2.37 GB | 8.90 GB | 12.32->14.15! |
+| fmgrep, no server | 42.28 s | 2.22 GB | - | 51.3 ms | 80.3 ms | 58.7 ms | 93.8 ms | 29.7 ms | 30.4 ms | 36.3 ms | 40.6 ms | 40.8 ms | 69.0 ms | 112.17 MB | 2.19 GB | 8.22 GB | 14.15->12.20! |
+| tgrep | 39.52 s | 2.77 GB | 12.41 s | 192 ms | 438 ms | 484 ms | 870 ms | 159 ms | 403 ms | 142 ms | 588 ms | 208 ms | 519 ms | 6.53 GB | 6.55 GB | 1.09 GB | 12.20->3.89! |
+| elgrep | 59.98 s | 3.23 GB | 60.41 s | 47.3 ms | 87.4 ms | 51.7 ms | 132 ms | 195 ms | 1.36 s | 82.5 ms | 891 ms | 59.9 ms | 402 ms | 67.48 MB | 618.80 MB | 15.91 GB | 3.89->6.37! |
 
 tgrep printed the same lines as rg on all 54 queries.
 
 elgrep answered 1 of the 54 queries by scanning: its index refuses a
 pattern that selects over 30% of the files. It differed from rg on 8
-intersections, missing 2 to 1268 lines each: `std::unique_ptr AND
-blink::LocalFrame` (1268 lines in 99 files), `DCHECK AND
-net::URLRequest` (297 in 21), `-i DCHECK AND net::URLRequest` (284 in
-18), `std::vector AND net::URLRequest` (272 in 33), `-i std::vector AND
-net::URLRequest` (272 in 33), `TODO AND blink::LocalFrame` (261 in 38),
-`CurrencyExtendedData AND UnitsDisplayNames` (2 in 1) and `-i
+intersections, missing 2 to 1162 lines each: `std::unique_ptr AND
+blink::LocalFrame` (1162 lines in 79 files), `TODO AND
+blink::LocalFrame` (297 in 47), `DCHECK AND net::URLRequest` (291 in
+20), `-i DCHECK AND net::URLRequest` (285 in 20), `std::vector AND
+net::URLRequest` (244 in 27), `-i std::vector AND net::URLRequest` (244
+in 27), `CurrencyExtendedData AND UnitsDisplayNames` (2 in 1) and `-i
 CurrencyExtendedData AND UnitsDisplayNames` (2 in 1).
 
-elgrep's index build, 61.78 s, ran without watchman's watch of the tree.
+elgrep's index build, 59.98 s, ran without watchman's watch of the tree.
 With the watch, a cookie file that watchman wrote into `.git` during the
 build made eg-indexd build a second time before it answered, about 9 s
 more.
@@ -195,12 +196,12 @@ more.
 
 | row | index build | index size | ready | literal p50 | literal mean | regex p50 | regex mean | intersection p50 | intersection mean | -i p50 | -i mean | all p50 | all mean | query footprint | query RSS | index peak RSS | load1 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| rg | - | - | - | 1.57 s | 1.57 s | 1.57 s | 1.60 s | 1.49 s | 1.50 s | 1.65 s | 1.65 s | 1.57 s | 1.58 s | 326.73 MB | 332.28 MB | - | 6.43->10.79! |
-| fmgrep | 198.93 s | 12.00 GB | 940 ms | 9.90 ms | 33.9 ms | 13.4 ms | 63.2 ms | 14.3 ms | 20.6 ms | 14.7 ms | 32.2 ms | 12.0 ms | 36.0 ms | 737.42 MB | 10.50 GB | 11.62 GB | 10.79->13.04! |
-| fmgrep `--store-docs` | 195.49 s | 29.38 GB | 58.7 ms | 9.17 ms | 30.5 ms | 10.6 ms | 65.1 ms | 16.8 ms | 57.6 ms | 15.9 ms | 29.0 ms | 10.6 ms | 39.4 ms | 730.62 MB | 10.58 GB | 10.51 GB | 13.04->14.46! |
-| fmgrep, no server | 197.06 s | 12.00 GB | - | 105 ms | 132 ms | 107 ms | 161 ms | 109 ms | 116 ms | 110 ms | 126 ms | 107 ms | 133 ms | 674.99 MB | 8.47 GB | 11.01 GB | 14.46->12.68! |
-| tgrep | 170.03 s | 9.87 GB | 35.92 s | 157 ms | 247 ms | 455 ms | 740 ms | 565 ms | 703 ms | 580 ms | 685 ms | 307 ms | 453 ms | 28.12 GB | 28.18 GB | 2.57 GB | 12.68->1.57! |
-| elgrep | 300.35 s | 12.24 GB | 334.11 s | 39.8 ms | 45.4 ms | 54.8 ms | 64.7 ms | 158 ms | 301 ms | 305 ms | 372 ms | 54.7 ms | 135 ms | 113.72 MB | 1004.52 MB | 58.01 GB | 1.57->8.60! |
+| rg | - | - | - | 1.57 s | 1.57 s | 1.56 s | 1.60 s | 1.51 s | 1.51 s | 1.66 s | 1.65 s | 1.57 s | 1.58 s | 319.95 MB | 325.51 MB | - | 7.04->10.89! |
+| fmgrep | 198.74 s | 12.00 GB | 932 ms | 10.3 ms | 34.9 ms | 12.5 ms | 54.8 ms | 14.7 ms | 20.5 ms | 13.2 ms | 30.7 ms | 11.6 ms | 35.1 ms | 732.78 MB | 10.54 GB | 10.13 GB | 10.89->12.16! |
+| fmgrep `--store-docs` | 200.73 s | 29.38 GB | 53.7 ms | 8.41 ms | 28.8 ms | 10.4 ms | 53.6 ms | 14.9 ms | 55.3 ms | 14.0 ms | 26.8 ms | 10.4 ms | 36.1 ms | 719.17 MB | 10.63 GB | 10.09 GB | 12.16->12.25! |
+| fmgrep, no server | 201.54 s | 12.00 GB | - | 97.1 ms | 121 ms | 97.9 ms | 142 ms | 102 ms | 108 ms | 104 ms | 118 ms | 97.9 ms | 122 ms | 677.02 MB | 8.47 GB | 11.20 GB | 12.25->11.60! |
+| tgrep | 165.34 s | 9.87 GB | 35.40 s | 145 ms | 241 ms | 459 ms | 715 ms | 538 ms | 675 ms | 506 ms | 649 ms | 285 ms | 436 ms | 28.15 GB | 28.21 GB | 2.63 GB | 11.60->1.50! |
+| elgrep | 298.66 s | 12.23 GB | 330.47 s | 39.7 ms | 47.2 ms | 54.7 ms | 66.3 ms | 160 ms | 304 ms | 303 ms | 368 ms | 54.7 ms | 136 ms | 113.71 MB | 1002.11 MB | 57.92 GB | 1.50->8.08! |
 
 tgrep printed the same lines as rg on all 54 queries.
 
@@ -211,14 +212,14 @@ counts each as a change. With the watch, every build of the tree (about
 5 min) raced some, and the row's first query, which waits for a build
 that raced none, still waited after 10 min.
 
-After its first build (300.35 s), eg-indexd scanned every query for 31
+After its first build (298.66 s), eg-indexd scanned every query for 29
 s: it then drops the watches of the directories its walk skipped (about
 37,000: `.repo` and each project's `.git`), their events overflow the
 kernel's inotify queue (16,384 events by default), and it counts every
 path as changed until its next build. eg gives "the corpus changed since
 the index was published" as its reason, but nothing in the tree
 changed: the queue overflowed. The row waited for that before it
-timed a query (`ready` 334.11 s); a user would see those scans, about
+timed a query (`ready` 330.47 s); a user would see those scans, about
 2.5 s each. No timed query scanned.
 
 elgrep differed from rg on 1 query: `MCK_ AND C_Check` (40 lines missed
