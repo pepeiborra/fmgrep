@@ -536,6 +536,18 @@ The build then prints `note: the index holds commit <id>`; otherwise
 `note: the index records no served commit (<why>)`, and the manifest has
 no `commit`. An index without `--store-docs` never runs git.
 
+With `--require-served-commit`, a build that would record no commit
+fails instead. It prints `error: the index cannot record its served
+commit: <why>`, with the reason that the note would give, and exits 2.
+The checks that need no walk run first, before the index reads a file:
+check 1, git status before the walk, check 3, the submodule check of 4,
+and the ignore files outside the tree of 5. A failure there writes
+nothing. A failure of a later check removes the index it built, as any
+failed build does. `index` never writes over an existing output, so an
+older index there stays. Build a server's index with this flag when
+every client must be able to search its own changes. The flag needs
+`--store-docs`.
+
 ## Determinism
 
 The same tree, the same ignore files outside it (see Documents) and `FMGREP_SHARD_BYTES` give the same `blobs.shard` and

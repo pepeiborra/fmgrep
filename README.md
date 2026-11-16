@@ -166,6 +166,14 @@ as a search does: a local index found by walking up wins over
 Where a server answers, status prints its reply (`--json`: as one JSON
 line). `fmgrep status --server ADDR` takes `--server` as a search does.
 
+`fmgrep index --store-docs` of the top of a git checkout records the
+served commit, or says in a note why it cannot
+([Dependencies](#dependencies)). With `--require-served-commit` it fails
+with that reason instead, exits 2, and leaves no index. A reason that git
+alone can tell, such as an edited file, fails before the index reads a
+file. Build a server's index with it when every client must be able to
+search its own changes.
+
 For many searches in a row, keep the index loaded in a server:
 
 ```console

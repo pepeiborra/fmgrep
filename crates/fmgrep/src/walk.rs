@@ -145,7 +145,7 @@ pub fn join_rel(rel: &str, name: &str) -> String {
 
 /// The ignore inputs from above the root: those of the root and its
 /// ancestors, then the global excludes file.
-fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
+pub fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
     let mut rows = Vec::new();
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     for (up, dir) in canonical.ancestors().enumerate() {

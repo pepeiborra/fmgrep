@@ -402,6 +402,7 @@ fn dispatch_in(
                 folder: &a.path,
                 output: a.output.as_deref(),
                 store_docs: a.store_docs,
+                require_commit: a.require_served_commit,
             })?;
             print::index_summary(out, a.json, &summary)?;
             Ok(Outcome::Index(summary))
