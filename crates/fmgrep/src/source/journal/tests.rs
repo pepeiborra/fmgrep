@@ -172,6 +172,79 @@ fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
     assert!(unsaid(src, &a, "no daemon").is_some(), "no cache directory");
 }
 
+/// A pin keeps one commit per checkout and server; one that cannot be
+/// used says why, as a record does.
+#[test]
+fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    crate::tests::CACHE.set(Some(tmp.path().into()));
+    let (src, addr) = (Path::new("/src/linux"), "h:7");
+    let full = |id: &str| id.len() == 40;
+    let id = "a".repeat(40);
+    assert_eq!(pinned(src, addr, full), Pinned::Missing);
+    pin(src, addr, Some(&id));
+    assert_eq!(pinned(src, addr, full), Pinned::Commit(id.clone()));
+    assert_eq!(pinned(src, "h:8", full), Pinned::Missing, "another server");
+    assert_eq!(pinned(Path::new("/src/l2"), addr, full), Pinned::Missing);
+    let file = pin_path(src, addr).unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("linux-") && name.ends_with(".pin"),
+        "{name}"
+    );
+    assert_ne!(Some(file.clone()), record_path(src, &Of::commit(&id)));
+    let text = std::fs::read_to_string(&file).unwrap();
+    let want = format!(r#"{{"v":1,"root":"/src/linux","server":"h:7","commit":"{id}"}}"#);
+    assert_eq!(text, want);
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        1,
+        "no temp left"
+    );
+    pin(src, addr, None);
+    assert_eq!(pinned(src, addr, full), Pinned::Missing, "removed");
+    pin(src, addr, None);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    let shown = file.display();
+    let other = json!({"v": 1, "root": "/src/l2", "server": addr, "commit": id});
+    let none = json!({"v": 1, "root": "/src/linux", "server": addr, "commit": null});
+    for (bytes, why) in [
+        (b"{".to_vec(), format!("the pin {shown} is malformed: ")),
+        (
+            b"{\"v\":1}".to_vec(),
+            format!("the pin {shown} is malformed: "),
+        ),
+        (
+            b"{\"v\":2}".to_vec(),
+            format!("the pin {shown} was written by another"),
+        ),
+        (
+            other.to_string().into_bytes(),
+            format!("the pin {shown} was written for another"),
+        ),
+        (
+            want.replace(&id, "HEAD").into_bytes(),
+            format!("the pin {shown} is malformed: not"),
+        ),
+        (
+            none.to_string().into_bytes(),
+            format!("the pin {shown} is malformed: "),
+        ),
+    ] {
+        std::fs::write(&file, &bytes).unwrap();
+        match pinned(src, addr, full) {
+            Pinned::Damaged(got) => assert!(got.starts_with(&why), "{got}"),
+            got => panic!("{got:?}"),
+        }
+    }
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    match pinned(src, addr, full) {
+        Pinned::Damaged(got) => assert!(got.starts_with("cannot read the pin "), "{got}"),
+        got => panic!("{got:?}"),
+    }
+}
+
 #[test]
 fn a_record_that_cannot_be_saved_says_so() {
     let tmp = tempfile::tempdir().unwrap();
