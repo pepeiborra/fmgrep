@@ -90,6 +90,7 @@ pub fn read_instead(
                 exact: Vec::new(),
                 candidates: Some(Vec::new()),
                 probe_us: walk.us(),
+                saved_us: 0,
                 counts: walk.counts(),
             },
         })
@@ -151,6 +152,7 @@ pub fn read_instead(
                 exact: Vec::new(),
                 candidates: Some(ids.clone()),
                 probe_us: a.probe_us,
+                saved_us: 0,
                 counts: Vec::new(),
             })
         })

@@ -216,12 +216,15 @@ fn panic_message(f: impl FnOnce()) -> String {
 }
 
 fn hits(index: &DocfmIndex, term: &str) -> Vec<(usize, u64)> {
-    index.probe_literal(term.as_bytes(), None)
+    index.probe_literal(term.as_bytes(), None, &Default::default())
 }
 
 fn candidates(index: &DocfmIndex, pattern: &str, num_docs: usize) -> Vec<usize> {
     let prepared = PreparedPattern::prepare(pattern).expect("valid pattern");
-    candidate_docs(index.regex_candidates(&prepared, None), num_docs)
+    candidate_docs(
+        index.regex_candidates(&prepared, None, &Default::default()),
+        num_docs,
+    )
 }
 
 const CAPS: [u64; 5] = [1, 8, 24, 64, 1 << 20];
@@ -839,10 +842,16 @@ fn probe_all_matches_per_query_probes() {
         let want: Answers = qs
             .iter()
             .map(|q| match *q {
-                Query::Literal(term) => (index.probe_literal(term, None), Vec::new()),
+                Query::Literal(term) => (
+                    index.probe_literal(term, None, &Default::default()),
+                    Vec::new(),
+                ),
                 Query::Regex(p) => (
                     Vec::new(),
-                    candidate_docs(index.regex_candidates(p, None), docs.len()),
+                    candidate_docs(
+                        index.regex_candidates(p, None, &Default::default()),
+                        docs.len(),
+                    ),
                 ),
                 Query::Count(_) | Query::LiteralWithin { .. } | Query::Walked(_) => {
                     unreachable!("not queried")

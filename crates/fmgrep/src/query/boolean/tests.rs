@@ -314,6 +314,7 @@ fn answer(exact: Vec<(usize, u64)>, probe_us: u64) -> Answer {
         exact,
         candidates: Some(Vec::new()),
         probe_us,
+        saved_us: 0,
         counts: Vec::new(),
     }
 }
@@ -421,6 +422,38 @@ fn cost_rule_samples_once_and_only_inside_the_band() {
         (demoted, samples.len()),
         (vec![false, true, true, true, true], 0)
     );
+}
+
+/// A reference whose locate walked in parallel prices its candidates by its
+/// work: its probe time plus what the parallel walks saved, as if it had
+/// walked on one thread.
+#[test]
+fn cost_rule_prices_a_parallel_reference_by_its_work() {
+    let e = Expr::And(vec![t("a"), t("b"), t("c"), t("d"), t("e")]);
+    let totals = [100, 150, 600, 1200, 100_000];
+    let counts = || totals.iter().map(|&t| vec![(0..40, t)]).collect();
+    let exact: Vec<(usize, u64)> = (0..20).map(|d| (d, 5)).collect();
+    let run = |probe_us, saved_us| {
+        let (_, mut plan) = arranged(&e, counts());
+        let a = Answer {
+            saved_us,
+            ..answer(exact.clone(), probe_us)
+        };
+        let stage1: Vec<Option<&Answer>> = (0..5).map(|i| (i == 0).then_some(&a)).collect();
+        let walked = unwalked(5);
+        demote::decide(
+            &mut plan,
+            band(10.0, 100.0),
+            &stage1,
+            &walked.of(),
+            &mut |_| Ok(sample(40.0, 0.0)),
+        );
+        plan.demoted
+    };
+    let serial = run(100, 0);
+    assert_eq!(serial, [false, false, false, true, true]);
+    assert_eq!(run(25, 75), serial);
+    assert_eq!(run(25, 0), [false, false, false, false, true]);
 }
 
 #[test]
@@ -688,6 +721,7 @@ fn decide_reads_a_folded_reference_from_its_candidates() {
         exact: Vec::new(),
         candidates: Some(vec![2, 5, 12]),
         probe_us: 40,
+        saved_us: 0,
         counts: Vec::new(),
     };
     let stage1 = [Some(&a), None];

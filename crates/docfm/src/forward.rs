@@ -1,7 +1,10 @@
 //! Forward locate: rows with their own mark first, then an occurrence at `p`
 //! from a mark at `p + i` in a probed tail `path[i..]`, `i` LF steps back.
 
-use std::time::Instant;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
+use rayon::prelude::*;
 
 use crate::build::word_start;
 use crate::marks::Marks;
@@ -15,6 +18,12 @@ const RATIO: u64 = 32;
 
 /// Deepest tail used.
 pub const MAX_DEPTH: usize = 15;
+
+/// Rows one task walks back when a walk runs in parallel. A row costs 0.25
+/// to 0.7 µs to walk back and a task about 45 µs to start on a parked
+/// thread (Apple M5), so a task's start costs about 1% of its walk. A walk
+/// of fewer than two tasks' rows runs on the caller's thread.
+pub(crate) const GRAIN: usize = 8192;
 
 /// Marks in `from..to`; decreasing ranks or more marks than rows mean a corrupt blob.
 fn marks_in(marks: &Marks<'_>, from: Row, to: Row) -> usize {
@@ -84,41 +93,21 @@ impl Cursor<'_> {
         visit: &mut dyn FnMut(usize),
         start: Option<Instant>,
     ) -> LocateStats {
-        let (lo, hi, view) = (self.lo, self.hi, self.view);
         let mut stats = LocateStats::default();
-        if self.root || lo == hi {
+        if self.root || self.lo == self.hi {
             return stats;
         }
-        let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
-        let mut own = 0;
-        for (row, rank) in view.header.marks(view.bytes).range(lo.get(), hi.get()) {
-            let at = Row::new(row) - lo;
-            resolved[at / 64] |= 1 << (at % 64);
-            visit(view.sampled(rank));
-            own += 1;
-        }
-        let tails = own < hi - lo
-            && self.resolve_into::<STATS>(depth, &mut resolved, &mut stats.probes, visit);
+        let left = self.resolve_marks::<STATS>(depth, &mut stats.probes, visit);
         let walk_start = if STATS {
             start.map(|_| Instant::now())
         } else {
             None
         };
-        let (steps, longest) = if own == hi - lo {
-            (0, 0)
-        } else if !tails && own == 0 {
-            view.docs::<STATS>(Row::range(lo, hi), visit)
-        } else {
-            view.docs::<STATS>(
-                Row::range(lo, hi).filter(|&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0),
-                visit,
-            )
-        };
+        let (steps, longest) = walk_back::<STATS>(self.view, std::slice::from_ref(&left), visit);
         if STATS {
-            let ones: u64 = resolved.iter().map(|w| u64::from(w.count_ones())).sum();
             stats.occurrences = self.count();
-            stats.zero_step = own as u64;
-            stats.forward = ones - own as u64;
+            stats.zero_step = left.own as u64;
+            stats.forward = (left.hi - left.lo - left.own - left.count) as u64;
             stats.walk_steps = steps;
             stats.max_walk = longest as u32;
             if let (Some(start), Some(walk_start)) = (start, walk_start) {
@@ -127,6 +116,41 @@ impl Cursor<'_> {
             }
         }
         stats
+    }
+
+    /// Visits the doc of each row its own mark or a probed tail `1..=depth`
+    /// (clamped to the cap) resolves; returns the rows left to walk back.
+    /// Under `STATS` adds the tail marks probed to `probes`. Neither the
+    /// root nor empty.
+    fn resolve_marks<const STATS: bool>(
+        &self,
+        depth: usize,
+        probes: &mut u64,
+        visit: &mut dyn FnMut(usize),
+    ) -> Left {
+        let (lo, hi, view) = (self.lo, self.hi, self.view);
+        let mut resolved = vec![0u64; (hi - lo).div_ceil(64)];
+        let mut own = 0;
+        for (row, rank) in view.header.marks(view.bytes).range(lo.get(), hi.get()) {
+            let at = Row::new(row) - lo;
+            resolved[at / 64] |= 1 << (at % 64);
+            visit(view.sampled(rank));
+            own += 1;
+        }
+        let tails =
+            own < hi - lo && self.resolve_into::<STATS>(depth, &mut resolved, probes, visit);
+        let ones = match tails {
+            true => resolved.iter().map(|w| w.count_ones() as usize).sum(),
+            false => own,
+        };
+        Left {
+            lo,
+            hi,
+            filtered: tails || own > 0,
+            resolved,
+            own,
+            count: hi - lo - ones,
+        }
     }
 
     /// Visits the doc of each occurrence a probed tail `1..=depth` (clamped
@@ -191,6 +215,136 @@ impl Cursor<'_> {
     }
 }
 
+/// The rows of one interval that neither their own mark nor a tail
+/// resolved: they walk back.
+struct Left {
+    lo: Row,
+    hi: Row,
+    /// Whether `resolved` has a bit set.
+    filtered: bool,
+    /// Bit `r - lo` set: row `r` is resolved.
+    resolved: Vec<u64>,
+    /// Rows resolved by their own mark.
+    own: usize,
+    /// Rows left.
+    count: usize,
+}
+
+impl Left {
+    /// The rows left in `from..to`, ascending.
+    fn rows(&self, from: Row, to: Row) -> impl Iterator<Item = Row> + '_ {
+        let (lo, resolved) = (self.lo, &self.resolved);
+        Row::range(from, to).filter(move |&r| resolved[(r - lo) / 64] >> ((r - lo) % 64) & 1 == 0)
+    }
+
+    /// [`View::docs`] of the rows left, on the caller's thread.
+    fn walk<const STATS: bool>(
+        &self,
+        view: View<'_>,
+        visit: &mut dyn FnMut(usize),
+    ) -> (u64, usize) {
+        if self.count == 0 {
+            (0, 0)
+        } else if !self.filtered {
+            view.docs::<STATS>(Row::range(self.lo, self.hi), visit)
+        } else {
+            view.docs::<STATS>(self.rows(self.lo, self.hi), visit)
+        }
+    }
+}
+
+/// [`View::docs`] of the rows `lefts` leave, all of `view`: on the caller's
+/// thread below two [`GRAIN`]s of rows, else in tasks of [`GRAIN`] rows on
+/// the current rayon pool, each task's docs visited in turn. Under `STATS`
+/// the LF steps and the longest walk.
+fn walk_back<const STATS: bool>(
+    view: View<'_>,
+    lefts: &[Left],
+    visit: &mut dyn FnMut(usize),
+) -> (u64, usize) {
+    let join = |(s, m): (u64, usize), (t, n): (u64, usize)| (s + t, m.max(n));
+    let rows: usize = lefts.iter().map(|l| l.count).sum();
+    if rows < 2 * GRAIN {
+        return (lefts.iter())
+            .map(|l| l.walk::<STATS>(view, visit))
+            .fold((0, 0), join);
+    }
+    let cuts = cuts(lefts);
+    #[cfg(test)]
+    TASKS.with(|t| t.set(t.get() + cuts.len() - 1));
+    let start = Instant::now();
+    let parts: Vec<(Vec<usize>, (u64, usize), Duration)> = cuts
+        .par_windows(2)
+        .map(|span| {
+            let task = Instant::now();
+            let mut docs = Vec::with_capacity(GRAIN);
+            let rows = between(lefts, span[0], span[1]);
+            let walked = view.docs::<STATS>(rows, &mut |d| docs.push(d));
+            (docs, walked, task.elapsed())
+        })
+        .collect();
+    let work: Duration = parts.iter().map(|p| p.2).sum();
+    SAVED.with(|s| s.set(s.get() + work.saturating_sub(start.elapsed())));
+    parts.into_iter().fold((0, 0), |sum, (docs, walked, _)| {
+        docs.into_iter().for_each(&mut *visit);
+        join(sum, walked)
+    })
+}
+
+/// A place among the rows of `lefts`: row `.1` of `lefts[.0]`.
+type Place = (usize, Row);
+
+/// Where each task of a parallel walk of the rows `lefts` leave begins,
+/// then where the last one ends: tasks of [`GRAIN`] rows, the last of the
+/// rest. Counts the rows left a word of each bitmap at a time.
+fn cuts(lefts: &[Left]) -> Vec<Place> {
+    let mut cuts = vec![(0, lefts[0].lo)];
+    // The rows the task begun last still takes.
+    let mut need = GRAIN;
+    for (i, l) in lefts.iter().enumerate() {
+        for (w, &word) in l.resolved.iter().enumerate() {
+            let at = l.lo + 64 * w;
+            let mut left = !word & (u64::MAX >> (64 - (l.hi - at).min(64)));
+            while left.count_ones() as usize >= need {
+                for _ in 1..need {
+                    left &= left - 1;
+                }
+                cuts.push((i, at + left.trailing_zeros() as usize + 1));
+                left &= left - 1;
+                need = GRAIN;
+            }
+            need -= left.count_ones() as usize;
+        }
+    }
+    // A cut after the last row left would begin an empty task.
+    if need == GRAIN {
+        cuts.pop();
+    }
+    cuts.push((lefts.len() - 1, lefts[lefts.len() - 1].hi));
+    cuts
+}
+
+/// The rows `lefts` leave from place `from` to place `to`, ascending.
+fn between(lefts: &[Left], (i, from): Place, (j, to): Place) -> impl Iterator<Item = Row> + '_ {
+    (lefts[i..=j].iter().enumerate()).flat_map(move |(k, l)| {
+        let lo = if k == 0 { from } else { l.lo };
+        let hi = if i + k == j { to } else { l.hi };
+        l.rows(lo, hi)
+    })
+}
+
+thread_local! {
+    /// What the parallel walks begun on this thread saved: their tasks'
+    /// time summed, less the time spent waiting for them.
+    pub(super) static SAVED: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tasks the parallel walks begun on this thread split into.
+    pub(crate) static TASKS: Cell<usize> = const { Cell::new(0) };
+}
+
 impl View<'_> {
     /// The row `codes.len()` LF steps before `row` if each step reads the
     /// next of `codes` from the back, else `None`.
@@ -207,5 +361,69 @@ impl View<'_> {
             row = self.lf_to(want, rank);
         }
         Some(row)
+    }
+}
+
+#[cfg(test)]
+mod cuts_tests {
+    use super::*;
+
+    /// A [`Left`] over the rows from `lo`, one per flag, those flagged
+    /// resolved.
+    fn left(lo: usize, flags: impl Iterator<Item = bool>) -> Left {
+        let flags: Vec<bool> = flags.collect();
+        let mut resolved = vec![0u64; flags.len().div_ceil(64)];
+        for at in (0..flags.len()).filter(|&at| flags[at]) {
+            resolved[at / 64] |= 1 << (at % 64);
+        }
+        let count = flags.iter().filter(|&&f| !f).count();
+        Left {
+            lo: Row::new(lo),
+            hi: Row::new(lo + flags.len()),
+            filtered: count < flags.len(),
+            resolved,
+            own: 0,
+            count,
+        }
+    }
+
+    /// Resolved: about one row in four, rolled from `r`.
+    fn rolled(r: usize) -> bool {
+        (r.wrapping_mul(2_654_435_761) >> 7) & 3 == 0
+    }
+
+    /// Each task walks the next [`GRAIN`] rows left, the last task the
+    /// rest: in order, each row once, none resolved, and no task empty.
+    #[test]
+    fn cuts_split_the_rows_left_into_grains() {
+        let flat = |n: usize| std::iter::repeat_n(false, n);
+        let cases: Vec<Vec<Left>> = vec![
+            vec![left(0, flat(2 * GRAIN))],
+            vec![left(5, flat(2 * GRAIN + 1))],
+            // A cut at an interval's end, and resolved rows after the last
+            // row left.
+            vec![
+                left(0, flat(GRAIN).chain([true; 3])),
+                left(9000, flat(2 * GRAIN).chain([true; 70])),
+            ],
+            // Many small intervals, a quarter of their rows resolved.
+            (0..300)
+                .map(|k| left(k * 1000, (0..100 + k % 37).map(|r| rolled(k * 1000 + r))))
+                .collect(),
+        ];
+        for lefts in &cases {
+            let all: Vec<Row> = (lefts.iter()).flat_map(|l| l.rows(l.lo, l.hi)).collect();
+            let rows: usize = lefts.iter().map(|l| l.count).sum();
+            assert!(rows >= 2 * GRAIN && rows == all.len());
+            let cuts = cuts(lefts);
+            let tasks: Vec<Vec<Row>> = (cuts.windows(2))
+                .map(|w| between(lefts, w[0], w[1]).collect())
+                .collect();
+            assert_eq!(tasks.len(), rows.div_ceil(GRAIN));
+            let (last, full) = tasks.split_last().unwrap();
+            assert!(full.iter().all(|t| t.len() == GRAIN));
+            assert!((1..=GRAIN).contains(&last.len()));
+            assert_eq!(tasks.concat(), all);
+        }
     }
 }

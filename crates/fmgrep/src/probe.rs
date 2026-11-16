@@ -36,6 +36,9 @@ pub struct Answer {
     /// Regex candidates; `None` is every doc.
     pub candidates: Option<Vec<usize>>,
     pub probe_us: u64,
+    /// What walking rows back in parallel saved the slowest-saving shard:
+    /// `probe_us` plus this is the probe's work, as one thread a shard.
+    pub saved_us: u64,
     /// Ascending disjoint doc ranges with their nonzero counts; empty unless
     /// a count query.
     pub counts: Vec<(Range<usize>, u64)>,
