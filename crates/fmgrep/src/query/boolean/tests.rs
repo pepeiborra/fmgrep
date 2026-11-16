@@ -1100,36 +1100,63 @@ fn a_measured_band_keeps_the_default_shape_within_2_to_200_us() {
     }
 }
 
-/// The band measured over `index`, once its answers to `expr` are checked
-/// against the default band's.
-fn measured_band(index: &std::path::Path, expr: &Expr) -> ReadBand {
+/// Answers to counts, -l and -c.
+type Answers = [Result<serde_json::Value, String>; 3];
+
+/// Pinned bands that make the plan whatever a probe's wall time: read the
+/// documents of every candidate, or locate every candidate. Between a
+/// band's edges, a probe's wall time picks the plan.
+const PLANS: [(f64, f64); 2] = [(0.0, 0.0), (f64::INFINITY, f64::INFINITY)];
+
+/// The band of a fresh load of `index`, measured when `measure`, and its
+/// answers to `expr` under the band `pin`, or its own band.
+fn answers(
+    index: &std::path::Path,
+    expr: &Expr,
+    measure: bool,
+    pin: Option<(f64, f64)>,
+) -> (ReadBand, Answers) {
     let manifest = crate::manifest::read_manifest(index).unwrap();
-    let answers = |measure: bool| {
-        let (fm, mut loaded) =
-            super::super::load(index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
-        if measure {
-            loaded.measure_band(&manifest);
-        }
-        let outs = [
-            QueryOutput::Counts,
-            QueryOutput::FilesWithMatches,
-            QueryOutput::CountLines,
-        ]
-        .map(|output| {
-            let req = QueryRequest {
-                expr: Some(expr),
-                ..crate::tests::support::request(index, &manifest, &[], output)
-            };
-            answer_expr(&fm, &mut loaded, &req, expr, &mut crate::sink::Discard)
-                .map(crate::tests::support::timeless)
-        });
-        (loaded.band, outs)
-    };
-    let (band, got) = answers(true);
-    let (default, want) = answers(false);
-    assert_eq!(default, ReadBand::DEFAULT);
-    assert_eq!(got, want);
-    band
+    let (fm, mut loaded) =
+        super::super::load(index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
+    if measure {
+        loaded.measure_band(&manifest);
+    }
+    crate::tests::BAND.set(pin);
+    let outs = [
+        QueryOutput::Counts,
+        QueryOutput::FilesWithMatches,
+        QueryOutput::CountLines,
+    ]
+    .map(|output| {
+        let req = QueryRequest {
+            expr: Some(expr),
+            ..crate::tests::support::request(index, &manifest, &[], output)
+        };
+        answer_expr(&fm, &mut loaded, &req, expr, &mut crate::sink::Discard)
+            .map(crate::tests::support::timeless)
+    });
+    crate::tests::BAND.set(None);
+    (loaded.band, outs)
+}
+
+/// The band measured over `index`, and the answers to `expr` under each of
+/// [`PLANS`], once a measured load is checked against a default one under
+/// each, and each answer under its own band against those of the plans.
+fn measured_band(index: &std::path::Path, expr: &Expr) -> (ReadBand, [Answers; 2]) {
+    let plans = PLANS.map(|pin| {
+        let (_, got) = answers(index, expr, true, Some(pin));
+        let (default, want) = answers(index, expr, false, Some(pin));
+        assert_eq!(default, ReadBand::DEFAULT);
+        assert_eq!(got, want, "{pin:?}");
+        got
+    });
+    // Each search plans on its own: its answer is one plan's.
+    let (band, got) = answers(index, expr, true, None);
+    for (i, got) in got.iter().enumerate() {
+        assert!(plans.iter().any(|p| p[i] == *got), "{i}: {got:?} {plans:?}");
+    }
+    (band, plans)
 }
 
 #[test]
@@ -1149,9 +1176,11 @@ fn serve_measures_the_band_through_the_store() {
     };
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
-        let band = measured_band(&indexed(tmp.path(), &files, store_docs), &expr);
+        let (band, [read, located]) =
+            measured_band(&indexed(tmp.path(), &files, store_docs), &expr);
         assert!((2.0..=200.0).contains(&band.min_us), "{band:?}");
         assert_eq!(band, ReadBand::around(band.min_us));
+        assert_eq!(read, located);
     }
     // Only stale or empty files: nothing fresh to read.
     let tmp = tempfile::tempdir().unwrap();
@@ -1165,7 +1194,11 @@ fn serve_measures_the_band_through_the_store() {
         b"one printk alpha, changed\n",
     )
     .unwrap();
-    assert_eq!(measured_band(&stale, &expr), ReadBand::DEFAULT);
+    let (band, [read, located]) = measured_band(&stale, &expr);
+    assert_eq!(band, ReadBand::DEFAULT);
+    assert_eq!(read, located);
+    // No docs.shard: the measure fails, and only a search whose plan reads
+    // documents fails: -c always, the counts and -l when they read.
     let tmp = tempfile::tempdir().unwrap();
     let blind = indexed(tmp.path(), &files, true);
     std::fs::rename(
@@ -1173,5 +1206,10 @@ fn serve_measures_the_band_through_the_store() {
         blind.join("hidden"),
     )
     .unwrap();
-    assert_eq!(measured_band(&blind, &expr), ReadBand::DEFAULT);
+    let (band, [read, located]) = measured_band(&blind, &expr);
+    assert_eq!(band, ReadBand::DEFAULT);
+    let unread = |r: &Result<_, String>| r.as_ref().is_err_and(|e| e.contains("cannot read"));
+    assert!(read.iter().all(unread), "{read:?}");
+    assert!(located[..2].iter().all(Result::is_ok), "{located:?}");
+    assert!(unread(&located[2]), "{located:?}");
 }
