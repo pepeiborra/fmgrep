@@ -257,6 +257,326 @@ fn a_plain_index_records_no_commit() {
     assert_eq!(commit_of(&s.path("idx")), None);
 }
 
+const REQUIRE: &str = "--require-served-commit";
+
+/// `index --store-docs` of `dir` into the sandbox's `name`, with `flags`,
+/// and with `PATH` set to `path` if given: its exit code and stderr.
+fn build(
+    s: &Sandbox,
+    dir: &std::path::Path,
+    name: &str,
+    flags: &[&str],
+    path: Option<&str>,
+) -> (Option<i32>, String) {
+    let output = s.path(name).display().to_string();
+    let mut cmd = s.fmgrep(dir);
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    cmd.args(["index", "--store-docs", ".", "--output", &output]);
+    let out = cmd.args(flags).output().unwrap();
+    (out.status.code(), String::from_utf8(out.stderr).unwrap())
+}
+
+/// The reason why the index of `dir` records no served commit, as the
+/// note of a build without [`REQUIRE`] gives it. With [`REQUIRE`], the
+/// build fails with the same reason in an error, exits 2 and leaves no
+/// index. Where `early`, it fails before the walk reads a file: an
+/// unreadable file in the tree, which stops any walk, changes nothing,
+/// and the error is all it prints.
+fn required(
+    s: &Sandbox,
+    dir: &std::path::Path,
+    name: &str,
+    path: Option<&str>,
+    early: bool,
+) -> String {
+    // The state of a wrapped git.
+    let reset = || {
+        let _ = std::fs::remove_file(s.path("seen"));
+    };
+    reset();
+    let (code, stderr) = build(s, dir, &format!("idx-{name}"), &[], path);
+    assert_eq!(code, Some(0), "{name}: {stderr}");
+    let note = note(&stderr);
+    let why = note
+        .strip_prefix("note: the index records no served commit (")
+        .and_then(|w| w.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{name}: {note}"))
+        .to_owned();
+    let error = format!("error: the index cannot record its served commit: {why}\n");
+    let mut runs = vec![format!("req-{name}")];
+    if early {
+        let unread = dir.join("unread.c");
+        std::fs::write(&unread, "printk unread\n").unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o000);
+        std::fs::set_permissions(&unread, mode).unwrap();
+        runs.push(format!("req-unread-{name}"));
+    }
+    for run in runs {
+        reset();
+        let (code, stderr) = build(s, dir, &run, &[REQUIRE], path);
+        assert_eq!(code, Some(2), "{run}: {stderr}");
+        match early {
+            true => assert_eq!(stderr, error, "{run}"),
+            false => {
+                assert!(stderr.ends_with(&error), "{run}: {stderr}");
+                assert!(!stderr.contains("note:"), "{run}: {stderr}");
+            }
+        }
+        assert!(!s.path(&run).exists(), "{run}");
+    }
+    why
+}
+
+/// Every reason that git alone can tell, before the walk: with
+/// `--require-served-commit` the build fails on it before it reads a file.
+#[test]
+fn a_required_commit_fails_before_the_walk() {
+    let s = Sandbox::new();
+    let outside = |path: &std::path::Path| {
+        format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        )
+    };
+
+    let plain = s.path("plain");
+    s.write(&plain, &FILES);
+    let plain = std::fs::canonicalize(plain).unwrap();
+    let why = format!("{} is in no git checkout", plain.display());
+    assert_eq!(required(&s, &plain, "plain", None, true), why);
+
+    let repo = s.repo("nogit", &FILES);
+    std::fs::create_dir(s.path("empty")).unwrap();
+    let empty = s.path("empty").display().to_string();
+    let enoent = std::io::Error::from_raw_os_error(2);
+    let why = format!("cannot run git ({enoent})");
+    assert_eq!(required(&s, &repo, "nogit", Some(&empty), true), why);
+
+    let repo = s.repo("sub", &FILES);
+    let dir = repo.join("dir");
+    let why = format!(
+        "{} is not the top of its git checkout, {}",
+        dir.display(),
+        repo.display()
+    );
+    assert_eq!(required(&s, &dir, "dir", None, true), why);
+
+    let unborn = s.path("unborn");
+    s.write(&unborn, &FILES);
+    s.git(&unborn, &["init", "-q", "-b", "main"]);
+    let why = "the checkout has no commit yet";
+    assert_eq!(required(&s, &unborn, "unborn", None, true), why);
+
+    let repo = s.repo("edited", &FILES);
+    s.write(&repo, &[("a.c", "printk edited\n")]);
+    let why = "a.c differs from HEAD";
+    assert_eq!(required(&s, &repo, "edited", None, true), why);
+
+    let repo = s.repo("nohead", &FILES);
+    let path = wrapped_git(&s, "[ \"$3\" = status ] && exit 0\n");
+    let why = "git status gave no HEAD";
+    assert_eq!(required(&s, &repo, "nohead", Some(&path), true), why);
+
+    let repo = s.repo("sparse", &FILES);
+    s.git(&repo, &["sparse-checkout", "set", "--no-cone", "/a.c"]);
+    let why = "git hides changes to 2 files (assume-unchanged or skip-worktree)";
+    assert_eq!(required(&s, &repo, "sparse", None, true), why);
+
+    let repo = s.repo("gitlink", &FILES);
+    let info = format!("160000,{},sub", s.head(&repo));
+    s.git(&repo, &["update-index", "--add", "--cacheinfo", &info]);
+    s.git(&repo, &["commit", "-q", "-m", "sub"]);
+    std::fs::create_dir(repo.join("sub")).unwrap();
+    let why = "the checkout holds a submodule (sub)";
+    assert_eq!(required(&s, &repo, "gitlink", None, true), why);
+
+    let repo = s.repo("parent/repo", &FILES);
+    s.write(&s.path("parent"), &[(".ignore", "*.h\n")]);
+    let why = outside(&repo.join("../.ignore"));
+    assert_eq!(required(&s, &repo, "parent", None, true), why);
+
+    let repo = s.repo("exclude", &FILES);
+    s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
+    let why = outside(&repo.join(".git/info/exclude"));
+    assert_eq!(required(&s, &repo, "exclude", None, true), why);
+
+    let repo = s.repo("global", &FILES);
+    s.write(&s.path("config"), &[("git/ignore", "*.h\n")]);
+    let why = outside(&s.path("config/git/ignore"));
+    assert_eq!(required(&s, &repo, "global", None, true), why);
+}
+
+/// Every reason that only the walk or the built index shows: with
+/// `--require-served-commit` the build fails on it after the build, and
+/// removes what it wrote.
+#[test]
+fn a_required_commit_fails_after_the_build() {
+    let s = Sandbox::new();
+
+    let repo = s.repo("untracked", &FILES);
+    s.write(&repo, &[("new.c", "printk new\n")]);
+    let why = "new.c is not tracked by git";
+    assert_eq!(required(&s, &repo, "untracked", None, false), why);
+
+    // Without symlinks, git checks a link out as a file of its target.
+    let repo = s.repo("link", &FILES);
+    std::os::unix::fs::symlink("a.c", repo.join("link.c")).unwrap();
+    s.commit(&repo, "link");
+    s.git(&repo, &["config", "core.symlinks", "false"]);
+    std::fs::remove_file(repo.join("link.c")).unwrap();
+    s.git(&repo, &["checkout", "--", "link.c"]);
+    assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
+    let why = "link.c is not a regular file of HEAD";
+    assert_eq!(required(&s, &repo, "link", None, false), why);
+
+    let repo = s.repo("crlf", &FILES);
+    s.git(&repo, &["config", "core.autocrlf", "true"]);
+    std::fs::remove_file(repo.join("a.c")).unwrap();
+    s.git(&repo, &["checkout", "--", "a.c"]);
+    let why = "a.c differs from its blob in HEAD";
+    assert_eq!(required(&s, &repo, "crlf", None, false), why);
+
+    let extra = [
+        ("nul.c", "printk Z\n"),
+        (".gitattributes", "nul.c filter=nul\n"),
+    ];
+    let repo = s.repo("nul", &[&FILES[..], &extra].concat());
+    s.git(&repo, &["config", "filter.nul.smudge", "tr Z '\\000'"]);
+    s.git(&repo, &["config", "filter.nul.clean", "tr '\\000' Z"]);
+    std::fs::remove_file(repo.join("nul.c")).unwrap();
+    s.git(&repo, &["checkout", "--", "nul.c"]);
+    let why = "nul.c differs from its blob in HEAD";
+    assert_eq!(required(&s, &repo, "nul", None, false), why);
+
+    let repo = s.repo("ignore", &FILES);
+    s.write(&repo, &[("dir/.ignore", "*.h\n")]);
+    let why = "the ignore file dir/.ignore is not tracked by git";
+    assert_eq!(required(&s, &repo, "ignore", None, false), why);
+
+    let extra = [
+        ("dir/.ignore", "*.x\n"),
+        (".gitattributes", ".ignore filter=up\n"),
+    ];
+    let repo = s.repo("converted", &[&FILES[..], &extra].concat());
+    s.git(&repo, &["config", "filter.up.smudge", "tr x h"]);
+    s.git(&repo, &["config", "filter.up.clean", "tr h x"]);
+    std::fs::remove_file(repo.join("dir/.ignore")).unwrap();
+    s.git(&repo, &["checkout", "--", "dir/.ignore"]);
+    let why = "the ignore file dir/.ignore differs from its blob in HEAD";
+    assert_eq!(required(&s, &repo, "converted", None, false), why);
+
+    // The first git status edits dir/.ignore after it ran; the second
+    // restores it before it runs.
+    let repo = s.repo("rules", &[&FILES[..], &[("dir/.ignore", "*.x\n")]].concat());
+    let body = format!(
+        "if [ \"$3\" = status ]; then\n\
+           [ -e '{seen}' ] && printf '*.x\\n' > \"$2/dir/.ignore\" && exec \"$real\" \"$@\"\n\
+           \"$real\" \"$@\"; code=$?; touch '{seen}'; printf '*.h\\n' > \"$2/dir/.ignore\"; exit $code\n\
+         fi\n",
+        seen = s.path("seen").display()
+    );
+    let path = wrapped_git(&s, &body);
+    let why = "the ignore file dir/.ignore changed during the build";
+    assert_eq!(required(&s, &repo, "rules", Some(&path), false), why);
+
+    // The first git status moves dir/b.c away after it ran; the second
+    // puts it back before it runs.
+    let repo = s.repo("moved", &FILES);
+    let body = format!(
+        "if [ \"$3\" = status ]; then\n\
+           [ -e '{seen}' ] && mv '{away}' \"$2/dir/b.c\" && exec \"$real\" \"$@\"\n\
+           \"$real\" \"$@\"; code=$?; touch '{seen}'; mv \"$2/dir/b.c\" '{away}'; exit $code\n\
+         fi\n",
+        seen = s.path("seen").display(),
+        away = s.path("away.c").display()
+    );
+    let path = wrapped_git(&s, &body);
+    let why = "the folder dir changed during the build";
+    assert_eq!(required(&s, &repo, "moved", Some(&path), false), why);
+
+    // The second git status commits first.
+    let repo = s.repo("head", &FILES);
+    let body = format!(
+        "if [ \"$3\" = status ]; then\n\
+           [ -e '{seen}' ] && \"$real\" -C \"$2\" commit -q --allow-empty -m moved\n\
+           touch '{seen}'\n\
+         fi\n",
+        seen = s.path("seen").display()
+    );
+    let path = wrapped_git(&s, &body);
+    let why = "HEAD moved during the build";
+    assert_eq!(required(&s, &repo, "head", Some(&path), false), why);
+
+    let repo = s.repo("corrupt", &FILES);
+    let oid = s.git(&repo, &["rev-parse", "HEAD:a.c"]);
+    let object = repo
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(oid[2..].trim());
+    let mode = std::os::unix::fs::PermissionsExt::from_mode(0o644);
+    std::fs::set_permissions(&object, mode).unwrap();
+    std::fs::write(&object, "not an object").unwrap();
+    let why = required(&s, &repo, "corrupt", None, false);
+    assert!(why.starts_with("git failed: "), "{why}");
+}
+
+/// A clean checkout with `--require-served-commit` records its commit and
+/// prints what it prints without the flag.
+#[test]
+fn a_required_commit_of_a_clean_checkout_is_recorded() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (code, plain) = build(&s, &repo, "idx-plain", &[], None);
+    assert_eq!(code, Some(0), "{plain}");
+    let (code, required) = build(&s, &repo, "idx", &[REQUIRE], None);
+    assert_eq!(code, Some(0), "{required}");
+    assert_eq!(required, plain);
+    assert_eq!(
+        required,
+        format!("note: the index holds commit {}\n", s.head(&repo))
+    );
+    assert_eq!(commit_of(&s.path("idx")), Some(s.head(&repo)));
+}
+
+/// Only a `--store-docs` index records a served commit, so the flag
+/// without it is a usage error, and nothing is built.
+#[test]
+fn a_required_commit_needs_store_docs() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let output = s.path("idx").display().to_string();
+    let out = s.run(&repo, &["index", REQUIRE, ".", "--output", &output]);
+    assert_eq!(out.status.code(), Some(2));
+    let want = "error: --require-served-commit needs --store-docs: only a --store-docs \
+                index records a served commit\n";
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), want);
+    assert!(!s.path("idx").exists());
+}
+
+/// A build that `--require-served-commit` stops before the walk leaves an
+/// older index at its output as it was.
+#[test]
+fn a_required_commit_keeps_an_older_index() {
+    let s = Sandbox::new();
+    let repo = s.repo("repo", &FILES);
+    let (_, stderr) = s.index(&repo, "idx");
+    let head = s.head(&repo);
+    assert_eq!(
+        note(&stderr),
+        format!("note: the index holds commit {head}")
+    );
+    let manifest = std::fs::read(s.path("idx/manifest.bin")).unwrap();
+    s.write(&repo, &[("a.c", "printk edited\n")]);
+    let (code, stderr) = build(&s, &repo, "idx", &[REQUIRE], None);
+    assert_eq!(code, Some(2), "{stderr}");
+    let want = "error: the index cannot record its served commit: a.c differs from HEAD\n";
+    assert_eq!(stderr, want);
+    assert_eq!(std::fs::read(s.path("idx/manifest.bin")).unwrap(), manifest);
+    assert_eq!(commit_of(&s.path("idx")), Some(head));
+}
+
 /// A `PATH` whose first `git` is a shell script that runs `body`, then the
 /// real git, `$real`, with the same arguments: `-C`, the directory, then
 /// git's own.

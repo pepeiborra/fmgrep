@@ -81,6 +81,10 @@ pub struct IndexArgs {
     /// Keep a copy of the files; searches never read them
     #[arg(long)]
     pub store_docs: bool,
+    /// With --store-docs: fail, and leave no index, unless it records its
+    /// served commit
+    #[arg(long)]
+    pub require_served_commit: bool,
     /// Print the summary as JSON
     #[arg(long)]
     pub json: bool,

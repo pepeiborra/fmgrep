@@ -20,6 +20,8 @@ pub struct IndexRequest<'a> {
     pub output: Option<&'a Path>,
     /// Keep a copy of the documents in `docs.shard`.
     pub store_docs: bool,
+    /// Fail unless the index records its served commit; `store_docs` only.
+    pub require_commit: bool,
 }
 
 /// Build, persist and summarize an index. Printing is the caller's job.
@@ -33,7 +35,19 @@ pub struct IndexRequest<'a> {
 /// index reads and builds. It records when it started. Any failure, error
 /// or panic, removes the output dir, so a half-written index is never
 /// queryable.
+///
+/// With `require_commit`, an index that would record no served commit is
+/// a failure, in the words of the note it would print: the checks that
+/// need no walk run before the output dir is made, so they fail before a
+/// file is read, and an index already at the output stays.
 pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
+    if req.require_commit && !req.store_docs {
+        return Err(
+            "error: --require-served-commit needs --store-docs: only a --store-docs index \
+             records a served commit"
+                .to_owned(),
+        );
+    }
     std::fs::read_dir(req.folder)
         .map_err(|e| format!("error: cannot list folder {}: {e}", req.folder.display()))?;
     let output: PathBuf = match req.output {
@@ -43,11 +57,18 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         }
         None => req.folder.join(INDEX_DIR),
     };
+    let start = Instant::now();
+    let started = SystemTime::now();
+    let early = match req.require_commit {
+        true => Some(served::early(req.folder).map_err(|why| no_commit(&why))?),
+        false => None,
+    };
     create_output_dir(&output)?;
     let persist = |output: &Path| -> Result<Manifest, String> {
-        let start = Instant::now();
-        let started = SystemTime::now();
-        let before = req.store_docs.then(|| served::before(req.folder));
+        let before = req.store_docs.then(|| match &early {
+            Some(head) => Ok(head.clone()),
+            None => served::before(req.folder),
+        });
         let mut sink = create_sink(output)?;
         let cap = shard_bytes()?;
         #[cfg(test)]
@@ -74,8 +95,10 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         let commit = before
             .map(|b| served::after(b, req.folder, output, &docs.paths, &docs.lens, &docs.walk));
         let build_time_us = start.elapsed().as_micros() as u64;
-        if let Some(commit) = &commit {
-            served::note(commit);
+        match &commit {
+            Some(Err(why)) if req.require_commit => return Err(no_commit(why)),
+            Some(commit) => served::note(commit),
+            None => {}
         }
         let since_epoch = started.duration_since(UNIX_EPOCH).unwrap_or_default();
         let manifest = Manifest {
@@ -116,6 +139,12 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         index_size_bytes: manifest.index_size_bytes,
         build_time_us: manifest.build_time_us,
     })
+}
+
+/// Why an index that must record its served commit fails: `why` is the
+/// reason that the note gives without `--require-served-commit`.
+fn no_commit(why: &str) -> String {
+    format!("error: the index cannot record its served commit: {why}")
 }
 
 /// A search reads a files-layout [`INDEX_DIR`] from its parent directory, so

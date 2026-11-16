@@ -2,9 +2,9 @@
 //! the served commit, which a client checkout can be compared with.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{entries, git, records};
+use super::{Entry, entries, git, records};
 use crate::manifest::{Commit, DOCS_SHARD};
 use crate::walk::WalkNotes;
 
@@ -60,6 +60,31 @@ fn clean_head(folder: &Path) -> Result<String, String> {
     head.ok_or_else(|| "git status gave no HEAD".to_owned())
 }
 
+/// The checks of [`after`] that need no walk, for an index that must
+/// record its served commit, so that it fails before it reads a file: the
+/// checks of [`before`], then git status sees every tracked file, HEAD's
+/// tree holds no submodule, and no ignore file outside the checkout holds
+/// a pattern. HEAD, else why not.
+pub fn early(folder: &Path) -> Before {
+    let head = before(folder)?;
+    let folder = std::fs::canonicalize(folder)
+        .map_err(|e| format!("cannot resolve {} ({e})", folder.display()))?;
+    hides_none(&folder)?;
+    let listed = git(&folder, &["ls-tree", "-r", "-z", &head])?;
+    for entry in entries(&listed) {
+        no_submodule(&entry?)?;
+    }
+    let mut outside = vec![exclude_file(&folder)?];
+    // Sorted as the walk lists them, so that the file named is the one
+    // that the check after the build would name.
+    let mut outer = crate::walk::outer_ignores(&folder);
+    outer.sort_by(|a, b| a.0.cmp(&b.0));
+    let outer = outer.into_iter().filter(|(rel, _)| is_outside(rel));
+    outside.extend(outer.map(|(rel, _)| folder.join(rel)));
+    no_pattern(outside)?;
+    Ok(head)
+}
+
 /// The served commit of the index just built from `folder` into `output`:
 /// HEAD, unchanged since [`before`], when git status sees every tracked
 /// file, no folder the walk listed changed since, every indexed file in
@@ -101,10 +126,7 @@ pub fn after(
     let mut skips = walk.skipped.iter().peekable();
     for entry in entries(&listed) {
         let entry = entry?;
-        if entry.mode == "160000" {
-            let path = String::from_utf8_lossy(entry.path);
-            return Err(format!("the checkout holds a submodule ({path})"));
-        }
+        no_submodule(&entry)?;
         // A skipped file that git does not track is in no checkout.
         while skips.next_if(|f| f.as_bytes() < entry.path).is_some() {}
         if let Some(file) = skips.next_if(|f| f.as_bytes() == entry.path) {
@@ -167,13 +189,10 @@ fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result
         let entry = entry?;
         tracked.insert(entry.path, entry.oid);
     }
-    let exclude = super::line(git(folder, &["rev-parse", "--git-path", "info/exclude"])?)?;
-    let mut outside = vec![folder.join(exclude)];
+    let mut outside = vec![exclude_file(folder)?];
     let (mut read, mut oids) = (Vec::new(), Vec::new());
     for (rel, stamp) in &walk.ignores {
-        let inside =
-            !(rel.starts_with('/') || rel.starts_with("../") || rel.ends_with(GIT_EXCLUDE));
-        match (inside, stamp) {
+        match (!is_outside(rel), stamp) {
             (true, Some(stamp)) => {
                 let Some(&oid) = tracked.get(rel.as_bytes()) else {
                     return Err(format!("the ignore file {rel} is not tracked by git"));
@@ -185,12 +204,7 @@ fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result
             (false, _) => outside.push(folder.join(rel)),
         }
     }
-    if let Some(path) = outside.into_iter().find(|p| has_pattern(p)) {
-        return Err(format!(
-            "the ignore file {} outside the checkout has a pattern",
-            path.display()
-        ));
-    }
+    no_pattern(outside)?;
     // A filter can change an ignore file on checkout while git status
     // shows no change.
     super::blobs(folder, &oids, |i, blob| {
@@ -211,6 +225,43 @@ fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result
 
 /// `.git/info/exclude`, as the walk lists it.
 const GIT_EXCLUDE: &str = ".git/info/exclude";
+
+/// Whether the walk's ignore file `rel` is outside the tree: an
+/// ancestor's, the global excludes file or `info/exclude`.
+fn is_outside(rel: &str) -> bool {
+    rel.starts_with('/') || rel.starts_with("../") || rel.ends_with(GIT_EXCLUDE)
+}
+
+/// The checkout's `info/exclude`, wherever git keeps it: a linked
+/// worktree shares its repository's.
+fn exclude_file(folder: &Path) -> Result<PathBuf, String> {
+    let exclude = super::line(git(folder, &["rev-parse", "--git-path", "info/exclude"])?)?;
+    Ok(folder.join(exclude))
+}
+
+/// Why the index records no commit, if an ignore file of `outside` holds
+/// a pattern.
+fn no_pattern(outside: Vec<PathBuf>) -> Result<(), String> {
+    match outside.into_iter().find(|p| has_pattern(p)) {
+        Some(path) => Err(format!(
+            "the ignore file {} outside the checkout has a pattern",
+            path.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Why the index records no commit, if `entry` of HEAD's tree is a
+/// submodule.
+fn no_submodule(entry: &Entry<'_>) -> Result<(), String> {
+    match entry.mode {
+        "160000" => Err(format!(
+            "the checkout holds a submodule ({})",
+            String::from_utf8_lossy(entry.path)
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Whether the ignore file at `path` exists and holds a line that is
 /// neither blank nor a comment. Leading blanks belong to a pattern: ` #a`
