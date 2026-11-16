@@ -431,7 +431,7 @@ fn any_capped<C: BackwardCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Opti
 /// the superset holds. Each of those strings ends in `anchor` and none ends
 /// in another, so each row located is one of `anchor`'s rows, in the same
 /// document: never more rows or documents than locating `anchor`.
-pub fn automaton_locate<C: LocatingCursor>(
+pub fn automaton_locate<C: LocatingCursor + Clone>(
     root: C,
     plan: &RegexPlan,
     anchor: Option<&[u8]>,
@@ -439,20 +439,23 @@ pub fn automaton_locate<C: LocatingCursor>(
     locate_capped(root, plan, &CAPS, anchor)
 }
 
-fn locate_capped<C: LocatingCursor>(
+/// The intervals accepted, then those of the last whole frontier, are
+/// located together once the walk ends: none when it gave up without one.
+fn locate_capped<C: LocatingCursor + Clone>(
     root: C,
     plan: &RegexPlan,
     caps: &Caps,
     anchor: Option<&[u8]>,
 ) -> Option<Vec<C::Hit>> {
-    let mut hits = Vec::new();
-    let mut locate = |cursor: &C| cursor.locate(&mut |hit| hits.push(hit));
+    let mut accepted = Vec::new();
     if let Err(owed) = walk(root, plan, caps, anchor, |cursor| {
-        locate(cursor);
+        accepted.push(cursor.clone());
         true
     }) {
-        owed?.iter().for_each(&mut locate);
+        accepted.extend(owed?);
     }
+    let mut hits = Vec::new();
+    C::locate_all(&accepted, &mut |hit| hits.push(hit));
     Some(hits)
 }
 

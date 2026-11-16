@@ -5,6 +5,7 @@ mod count;
 mod docfm;
 mod frontier;
 mod literals;
+mod parallel;
 mod walk;
 use std::path::Path;
 use std::sync::Mutex;

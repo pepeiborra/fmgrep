@@ -362,6 +362,13 @@ impl Cursor<'_> {
         self.locate_from::<false>(self.forward_depth(), visit, None);
     }
 
+    /// [`Cursor::locate`] of each of `cursors`, all of one index, in no
+    /// fixed order; their rows walk back together, so many small intervals
+    /// walk back in parallel as one large one does.
+    pub fn locate_all(cursors: &[Self], visit: &mut dyn FnMut(usize)) {
+        forward::locate_all(cursors, visit);
+    }
+
     /// [`Cursor::locate`], counted and timed.
     pub fn locate_stats(&self, visit: &mut dyn FnMut(usize)) -> LocateStats {
         let start = std::time::Instant::now();
