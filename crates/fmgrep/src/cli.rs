@@ -381,6 +381,16 @@ fn client(
     let status = match &had {
         Some(Pinned::Commit(id)) => {
             crate::held::hold();
+            if crate::verbose::verbose() {
+                let pin =
+                    (top.as_deref()).and_then(|top| crate::source::pin_path(top, &server.addr));
+                let pin = pin.map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+                crate::held::line(&format!(
+                    "note: sent the query pinned to the served commit {}, which the pin {pin} \
+                     keeps, with no status request",
+                    checkout::short(id)
+                ));
+            }
             let tried = search(&mut conn, &serve::ServeStatus::pinned(id), p.clone());
             if !crate::held::holding() || tried.is_ok() {
                 crate::held::release();
@@ -390,11 +400,17 @@ fn client(
                 .and_then(|status| same_format(server, status.format).map(|()| status));
             match status {
                 Ok(status) if checkout::pin_of(&status) == Some(id) => {
+                    asked(server, "the search failed before a result came");
                     crate::held::release();
                     return tried;
                 }
                 Ok(status) => {
                     crate::held::discard();
+                    let short = checkout::short(id);
+                    asked(
+                        server,
+                        &format!("it no longer serves {short}, the commit that the pin keeps"),
+                    );
                     status
                 }
                 Err(e) => {
@@ -403,9 +419,14 @@ fn client(
                 }
             }
         }
-        damaged => {
-            if let Some(Pinned::Damaged(why)) = damaged {
-                warn(&format!("{why}; asked {server} for its status"));
+        other => {
+            match other {
+                Some(Pinned::Damaged(why)) => {
+                    warn(&format!("{why}; asked {server} for its status"))
+                }
+                // Outside a checkout no pin applies: no note.
+                None => {}
+                Some(_) => asked(server, "no pin of an earlier search"),
             }
             let status = serve::status_on(&mut conn)?;
             same_format(server, status.format)?;
@@ -424,6 +445,14 @@ fn client(
         crate::source::pin(&top, &server.addr, now);
     }
     answered
+}
+
+/// Under `FMGREP_VERBOSE`, that a search asked `server` for its status,
+/// and `why`.
+fn asked(server: &Server, why: &str) {
+    if crate::verbose::verbose() {
+        crate::held::line(&format!("note: asked {server} for its status ({why})"));
+    }
 }
 
 /// A search through `server` of `status`, on `conn`, from the canonical
