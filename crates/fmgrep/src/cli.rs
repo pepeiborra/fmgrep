@@ -347,14 +347,15 @@ impl std::fmt::Display for Server {
     }
 }
 
-/// A search through `server`, on `conn`; PATHs resolve against the served
-/// tree. With `ignore` (`--ignore-local-changes`), the server's answer
-/// alone, and no look at the checkout's changes.
+/// A search through `server`, on `conn`. With `ignore`
+/// (`--ignore-local-changes`), the server's answer alone, and no look at
+/// the checkout's changes. From a git checkout, the served commit of the
+/// status is pinned for the next search, once the search ends.
 fn client(
     server: &Server,
     mut conn: Conn,
     ignore: bool,
-    mut p: QueryParams,
+    p: QueryParams,
     typed: &[String],
     json: bool,
     out: &mut dyn Write,
@@ -362,10 +363,44 @@ fn client(
     let status = serve::status_on(&mut conn)?;
     same_format(server, status.format)?;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
+    let top = checkout::top(&cwd);
+    let had =
+        (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
+    let answered = answer(
+        server, &mut conn, &status, &cwd, ignore, p, typed, json, out,
+    );
+    // After the search, so that a record that cannot be saved says so first.
+    let now = checkout::pin_of(&status);
+    let kept = match &had {
+        Some(crate::source::Pinned::Commit(id)) => now == Some(id.as_str()),
+        Some(crate::source::Pinned::Missing) => now.is_none(),
+        _ => false,
+    };
+    if let Some(top) = top.filter(|_| !kept) {
+        crate::source::pin(&top, &server.addr, now);
+    }
+    answered
+}
+
+/// A search through `server` of `status`, on `conn`, from the canonical
+/// `cwd`; PATHs resolve against the served tree, unless the cwd is in a
+/// checkout and the server serves a commit.
+#[allow(clippy::too_many_arguments)]
+fn answer(
+    server: &Server,
+    conn: &mut Conn,
+    status: &serve::ServeStatus,
+    cwd: &Path,
+    ignore: bool,
+    mut p: QueryParams,
+    typed: &[String],
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<Outcome, String> {
     let mut ours = None;
     let plan = match ignore {
         true => checkout::Plan::Ignored,
-        false => checkout::plan(server, &status, &cwd),
+        false => checkout::plan(server, status, cwd),
     };
     match plan {
         // The checkout holds the served commit: PATHs and the cwd are
@@ -383,9 +418,9 @@ fn client(
             let pinned = match plan {
                 checkout::Plan::Degraded(why) => {
                     checkout::degraded(&why);
-                    checkout::top(&cwd).zip(status.commit.as_ref())
+                    checkout::top(cwd).zip(status.commit.as_ref())
                 }
-                checkout::Plan::Ignored => checkout::top(&cwd).zip(status.commit.as_ref()),
+                checkout::Plan::Ignored => checkout::top(cwd).zip(status.commit.as_ref()),
                 _ => None,
             };
             match pinned {
@@ -413,7 +448,7 @@ fn client(
         // The client's own files go between the server's: it needs each
         // file of the server's in a frame of its own.
         Some((top, (skip, local))) if !local.files.is_empty() => {
-            merged(&mut conn, p, &top, skip, &local, json, out)
+            merged(conn, p, &top, skip, &local, json, out)
         }
         // The server's files only, those on the skip list (deleted
         // files) left out: its output is the search's.
@@ -423,7 +458,7 @@ fn client(
             if let Some((_, (skip, _))) = ours {
                 p.skip = skip;
             }
-            serve::rendered(&mut conn, &p, json, out)
+            serve::rendered(conn, &p, json, out)
         }
     };
     answered

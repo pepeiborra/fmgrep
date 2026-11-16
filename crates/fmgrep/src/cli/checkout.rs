@@ -46,8 +46,20 @@ pub fn short(id: &str) -> &str {
 /// id: 40 lowercase hex digits (SHA-1) or 64 (SHA-256). Only such an id
 /// goes to git: a ref such as `HEAD` names whatever it points to here.
 fn git_commit(vcs: &str, id: &str) -> bool {
+    vcs == "git" && full_id(id)
+}
+
+/// Whether `id` is a full git commit id: 40 or 64 lowercase hex digits.
+pub fn full_id(id: &str) -> bool {
     let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
-    vcs == "git" && matches!(id.len(), 40 | 64) && id.bytes().all(hex)
+    matches!(id.len(), 40 | 64) && id.bytes().all(hex)
+}
+
+/// The commit that a pin keeps for `status`: its served commit, when it is
+/// a git commit by its full id; else none.
+pub fn pin_of(status: &ServeStatus) -> Option<&str> {
+    let commit = status.commit.as_ref()?;
+    git_commit(&commit.vcs, &commit.id).then_some(commit.id.as_str())
 }
 
 /// How a search from canonical `cwd` through `server`, of `status`, treats

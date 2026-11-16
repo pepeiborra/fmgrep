@@ -365,6 +365,112 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     wrote
 }
 
+const PIN_VERSION: u32 = 1;
+
+/// A pin: the served commit of the last status that a search through the
+/// server at `server` from the checkout at `root` asked for, a full git
+/// commit id. The next search pins its query to it and asks for no
+/// status.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pin {
+    v: u32,
+    root: String,
+    server: String,
+    commit: String,
+}
+
+/// What the pin of a checkout and a server says.
+#[derive(Debug, PartialEq)]
+pub enum Pinned {
+    /// The served commit of the last status.
+    Commit(String),
+    /// No pin.
+    Missing,
+    /// A pin that cannot be used, and why.
+    Damaged(String),
+}
+
+/// The pin of the checkout at canonical `root` and the server at `addr`:
+/// `<cache>/<basename of root>-<16 hex>.pin`.
+pub fn pin_path(root: &Path, addr: &str) -> Option<PathBuf> {
+    let root = root.to_str()?;
+    let base = Path::new(root).file_name().and_then(|n| n.to_str());
+    let hash = fnv(format!("{root}\0server {addr}").as_bytes());
+    Some(cache_dir()?.join(format!("{}-{hash:016x}.pin", base.unwrap_or("root"))))
+}
+
+/// The pin of the checkout at canonical `root` and the server at `addr`.
+/// A pin that cannot be read, is malformed, was written by another
+/// fmgrep version or for another checkout or server, or keeps a commit
+/// that `full_id` refuses, is not used, as a record is not.
+pub fn pinned(root: &Path, addr: &str, full_id: fn(&str) -> bool) -> Pinned {
+    let Some(path) = pin_path(root, addr) else {
+        return Pinned::Missing;
+    };
+    let shown = path.display();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Pinned::Missing,
+        Err(e) => return Pinned::Damaged(format!("cannot read the pin {shown}: {e}")),
+    };
+    let malformed = |e: &dyn std::fmt::Display| format!("the pin {shown} is malformed: {e}");
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(e) => return Pinned::Damaged(malformed(&e)),
+    };
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(u64::from(PIN_VERSION)) {
+        return Pinned::Damaged(format!(
+            "the pin {shown} was written by another fmgrep version"
+        ));
+    }
+    let pin: Pin = match serde_json::from_value(value) {
+        Ok(pin) => pin,
+        Err(e) => return Pinned::Damaged(malformed(&e)),
+    };
+    if Some(pin.root.as_str()) != root.to_str() || pin.server != addr {
+        return Pinned::Damaged(format!(
+            "the pin {shown} was written for another checkout or server"
+        ));
+    }
+    match full_id(&pin.commit) {
+        true => Pinned::Commit(pin.commit),
+        false => Pinned::Damaged(malformed(&"not a git commit id")),
+    }
+}
+
+/// Pin `commit` for the checkout at canonical `root` and the server at
+/// `addr`; with none, remove the pin. Says why it could not, once per
+/// process, as a record does.
+pub fn pin(root: &Path, addr: &str, commit: Option<&str>) {
+    let Some(root_str) = root.to_str() else {
+        return cannot_save(format_args!("the pin (the checkout's path is not UTF-8)"));
+    };
+    let Some(path) = pin_path(root, addr) else {
+        return cannot_save(format_args!(
+            "the pin (no cache directory: set XDG_CACHE_HOME or HOME)"
+        ));
+    };
+    let wrote = match commit {
+        Some(commit) => {
+            let pin = Pin {
+                v: PIN_VERSION,
+                root: root_str.to_owned(),
+                server: addr.to_owned(),
+                commit: commit.to_owned(),
+            };
+            write_atomic(&path, &serde_json::to_vec(&pin).expect("a pin serializes"))
+        }
+        None => std::fs::remove_file(&path),
+    };
+    match wrote {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            cannot_save(format_args!("the pin {}: {e}", path.display()));
+        }
+        _ => {}
+    }
+}
+
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
 /// a token for the record; why watchman cannot say goes to stderr, worded
 /// for a server's queries if `served`, unless `served` and the cause
