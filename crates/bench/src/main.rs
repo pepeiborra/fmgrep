@@ -389,7 +389,10 @@ fn run() -> Result<(), Fail> {
         let row = match (name.kind, &fmgrep, &tgrep, &elgrep) {
             (RowKind::Rg, ..) => rows::rg(&paths, &root, terms),
             (RowKind::Tgrep, _, Ok(t), _) => tgrep::row(&t.bin, &paths, &root, terms),
-            (RowKind::Elgrep, _, _, Ok(e)) => elgrep::row(e, &paths, &root, terms),
+            (RowKind::Elgrep, _, _, Ok(e)) => {
+                let watchman = Some(Path::new("watchman"));
+                elgrep::row(e, &paths, &root, terms, watchman)
+            }
             (RowKind::FmgrepServer, Some(bin), ..) => {
                 let server = servers.iter().find(|s| s.name == name);
                 let server = server.expect("server rows come from --server");

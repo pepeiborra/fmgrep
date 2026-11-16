@@ -24,7 +24,8 @@ harness and prints its markdown, by default
 with its kind, and per row in `target/bench/trace-<corpus>.jsonl`. Every
 row searches the checkout in place, and nothing is written under it:
 indexes and tool state go to temporary directories; watchman keeps
-watching it, as under [File monitor](#file-monitor). Every row first runs
+watching it, as under [File monitor](#file-monitor), but for the elgrep
+row ([elgrep](#elgrep-optional)). Every row first runs
 the set's first query once as a warm-up, neither timed, nor kept, nor
 counted in the query footprint or RSS, then times every query; the
 `fmgrep-direct` row runs `fmgrep status` instead of that query. Every row
@@ -186,6 +187,34 @@ state in the row's temporary directory, so it never touches an index of
 yours, and stops the daemon when the row ends. The index answers only on
 Linux, so the default rows include elgrep only there; elsewhere
 `--rows elgrep` runs a row in which every query is a scan, as its note says.
+
+watchman writes a cookie file about once a minute into a tree it watches,
+into its `.git`, or into the root of a tree that has none, such as AOSP.
+eg-indexd counts each as a change, and a build that raced one does not
+prove its index fresh: with watchman watching AOSP, every build raced one,
+and `eg --bench` still waited after 10 min. So on Linux the row edits
+your own running watchman, if one runs; it starts none. It removes the
+watch of the checkout, and every watch of a directory under it, and
+prints a line for each. When the row ends, it watches each of them again
+with `watchman watch` of the same directory, waits for the crawl as
+`scripts/fsmonitor.sh` does, and prints a line for each. The triggers
+and subscriptions of a removed watch do not come back. If the run is
+killed, the watches stay removed: put each back with
+`watchman watch DIR`, as its line says. A watch of a directory above the
+checkout is left alone, with a warning: its cookie files may keep elgrep
+from proving its index current.
+
+Once `eg --bench` reports the first build, the row runs the same probe
+under `--debug` every 200 ms until three in a row read the index, for at
+most 30 min, and only then times the queries: on AOSP, eg-indexd then
+drops the watches of the directories its walk skipped, their events
+overflow the kernel's inotify queue (`fs.inotify.max_queued_events`,
+16,384 by default), and it scans every query until its next build, about
+30 s later. `ready` counts that wait, with the probes and the 200 ms
+pauses between them: 0.4 s between the last three. A note under the
+table says how many probes scanned and for how long. After 30 min the
+row times the queries anyway, and its note says that the index did not
+answer. If eg-indexd exits during the wait, the run stops with an error.
 
 ## Queries
 
