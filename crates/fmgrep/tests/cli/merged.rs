@@ -122,6 +122,65 @@ fn each_uncommitted_change_answers_as_a_local_index() {
     }
 }
 
+/// Tracked files that the client's own excludes ignore (its global excludes
+/// file, its `info/exclude`, also from a linked worktree, a directory
+/// pattern, a rule of one that the other negates) are left out, as its
+/// local index leaves them out.
+#[test]
+fn tracked_files_the_clients_excludes_ignore_are_left_out() {
+    let r = Remote::new(&FILES);
+    let global = r.s.path("config");
+    for (name, exclude) in [
+        ("global", global.join("git/ignore")),
+        ("info", r.client.join(".git/info/exclude")),
+    ] {
+        for pattern in ["*.h\n", "dir/sub/\n", "e.c\n"] {
+            reset(&r);
+            r.s.write(
+                exclude.parent().unwrap(),
+                &[(exclude.file_name().unwrap().to_str().unwrap(), pattern)],
+            );
+            r.s.write(&r.client, &[("a.c", "printk edited\n")]);
+            for args in [&["printk"][..], &["-l", "printk"]] {
+                r.same("", args);
+            }
+            std::fs::remove_file(&exclude).unwrap();
+            let _ = name;
+        }
+    }
+    // Where the two disagree, `info/exclude` decides, as in the walk.
+    let info = r.client.join(".git/info/exclude");
+    for (mine, global_rule) in [("e.c\n", "!e.c\n"), ("!e.c\n", "e.c\n")] {
+        reset(&r);
+        r.s.write(&r.client, &[(".git/info/exclude", mine)]);
+        r.s.write(&global, &[("git/ignore", global_rule)]);
+        r.s.write(&r.client, &[("a.c", "printk edited\n")]);
+        for args in [&["printk"][..], &["-l", "printk"]] {
+            r.same("", args);
+        }
+        std::fs::remove_file(&info).unwrap();
+        std::fs::remove_file(global.join("git/ignore")).unwrap();
+    }
+    reset(&r);
+    let tree = r.s.path("linked");
+    r.s.git(
+        &r.client,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &tree.display().to_string(),
+            &r.commit,
+        ],
+    );
+    r.s.write(&r.client, &[(".git/info/exclude", "*.h\n")]);
+    let tree = std::fs::canonicalize(tree).unwrap();
+    let out = r.search(&tree, &["-l", "printk"]);
+    assert_eq!(stderr(&out), "");
+    assert_eq!(stdout(&out), "a.c\ndir/b.c\ne.c\n");
+}
+
 /// One change set that interleaves the client's files with the server's,
 /// in every output mode.
 #[test]

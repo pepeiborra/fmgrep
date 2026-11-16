@@ -130,11 +130,14 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
             "an ignore file differs from the served commit ({p})"
         ));
     }
+    // Tracked files that the client's own excludes ignore are left out of
+    // its part when it resolves the list, as its index would leave them.
+    skip.extend(excluded(top)?);
+    skip.sort_unstable();
+    skip.dedup();
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
     }
-    skip.sort_unstable();
-    skip.dedup();
     Ok(skip)
 }
 
@@ -144,6 +147,33 @@ pub fn over(n: usize, commit: &str) -> String {
         "{n} files differ from the served commit {}; the limit is {MAX_SKIP}",
         short(commit)
     )
+}
+
+/// The tracked files that rules the served commit does not carry ignore:
+/// the patterns of the checkout's `info/exclude` and of the global
+/// excludes file that the index's walk reads.
+fn excluded(top: &Path) -> Result<Vec<String>, String> {
+    let exclude = vcs::line(vcs::git(top, &["rev-parse", "--git-path", "info/exclude"])?)?;
+    let global = ignore::gitignore::gitconfig_excludes_path();
+    // The last file passed wins; `info/exclude` wins in the walk.
+    let from: Vec<String> = (global.into_iter())
+        .chain([top.join(exclude)])
+        .filter(|p| vcs::served::has_pattern(p))
+        .map(|p| format!("--exclude-from={}", p.display()))
+        .collect();
+    if from.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["ls-files", "-z", "-c", "-i"];
+    args.extend(from.iter().map(String::as_str));
+    let out = vcs::git(top, &args)?;
+    vcs::records(&out)
+        .map(|r| {
+            std::str::from_utf8(r)
+                .map(str::to_owned)
+                .map_err(|_| "a changed path is not UTF-8".to_owned())
+        })
+        .collect()
 }
 
 /// The files of the checkout at `top` that the skip list `skip` holds and
