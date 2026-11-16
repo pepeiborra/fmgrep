@@ -19,8 +19,8 @@ mod journal;
 mod recorded;
 
 pub use journal::{
-    Index, Of, Pinned, Remembered, keep, kept, not_due, pin, pinned, record_path, recorded,
-    remember, remembered, request_watch, unsaid,
+    Index, Of, Pinned, Remembered, keep, kept, not_due, pin, pin_path, pinned, record_path,
+    recorded, remember, remembered, request_watch, unsaid,
 };
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};

@@ -424,8 +424,13 @@ fn a_later_search_prints_its_plan_in_place() {
     let (want, asked) = planned(&r, &fresh, &args);
     assert_eq!(asked, ["status", "query"]);
     let costs = regex::Regex::new(r"\d+(\.\d+)? ?(µs|ms)").unwrap();
+    // Less the note on the status, which differs.
     let plain = |out: &Output, addr: &str| {
         let (printed, text, code) = seen(out, addr);
+        let text: String = (text.lines())
+            .filter(|l| !l.starts_with("note: sent the query") && !l.starts_with("note: asked"))
+            .map(|l| format!("{l}\n"))
+            .collect();
         (printed, costs.replace_all(&text, "T").into_owned(), code)
     };
     assert!(stderr(&got).contains("\nplan: "), "{}", stderr(&got));
@@ -507,7 +512,12 @@ fn a_moved_server_refuses_either_kind_of_pinned_query() {
             notes[0].contains(&format!("served commit {}", &new[..7])),
             "{text}"
         );
-        assert!(!text.contains(&r.commit[..7]), "{text}");
+        // The note on why the status was asked names the old commit, once.
+        let named: Vec<&str> = (text.lines())
+            .filter(|l| l.contains(&r.commit[..7]))
+            .collect();
+        assert_eq!(named.len(), 1, "{text}");
+        assert!(named[0].contains("it no longer serves"), "{text}");
         assert!(!text.lines().any(|l| l.starts_with("error")), "{text}");
     }
 }
@@ -543,4 +553,56 @@ fn a_failure_after_the_first_frame_asks_for_no_status() {
         assert_eq!(text.lines().last(), Some("error: server: m"), "{text}");
         assert_eq!(out.status.code(), Some(2), "{text}");
     }
+}
+
+/// Under `FMGREP_VERBOSE=1`, a search from a checkout says whether it
+/// asked for the status, and why; from no checkout it says nothing of it.
+#[test]
+fn fmgrep_verbose_says_whether_the_status_was_asked() {
+    let r = Remote::new(&FILES);
+    let proxy = Proxy::new(&r.addr);
+    let note = |cwd: &Path| {
+        let out = r.tried(|| {
+            let mut cmd = r.command(&proxy.addr, cwd, &["-l", "printk"]);
+            cmd.env("FMGREP_VERBOSE", "1").output().unwrap()
+        });
+        assert!(out.status.success(), "{}", stderr(&out));
+        let text = stderr(&out);
+        let notes: Vec<String> = (text.lines())
+            .filter(|l| l.starts_with("note: ") && !l.starts_with("note: local changes from "))
+            .map(str::to_owned)
+            .collect();
+        assert!(notes.len() <= 1, "{text}");
+        notes.into_iter().next().unwrap_or_default()
+    };
+    let server = format!("the server at {} (FMGREP_SERVER)", proxy.addr);
+    let asked = |why: &str| format!("note: asked {server} for its status ({why})");
+    assert_eq!(note(&r.client), asked("no pin of an earlier search"));
+    let pin = pin_of(&r, &proxy.addr);
+    let short = &r.commit[..7];
+    let pinned = format!(
+        "note: sent the query pinned to the served commit {short}, which the pin {} keeps, with \
+         no status request",
+        pin.display()
+    );
+    assert_eq!(note(&r.client.join("dir")), pinned);
+    let away = std::fs::canonicalize(r.s.path("home")).unwrap();
+    assert_eq!(note(&away), "");
+    // A search that fails before a result, through a server that still
+    // serves the pinned commit.
+    let mut cmd = r.command(&proxy.addr, &r.client, &["--regex", "(", "-l"]);
+    let out = cmd.env("FMGREP_VERBOSE", "1").output().unwrap();
+    let text = stderr(&out);
+    let failed = asked("the search failed before a result came");
+    assert!(text.lines().any(|l| l == failed), "{text}");
+    assert_eq!(out.status.code(), Some(2), "{text}");
+
+    let output = r.s.path("idx-files").display().to_string();
+    let built = r.s.run(&r.origin, &["index", ".", "--output", &output]);
+    assert!(built.status.success(), "{}", stderr(&built));
+    let (_files, addr) = r.s.serve(&r.s.path("idx-files"), &["--no-watch"]);
+    proxy.point(&addr);
+    let moved = format!("it no longer serves {short}, the commit that the pin keeps");
+    assert_eq!(note(&r.client), asked(&moved));
+    assert_eq!(note(&r.client), asked("no pin of an earlier search"));
 }
