@@ -310,9 +310,18 @@ fn live_bytes(
 /// interval whose walked bytes form a whole match; `accepted` returns false
 /// to stop the walk.
 ///
-/// `Some(true)` when some branch was accepted, `Some(false)` when the
-/// frontier emptied, `None` when a budget was exhausted.
-fn walk<C, F>(root: C, plan: &RegexPlan, caps: &Caps, mut accepted: F) -> Option<bool>
+/// `Ok(true)` when some branch was accepted, `Ok(false)` when the frontier
+/// emptied, `Err` when a budget was exhausted. When the next frontier
+/// would hold over `caps.live` intervals, and the root's one step walked
+/// `anchor` whole at its end, the `Err` holds the intervals of the last
+/// whole frontier not accepted: every string in them ends in `anchor`.
+fn walk<C, F>(
+    root: C,
+    plan: &RegexPlan,
+    caps: &Caps,
+    anchor: Option<&[u8]>,
+    mut accepted: F,
+) -> Result<bool, Option<Vec<C>>>
 where
     C: BackwardCursor,
     F: FnMut(&C) -> bool,
@@ -328,24 +337,26 @@ where
     let mut bytes: Vec<(u8, StateID)> = Vec::new();
     let mut run: Vec<u8> = Vec::new();
     let (mut found, mut nodes) = (false, 0usize);
+    // Whether the root's step walked `anchor` whole at its end.
+    let mut whole = false;
     while !live.is_empty() {
         next.clear();
         for node in &live {
             nodes += 1;
             if nodes > caps.nodes {
-                return None;
+                return Err(None);
             }
             if accepts(dfa, node.sid) {
                 found = true;
                 if !accepted(&node.cursor) {
-                    return Some(true);
+                    return Ok(true);
                 }
                 continue;
             }
             if node.depth >= caps.depth {
-                return None;
+                return Err(None);
             }
-            live_bytes(dfa, classes, node.sid, caps.class_bytes, &mut bytes)?;
+            live_bytes(dfa, classes, node.sid, caps.class_bytes, &mut bytes).ok_or(None)?;
             if bytes.len() != 1 {
                 for &(byte, to) in &bytes {
                     let ext = node.cursor.extend_front(&[byte]);
@@ -372,12 +383,13 @@ where
                 if depth >= caps.depth || accepts(dfa, sid) {
                     break;
                 }
-                live_bytes(dfa, classes, sid, caps.class_bytes, &mut bytes)?;
+                live_bytes(dfa, classes, sid, caps.class_bytes, &mut bytes).ok_or(None)?;
                 if bytes.len() != 1 {
                     break;
                 }
             }
             run.reverse();
+            whole |= node.depth == 0 && anchor.is_some_and(|a| run.ends_with(a));
             let ext = node.cursor.extend_front(&run);
             if ext.count() > 0 {
                 next.push(Node {
@@ -388,37 +400,59 @@ where
             }
         }
         if next.len() > caps.live {
-            return None;
+            let owed = live.into_iter().filter(|n| !accepts(dfa, n.sid));
+            return Err(whole.then(|| owed.map(|n| n.cursor).collect()));
         }
         std::mem::swap(&mut live, &mut next);
     }
-    Some(found)
+    Ok(found)
 }
 
 /// Boolean form of the walk, kept as [`automaton_locate`]'s oracle; see
-/// [`walk`] for the tri-state contract.
+/// [`walk`] for the contract.
 #[cfg(test)]
 fn any_capped<C: BackwardCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Option<bool> {
-    walk(root, plan, caps, |_| false)
+    walk(root, plan, caps, None, |_| false).ok()
 }
 
-/// Located accepted matches, or `None` when a budget was exhausted, and the
+/// Located rows: the accepted matches, plus the last whole frontier's
+/// strings on the give-up below. `None` when a budget was exhausted, and the
 /// caller then widens: keeps the document, the shard, or every document. An
 /// empty list means the frontier emptied with no truncation.
 ///
-/// Each hit locates a whole match, and every match contains one (the walk
-/// stops at the shortest accepting suffix), so the hits' documents are a
-/// superset of the matching documents.
-pub fn automaton_locate<C: LocatingCursor>(root: C, plan: &RegexPlan) -> Option<Vec<C::Hit>> {
-    locate_capped(root, plan, &CAPS)
+/// Each accepted hit locates a whole match, and every match contains one
+/// (the walk stops at the shortest accepting suffix), so the hits'
+/// documents are a superset of the matching documents.
+///
+/// A walk whose first step walked `anchor` whole at its end, and which then
+/// met the live cap, still answers: it also locates its last whole
+/// frontier. Such a hit locates a suffix of a possible match, not a whole
+/// match, and every match not accepted yet ends in one of those strings, so
+/// the superset holds. Each of those strings ends in `anchor` and none ends
+/// in another, so each row located is one of `anchor`'s rows, in the same
+/// document: never more rows or documents than locating `anchor`.
+pub fn automaton_locate<C: LocatingCursor>(
+    root: C,
+    plan: &RegexPlan,
+    anchor: Option<&[u8]>,
+) -> Option<Vec<C::Hit>> {
+    locate_capped(root, plan, &CAPS, anchor)
 }
 
-fn locate_capped<C: LocatingCursor>(root: C, plan: &RegexPlan, caps: &Caps) -> Option<Vec<C::Hit>> {
+fn locate_capped<C: LocatingCursor>(
+    root: C,
+    plan: &RegexPlan,
+    caps: &Caps,
+    anchor: Option<&[u8]>,
+) -> Option<Vec<C::Hit>> {
     let mut hits = Vec::new();
-    walk(root, plan, caps, |cursor| {
-        cursor.locate(&mut |hit| hits.push(hit));
+    let mut locate = |cursor: &C| cursor.locate(&mut |hit| hits.push(hit));
+    if let Err(owed) = walk(root, plan, caps, anchor, |cursor| {
+        locate(cursor);
         true
-    })?;
+    }) {
+        owed?.iter().for_each(&mut locate);
+    }
     Some(hits)
 }
 
