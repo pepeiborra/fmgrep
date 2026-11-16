@@ -194,6 +194,13 @@ impl PathFilter {
         .filter_map(move |(id, path)| path.is_some_and(&mut keep).then_some(id))
     }
 
+    /// The positions of `rels`, paths from the root of files that no index
+    /// holds, that a search keeps.
+    pub fn kept_of<'a>(&'a self, rels: &'a [String]) -> impl Iterator<Item = usize> + 'a {
+        let mut keep = self.keeper();
+        (rels.iter().enumerate()).filter_map(move |(i, rel)| keep(rel).then_some(i))
+    }
+
     /// Keep the items whose file a search keeps; Err, and every item kept,
     /// when a path is refused.
     pub fn retain<T>(

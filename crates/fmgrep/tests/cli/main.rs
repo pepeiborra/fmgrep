@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 mod commit;
 mod git;
+mod merged;
 mod remote;
 mod roundtrip;
 mod serve;
