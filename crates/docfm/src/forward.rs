@@ -253,6 +253,28 @@ impl Left {
     }
 }
 
+/// [`Cursor::locate_all`].
+pub(super) fn locate_all(cursors: &[Cursor<'_>], visit: &mut dyn FnMut(usize)) {
+    let Some(first) = cursors.first() else {
+        return;
+    };
+    let rows: u64 = cursors.iter().filter(|c| !c.root).map(Cursor::count).sum();
+    if rows < 2 * GRAIN as u64 {
+        return cursors.iter().for_each(|c| c.locate(visit));
+    }
+    assert!(
+        cursors
+            .iter()
+            .all(|c| std::ptr::eq(c.view.bytes, first.view.bytes)),
+        "Cursor::locate_all over cursors of different indexes"
+    );
+    let lefts: Vec<Left> = (cursors.iter())
+        .filter(|c| !c.root && c.lo != c.hi)
+        .map(|c| c.resolve_marks::<false>(c.forward_depth(), &mut 0, visit))
+        .collect();
+    walk_back::<false>(first.view, &lefts, visit);
+}
+
 /// [`View::docs`] of the rows `lefts` leave, all of `view`: on the caller's
 /// thread below two [`GRAIN`]s of rows, else in tasks of [`GRAIN`] rows on
 /// the current rayon pool, each task's docs visited in turn. Under `STATS`

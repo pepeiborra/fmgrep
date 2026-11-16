@@ -34,6 +34,12 @@ impl LocatingCursor for docfm::Cursor<'_> {
     fn locate(&self, visit: &mut impl FnMut(ShardDoc)) {
         docfm::Cursor::locate(self, &mut |hit| visit(ShardDoc(hit)));
     }
+
+    /// One locate: many small intervals walk back in parallel as one
+    /// large one does.
+    fn locate_all(cursors: &[Self], visit: &mut impl FnMut(ShardDoc)) {
+        docfm::Cursor::locate_all(cursors, &mut |hit| visit(ShardDoc(hit)));
+    }
 }
 
 /// False only when `term` provably occurs nowhere in `structure`.

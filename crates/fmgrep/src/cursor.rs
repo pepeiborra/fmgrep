@@ -22,10 +22,16 @@ pub trait LocatingCursor: BackwardCursor {
     /// Visit every occurrence of the current query, in any order. Empty
     /// cursors visit nothing.
     fn locate(&self, visit: &mut impl FnMut(Self::Hit));
+
+    /// Visit every occurrence of each of `cursors`, in any order.
+    fn locate_all(cursors: &[Self], visit: &mut impl FnMut(Self::Hit)) {
+        cursors.iter().for_each(|c| c.locate(visit));
+    }
 }
 
 /// Naive cursor over a text: the walks' reference semantics.
 #[cfg(test)]
+#[derive(Clone)]
 pub struct ScanCursor<'a> {
     text: &'a [u8],
     query: Vec<u8>,

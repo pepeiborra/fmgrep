@@ -182,9 +182,7 @@ fn fold_count_capped<C: BackwardCursor>(root: C, plan: &FoldPlan, cap: usize) ->
 /// Every occurrence of the intervals `live`.
 pub fn locate_intervals<C: LocatingCursor>(live: &[C]) -> Vec<C::Hit> {
     let mut hits = Vec::new();
-    for cursor in live {
-        cursor.locate(&mut |hit| hits.push(hit));
-    }
+    C::locate_all(live, &mut |hit| hits.push(hit));
     hits
 }
 
