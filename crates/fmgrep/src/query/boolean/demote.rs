@@ -350,7 +350,8 @@ pub fn arrange(
 pub struct Walked<'a> {
     /// Per leaf, whether the count pass walked it.
     pub leaves: &'a [bool],
-    /// Per leaf, once a walked one is located, the longest one shard took.
+    /// Per leaf, once a walked one is located, the longest one shard took,
+    /// with what its parallel walks saved.
     pub located_us: &'a [Option<f64>],
     /// µs per located row: the index's measured cost, or its default.
     pub row_us: f64,
@@ -372,9 +373,11 @@ pub struct Sample {
 /// documents.
 ///
 /// A literal candidate's locate is the reference's probe time scaled by
-/// their occurrences. A walked candidate's is its busiest shard's rows (the
-/// shards locate in parallel) at the reference's time per row of its own
-/// busiest shard, clamped as a measured row cost is, and at most
+/// their occurrences: its work, with what walking rows back in parallel
+/// saved added back, since the candidate's locate may not split as well.
+/// A walked candidate's is its busiest shard's rows (the shards locate in
+/// parallel) at the reference's time per row of its own busiest shard,
+/// clamped as a measured row cost is, and at most
 /// `walked.row_us`: for a walked reference, the time of its slowest shard,
 /// since a reference of few rows probes in mostly the fixed cost of
 /// starting a probe, which scaling would multiply.
@@ -404,7 +407,9 @@ pub fn decide(
             .filter(|&d| contains(&g.within, d))
             .collect();
         let occ_m = occurrences(&plan.counts[g.reference], &g.within);
-        let reference_us = (walked.located_us[g.reference]).unwrap_or(a.probe_us.max(1) as f64);
+        // The reference's work: its time, plus what walking in parallel saved.
+        let work_us = a.probe_us + a.saved_us;
+        let reference_us = (walked.located_us[g.reference]).unwrap_or(work_us.max(1) as f64);
         let per_row = reference_us / busiest(&plan.counts[g.reference]).max(1) as f64;
         let row_us = read::locate_us(Some(per_row)).min(walked.row_us);
         // For a walked candidate, the documents of the usual size, and the
@@ -426,7 +431,7 @@ pub fn decide(
                     let rows = busiest(&plan.counts[i]);
                     (rows as f64 * row_us, Some((rows, row_us)))
                 }
-                false => (locate_est_us(a.probe_us, occ_m, occ_i), None),
+                false => (locate_est_us(work_us, occ_m, occ_i), None),
             };
             // Reading at `us` a usual document, but for the share `held`
             // that locating reads too, and the large ones.
@@ -436,7 +441,7 @@ pub fn decide(
             };
             let cost = |us, held| match walk {
                 true => docs.is_empty() || locate_us > read_total(us, held),
-                false => demote_by_cost(a.probe_us, occ_m, docs.len(), occ_i, us),
+                false => demote_by_cost(work_us, occ_m, docs.len(), occ_i, us),
             };
             let ceiling = cost(band.max_us, 0.0);
             // What a sample may cost a walked candidate, when that is no

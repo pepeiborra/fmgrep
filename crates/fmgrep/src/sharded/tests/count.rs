@@ -33,7 +33,7 @@ fn counts(index: &DocfmIndex, terms: &[&[u8]]) -> Vec<Vec<(Range<usize>, u64)>> 
 
 /// `probe_literal` summed per shard, nonzero shards only.
 fn per_shard(index: &DocfmIndex, term: &[u8]) -> Vec<(Range<usize>, u64)> {
-    let hits = index.probe_literal(term, None);
+    let hits = index.probe_literal(term, None, &Default::default());
     index
         .metas
         .iter()
@@ -88,7 +88,7 @@ fn literal_within_skips_shards_outside_within() {
     // One doc per shard; the empty doc shares one.
     let index = DocfmIndex::build_with_cap(&docs, 1);
     assert_eq!(index.metas.len(), 5);
-    let everywhere = index.probe_literal(b"printk", None);
+    let everywhere = index.probe_literal(b"printk", None, &Default::default());
     assert_eq!(everywhere.len(), 5);
     for w in [&[][..], &[(0, 1)], &[(0, 1), (2, 5)], &[(3, 4)], &[(4, 6)]].map(ranges) {
         let shard_in = |d: usize| {

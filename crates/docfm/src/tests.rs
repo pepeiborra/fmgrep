@@ -1221,5 +1221,8 @@ fn more_marks_than_rows_panic_as_corrupt() {
 #[path = "forward_tests.rs"]
 mod forward_tests;
 
+#[path = "parallel_tests.rs"]
+mod parallel_tests;
+
 #[path = "wavelet_tests.rs"]
 mod wavelet_tests;

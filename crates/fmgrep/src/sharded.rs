@@ -154,6 +154,8 @@ pub struct Walk<'a> {
     us: u64,
     /// The longest one shard took to locate, ns; 0 until located.
     slowest_ns: AtomicU64,
+    /// The most a shard's parallel walks saved when located, µs.
+    saved_us: AtomicU64,
 }
 
 impl Walk<'_> {
@@ -162,8 +164,9 @@ impl Walk<'_> {
         self.us
     }
 
-    /// Once located, the longest one shard took, µs: the locate's wall
-    /// time without the cost of starting it.
+    /// Once located, the longest one shard took, µs, with what its
+    /// parallel walks saved: the locate's work in its busiest shard,
+    /// without the cost of starting it.
     pub fn slowest_us(&self) -> Option<f64> {
         match self.slowest_ns.load(Ordering::Relaxed) {
             0 => None,
@@ -181,15 +184,19 @@ impl Walk<'_> {
     }
 
     /// [`Query::Regex`]'s candidates, located from the intervals, for the
-    /// walked shards overlapping `within`.
+    /// walked shards overlapping `within`. A shard's time counts what its
+    /// parallel walks saved: it is its work.
     fn docs(&self, within: Option<&[Range<usize>]>) -> Vec<usize> {
         let docs = |(meta, s, walk): &ShardWalk<'_>| match within.is_none_or(|w| meta.overlaps(w)) {
             true => {
                 let start = Instant::now();
-                let hits = walk.as_ref().ok().map(|live| locate_intervals(live));
-                let docs = meta.docs_at(s, hits, self.anchor.as_deref());
-                let ns = start.elapsed().as_nanos().max(1) as u64;
+                let (docs, saved) = docfm::saved_by_tasks(|| {
+                    let hits = walk.as_ref().ok().map(|live| locate_intervals(live));
+                    meta.docs_at(s, hits, self.anchor.as_deref())
+                });
+                let ns = (start.elapsed() + saved).as_nanos().max(1) as u64;
                 self.slowest_ns.fetch_max(ns, Ordering::Relaxed);
+                (self.saved_us).fetch_max(saved.as_micros() as u64, Ordering::Relaxed);
                 docs
             }
             false => Vec::new(),
@@ -285,14 +292,24 @@ impl DocfmIndex {
     }
 
     /// Per-shard hits of the shards overlapping `within` (all when None),
-    /// concatenated in shard order, so the result stays ascending.
-    fn map_shards<T, F>(&self, within: Option<&[Range<usize>]>, hits: F) -> Vec<T>
+    /// concatenated in shard order, so the result stays ascending. Raises
+    /// `saved` to the most a shard's parallel walks saved, µs.
+    fn map_shards<T, F>(
+        &self,
+        within: Option<&[Range<usize>]>,
+        saved: &AtomicU64,
+        hits: F,
+    ) -> Vec<T>
     where
         T: Send,
         F: Fn(&Structure, &ShardMeta) -> Vec<T> + Sync,
     {
         let hits = |(s, m): (&Structure, &ShardMeta)| match within.is_none_or(|w| m.overlaps(w)) {
-            true => hits(s, m),
+            true => {
+                let (hits, by_tasks) = docfm::saved_by_tasks(|| hits(s, m));
+                saved.fetch_max(by_tasks.as_micros() as u64, Ordering::Relaxed);
+                hits
+            }
             false => Vec::new(),
         };
         let shards = self.shards.iter().zip(&self.metas);
@@ -347,6 +364,7 @@ impl DocfmIndex {
             anchor,
             us,
             slowest_ns: AtomicU64::new(0),
+            saved_us: AtomicU64::new(0),
         })
     }
 
@@ -355,9 +373,14 @@ impl DocfmIndex {
     /// holding the separator counts 0 everywhere. Counts are document-wide
     /// and overlapping, which is rg's only for a literal that can neither
     /// overlap itself nor cross a line.
-    fn probe_literal(&self, term: &[u8], within: Option<&[Range<usize>]>) -> Vec<(usize, u64)> {
+    fn probe_literal(
+        &self,
+        term: &[u8],
+        within: Option<&[Range<usize>]>,
+        saved: &AtomicU64,
+    ) -> Vec<(usize, u64)> {
         match literal_term(term) {
-            Some(term) => self.map_shards(within, |s, meta| meta.counts(s, term)),
+            Some(term) => self.map_shards(within, saved, |s, meta| meta.counts(s, term)),
             None => Vec::new(),
         }
     }
@@ -367,11 +390,12 @@ impl DocfmIndex {
         &self,
         pattern: &PreparedPattern,
         within: Option<&[Range<usize>]>,
+        saved: &AtomicU64,
     ) -> Option<Vec<usize>> {
         if !crate::pattern::narrows(pattern) {
             return None;
         }
-        Some(self.map_shards(within, |s, meta| meta.regex_docs(s, pattern)))
+        Some(self.map_shards(within, saved, |s, meta| meta.regex_docs(s, pattern)))
     }
 
     /// One answer per query, in order; shards outside ascending disjoint
@@ -381,13 +405,17 @@ impl DocfmIndex {
             .iter()
             .map(|q| {
                 let start = Instant::now();
+                // The most a shard's parallel walks saved, µs.
+                let saved = AtomicU64::new(0);
                 let mut counts = Vec::new();
                 let (exact, candidates) = match *q {
-                    Query::Literal(term) => (self.probe_literal(term, within), Some(Vec::new())),
+                    Query::Literal(term) => {
+                        (self.probe_literal(term, within, &saved), Some(Vec::new()))
+                    }
                     Query::LiteralWithin { term, within: w } => {
                         let exact = match literal_term(term) {
                             Some(term) => {
-                                self.map_shards(within, |s, meta| match meta.overlaps(w) {
+                                self.map_shards(within, &saved, |s, meta| match meta.overlaps(w) {
                                     true => meta.counts(s, term),
                                     false => Vec::new(),
                                 })
@@ -402,13 +430,20 @@ impl DocfmIndex {
                         });
                         (Vec::new(), Some(Vec::new()))
                     }
-                    Query::Regex(pattern) => (Vec::new(), self.regex_candidates(pattern, within)),
-                    Query::Walked(walk) => (Vec::new(), Some(walk.docs(within))),
+                    Query::Regex(pattern) => {
+                        (Vec::new(), self.regex_candidates(pattern, within, &saved))
+                    }
+                    Query::Walked(walk) => {
+                        let docs = walk.docs(within);
+                        saved.fetch_max(walk.saved_us.load(Ordering::Relaxed), Ordering::Relaxed);
+                        (Vec::new(), Some(docs))
+                    }
                 };
                 Answer {
                     exact,
                     candidates,
                     probe_us: start.elapsed().as_micros() as u64,
+                    saved_us: saved.into_inner(),
                     counts,
                 }
             })

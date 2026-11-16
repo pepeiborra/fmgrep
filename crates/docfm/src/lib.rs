@@ -45,6 +45,17 @@ pub const MAX_TEXT_BYTES: u64 = i32::MAX as u64;
 /// Ends every document, the last included.
 pub const DOC_END: u8 = 0;
 
+/// Runs `f` and returns, with its result, the time the parallel walks back
+/// it began on this thread saved: their tasks' time summed, less the time
+/// `f` waited for them; zero when no walk split. `f`'s time plus this is
+/// what `f` would take with every walk on one thread: the work, which a
+/// caller that prices a locate by its time can use.
+pub fn saved_by_tasks<R>(f: impl FnOnce() -> R) -> (R, std::time::Duration) {
+    let outer = forward::SAVED.with(std::cell::Cell::take);
+    let out = f();
+    (out, forward::SAVED.with(|s| s.replace(outer)))
+}
+
 /// An index over its blob bytes `D`, owned or borrowed from a mapping.
 pub struct FmIndex<D> {
     bytes: D,
@@ -345,7 +356,8 @@ impl Cursor<'_> {
 
     /// Visit the doc id of every occurrence, in no fixed order; the root
     /// visits nothing. Occurrences resolve from samples at or a few bytes
-    /// into the query first; the rest walk back.
+    /// into the query first; the rest walk back, in tasks on the current
+    /// rayon pool when they are many.
     pub fn locate(&self, visit: &mut dyn FnMut(usize)) {
         self.locate_from::<false>(self.forward_depth(), visit, None);
     }

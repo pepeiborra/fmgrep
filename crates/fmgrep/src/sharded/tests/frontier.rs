@@ -132,7 +132,10 @@ fn the_frontier_never_locates_more_rows_or_keeps_more_docs() {
                 let p = PreparedPattern::prepare_with(pattern, mode).unwrap();
                 let what = format!("round {round} cap {cap} {pattern:?}");
                 let [(rows, got), (anchor_rows, anchor)] = both(&index, &p);
-                let found = candidate_docs(index.regex_candidates(&p, None), docs.len());
+                let found = candidate_docs(
+                    index.regex_candidates(&p, None, &Default::default()),
+                    docs.len(),
+                );
                 assert_eq!(found, got, "{what}");
                 assert!(rows <= anchor_rows, "{what}: {rows} > {anchor_rows} rows");
                 assert!(got.iter().all(|d| anchor.contains(d)), "{what}");
