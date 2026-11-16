@@ -78,18 +78,38 @@ impl Remote {
     }
 
     /// `args` from `rel` below the client's top, through the server and
-    /// as the oracle: the same stdout and exit status, and no stderr.
+    /// as the oracle: the same stdout, timings and the index's own figures
+    /// aside, the same exit status, and on stderr the same error or none.
     pub fn same(&self, rel: &str, args: &[&str]) {
         let want = self.oracle(rel, args);
         let got = self.search(&self.client.join(rel), args);
-        assert_eq!(stderr(&got), "", "{rel} {args:?}");
+        // The copy's index warns that it holds a changed ignore file.
+        let errors: Vec<String> = stderr(&want)
+            .lines()
+            .filter(|l| !l.starts_with("warning:"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(stderr(&got), errors.concat(), "{rel} {args:?}");
         assert_eq!(
-            (stdout(&got), got.status.code()),
-            (stdout(&want), want.status.code()),
+            (comparable(&stdout(&got)), got.status.code()),
+            (comparable(&stdout(&want)), want.status.code()),
             "{rel} {args:?}: {}",
             stderr(&want)
         );
     }
+}
+
+/// `stdout` without what differs from run to run or from index to index:
+/// timings (of `--json` and `--stats`), and the index's file count and size.
+pub fn comparable(stdout: &str) -> String {
+    let re = regex::Regex::new(
+        r#""(latency_us|index_time_us|elapsed|elapsed_total|num_files_indexed|index_size_bytes)":(\d+|\{[^}]*\})"#,
+    )
+    .unwrap();
+    let seconds =
+        regex::Regex::new(r"(?m)^\d+\.\d+ (seconds spent searching|seconds total)$").unwrap();
+    let stdout = re.replace_all(stdout, "\"$1\":0");
+    seconds.replace_all(&stdout, "0 $1").into_owned()
 }
 
 pub fn stderr(out: &Output) -> String {
