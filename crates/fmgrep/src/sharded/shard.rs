@@ -195,7 +195,7 @@ impl ShardMeta {
         }
         if let Some(hits) = deferred(pattern)
             .and_then(DeferredPlan::plan)
-            .and_then(|plan| automaton_locate(structure.cursor(), plan))
+            .and_then(|plan| automaton_locate(structure.cursor(), plan, None))
         {
             return self.docs_at(structure, Some(hits), None);
         }
@@ -237,7 +237,7 @@ impl ShardMeta {
     ) -> Vec<usize> {
         self.docs_at(
             structure,
-            automaton_locate(structure.cursor(), plan),
+            automaton_locate(structure.cursor(), plan, anchor),
             anchor,
         )
     }

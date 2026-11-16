@@ -3,6 +3,7 @@ use super::*;
 mod build;
 mod count;
 mod docfm;
+mod frontier;
 mod literals;
 mod walk;
 use std::path::Path;
