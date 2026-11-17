@@ -420,6 +420,55 @@ fn a_client_leaving_mid_stream_leaves_the_server_serving() {
     server.join().unwrap().unwrap();
 }
 
+/// A reply much smaller than the server's output buffer still reaches a
+/// client that waits for it: the status, a short stream, and each kind of
+/// error. A missing flush shows here as a timeout, not a hang.
+#[test]
+fn a_short_reply_is_flushed_to_a_waiting_client() {
+    use std::io::Read;
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage(tmp.path(), true);
+    let (addr, server) = spawn_server(&index, FIXED);
+    let stream = std::net::TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let mut reader = std::io::BufReader::new(&stream);
+    let query = streamed(r#""terms":["printk"],"mode":"lines""#);
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"status"}"#,
+        &query,
+        "not json",
+        r#"{"jsonrpc":"2.0","id":1,"method":"nothing"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["printk"],"stream":true,"mode":"lines","expr":{"regex":"("}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"shutdown"}"#,
+    ];
+    for (i, request) in requests.iter().enumerate() {
+        (&stream)
+            .write_all(format!("{request}\n").as_bytes())
+            .unwrap();
+        // Frames, then the response line.
+        let mut frames = 0;
+        let response = loop {
+            let mut line = String::new();
+            let n = reader
+                .read_line(&mut line)
+                .unwrap_or_else(|e| panic!("request {i} got no reply: {e}"));
+            assert!(n > 0, "request {i}: connection closed");
+            match line.trim_end().parse::<u64>() {
+                Ok(len) => {
+                    std::io::copy(&mut (&mut reader).take(len), &mut std::io::sink()).unwrap();
+                    frames += 1;
+                }
+                Err(_) => break line,
+            }
+        };
+        assert!(response.starts_with(r#"{"jsonrpc":"2.0""#), "{response}");
+        assert_eq!(frames > 0, i == 1, "request {i}: {frames} frames");
+    }
+    server.join().unwrap().unwrap();
+}
+
 /// Past a file's first matched lines in colour, the served text is the
 /// local text, and -o and --json keep each match.
 #[test]

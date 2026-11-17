@@ -1,6 +1,6 @@
 //! `serve` and `--server`: newline-delimited JSON-RPC 2.0 over one loaded index.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 
@@ -352,7 +352,12 @@ fn serve_tcp(session: &mut Served<'_>, listener: TcpListener) -> Result<(), Stri
         let served = stream
             .and_then(|s| {
                 s.set_nodelay(true)?;
-                Ok((BufReader::new(s.try_clone()?), s))
+                // A frame is small and there is one per matching file: send
+                // them in 64 KiB writes. `serve_lines` flushes each response.
+                Ok((
+                    BufReader::new(s.try_clone()?),
+                    BufWriter::with_capacity(64 << 10, s),
+                ))
             })
             .map_err(|e| format!("error: cannot accept: {e}"))
             .and_then(|(mut input, mut output)| serve_lines(session, &mut input, &mut output));
