@@ -207,6 +207,16 @@ runs, watchman's client starts one. To serve a tree that does not change
 `--store-docs` index never reads the tree, so serving it never needs
 watchman.
 
+### A shared server for a team's checkouts
+
+One machine can serve a large git tree to a whole team: it builds the
+index of a clean checkout with `fmgrep index --store-docs` and runs
+`fmgrep serve`. Each developer sets `FMGREP_SERVER` and searches from
+their own checkout; the client searches the files that differ from the
+served commit itself and takes the rest from the server.
+[docs/shared-server.md](docs/shared-server.md) gives the setup, the
+warning that local changes are ignored, and the limits.
+
 ## Expressions
 
 ```sh
@@ -274,6 +284,8 @@ A count-augmented n-gram index provides the same two operations at similar cost,
 ## Links
 
 - [AGENTS.md](AGENTS.md): using fmgrep from a coding agent
+- [docs/shared-server.md](docs/shared-server.md): a shared server, searched
+  from each developer's checkout
 - [docs/protocol.md](docs/protocol.md): the serve protocol and `--json`
   report (unstable)
 - [BENCHMARKS.md](BENCHMARKS.md): method and full results
