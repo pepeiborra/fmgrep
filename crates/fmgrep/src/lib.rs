@@ -27,6 +27,7 @@
 //!
 //! - `docs/index-format.md`: the on-disk layout, the walk and staleness.
 //! - `docs/protocol.md`: `serve`, `--server` and the `--json` shapes.
+//! - `docs/shared-server.md`: a shared server, searched from a checkout.
 //! - `docs/tuning.md`: the `FMGREP_*` environment variables.
 //! - `fmgrep --help`: the command line.
 //!
