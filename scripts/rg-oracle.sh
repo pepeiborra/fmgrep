@@ -33,11 +33,22 @@
 # with the same globs over the manifest's files; then, for the files layout,
 # PATH and no-PATH sets the same way from DIR/compiler. Needs jq.
 #
+# --remote makes the tree a real git repository, indexes it with
+# --store-docs (which must record its commit as the served commit), serves
+# it, clones it into another repository (as a kept clone is: that
+# .gitignore ignores most of the fixture and the clone itself, and its
+# .ignore brings the clone back by its path), and runs every case from the
+# clone through the server
+# (FMGREP_SERVER) against rg in the clone; the stale pass edits the clone.
+# The client asks git, or the private watchman daemon as --serve finds one,
+# and its lines that say so are not counted as warnings. git config, HOME
+# and the global excludes are the work directory's, never the user's.
+#
 # Needs rg and builds release, so it is not part of scripts/check.sh. Ends with
 # `pass N / fail M` (plus the served count); exits 1 if any case
 # differs, 2 on a usage error or an index whose manifest contradicts the flag.
 #
-# Usage: scripts/rg-oracle.sh [--store-docs] [--serve]
+# Usage: scripts/rg-oracle.sh [--store-docs] [--serve | --remote]
 #        scripts/rg-oracle.sh --corpus DIR [--store-docs]
 
 set -euo pipefail
@@ -52,21 +63,28 @@ command -v rg >/dev/null || { echo "rg is not on PATH"; exit 2; }
 STORE_DOCS=false
 INDEX_FLAGS=()
 SERVE=false
+REMOTE=false
 CORPUS_DIR=""
 usage() {
-    sed -n 's/^# \{0,1\}//; 31,32p' "${BASH_SOURCE[0]}" >&2
+    sed -n '/^# Usage:/,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" >&2
     exit 2
 }
 while [[ $# -gt 0 ]]; do
     case "$1" in
     --store-docs) STORE_DOCS=true; INDEX_FLAGS=(--store-docs) ;;
     --serve) SERVE=true ;;
+    --remote) REMOTE=true ;;
     --corpus) [[ $# -ge 2 ]] || usage; CORPUS_DIR="$2"; shift ;;
     *) usage ;;
     esac
     shift
 done
-if [[ -n "$CORPUS_DIR" && "$SERVE" == true ]]; then usage; fi
+if [[ -n "$CORPUS_DIR" && ("$SERVE" == true || "$REMOTE" == true) ]]; then usage; fi
+if [[ "$SERVE" == true && "$REMOTE" == true ]]; then usage; fi
+if [[ "$REMOTE" == true ]]; then
+    STORE_DOCS=true
+    INDEX_FLAGS=(--store-docs)
+fi
 if [[ -n "$CORPUS_DIR" ]]; then
     command -v jq >/dev/null || { echo "jq is not on PATH"; exit 2; }
     CORPUS="$(cd "$CORPUS_DIR" && pwd)" || exit 2
@@ -96,9 +114,19 @@ stop_daemon() {
 trap 'stop_server; stop_daemon; rm -rf "$WORK"' EXIT
 # Records of the server's tokens stay in the work directory.
 export XDG_CACHE_HOME="$WORK/cache"
+if [[ "$REMOTE" == true ]]; then
+    # git and rg read only the work directory's config and excludes.
+    mkdir -p "$WORK/home"
+    : > "$WORK/gitconfig"
+    export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/.config"
+    export GIT_CONFIG_GLOBAL="$WORK/gitconfig" GIT_CONFIG_SYSTEM="$WORK/gitconfig"
+    export GIT_AUTHOR_NAME=oracle GIT_AUTHOR_EMAIL=oracle@example.com
+    export GIT_COMMITTER_NAME=oracle GIT_COMMITTER_EMAIL=oracle@example.com
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+fi
 # Flags of every server: none when it asks the private daemon.
 SERVE_FLAGS=(--no-watch)
-if [[ "$SERVE" == true ]]; then
+if [[ "$SERVE" == true || "$REMOTE" == true ]]; then
     WATCHMAN="${FMGREP_TEST_WATCHMAN-$(command -v watchman || true)}"
     if [[ -n "$WATCHMAN" ]]; then
         # min_acceptable_nice_value: watchman refuses to start at a raised
@@ -116,6 +144,9 @@ if [[ "$SERVE" == true ]]; then
         [[ -S "$WORK/w/sock" ]] || { echo "watchman did not start"; cat "$WORK/w/out"; exit 2; }
         export WATCHMAN_SOCK="$WORK/w/sock"
         SERVE_FLAGS=()
+    elif [[ "$REMOTE" == true ]]; then
+        # No daemon: the client asks git each time, and starts none.
+        export WATCHMAN_SOCK="$WORK/no-daemon"
     fi
 fi
 # `serve $1` in the background (`$2` in errors): pid into `$3`, address into `$4`.
@@ -150,6 +181,13 @@ OK=0
 FAILED=0
 SERVED=0
 RC=0
+
+# The warning lines of stderr file $1, but the one that says a search through
+# a server asked git (--remote): they depend on watchman, not on the case.
+warnings_in() {
+    grep '^warning:' "$1" | grep -c -v -e '^warning: watchman cannot say what changed' \
+        -e '^warning: asked git what differs' || true
+}
 
 # The case just run, again through the `--serve` server: no stderr unless the
 # local search refused, and its exit status, RC.
@@ -204,7 +242,7 @@ check() {
         cat "$WORK/err"
         FAIL=1
         FAILED=$((FAILED + 1))
-    elif [[ "$(grep -c '^warning:' "$WORK/err")" != "${WANT:-$WARNINGS}" ]]; then
+    elif [[ "$(warnings_in "$WORK/err")" != "${WANT:-$WARNINGS}" ]]; then
         echo "FAIL $PASS$name  (want ${WANT:-$WARNINGS} warning line(s))"
         cat "$WORK/err"
         FAIL=1
@@ -389,7 +427,7 @@ check_expr() {
             cat "$WORK/err"
             FAIL=1
             FAILED=$((FAILED + 1))
-        elif [[ "$(grep -c '^warning:' "$WORK/err")" != "$WARNINGS" ]]; then
+        elif [[ "$(warnings_in "$WORK/err")" != "$WARNINGS" ]]; then
             echo "FAIL $PASS$name  (want $WARNINGS warning line(s))"
             cat "$WORK/err"
             FAIL=1
@@ -752,6 +790,14 @@ printf 'alpha whitelisted\n' > "$CORPUS/.wl.txt"
 printf 'alpha nested ignore\n' > "$CORPUS/ns/g.log"
 printf 'alpha soon ignored\n' > "$CORPUS/n.md"
 find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
+if [[ "$REMOTE" == true ]]; then
+    rm -rf "$CORPUS/.git"
+    # The index lives in the tree, and git leaves it out.
+    printf '.fmgrep/\n' >> "$CORPUS/.gitignore"
+    git -C "$CORPUS" init -q -b main
+    git -C "$CORPUS" add -A
+    git -C "$CORPUS" commit -q -m fixture
+fi
 
 ( cd "$CORPUS" && "$BIN" index ${INDEX_FLAGS[@]+"${INDEX_FLAGS[@]}"} ) >&2
 manifest_ok "$CORPUS/.fmgrep"
@@ -760,6 +806,31 @@ start_server() {
     spawn_serve "$CORPUS" serve SERVER ADDR
 }
 [[ "$SERVE" == true ]] && start_server
+if [[ "$REMOTE" == true ]]; then
+    # manifest_ok just wrote the manifest of $CORPUS/.fmgrep.
+    grep -q '"commit":{"vcs":"git"' "$WORK/manifest" ||
+        { echo "the index records no served commit" >&2; exit 2; }
+    REMOTE_SERVER=""
+    REMOTE_ADDR=""
+    spawn_serve "$CORPUS" serve REMOTE_SERVER REMOTE_ADDR
+    stop_remote() {
+        "$BIN" --server "$REMOTE_ADDR" --shutdown > /dev/null 2>&1 || kill "$REMOTE_SERVER" 2> /dev/null || true
+        wait "$REMOTE_SERVER" 2> /dev/null || true
+    }
+    trap 'stop_remote; stop_server; stop_daemon; rm -rf "$WORK"' EXIT
+    # The clone lies inside another repository whose .gitignore holds
+    # patterns for the fixture's files: neither rg nor the client reads
+    # it, as both stop at the top of the clone. Its .ignore holds only
+    # the path of the clone, which matches nothing below the clone.
+    git init -q -b main "$WORK/outer"
+    printf '*.txt\n*.md\n*.gen\n/client/\n' > "$WORK/outer/.gitignore"
+    printf '!/client/\n' > "$WORK/outer/.ignore"
+    git clone -q "$CORPUS" "$WORK/outer/client"
+    # Every case runs in the clone, through the server; rg runs there too.
+    CORPUS="$WORK/outer/client"
+    export FMGREP_SERVER="$REMOTE_ADDR"
+    echo "remote: server $REMOTE_ADDR, client $CORPUS"
+fi
 
 cases() {
 
@@ -945,9 +1016,11 @@ alone "cwd-only       " "--heading -n -o" "--heading -n -o"   ""
 
 
 cases
-if [[ "$STORE_DOCS" == false ]]; then
+if [[ "$STORE_DOCS" == false || "$REMOTE" == true ]]; then
     PASS="[stale] "
     WARNINGS=4
+    # Through a server, the client searches what changed: nothing is stale.
+    [[ "$REMOTE" == true ]] && WARNINGS=0
     printf 'alpha new\nbeta\nalpha two alpha\nalpha\nzeta\n' > "$CORPUS/a.txt"
     printf 'no hits here\nbut alpha now\n' > "$CORPUS/b.txt"
     rm -f "$CORPUS/d.txt"
@@ -968,7 +1041,16 @@ if [[ "$STORE_DOCS" == false ]]; then
     { printf '\xff\xfe'; printf 'alpha added utf16\n' | iconv -f UTF-8 -t UTF-16LE; } > "$CORPUS/ub.txt"
     mv "$CORPUS/mw" "$CORPUS/mv2"
     # Edited in place: s.gen comes back, n.md goes without a warning.
-    printf 'ig/\nn.md\n' > "$CORPUS/.gitignore"
+    if [[ "$REMOTE" == true ]]; then
+        # Below the top, so that the client searches ns/ and the server
+        # the rest: the top's would make the client search every file.
+        printf 'g.log\n*.md\n' > "$CORPUS/ns/.gitignore"
+        printf 'alpha hidden md\n' > "$CORPUS/ns/new.md"
+        printf 'alpha kept\n' > "$CORPUS/ns/keep.txt"
+        mkdir -p "$CORPUS/ig"
+    else
+        printf 'ig/\nn.md\n' > "$CORPUS/.gitignore"
+    fi
     printf 'alpha never seen\n' > "$CORPUS/ig/new.txt"
     RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
     # One query sees gone.txt added; the cases see it deleted.
@@ -986,6 +1068,8 @@ fi
 
 if [[ "$SERVE" == true ]]; then
     echo "pass $OK / fail $FAILED / served $SERVED"
+elif [[ "$REMOTE" == true ]]; then
+    echo "pass $OK / fail $FAILED (through the server, from a clone)"
 else
     echo "pass $OK / fail $FAILED"
 fi
