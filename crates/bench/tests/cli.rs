@@ -170,6 +170,21 @@ fn snapshot(root: &Path) -> Vec<(std::path::PathBuf, std::time::SystemTime)> {
     all
 }
 
+/// Each literal leaf of the ghc queries, one per line: a file that every
+/// such query finds.
+fn literal_lines() -> String {
+    let queries: serde_json::Value =
+        serde_json::from_str(include_str!("../queries/ghc.json")).unwrap();
+    let literals = queries["queries"].as_array().unwrap().iter();
+    let literals = literals
+        .filter_map(|q| q.as_str())
+        .filter(|q| !q.starts_with('/'));
+    literals
+        .flat_map(|q| q.split(" AND "))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
 #[test]
 fn in_place_run_lists_files_only_some_rows_searched() {
     let fmgrep = Path::new(env!("CARGO_BIN_EXE_bench")).with_file_name("fmgrep");
@@ -187,16 +202,7 @@ fn in_place_run_lists_files_only_some_rows_searched() {
         .arg(&root)
         .status();
     assert!(git.unwrap().success());
-    let queries: serde_json::Value =
-        serde_json::from_str(include_str!("../queries/ghc.json")).unwrap();
-    let literals = queries["queries"].as_array().unwrap().iter();
-    let literals = literals
-        .filter_map(|q| q.as_str())
-        .filter(|q| !q.starts_with('/'));
-    let lines: String = literals
-        .flat_map(|q| q.split(" AND "))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let lines = literal_lines();
     for name in ["a.txt", "ign.txt", ".w.txt"] {
         std::fs::write(root.join(name), &lines).unwrap();
     }
@@ -317,16 +323,7 @@ fn served_tree(fmgrep: &Path, dir: &Path, name: &str) -> (std::path::PathBuf, Se
         .arg(&root)
         .status();
     assert!(git.unwrap().success());
-    let queries: serde_json::Value =
-        serde_json::from_str(include_str!("../queries/ghc.json")).unwrap();
-    let literals = queries["queries"].as_array().unwrap().iter();
-    let literals = literals
-        .filter_map(|q| q.as_str())
-        .filter(|q| !q.starts_with('/'));
-    let lines: String = literals
-        .flat_map(|q| q.split(" AND "))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let lines = literal_lines();
     std::fs::write(root.join("a.txt"), &lines).unwrap();
     std::fs::write(root.join("p.txt"), format!("%PDF-\n{lines}")).unwrap();
     let index = dir.join(format!("{name}.idx"));
@@ -441,4 +438,54 @@ fn server_flags_that_cannot_run_exit_2() {
         &fixture,
         &["error: --server needs the corpus, not --fixture"],
     );
+}
+
+#[test]
+fn store_docs_row_searches_the_whole_corpus_from_inside_another_checkout() {
+    let Some(_) = needs_fmgrep_rg_and_git() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path().canonicalize().unwrap();
+    // No ignore file of the user's: one keeps the commit out of the index.
+    let (config, xdg) = (dir.join("gitconfig"), dir.join("xdg"));
+    std::fs::write(&config, "").unwrap();
+    std::fs::create_dir(&xdg).unwrap();
+    let env = [
+        ("GIT_CONFIG_GLOBAL", config.as_path()),
+        ("GIT_CONFIG_SYSTEM", config.as_path()),
+        ("XDG_CONFIG_HOME", xdg.as_path()),
+    ];
+    let git = |at: &Path, args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(at)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"]);
+        let status = cmd.args(args).envs(env).status().unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    // The corpus at a commit, with a `sub/` of its own.
+    let root = dir.join("tree");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.txt"), literal_lines()).unwrap();
+    std::fs::write(root.join("sub/b.txt"), literal_lines()).unwrap();
+    git(&dir, &["init", "-q", "tree"]);
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "c"]);
+    // The bench runs from `sub/` of another checkout.
+    let cwd = dir.join("other/sub");
+    std::fs::create_dir_all(&cwd).unwrap();
+    git(&dir, &["init", "-q", "other"]);
+    let mut env = env.to_vec();
+    env.push(("FMGREP_CORPUS_GHC", root.as_path()));
+    let out = bench(&cwd, &env, &["--rows", "rg,fmgrep-store-docs"]);
+    let (md, stderr) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{md}\n{stderr}");
+    assert!(stderr.contains("note: the index holds commit "), "{stderr}");
+    let wants = [
+        "\n- files searched: rg 2, fmgrep `--store-docs` 2 (non-empty)\n",
+        "verify: OK, 2 rows agree on 44 queries\n",
+    ];
+    for want in wants {
+        assert!(md.contains(want), "{want:?} not in\n{md}");
+    }
 }
