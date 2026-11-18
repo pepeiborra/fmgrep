@@ -103,20 +103,26 @@ fn searched(paths: &Paths, docs: &[fmgrep::DocMeta]) -> Vec<u32> {
     searched
 }
 
-/// Each query through `fmgrep --server addr`, after the warm-up, which the
-/// server's `sampler`, if any, does not sample.
+/// Each query through `fmgrep --server addr` from the corpus root, after the
+/// warm-up, which the server's `sampler`, if any, does not sample. From
+/// elsewhere in a git checkout, the client would scope a search to the
+/// cwd's place in that checkout.
 fn clients(
     bin: &Path,
     addr: &str,
+    root: &Path,
     paths: &Paths,
     terms: &[String],
     row: &mut Row,
     mut sampler: Option<&mut Sampler>,
 ) -> Result<(), String> {
+    let bin = bin
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
     for (term, warm_up) in with_warm_up(terms) {
-        let mut cmd = Command::new(bin);
+        let mut cmd = Command::new(&bin);
         let leaves = leaves(term);
-        cmd.args(["--server", addr]).args(LINES);
+        cmd.current_dir(root).args(["--server", addr]).args(LINES);
         cmd.args(case_flag(term));
         cmd.args((leaves.len() > 1).then_some("--and"));
         cmd.arg("--").args(leaves);
@@ -162,13 +168,22 @@ pub fn check_server(bin: &Path, addr: &str, root: &Path, files: usize) -> Result
 pub fn server(
     bin: &Path,
     paths: &Paths,
+    root: &Path,
     docs: &[fmgrep::DocMeta],
     server: &Server,
     terms: &[String],
 ) -> Result<Row, String> {
     let mut row = Row::new(server.name);
     row.searched = searched(paths, docs);
-    clients(bin, &server.addr, paths, terms, &mut row, None)?;
+    clients(
+        bin,
+        server.addr.as_str(),
+        root,
+        paths,
+        terms,
+        &mut row,
+        None,
+    )?;
     Ok(row)
 }
 
@@ -232,7 +247,15 @@ pub fn fmgrep(
     row.ready = Some(start.elapsed());
     std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
 
-    clients(bin, &addr, paths, terms, &mut row, Some(&mut sampler))?;
+    clients(
+        bin,
+        addr.as_str(),
+        root,
+        paths,
+        terms,
+        &mut row,
+        Some(&mut sampler),
+    )?;
     let mut shutdown = Command::new(bin);
     let (out, _, _) = timed(shutdown.args(["--server", &addr, "--shutdown"]), None)?;
     if !out.status.success() {
@@ -517,7 +540,7 @@ mod tests {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let (bin, log) = (root.join("fmgrep"), root.join("log"));
         let script = format!(
-            "#!/bin/sh\necho \"$*\" >>'{}'\n[ \"$1\" = status ] && exit 0\nexit 1\n",
+            "#!/bin/sh\necho \"$(pwd -P) $*\" >>'{}'\n[ \"$1\" = status ] && exit 0\nexit 1\n",
             log.display()
         );
         crate::fake_bin::write(&bin, &script);
@@ -526,7 +549,16 @@ mod tests {
         let paths = Paths::from_lists(&root, b"", b"", &[]);
         let terms = ["a", "b AND c", "-i d AND e"].map(String::from);
         let mut served = Row::new(RowKind::Fmgrep);
-        clients(&bin, "h:1", &paths, &terms, &mut served, None).unwrap();
+        clients(
+            &bin,
+            "h:1",
+            root.as_path(),
+            &paths,
+            &terms,
+            &mut served,
+            None,
+        )
+        .unwrap();
         let mut by_process = Row::new(RowKind::FmgrepDirect);
         let tree = (&paths, root.as_path());
         direct(&bin, tree, Path::new("/i"), &terms, &mut by_process).unwrap();
@@ -536,13 +568,14 @@ mod tests {
         }
         let runs = std::fs::read_to_string(&log).unwrap();
         let runs: Vec<_> = runs.lines().collect();
-        let query = |how, what| format!("{how} -n --no-heading --color never {what}");
+        let from = root.display();
+        let query = |how, what| format!("{from} {how} -n --no-heading --color never {what}");
         let want = [
             query("--server h:1", "-- a"),
             query("--server h:1", "-- a"),
             query("--server h:1", "--and -- b c"),
             query("--server h:1", "-i --and -- d e"),
-            "status /i".to_owned(),
+            format!("{from} status /i"),
             query("--index /i", "-- a"),
             query("--index /i", "--and -- b c"),
             query("--index /i", "-i --and -- d e"),

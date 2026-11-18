@@ -510,17 +510,6 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
     ask_on(conn, "status")
 }
 
-/// Send one request to a server and print its result as a search would:
-/// each file's frame through this search's own writer.
-pub fn run_client(
-    conn: &mut Conn,
-    p: &QueryParams,
-    json: bool,
-    out: &mut dyn Write,
-) -> Result<Outcome, String> {
-    render(p, json, out, |sink| remote(conn, p, sink)).map(Outcome::Query)
-}
-
 /// `p` (with `stream`) answered by the server: each event to `sink`, then
 /// the report.
 pub fn remote(
