@@ -17,3 +17,7 @@ opt-level = 3
 
 [profile.dev.package.docfm-bits]
 opt-level = 3
+
+# msbwt's tests invert large random texts; unoptimized they take half a minute.
+[profile.dev.package.msbwt]
+opt-level = 3
