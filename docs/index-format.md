@@ -486,7 +486,10 @@ Magic `fmigns\0\x01`, then records as in `dirs.stamps`, strictly
 ascending by path: every `.gitignore`, `.ignore`, `.rgignore` and
 `.git/info/exclude` in a walked directory, stamped before it is read; the
 same four of the root and of each directory above it, prefixed `../` once
-per level; and the global git excludes file, by absolute path. The stamp
+per level, but a `.gitignore` and a `.git/info/exclude` above the top of
+the repository that holds the root (the nearest directory with a `.git` or
+a `.jj`) are left out, as rg does not read them; and the global git
+excludes file, by absolute path. The stamp
 `len = u64::MAX, mtime_ns = i64::MAX` records an absent file; the other
 sentinel and the 2 s rule are those of `dirs.stamps`.
 
@@ -521,8 +524,10 @@ replace refs and no fetch) and records HEAD only when all of these hold:
 5. every ignore file that the walk read below the top is a file of that
    tree, with its blob's bytes, unchanged since the walk read it, and
    those outside the tree hold no pattern (a line that is neither blank
-   nor a comment): the ignore files of the ancestors, the global excludes
-   file, and the checkout's `info/exclude`, where `git rev-parse
+   nor a comment): the `.ignore` and `.rgignore` files of the ancestors
+   (a `.gitignore` above the checkout is no rule for it: rg and git stop
+   reading it at the top of a repository), the global excludes file, and
+   the checkout's `info/exclude`, where `git rev-parse
    --git-path` puts it (a linked worktree shares its repository's). A
    checkout of the commit elsewhere would not have them;
 6. each stored document equals the text of its blob in that tree, read

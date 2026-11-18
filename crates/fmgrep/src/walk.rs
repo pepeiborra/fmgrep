@@ -144,13 +144,27 @@ pub fn join_rel(rel: &str, name: &str) -> String {
 }
 
 /// The ignore inputs from above the root: those of the root and its
-/// ancestors, then the global excludes file.
+/// ancestors, then the global excludes file. rg reads the `.gitignore`
+/// and `info/exclude` of the ancestors only up to the top of the
+/// repository that holds the root, the nearest directory with a `.git`
+/// (file or directory) or a `.jj`; a repository nested in another has
+/// the rules of its own. `.ignore` and `.rgignore` go all the way up.
+/// Outside any repository the walk lists them all.
 pub fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
     let mut rows = Vec::new();
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let top = canonical
+        .ancestors()
+        .position(|d| d.join(".git").exists() || d.join(".jj").exists());
     for (up, dir) in canonical.ancestors().enumerate() {
         let prefix = "../".repeat(up);
-        rows.extend(ignore_files(dir).map(|(name, s)| (format!("{prefix}{name}"), s)));
+        let vcs = top.is_none_or(|top| up <= top);
+        let read = |name: &str| vcs || matches!(name, ".ignore" | ".rgignore");
+        rows.extend(
+            ignore_files(dir)
+                .filter(|(name, _)| read(name))
+                .map(|(name, s)| (format!("{prefix}{name}"), s)),
+        );
     }
     if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
         rows.push((global.to_string_lossy().into_owned(), stamp(&global)));
