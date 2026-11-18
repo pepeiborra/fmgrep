@@ -526,10 +526,13 @@ replace refs and no fetch) and records HEAD only when all of these hold:
    those outside the tree hold no pattern (a line that is neither blank
    nor a comment): the `.ignore` and `.rgignore` files of the ancestors
    (a `.gitignore` above the checkout is no rule for it: rg and git stop
-   reading it at the top of a repository), the global excludes file, and
-   the checkout's `info/exclude`, where `git rev-parse
-   --git-path` puts it (a linked worktree shares its repository's). A
-   checkout of the commit elsewhere would not have them;
+   reading it at the top of a repository; nor is a pattern that names one
+   path, anchored and without a glob character, such as `/clone/`, when
+   the path is the checkout or is not below it: rg tests neither the root
+   of a walk nor what lies above it), the global excludes file, and the
+   checkout's `info/exclude`, where `git rev-parse --git-path` puts it (a
+   linked worktree shares its repository's). A checkout of the commit
+   elsewhere would not have them;
 6. each stored document equals the text of its blob in that tree, read
    with one `git cat-file --batch` and decoded as the index decodes a
    file, and each file of the tree that the walk left out as binary or
