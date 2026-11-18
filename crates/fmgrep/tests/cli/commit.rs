@@ -166,7 +166,8 @@ fn a_converted_file_records_no_commit() {
 }
 
 /// An ignore rule that a checkout of the commit would not have: an
-/// untracked ignore file in the tree, or a pattern above it, in the global
+/// untracked ignore file in the tree, or a pattern above it (an `.ignore`
+/// or `.rgignore`, not a `.gitignore`), in the global
 /// excludes file, or in `info/exclude` (of a linked worktree too). Comments
 /// alone are no rule.
 #[test]
@@ -200,6 +201,21 @@ fn an_ignore_rule_from_outside_records_no_commit() {
     assert_eq!(commit_of(&index), Some(s.head(&repo)));
     s.write(&parent, &[(".ignore", "*.h\n")]);
     no(&repo, "parent", outside(&repo.join("../.ignore")));
+
+    // A repository around the checkout: rg and git stop at the top of the
+    // checkout, so its `.gitignore` and `info/exclude` are no rule here,
+    // but an `.rgignore` is.
+    let repo = s.repo("around/repo", &FILES);
+    let around = std::fs::canonicalize(s.path("around")).unwrap();
+    s.git(&around, &["init", "-q"]);
+    s.write(
+        &around,
+        &[(".gitignore", "*.h\n"), (".git/info/exclude", "*.c\n")],
+    );
+    let (index, _) = s.index(&repo, "idx-around-clean");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&around, &[(".rgignore", "*.h\n")]);
+    no(&repo, "around", outside(&repo.join("../.rgignore")));
 
     let repo = s.repo("exclude", &FILES);
     s.write(&repo, &[(".git/info/exclude", "*.h\n")]);
