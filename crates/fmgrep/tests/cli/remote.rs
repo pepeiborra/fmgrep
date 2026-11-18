@@ -127,16 +127,55 @@ impl Remote {
     /// `args` through the server from `cwd`, with `FMGREP_SERVER`, and the
     /// private daemon's socket when there is one; by [`Self::tried`].
     pub fn search(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.tried(|| {
-            let mut cmd = self.s.fmgrep(cwd);
-            if let Some(daemon) = &self.daemon {
-                cmd.env("WATCHMAN_SOCK", &daemon.sock);
+        self.tried(|| self.search_at(&self.addr, cwd, args))
+    }
+
+    /// `args` once, from `cwd`, through the server at `addr`.
+    fn search_at(&self, addr: &str, cwd: &Path, args: &[&str]) -> Output {
+        let mut cmd = self.s.fmgrep(cwd);
+        if let Some(daemon) = &self.daemon {
+            cmd.env("WATCHMAN_SOCK", &daemon.sock);
+        }
+        cmd.env("FMGREP_SERVER", addr)
+            .args(args)
+            .output()
+            .expect("spawn fmgrep")
+    }
+
+    /// `args` from the client's top, once, and the `query` request it sent
+    /// to the server, seen through a proxy that passes the connection on.
+    fn query_sent(&self, args: &[&str]) -> (Output, serde_json::Value) {
+        use std::io::BufRead as _;
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap().to_string();
+        let server = self.addr.clone();
+        let spy = std::thread::spawn(move || {
+            let (client, _) = listener.accept().unwrap();
+            let upstream = TcpStream::connect(server).unwrap();
+            let (mut from, mut to) = (upstream.try_clone().unwrap(), client.try_clone().unwrap());
+            let back = std::thread::spawn(move || std::io::copy(&mut from, &mut to));
+            let (mut lines, mut input) = (Vec::new(), std::io::BufReader::new(client));
+            loop {
+                let mut line = String::new();
+                if input.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                (&upstream).write_all(line.as_bytes()).unwrap();
+                lines.push(line);
             }
-            cmd.env("FMGREP_SERVER", &self.addr)
-                .args(args)
-                .output()
-                .expect("spawn fmgrep")
-        })
+            upstream.shutdown(Shutdown::Write).unwrap();
+            back.join().unwrap().unwrap();
+            lines
+        });
+        let out = self.search_at(&proxy, &self.client, args);
+        let query = spy
+            .join()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.contains(r#""method":"query""#))
+            .expect("a query request");
+        (out, serde_json::from_str(&query).unwrap())
     }
 
     /// `run`, a search that asks the private daemon, run again while it
@@ -367,6 +406,40 @@ fn ignore_local_changes_prints_the_servers_answer_alone() {
     );
 }
 
+/// A search asks for the server's output as it prints, in frames of
+/// bytes, unless it has files of its own to put between the server's:
+/// then it asks for one frame per file. A clean checkout, one whose only
+/// change is a deleted file, and `--ignore-local-changes` have none; the
+/// answer is the same either way.
+#[test]
+fn a_search_asks_for_frames_of_files_only_to_merge_its_own() {
+    let r = Remote::new(&FILES);
+    let all = "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n";
+    let asked = |args: &[&str]| {
+        let (out, q) = r.query_sent(args);
+        let p = &q["params"];
+        let rendered = p["rendered"] == true;
+        assert_eq!(p["stream"], true, "{q}");
+        // Without watchman the skip list lacks the directory entry.
+        (stdout(&out), rendered, p["skip"][0].to_string())
+    };
+    let list = ["-l", "printk"];
+    assert_eq!(asked(&list), (all.into(), true, "null".into()));
+    // Deleted: the server leaves it out, and the client has no file to add.
+    std::fs::remove_file(r.client.join("a.c")).unwrap();
+    let rest = "dir/b.c\ndir/sub/c.h\ne.c\n";
+    assert_eq!(asked(&list), (rest.into(), true, r#""a.c""#.into()));
+    // Changed: the client searches a.c itself, and prints it first.
+    r.s.write(&r.client, &[("a.c", "printk changed\n")]);
+    assert_eq!(asked(&list), (all.into(), false, r#""a.c""#.into()));
+    let ignoring = ["--ignore-local-changes", "-l", "printk"];
+    assert_eq!(asked(&ignoring), (all.into(), true, "null".into()));
+    // Counts have no output to copy: the field is left out.
+    let (_, q) = r.query_sent(&["--ignore-local-changes", "--approx-counts", "printk"]);
+    assert_eq!(q["params"]["mode"], "counts", "{q}");
+    assert!(q["params"].get("rendered").is_none(), "{q}");
+}
+
 /// A served commit that is not a git commit id is never asked of git,
 /// even when the checkout has a commit of that id: the search is the
 /// server's alone, with the warning.
@@ -551,5 +624,27 @@ fn a_search_of_no_file_fails_as_a_local_one() {
                 Some(2)
             )
         );
+    }
+}
+
+/// A search of no file prints what a local search prints before its error
+/// (the statistics, rg's JSON summary), and fails with the same status:
+/// from a clean clone, where the output is the server's bytes, and after a
+/// local change, where the client merges the files.
+#[test]
+fn a_search_of_no_file_prints_what_a_local_one_prints_first() {
+    let r = Remote::new(&FILES);
+    let modes: [&[&str]; 2] = [&["--stats"], &["--json", "-o"]];
+    for changed in [false, true] {
+        if changed {
+            r.s.write(&r.client, &[("a.c", "printk changed\n")]);
+        }
+        for mode in modes {
+            let args = [mode, &["-g", "*.none", "printk"]].concat();
+            let out = r.search(&r.client, &args);
+            assert_eq!(out.status.code(), Some(2), "{changed} {args:?}");
+            assert!(!stdout(&out).is_empty(), "{changed} {args:?}");
+            r.same("", &args);
+        }
     }
 }

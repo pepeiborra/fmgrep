@@ -65,6 +65,7 @@ response line each, after any [frames](#streamed-output).
 | `cwd` | string | `""` | the client's working directory: stripped as by rg from printed paths before `globs` match them; without `paths` and `commit`, the server searches only below it when it lies in the served tree |
 | `filename` | bool | true | false: one file PATH; human output omits its path except under `-l` |
 | `stream` | bool | false | send the output as [frames](#streamed-output) |
+| `rendered` | bool | false | with `stream`: frames of the printed bytes, not one per event; refused without `stream` (-32602) |
 | `stats` | bool | false | `--stats`: modes `lines` and `only` print rg's statistics after each term's output, and `lines` reports matches (below) |
 | `format` | u32 | absent | the manifest format the client reads; a server of another answers -32001 |
 | `commit` | string | absent | the served commit (hex id) the client compared its checkout with; a server that serves another, or none, answers -32001 |
@@ -125,6 +126,29 @@ holds all that the file prints, however long. The result is
 `{"report"}`. A search that fails after output started sends the frames
 so far, then the error. `counts` ignores `stream`. Connections are still
 served one at a time.
+
+A client with no files of its own to put between the server's has no use
+for the events, and decoding one frame per file costs it CPU. With
+`rendered: true` as well, the server sends what a local search prints
+(its banners, headings, separators and statistics included) as frames
+of at most 64 KiB, cut wherever the 64 KiB fall, and the client copies
+them to its stdout. The result is the same `{"report"}`. A query that
+searched no file sends what the local search prints before its error
+(statistics, rg's JSON summary), and its report carries
+`none_searched`. A request without `rendered` gets one frame per event,
+as before: a client that puts files of its own between the server's needs
+it.
+
+```text
+> {"jsonrpc":"2.0","id":7,"method":"query","params":{"terms":["hello"],"mode":"lines","stream":true,"rendered":true}}
+< 74
+< Lib.hs
+< 1:greet name = "hello " ++ name
+<
+< README.md
+< 1:Say hello with greet.
+< {"jsonrpc":"2.0","id":7,"result":{"report":{"index_time_us":7059,"index_size_bytes":19440,"num_files_indexed":2,"queries":[{"term":"hello","latency_us":207,"total_matches":2,"docs_matched":2}]}}}
+```
 
 ```text
 > {"jsonrpc":"2.0","id":6,"method":"query","params":{"terms":["hello"],"mode":"lines","stream":true}}
@@ -221,9 +245,11 @@ Serving continues after any error.
 
 `fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
 `--index` and prints what the local search prints. It sends one `query`
-(all terms, or the expression) with `stream: true`, and prints each file
-through its own writer. `--json` alone and
-`--approx-counts` send `mode` `counts`. `--color auto`, line numbers and
+(all terms, or the expression) with `stream: true` and `rendered: true`,
+and copies the frames to its stdout; only a search that must put files of
+its own between the server's ([From a checkout](#from-a-checkout)) asks
+for a frame per file, and prints each through its own writer. `--json`
+alone and `--approx-counts` send `mode` `counts`, with no `rendered`. `--color auto`, line numbers and
 headings follow the client's stdout, as in rg. `--shutdown` stops the
 server; `fmgrep status --server ADDR --json` prints the status object.
 An error response exits 2, as `error: server: <message>`, after any
