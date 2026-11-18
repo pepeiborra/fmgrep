@@ -24,7 +24,7 @@ Once, before the first release:
 2. Gates, all clean:
 
    ```sh
-   scripts/check.sh
+   scripts/check.sh --all
    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
    cargo package --list -p docfm
    cargo package --list -p fmgrep

@@ -4,8 +4,9 @@ Bug reports, fixes and measurements are welcome.
 
 ## Before a pull request
 
-- `scripts/check.sh` (format, clippy, tests) must pass; CI runs it on Linux
-  and macOS.
+- `scripts/check.sh` (format, clippy, tests) must pass. It tests the crates
+  your branch changes and the crates that depend on them; `--all` tests every
+  crate. CI runs `--all` on Linux and macOS.
 - A test that needs watchman starts a private daemon of its own, from
   `$FMGREP_TEST_WATCHMAN` or else `watchman` on `PATH`, and never uses
   yours. Without watchman it prints one `skipped` line. CI's Watchman job

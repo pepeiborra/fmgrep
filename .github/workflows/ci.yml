@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
-      - run: scripts/check.sh
+      - run: scripts/check.sh --all
 
   # The check job has no watchman, so it skips the tests that need a
   # daemon. This job installs one on Linux and runs them, then the race.
