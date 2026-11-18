@@ -166,8 +166,8 @@ fn a_converted_file_records_no_commit() {
 }
 
 /// An ignore rule that a checkout of the commit would not have: an
-/// untracked ignore file in the tree, or a pattern above it (an `.ignore`
-/// or `.rgignore`, not a `.gitignore`), in the global
+/// untracked ignore file in the tree, or a pattern above it that can match
+/// below it (in an `.ignore` or `.rgignore`, not a `.gitignore`), in the global
 /// excludes file, or in `info/exclude` (of a linked worktree too). Comments
 /// alone are no rule.
 #[test]
@@ -216,6 +216,24 @@ fn an_ignore_rule_from_outside_records_no_commit() {
     assert_eq!(commit_of(&index), Some(s.head(&repo)));
     s.write(&around, &[(".rgignore", "*.h\n")]);
     no(&repo, "around", outside(&repo.join("../.rgignore")));
+
+    // A pattern that names one path outside the checkout, or the checkout
+    // itself, matches nothing in it; one that can match below it, or has a
+    // glob character, is a rule.
+    let repo = s.repo("named/repo", &FILES);
+    let named = std::fs::canonicalize(s.path("named")).unwrap();
+    s.write(&named, &[(".ignore", "!/repo/\n/other/x.c\n/repo/../y\n")]);
+    no(&repo, "named-dots", outside(&repo.join("../.ignore")));
+    s.write(&named, &[(".ignore", "!/repo/\n/repo\n/other/x.c\n")]);
+    let (index, _) = s.index(&repo, "idx-named-clean");
+    assert_eq!(commit_of(&index), Some(s.head(&repo)));
+    s.write(&named, &[(".ignore", "!/repo/dir/\n")]);
+    no(&repo, "named", outside(&repo.join("../.ignore")));
+    // A brace is an alternation to rg, so a pattern with one is no name.
+    s.write(&named, &[(".ignore", "/{repo,zz}/dir/\n")]);
+    no(&repo, "named-braces", outside(&repo.join("../.ignore")));
+    s.write(&named, &[(".ignore", "/re{po}/y\n")]);
+    no(&repo, "named-brace", outside(&repo.join("../.ignore")));
 
     let repo = s.repo("exclude", &FILES);
     s.write(&repo, &[(".git/info/exclude", "*.h\n")]);

@@ -74,14 +74,14 @@ pub fn early(folder: &Path) -> Before {
     for entry in entries(&listed) {
         no_submodule(&entry?)?;
     }
-    let mut outside = vec![exclude_file(&folder)?];
+    let mut outside = vec![(exclude_file(&folder)?, false)];
     // Sorted as the walk lists them, so that the file named is the one
     // that the check after the build would name.
     let mut outer = crate::walk::outer_ignores(&folder);
     outer.sort_by(|a, b| a.0.cmp(&b.0));
     let outer = outer.into_iter().filter(|(rel, _)| is_outside(rel));
-    outside.extend(outer.map(|(rel, _)| folder.join(rel)));
-    no_pattern(outside)?;
+    outside.extend(outer.map(|(rel, _)| (folder.join(&rel), rel.starts_with("../"))));
+    no_pattern(&folder, outside)?;
     Ok(head)
 }
 
@@ -189,7 +189,7 @@ fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result
         let entry = entry?;
         tracked.insert(entry.path, entry.oid);
     }
-    let mut outside = vec![exclude_file(folder)?];
+    let mut outside = vec![(exclude_file(folder)?, false)];
     let (mut read, mut oids) = (Vec::new(), Vec::new());
     for (rel, stamp) in &walk.ignores {
         match (!is_outside(rel), stamp) {
@@ -201,10 +201,10 @@ fn ignores_are_tracked(folder: &Path, listed: &[u8], walk: &WalkNotes) -> Result
                 oids.push(oid);
             }
             (true, None) => {}
-            (false, _) => outside.push(folder.join(rel)),
+            (false, _) => outside.push((folder.join(rel), rel.starts_with("../"))),
         }
     }
-    no_pattern(outside)?;
+    no_pattern(folder, outside)?;
     // A filter can change an ignore file on checkout while git status
     // shows no change.
     super::blobs(folder, &oids, |i, blob| {
@@ -240,10 +240,15 @@ fn exclude_file(folder: &Path) -> Result<PathBuf, String> {
 }
 
 /// Why the index records no commit, if an ignore file of `outside` holds
-/// a pattern.
-fn no_pattern(outside: Vec<PathBuf>) -> Result<(), String> {
-    match outside.into_iter().find(|p| has_pattern(p)) {
-        Some(path) => Err(format!(
+/// a pattern: any pattern of a file that is not above the checkout (the
+/// flag), else one that [`reaches`] it.
+fn no_pattern(folder: &Path, outside: Vec<(PathBuf, bool)>) -> Result<(), String> {
+    let rule = |(p, above): &(PathBuf, bool)| match above {
+        true => reaches(p, folder),
+        false => has_pattern(p),
+    };
+    match outside.into_iter().find(rule) {
+        Some((path, _)) => Err(format!(
             "the ignore file {} outside the checkout has a pattern",
             path.display()
         )),
