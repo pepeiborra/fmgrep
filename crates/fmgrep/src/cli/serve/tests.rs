@@ -64,3 +64,48 @@ fn a_server_error_after_a_frame_per_file_keeps_the_output() {
         assert_eq!(out, printed);
     }
 }
+
+/// The reply of a `store_docs` server, with the reason it has no commit
+/// if given: `status --server` prints every field, `none` for one the
+/// reply leaves out, and `--json` the reply, with the reason only when
+/// there is one.
+#[test]
+fn the_report_prints_why_the_server_has_no_commit() {
+    let reply = |why: Option<&str>| -> ServeStatus {
+        serde_json::from_value(serde_json::json!({
+            "format": 9,
+            "store_docs": true,
+            "files": 1,
+            "num_bytes": 1,
+            "index_size_bytes": 1,
+            "load_us": 1,
+            "root": "/idx",
+            "why_no_commit": why,
+        }))
+        .unwrap()
+    };
+    let printed = |s: &ServeStatus, json: bool| {
+        let mut out = Vec::new();
+        report(&mut out, json, "the server", s).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let why = "the checkout holds a submodule (agents/internal)";
+    let some = reply(Some(why));
+    let text = printed(&some, false);
+    assert!(
+        text.ends_with(&format!("commit: none\nwhy_no_commit: {why}\n")),
+        "{text}"
+    );
+    assert!(
+        printed(&some, true).ends_with(&format!(",\"why_no_commit\":\"{why}\"}}\n")),
+        "{}",
+        printed(&some, true)
+    );
+    let none = reply(None);
+    let text = printed(&none, false);
+    assert!(
+        text.ends_with("commit: none\nwhy_no_commit: none\n"),
+        "{text}"
+    );
+    assert!(!printed(&none, true).contains("why_no_commit"));
+}

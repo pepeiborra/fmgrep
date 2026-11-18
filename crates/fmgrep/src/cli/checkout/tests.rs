@@ -79,7 +79,9 @@ fn a_served_commit_that_is_not_a_git_id_is_not_asked_of_git() {
 /// A server that serves no commit, from inside the tree it names: a
 /// files-layout server reads that tree, so no warning; stored docs ignore
 /// its edits, so the warning. From another checkout, in either layout:
-/// the warning. From no checkout: none.
+/// the warning. From no checkout: none. The warning says why the server
+/// serves no commit, when it can: the reason a `--store-docs` index
+/// recorded, or that only a `--store-docs` index records one.
 #[test]
 fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
     let canon = |t: &tempfile::TempDir| std::fs::canonicalize(t.path()).unwrap();
@@ -98,9 +100,27 @@ fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
         addr: "127.0.0.1:1".to_owned(),
         env: true,
     };
-    let why = "the server at 127.0.0.1:1 (FMGREP_SERVER) reports no served commit";
+    let none = "the server at 127.0.0.1:1 (FMGREP_SERVER) reports no served commit";
     let index = top.join(".fmgrep");
-    for (store_docs, root) in [(false, &top), (true, &index)] {
+    let submodule = "the checkout holds a submodule (agents/internal)";
+    // The layout, the root, the reason the status carries, and the
+    // warning from a checkout that is not the served tree.
+    let cases = [
+        (
+            false,
+            &top,
+            None,
+            format!("{none}: only a --store-docs index records one"),
+        ),
+        (true, &index, None, none.to_owned()),
+        (
+            true,
+            &index,
+            Some(submodule),
+            format!("{none}: {submodule}"),
+        ),
+    ];
+    for (store_docs, root, why, text) in cases {
         let status: ServeStatus = serde_json::from_value(serde_json::json!({
             "format": 9,
             "store_docs": store_docs,
@@ -109,18 +129,19 @@ fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
             "index_size_bytes": 1,
             "load_us": 1,
             "root": root.display().to_string(),
+            "why_no_commit": why,
         }))
         .unwrap();
-        let warns = |cwd: &std::path::Path| match plan(&server, &status, cwd) {
+        let warns = |cwd: &std::path::Path, want: &str| match plan(&server, &status, cwd) {
             Plan::Degraded(got) => {
-                assert_eq!(got, why);
+                assert_eq!(got, want);
                 true
             }
             Plan::Plain => false,
             _ => panic!("store_docs {store_docs}: {}: a checkout", cwd.display()),
         };
-        assert_eq!(warns(&inside), store_docs, "store_docs {store_docs}");
-        assert!(warns(&other), "store_docs {store_docs}");
-        assert!(!warns(&away), "store_docs {store_docs}");
+        assert_eq!(warns(&inside, &text), store_docs, "store_docs {store_docs}");
+        assert!(warns(&other, &text), "store_docs {store_docs}");
+        assert!(!warns(&away, &text), "store_docs {store_docs}");
     }
 }

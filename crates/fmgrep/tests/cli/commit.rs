@@ -866,12 +866,24 @@ fn status_reports_the_served_commit() {
     let lines = s.status_lines(&addr);
     let commit = format!("commit: git {}", s.head(&repo));
     assert_eq!(lines[1], "format: 9", "{lines:?}");
-    assert_eq!(lines.last(), Some(&commit), "{lines:?}");
+    // Then the reason, which an index of a commit does not have.
+    let n = lines.len();
+    assert_eq!(
+        lines[n - 2..],
+        [commit.as_str(), "why_no_commit: none"],
+        "{lines:?}"
+    );
+    assert!(status.get("why_no_commit").is_none(), "{status}");
     let plain = s.path("plain").display().to_string();
     let out = s.run(&repo, &["index", ".", "--output", &plain]);
     assert!(out.status.success());
     let (_server, addr) = s.serve(&s.path("plain"), &["--no-watch"]);
     assert!(s.status(&addr).get("commit").is_none());
     let lines = s.status_lines(&addr);
-    assert_eq!(lines.last().map(String::as_str), Some("commit: none"));
+    let n = lines.len();
+    assert_eq!(
+        lines[n - 2..],
+        ["commit: none", "why_no_commit: none"],
+        "{lines:?}"
+    );
 }

@@ -128,6 +128,11 @@ pub struct ServeStatus {
     /// The served commit: the commit whose files a `store_docs` index holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<Commit>,
+    /// Why a `store_docs` index records no served commit: the reason that
+    /// its build gave. Absent when there is a commit, for a files layout,
+    /// and from a server older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_no_commit: Option<String>,
 }
 
 impl ServeStatus {
@@ -147,6 +152,7 @@ impl ServeStatus {
                 vcs: "git".to_owned(),
                 id: id.to_owned(),
             }),
+            why_no_commit: None,
         }
     }
 }
@@ -262,6 +268,7 @@ impl Served<'_> {
             load_us: self.docs.load_wall.as_micros() as u64,
             root: self.root.display().to_string(),
             commit: self.manifest.commit.clone(),
+            why_no_commit: self.manifest.why_no_commit.clone(),
         }
     }
 }
@@ -560,10 +567,12 @@ pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> 
         load_us,
         root,
         commit,
+        why_no_commit,
     } = s;
     let or_none = |v: Option<String>| v.unwrap_or_else(|| "none".to_owned());
     let format = or_none(format.map(|f| f.to_string()));
     let commit = or_none(commit.as_ref().map(|c| format!("{} {}", c.vcs, c.id)));
+    let why_no_commit = or_none(why_no_commit.clone());
     let lines = [
         first.to_owned(),
         format!("format: {format}"),
@@ -574,6 +583,7 @@ pub fn report(out: &mut dyn Write, json: bool, first: &str, s: &ServeStatus) -> 
         format!("load_us: {load_us}"),
         format!("root: {root}"),
         format!("commit: {commit}"),
+        format!("why_no_commit: {why_no_commit}"),
     ];
     lines.iter().try_for_each(|l| print::line(out, l))
 }

@@ -624,7 +624,8 @@ fn status_names_what_a_search_uses() {
     let uses = format!("a search here uses the server at {addr} (FMGREP_SERVER)");
     let head = [uses.as_str(), "format: 9", "store_docs: false", "files: 3"];
     let got = (&lines[..4], lines.last().copied());
-    assert_eq!(got, (&head[..], Some("commit: none")));
+    assert_eq!(got, (&head[..], Some("why_no_commit: none")));
+    assert_eq!(lines[lines.len() - 2], "commit: none");
     let out = run_env(&away, &addr, &["status", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(out.stdout, reply.stdout);
