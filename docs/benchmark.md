@@ -43,7 +43,9 @@ test.
 
 ## File monitor
 
-fmgrep does not call git. `fmgrep index` asks watchman to watch a tree
+In a checkout whose index records a served commit, a served row's client
+asks watchman what changed and, without watchman, runs git on each query
+(see BENCHMARKS.md, Method). `fmgrep index` asks watchman to watch a tree
 of 50,000 files or more, without waiting for the crawl, and takes no
 token; it starts the daemon when none runs, as a search does. On every
 query without a server, a load of 50,000 indexed files or more asks
@@ -67,7 +69,8 @@ watch-project`, which starts watchman if it is not running) and waits until
 watchman has crawled it, so the crawl is over before any fmgrep row and
 no timed row runs during it. It
 prints how long the crawl took. Without watchman, or when the watch fails,
-it warns, and fmgrep stats every file. fmgrep runs with its defaults, so
+it warns, fmgrep stats every file, and such a client runs git on each
+query. fmgrep runs with its defaults, so
 on linux, chromium and aosp the `fmgrep-direct` row asks watchman at each
 load, and on ghc (about 27,000 files) it stats every file. The watch
 covers an AOSP tree too.
