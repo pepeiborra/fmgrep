@@ -127,17 +127,17 @@ impl Remote {
     /// `args` through the server from `cwd`, with `FMGREP_SERVER`, and the
     /// private daemon's socket when there is one; by [`Self::tried`].
     pub fn search(&self, cwd: &Path, args: &[&str]) -> Output {
-        self.tried(|| self.search_at(&self.addr, cwd, args))
+        self.through(&self.addr, cwd, args)
     }
 
-    /// `args` once, from `cwd`, through the server at `addr`.
-    fn search_at(&self, addr: &str, cwd: &Path, args: &[&str]) -> Output {
-        let mut cmd = self.s.fmgrep(cwd);
-        if let Some(daemon) = &self.daemon {
-            cmd.env("WATCHMAN_SOCK", &daemon.sock);
-        }
-        cmd.env("FMGREP_SERVER", addr)
-            .args(args)
+    /// [`Self::search`] through the server at `addr`.
+    pub fn through(&self, addr: &str, cwd: &Path, args: &[&str]) -> Output {
+        self.tried(|| self.once(addr, cwd, args))
+    }
+
+    /// One try of [`Self::through`].
+    pub fn once(&self, addr: &str, cwd: &Path, args: &[&str]) -> Output {
+        self.command(addr, cwd, args)
             .output()
             .expect("spawn fmgrep")
     }
@@ -168,7 +168,7 @@ impl Remote {
             back.join().unwrap().unwrap();
             lines
         });
-        let out = self.search_at(&proxy, &self.client, args);
+        let out = self.once(&proxy, &self.client, args);
         let query = spy
             .join()
             .unwrap()
@@ -176,6 +176,16 @@ impl Remote {
             .find(|l| l.contains(r#""method":"query""#))
             .expect("a query request");
         (out, serde_json::from_str(&query).unwrap())
+    }
+
+    /// The command of [`Self::once`].
+    pub fn command(&self, addr: &str, cwd: &Path, args: &[&str]) -> std::process::Command {
+        let mut cmd = self.s.fmgrep(cwd);
+        if let Some(daemon) = &self.daemon {
+            cmd.env("WATCHMAN_SOCK", &daemon.sock);
+        }
+        cmd.env("FMGREP_SERVER", addr).args(args);
+        cmd
     }
 
     /// `run`, a search that asks the private daemon, run again while it

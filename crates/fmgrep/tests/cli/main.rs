@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 mod commit;
 mod git;
 mod merged;
+mod pinned;
+mod proxy;
 mod remote;
 mod roundtrip;
 mod serve;

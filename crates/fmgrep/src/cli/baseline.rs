@@ -65,15 +65,15 @@ pub fn skip_list(
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
-                super::warn(&format!(
-                    "watchman cannot say what changed ({why}); asked git what differs from the \
-                     served commit {} (took {})",
-                    short(commit),
-                    crate::verbose::Us(took.as_secs_f64() * 1e6)
-                ));
-            }
-            if let Some(keep) = said {
-                keep();
+                crate::held::then(
+                    &format!(
+                        "warning: watchman cannot say what changed ({why}); asked git what \
+                         differs from the served commit {} (took {})",
+                        short(commit),
+                        crate::verbose::Us(took.as_secs_f64() * 1e6)
+                    ),
+                    said,
+                );
             }
             note(
                 top,
@@ -145,14 +145,14 @@ fn note(
         _ => (local.files.len(), local.bytes),
     };
     let s = skip.len();
-    eprintln!(
+    crate::held::line(&format!(
         "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
          searched here; served commit {}; record {record}",
         crate::verbose::plural(s),
         crate::verbose::plural(n),
         bytes,
         short(commit)
-    );
+    ));
 }
 
 /// The baseline plus what watchman says `changed`, when the variables

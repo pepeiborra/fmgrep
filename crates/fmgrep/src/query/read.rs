@@ -127,19 +127,19 @@ pub fn read_instead(
         if !reads(bound, ids.len(), bytes, costs) {
             if plans() {
                 let (read, locate) = estimates(bound, ids.len(), bytes, costs);
-                eprintln!(
-                    "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}",
+                crate::held::text(&format!(
+                    "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}\n",
                     ids.len(),
                     plural(ids.len()),
                     Us(read),
                     Us(locate)
-                );
+                ));
             }
             return none();
         }
     }
     if plans() {
-        eprint!("{}", note(terms, &spreads, ids.len(), bytes, costs));
+        crate::held::text(&note(terms, &spreads, ids.len(), bytes, costs));
     }
     let mut counted = counted.into_iter().zip(spreads);
     terms

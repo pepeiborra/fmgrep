@@ -329,7 +329,7 @@ fn local(
 
 /// `line` on stderr, as a warning.
 fn warn(line: &str) {
-    eprintln!("warning: {line}");
+    crate::held::line(&format!("warning: {line}"));
 }
 
 /// A server's address, and whether `FMGREP_SERVER` gave it.
@@ -349,8 +349,18 @@ impl std::fmt::Display for Server {
 
 /// A search through `server`, on `conn`. With `ignore`
 /// (`--ignore-local-changes`), the server's answer alone, and no look at
-/// the checkout's changes. From a git checkout, the served commit of the
-/// status is pinned for the next search, once the search ends.
+/// the checkout's changes.
+///
+/// From a git checkout, the served commit of each status is pinned for
+/// the next search. A search that finds a pin of a commit asks for no
+/// status. It searches as with a status of that commit: a search from a
+/// checkout reads only the format and the commit of a status, and a
+/// server of another commit or format refuses its pinned query before it
+/// searches. Its lines on stderr are held until the server answers. When
+/// the server refuses, or the search fails before an answer, the client
+/// asks for the status. If the status has the pinned commit, the lines
+/// print and the search ends as it would have; else they are dropped, and
+/// the search runs again as one without a pin.
 fn client(
     server: &Server,
     mut conn: Conn,
@@ -360,20 +370,54 @@ fn client(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, String> {
-    let status = serve::status_on(&mut conn)?;
-    same_format(server, status.format)?;
+    use crate::source::Pinned;
     let cwd = std::fs::canonicalize(".").unwrap_or_else(|_| PathBuf::from(&p.cwd));
     let top = checkout::top(&cwd);
     let had =
         (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
-    let answered = answer(
-        server, &mut conn, &status, &cwd, ignore, p, typed, json, out,
-    );
+    let mut search = |conn: &mut Conn, status: &serve::ServeStatus, p: QueryParams| {
+        answer(server, conn, status, &cwd, ignore, p, typed, json, out)
+    };
+    let status = match &had {
+        Some(Pinned::Commit(id)) => {
+            crate::held::hold();
+            let tried = search(&mut conn, &serve::ServeStatus::pinned(id), p.clone());
+            if !crate::held::holding() || tried.is_ok() {
+                crate::held::release();
+                return tried;
+            }
+            let status = serve::status_on(&mut conn)
+                .and_then(|status| same_format(server, status.format).map(|()| status));
+            match status {
+                Ok(status) if checkout::pin_of(&status) == Some(id) => {
+                    crate::held::release();
+                    return tried;
+                }
+                Ok(status) => {
+                    crate::held::discard();
+                    status
+                }
+                Err(e) => {
+                    crate::held::discard();
+                    return Err(e);
+                }
+            }
+        }
+        damaged => {
+            if let Some(Pinned::Damaged(why)) = damaged {
+                warn(&format!("{why}; asked {server} for its status"));
+            }
+            let status = serve::status_on(&mut conn)?;
+            same_format(server, status.format)?;
+            status
+        }
+    };
+    let answered = search(&mut conn, &status, p);
     // After the search, so that a record that cannot be saved says so first.
     let now = checkout::pin_of(&status);
     let kept = match &had {
-        Some(crate::source::Pinned::Commit(id)) => now == Some(id.as_str()),
-        Some(crate::source::Pinned::Missing) => now.is_none(),
+        Some(Pinned::Commit(id)) => now == Some(id.as_str()),
+        Some(Pinned::Missing) => now.is_none(),
         _ => false,
     };
     if let Some(top) = top.filter(|_| !kept) {

@@ -868,7 +868,7 @@ static KEPT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// `line` on stderr, once per process for each `seen`; kept instead once
 /// [`keep`] was called.
-pub(super) fn warn(seen: &AtomicBool, line: &str) {
+pub(super) fn warn(seen: &'static AtomicBool, line: &str) {
     #[cfg(test)]
     crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
     if seen.swap(true, Ordering::Relaxed) {
@@ -879,7 +879,7 @@ pub(super) fn warn(seen: &AtomicBool, line: &str) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(line.to_owned()),
-        false => eprintln!("warning: {line}"),
+        false => crate::held::once(Some(seen), &format!("warning: {line}")),
     }
 }
 
