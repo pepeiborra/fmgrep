@@ -130,6 +130,27 @@ pub struct ServeStatus {
     pub commit: Option<Commit>,
 }
 
+impl ServeStatus {
+    /// The status that a pin of the served git commit `id` stands for. A
+    /// search from a checkout through a server that serves a commit reads
+    /// only its format and its commit; the root here is empty.
+    pub fn pinned(id: &str) -> Self {
+        Self {
+            format: Some(crate::manifest::MANIFEST_FORMAT),
+            store_docs: true,
+            files: 0,
+            num_bytes: 0,
+            index_size_bytes: 0,
+            load_us: 0,
+            root: String::new(),
+            commit: Some(Commit {
+                vcs: "git".to_owned(),
+                id: id.to_owned(),
+            }),
+        }
+    }
+}
+
 /// What `serve` serves.
 pub struct ServeRequest<'a> {
     pub index_dir: &'a Path,
@@ -581,6 +602,8 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
 /// `p` (with `stream` and `rendered`) answered by the server: its output
 /// copied to `out` as it comes, as a local search prints it, then the
 /// report. The search fails as a local one does when it searched no file.
+/// The first frame, or the result, prints the held lines: the server took
+/// the query.
 pub fn rendered(
     conn: &mut Conn,
     p: &QueryParams,
@@ -592,10 +615,14 @@ pub fn rendered(
     // The report alone is printed by this client under `--json`.
     let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
     let mut pipe = Pipe::new(&mut *out);
-    let result = conn.call("query", sent, &mut |frame| match printed {
-        true => pipe.raw(frame),
-        false => Ok(()),
+    let result = conn.call("query", sent, &mut |frame| {
+        crate::held::release();
+        match printed {
+            true => pipe.raw(frame),
+            false => Ok(()),
+        }
     })?;
+    crate::held::release();
     pipe.finish()?;
     let report = match p.mode {
         Mode::Counts => conn.decode(result)?,
@@ -609,7 +636,8 @@ pub fn rendered(
 }
 
 /// `p` (with `stream`) answered by the server: each event to `sink`, then
-/// the report.
+/// the report. The first frame, or the result, prints the held lines: the
+/// server took the query.
 pub fn remote(
     conn: &mut Conn,
     p: &QueryParams,
@@ -618,8 +646,10 @@ pub fn remote(
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
     let result = conn.call("query", sent, &mut |frame| {
+        crate::held::release();
         Frame::decode(frame)?.replay(sink)
     })?;
+    crate::held::release();
     match p.mode {
         Mode::Counts => conn.decode(result),
         _ => Ok(conn.decode::<Rendered>(result)?.report),

@@ -466,20 +466,18 @@ pub fn answer_expr(
         (_, Some(_)) => union(&root.yes, &root.maybe),
     };
     if verbose {
-        eprint!(
-            "{}",
-            explain::Explain {
-                expr,
-                leaves: &leaves,
-                plan: &plan,
-                leaf_us: &leaf_us,
-                hits: &hits,
-                root: &root,
-                stale: stale.len(),
-                output: req.output,
-                reads: fetch.len(),
-            }
-        );
+        let explain = explain::Explain {
+            expr,
+            leaves: &leaves,
+            plan: &plan,
+            leaf_us: &leaf_us,
+            hits: &hits,
+            root: &root,
+            stale: stale.len(),
+            output: req.output,
+            reads: fetch.len(),
+        };
+        crate::held::text(&explain.to_string());
     }
     match (req.output, alternation.as_ref()) {
         (QueryOutput::Counts, _) => {

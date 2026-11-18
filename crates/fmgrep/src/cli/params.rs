@@ -13,7 +13,7 @@ use crate::query::QueryRequest;
 
 /// Every field but `terms` is optional; `terms` may be omitted only when
 /// `expr` is given.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryParams {
     #[serde(default)]
