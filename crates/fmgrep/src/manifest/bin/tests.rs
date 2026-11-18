@@ -31,6 +31,15 @@ fn sample(paths: &[&str], shards: usize, root: Option<&str>) -> Manifest {
         blob_lens: (0..shards as u64).map(|s| 100 + s).collect(),
         corpus_root: root.map(str::to_owned),
         commit: None,
+        why_no_commit: None,
+    }
+}
+
+/// [`sample`] in the documents layout, recording no commit for `why`.
+fn unserved(paths: &[&str], why: &str) -> Manifest {
+    Manifest {
+        why_no_commit: Some(why.into()),
+        ..sample(paths, 1, None)
     }
 }
 
@@ -93,13 +102,14 @@ struct Offsets {
     label_ends: usize,
     root: usize,
     commit: usize,
+    why: usize,
     labels: usize,
     paths: usize,
 }
 
 fn offsets(m: &Manifest) -> Offsets {
     let (n, s) = (m.files.len(), m.blobs.len());
-    let path_ends = 88 + 8 * n;
+    let path_ends = 96 + 8 * n;
     let label_ends = path_ends + 8 * n + 8 * s;
     let root = label_ends + 8 * s;
     let commit = root + m.corpus_root.as_deref().map_or(0, str::len);
@@ -107,13 +117,15 @@ fn offsets(m: &Manifest) -> Offsets {
         .commit
         .as_ref()
         .map_or(0, |c| c.vcs.len() + 1 + c.id.len());
-    let labels = commit + commit_len;
+    let why = commit + commit_len;
+    let labels = why + m.why_no_commit.as_deref().map_or(0, str::len);
     let paths = labels + m.blobs.iter().map(String::len).sum::<usize>();
     Offsets {
         path_ends,
         label_ends,
         root,
         commit,
+        why,
         labels,
         paths,
     }
@@ -161,6 +173,8 @@ fn a_manifest_reads_back_equal() {
         before_epoch,
         served(&["a.c"], "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"),
         served(&[], "0"),
+        unserved(&["a.c"], "the checkout holds a submodule (agents/internal)"),
+        unserved(&[], "cannot read é\n中"),
     ] {
         let b = bytes(&m);
         assert_eq!(read(&b).as_ref(), Ok(&m));
@@ -175,7 +189,7 @@ fn the_layout_is_fixed() {
     let m = sample(&["a.c", "é"], 1, Some("/r"));
     let want = [
         "666d6d616e696600", // magic
-        "08000000",         // format
+        "09000000",         // format
         "00000000",         // flags: the files layout
         "0200000000000000", // num_docs
         "0900000000000000", // num_bytes
@@ -186,6 +200,7 @@ fn the_layout_is_fixed() {
         "0100000000000000", // shards
         "0200000000000000", // bytes of corpus_root
         "0000000000000000", // bytes of the served commit
+        "0000000000000000", // bytes of why_no_commit
         "0100000000000000", // doc_lens
         "0800000000000000",
         "0300000000000000", // path ends
@@ -203,7 +218,7 @@ fn the_layout_is_fixed() {
     let m = served(&["a"], "1a2b");
     let want = [
         "666d6d616e696600",                                       // magic
-        "08000000",                                               // format
+        "09000000",                                               // format
         "01000000",                                               // flags: store_docs
         "0100000000000000",                                       // num_docs
         "0100000000000000",                                       // num_bytes
@@ -214,6 +229,7 @@ fn the_layout_is_fixed() {
         "0100000000000000",                                       // shards
         "0000000000000000",                                       // bytes of corpus_root
         "0800000000000000",                                       // bytes of the served commit
+        "0000000000000000",                                       // bytes of why_no_commit
         "0100000000000000",                                       // doc_lens
         "0100000000000000",                                       // path ends
         "6400000000000000",                                       // blob_lens
@@ -224,11 +240,43 @@ fn the_layout_is_fixed() {
     ];
     let hex: String = bytes(&m).iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(hex, want.concat());
+    // A reason fills its length and its section, after where a commit
+    // would go, and moves nothing else but the sections after it.
+    let m = unserved(&["a"], "a.c differs from HEAD");
+    let want = [
+        "666d6d616e696600",                                       // magic
+        "09000000",                                               // format
+        "01000000",                                               // flags: store_docs
+        "0100000000000000",                                       // num_docs
+        "0100000000000000",                                       // num_bytes
+        "0100000000000000",                                       // bom_bytes
+        "3930000000000000",                                       // index_size_bytes
+        "a602000000000000",                                       // build_time_us
+        "150f187057a77718",                                       // index_started_ns
+        "0100000000000000",                                       // shards
+        "0000000000000000",                                       // bytes of corpus_root
+        "0000000000000000",                                       // bytes of the served commit
+        "1500000000000000",                                       // bytes of why_no_commit
+        "0100000000000000",                                       // doc_lens
+        "0100000000000000",                                       // path ends
+        "6400000000000000",                                       // blob_lens
+        "1b00000000000000",                                       // label ends
+        "612e6320646966666572732066726f6d2048454144",             // why_no_commit
+        "73686172642d30303030303030302d30303030303030312e62696e", // labels
+        "61",                                                     // paths
+    ];
+    let hex: String = bytes(&m).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, want.concat());
 }
 
 #[test]
 fn every_truncation_is_refused() {
-    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
+    for m in [
+        small(),
+        mid(),
+        served(&["a.c", "b"], "1a2b"),
+        unserved(&["a.c", "b"], "a.c differs from HEAD"),
+    ] {
         let b = bytes(&m);
         for cut in 0..b.len() {
             refused(&b[..cut], "is truncated");
@@ -299,7 +347,12 @@ fn refusal(why: &str) -> String {
 /// or of the path text opens and is refused when read.
 #[test]
 fn every_byte_change_is_refused_or_reads_back_whole() {
-    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
+    for m in [
+        small(),
+        mid(),
+        served(&["a.c", "b"], "1a2b"),
+        unserved(&["a.c", "b"], "a.c differs from HEAD"),
+    ] {
         let b = bytes(&m);
         let off = offsets(&m);
         let ends = off.path_ends..off.path_ends + 8 * m.files.len();
@@ -326,7 +379,12 @@ fn every_byte_change_is_refused_or_reads_back_whole() {
 /// whole. A count of 2^60 sizes no buffer.
 #[test]
 fn edge_values_in_every_word_are_refused_or_read_back() {
-    for m in [small(), mid(), served(&["a.c", "b"], "1a2b")] {
+    for m in [
+        small(),
+        mid(),
+        served(&["a.c", "b"], "1a2b"),
+        unserved(&["a.c", "b"], "a.c differs from HEAD"),
+    ] {
         let b = bytes(&m);
         let len = b.len() as u64;
         for at in (16..offsets(&m).root).step_by(8) {
@@ -389,6 +447,9 @@ fn each_bad_header_is_refused_by_name() {
     let mut c = b.clone();
     put(&mut c, 80, b.len() as u64);
     refused(&c, "is truncated");
+    let mut c = b.clone();
+    put(&mut c, 88, b.len() as u64);
+    refused(&c, "is truncated");
 }
 
 #[test]
@@ -426,6 +487,12 @@ fn each_bad_section_is_refused_by_name() {
     let mut c = b.clone();
     put(&mut c, at.path_ends + 16, get(&b, at.path_ends + 16) + 1);
     refused(&c, "is truncated");
+    let m = unserved(&["a.c"], "a.c differs from HEAD");
+    let (b, at) = (bytes(&m), offsets(&m));
+    let mut c = b.clone();
+    c[at.why] = 0xFF;
+    refused(&c, "holds a why_no_commit that is not UTF-8");
+    let (b, at) = (bytes(&small()), offsets(&small()));
     for (offset, what) in [(at.root, "a corpus_root"), (at.labels, "a shard label")] {
         let mut c = b.clone();
         c[offset] = 0xFF;
@@ -465,20 +532,18 @@ fn a_damaged_path_is_refused_when_read() {
     assert_eq!(fate(&c, "an end inside é"), Fate::Read);
 }
 
-/// The served commit is read from the section that format 8 has always
-/// had: a file without one, as every fmgrep of format 8 wrote before, reads
-/// as one without a commit.
+/// A file without a served commit reads as one without a commit.
 #[test]
 fn a_served_commit_is_its_vcs_a_space_and_its_id() {
     let m = sample(&["a.c", "b"], 1, None);
     let (b, at) = (bytes(&m), offsets(&m));
-    assert_eq!(at.commit, at.labels);
+    assert_eq!(at.commit, at.why);
     assert_eq!(get(&b, 80), 0);
     let with = |commit: &[u8]| {
-        let mut c = b[..at.labels].to_vec();
+        let mut c = b[..at.commit].to_vec();
         put(&mut c, 80, commit.len() as u64);
         c.extend_from_slice(commit);
-        c.extend_from_slice(&b[at.labels..]);
+        c.extend_from_slice(&b[at.commit..]);
         c
     };
     let id = "0123456789abcdef0123456789abcdef01234567";
@@ -579,6 +644,19 @@ fn values_are_checked_as_before() {
         "blob tables skew (blobs=2 blob_lens=1)",
     );
     assert_eq!(validate(&served(&["a"], "1a2b"), at), Ok(()));
+    assert_eq!(validate(&unserved(&["a"], "a.c differs"), at), Ok(()));
+    check(
+        &|m| m.why_no_commit = Some("a.c differs".into()),
+        "records why it has no commit but reads documents from files",
+    );
+    let mut both = served(&["a"], "1a2b");
+    both.why_no_commit = Some("a.c differs".into());
+    let err = validate(&both, at).unwrap_err();
+    assert!(
+        err.contains("records why it has no commit but records a commit")
+            && err.contains("refusing a tampered index"),
+        "{err}"
+    );
     check(
         &|m| m.commit = served(&[], "1a2b").commit,
         "reads documents from files but records a commit",
@@ -614,9 +692,9 @@ fn a_foreign_header_asks_for_no_read_ahead() {
     let n = 1 << 20;
     let mut b = bytes(&small());
     put(&mut b, 16, n);
-    b.resize(88 + 16 * (n as usize + 2), 0);
+    b.resize(96 + 16 * (n as usize + 2), 0);
     assert_eq!(tables_len(&b), b.len());
-    let format = (MANIFEST_FORMAT - 1).to_le_bytes();
+    let format = 7u32.to_le_bytes();
     for (at, with, why) in [
         (0..8, &b"NOTMANIF"[..], "is not an fmgrep manifest"),
         (8..12, &format[..], "unsupported manifest format 7"),

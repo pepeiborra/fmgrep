@@ -192,3 +192,22 @@ pub fn commit_of(index: &Path) -> Option<String> {
     }
     id
 }
+
+/// The `why_no_commit` a manifest records, as `status --json` prints it;
+/// plain `status` prints the same reason as a line of the manifest's.
+pub fn why_of(index: &Path) -> Option<String> {
+    let status = |json: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fmgrep"));
+        cmd.arg("status").arg(index).args(json.then_some("--json"));
+        let out = cmd.output().expect("spawn fmgrep");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "status: {stderr}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let manifest: serde_json::Value = serde_json::from_str(&status(true)).unwrap();
+    let why = manifest["why_no_commit"].as_str().map(str::to_owned);
+    let text = status(false);
+    let line = text.lines().find_map(|l| l.strip_prefix("why_no_commit: "));
+    assert_eq!(line, why.as_deref(), "{text}");
+    why
+}

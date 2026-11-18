@@ -299,7 +299,7 @@ fn old_format_manifest_is_refused() {
     let err = query_it_err(tmp.path(), false, &["printk"]);
     assert!(
         err.contains("unsupported manifest format 1 in")
-            && err.contains("manifest.json (want 8); re-run `index`"),
+            && err.contains("manifest.json (want 9); re-run `index`"),
         "got: {err}"
     );
 }

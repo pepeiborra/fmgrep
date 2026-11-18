@@ -115,7 +115,8 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
             doc_lens: docs.lens.into(),
             blob_lens,
             corpus_root: docs.root,
-            commit: commit.and_then(Result::ok),
+            commit: commit.as_ref().and_then(|c| c.as_ref().ok().cloned()),
+            why_no_commit: commit.and_then(Result::err),
         };
         write_manifest(output, &manifest)?;
         Ok(manifest)

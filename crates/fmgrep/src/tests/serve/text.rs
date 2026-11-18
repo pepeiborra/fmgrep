@@ -340,7 +340,7 @@ fn a_client_refuses_a_server_of_another_index() {
     for (replies, want) in [
         (
             vec![status_reply(Some(7))],
-            "serves an index of format 7; this fmgrep reads format 8 (use one fmgrep version \
+            "serves an index of format 7; this fmgrep reads format 9 (use one fmgrep version \
              on both sides)",
         ),
         (

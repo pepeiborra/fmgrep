@@ -71,6 +71,7 @@ pub fn status(
             .as_ref()
             .map(|c| format!("commit: {} {}", c.vcs, c.id)),
     );
+    lines.extend((m.why_no_commit.as_ref()).map(|why| format!("why_no_commit: {why}")));
     lines.iter().try_for_each(|l| line(out, l))
 }
 
@@ -126,6 +127,7 @@ mod tests {
             blob_lens: vec![],
             corpus_root: None,
             commit: None,
+            why_no_commit: None,
         }
     }
 
@@ -177,6 +179,7 @@ mod tests {
                 vcs: "git".into(),
                 id: "1a2b".into(),
             }),
+            why_no_commit: None,
         };
         let printed = |json: bool| {
             let mut out = Vec::new();
@@ -188,5 +191,37 @@ mod tests {
         let json = printed(true);
         let tail = r#""blob_lens":[11],"commit":{"vcs":"git","id":"1a2b"}}"#;
         assert!(json.ends_with(&format!("{tail}\n")), "{json}");
+    }
+
+    /// The reason that an index records no commit is its last line, and
+    /// its last key in `--json`; an index of a commit prints none.
+    #[test]
+    fn status_prints_why_there_is_no_served_commit_last() {
+        let why = "the checkout holds a submodule (agents/internal)";
+        let m = Manifest {
+            commit: None,
+            why_no_commit: Some(why.into()),
+            ..manifest(["a.c"].into_iter().collect())
+        };
+        let printed = |json: bool| {
+            let mut out = Vec::new();
+            status(&mut out, json.then_some(&m), "index: /idx", &m).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let text = printed(false);
+        assert!(
+            text.ends_with(&format!("shards: 0\nwhy_no_commit: {why}\n")),
+            "{text}"
+        );
+        assert!(!text.contains("commit: git"), "{text}");
+        let json = printed(true);
+        assert!(
+            json.ends_with(&format!("\"why_no_commit\":\"{why}\"}}\n")),
+            "{json}"
+        );
+        let none = manifest(["a.c"].into_iter().collect());
+        let mut out = Vec::new();
+        status(&mut out, None::<&Manifest>, "idx", &none).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("why_no_commit"));
     }
 }
