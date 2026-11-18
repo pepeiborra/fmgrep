@@ -71,5 +71,6 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `warning: Using local index DIR, not the server at ADDR (FMGREP_SERVER)` | an index above the cwd answers; the server is not asked |
 | `warning: local changes are ignored (...)` | through a shared server, the answer is for the served commit, not for this checkout; the reason says what to change, or pass `--ignore-local-changes` to accept it |
 | `warning: asked git what differs from the served commit ...` | a search through a shared server took longer once; later ones ask watchman |
+| `warning: the pin PATH ...; asked the server at ADDR for its status` | the pin, the file that keeps the server's commit, is damaged or of another fmgrep version; the search asked for the status, answered right, and wrote a new pin |
 
 Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md); design notes live in `docs/`.

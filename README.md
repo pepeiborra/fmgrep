@@ -54,7 +54,8 @@ answers. `fmgrep serve` needs it, unless given `--no-watch` or a
   watchman at any checkout size, to learn what changed since git last
   compared the checkout with the served commit: it starts the daemon
   when none runs and asks it to watch the whole checkout, and keeps one
-  record per checkout and served commit.
+  record per checkout and served commit, and one pin per checkout and
+  server.
   `fmgrep serve` checks before every query, not once, so it asks watchman
   at any tree size, unless given `--no-watch`: it starts the daemon and
   asks it to watch even a small tree. On Linux that makes each served

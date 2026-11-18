@@ -294,6 +294,30 @@ note goes once watchman answers, so the line comes again when it cannot;
 a note that cannot be written is not kept, and the next search says it
 again.
 
+Such a search also keeps a **pin**, one per checkout and server
+address: `<checkout name>-<16 hex digits>.pin`, in the same directory,
+written in the same way. It keeps the served commit of the server's
+last `status`, so that a later search sends its pinned query with no
+`status` first ([protocol.md](protocol.md#from-a-checkout)). It is one
+line of JSON:
+
+| field | holds |
+|---|---|
+| `v` | `1` |
+| `root` | the canonical top of the checkout |
+| `server` | the server's address, as `--server` or `FMGREP_SERVER` gives it |
+| `commit` | the served commit, by its full git id |
+
+A `status` that reports no served commit, or one that is not a full git
+id, removes the pin.
+
+A record or a pin that cannot be read, is malformed, was written by
+another fmgrep version or for another tree, index, commit or server, is
+not used, and the search says why on stderr: a record in the line that
+says the search asked git or checked every file, a pin in `warning:
+<why>; asked the server at ADDR for its status`. The search then does
+what it does without one, and writes a new one.
+
 A **token** is the second of two watchman clocks synced within 100 ms,
 kept only when it is a later tick than the first. A clock answered during
 a crawl, its tail included, is the crawl's tick, which files changed then

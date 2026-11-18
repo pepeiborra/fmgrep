@@ -44,7 +44,10 @@ commit (edits, new and deleted files, commits on top, another branch).
 It searches those files itself and asks the server to leave them out.
 The first search asks git; later ones ask
 [watchman](../README.md#dependencies) what changed since, and without it
-every search asks git.
+every search asks git. Later searches also skip the server's status
+request: the client remembers the served commit in a pin
+([details](index-format.md#watchman)) and asks again only when the
+server has moved.
 
 ## When local changes are ignored
 

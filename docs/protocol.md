@@ -264,7 +264,8 @@ the query, and refuses a server whose index format is not its own, or
 that reports none: use one fmgrep version on both sides. Its query
 carries `format`; a server that answers it with -32001 (its index
 changed after the `status`) exits 2, as `error: the server at ADDR
-changed its index during this search; run the search again`.
+changed its index during this search; run the search again`. A later
+search from a git checkout skips the `status`: see the pin, below.
 
 ### From a checkout
 
@@ -297,9 +298,29 @@ asks git, and the first for each reason and served commit (every one
 under `FMGREP_VERBOSE=1`) prints `warning:
 watchman cannot say what changed (<why>); asked git what differs from
 the served commit <id> (took <time>)`. Either line prints only when the
-client can search the files that git listed. `FMGREP_VERBOSE=1` adds
-one note: where the skip list came from, the sizes, the served commit
-and the record.
+client can search the files that git listed.
+
+After each `status`, the client writes a pin
+([index-format.md](index-format.md#watchman)): the served commit, for
+this checkout and server address. A later search that finds a pin of a
+commit sends no `status`. It searches as with a status of that commit,
+since a search from a checkout reads only the format and the commit of
+a status, and sends its query, which carries both. A server of another
+commit or format refuses it with -32001 before it searches. The
+client's lines on stderr wait for the server's first frame or result.
+When the server refuses the query, or the search fails before an
+answer, the client asks for `status` on the same connection. If the
+status has the pinned commit, the lines print and the search ends as it
+would have. If it has another format, the search fails as above. If it
+has another commit, or none, the lines are dropped, the pin is
+rewritten or removed, and the search runs as one without a pin: it
+prints what a first search prints. A server without a served commit,
+and a cwd in no checkout, get a `status` on every search. `fmgrep
+status --server ADDR` always asks the server.
+
+`FMGREP_VERBOSE=1` adds two notes: whether the search asked for the
+`status`, and why; and where the skip list came from, the sizes, the
+served commit and the record.
 
 Where the client cannot compute its local changes soundly, it sends no
 skip list, searches nothing itself, and prints one warning, `warning:
@@ -346,6 +367,11 @@ Known limits of this first version:
   without `--ignored`.
 - When the server moves to a new commit during a search, the search
   stops and asks to be run again.
+- A pinned query carries the commit's id, not its VCS: the server
+  checks the id. This fmgrep records only git commits.
+- After the server moves to another commit, the next search sends three
+  requests, and compares the checkout with the old commit before it
+  learns of the new one.
 - `--json` alone and `--approx-counts` print the server's
   `num_files_indexed` and `index_size_bytes`.
 - Under `--stats` with a PATH, a glob or a cwd below the top, the bytes
