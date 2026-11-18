@@ -252,8 +252,8 @@ files are read in full; after many edits, remove `.fmgrep` and re-index.
 |---|--:|--:|--:|
 | index size | 1.11 GB / - | 2.22 GB / - | 12.00 GB / - |
 | files read per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
-| literal p50 | 4.06 / 113 ms | 24.3 / 496 ms | 10.1 / 1550 ms |
-| regex p50 | 8.88 / 115 ms | 29.6 / 493 ms | 13.3 / 1580 ms |
+| literal p50 | 4.08 / 114 ms | 24.9 / 494 ms | 10.6 / 1560 ms |
+| regex p50 | 8.23 / 118 ms | 30.1 / 500 ms | 13.2 / 1580 ms |
 
 aosp is Android's platform source: 17.4 GB of text in 1.25 M files from
 about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
