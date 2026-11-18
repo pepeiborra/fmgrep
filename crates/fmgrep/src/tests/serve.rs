@@ -163,6 +163,8 @@ pub(crate) fn pin(index: &Path, id: &str) {
             vcs: "git".into(),
             id: id.into(),
         });
+        // An index that records a commit has no reason to give.
+        m.why_no_commit = None;
     });
 }
 
@@ -428,15 +430,16 @@ fn a_query_pinned_to_another_index_is_refused() {
         assert_eq!(got[0]["error"]["code"], -32001, "{params}: {got:?}");
         assert_eq!(got[0]["error"]["message"], message, "{params}");
     };
-    let ours = format!("this server serves commit {id} of index format 8");
+    let format = crate::manifest::MANIFEST_FORMAT;
+    let ours = format!("this server serves commit {id} of index format {format}");
     refused(&pinned, r#""format":7"#, &ours);
     refused(&pinned, r#""commit":"ffff""#, &ours);
     refused(&pinned, &format!(r#""format":7,"commit":"{id}""#), &ours);
-    let none = "this server serves no commit, of index format 8";
-    refused(&plain, &format!(r#""commit":"{id}""#), none);
+    let none = format!("this server serves no commit, of index format {format}");
+    refused(&plain, &format!(r#""commit":"{id}""#), &none);
     for (index, params) in [
-        (&pinned, format!(r#""format":8,"commit":"{id}""#)),
-        (&plain, r#""format":8"#.to_owned()),
+        (&pinned, format!(r#""format":{format},"commit":"{id}""#)),
+        (&plain, format!(r#""format":{format}"#)),
     ] {
         let got = serve_stdio(index, &[&ask(&params)]);
         assert_eq!(

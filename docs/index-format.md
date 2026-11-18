@@ -1,6 +1,6 @@
 # Index format
 
-The on-disk layout `fmgrep index` writes (manifest format 8): what each
+The on-disk layout `fmgrep index` writes (manifest format 9): what each
 file holds and the rules a reader relies on.
 
 ## Directory
@@ -33,7 +33,7 @@ JSON object on one line, in this order.
 
 | field | type | meaning |
 |---|---|---|
-| `format` | u32 | `8` |
+| `format` | u32 | `9` |
 | `store_docs` | bool | documents are in `docs.shard`, not read from the tree |
 | `num_docs` | u64 | documents indexed |
 | `num_bytes` | u64 | sum of `doc_lens` |
@@ -47,6 +47,7 @@ JSON object on one line, in this order.
 | `blob_lens` | [u64] | byte length per blob, parallel to `blobs` |
 | `corpus_root` | string | absolute path of the tree; present iff not `store_docs` |
 | `commit` | `{vcs, id}` | the served commit: the commit whose files the documents are, byte for byte; only with `store_docs`, and optional |
+| `why_no_commit` | string | why the index records no `commit`, as the build's note says it; only with `store_docs`, and without a `commit` |
 
 `num_bytes - bom_bytes` is the `bytes_searched` that rg reports for the
 tree, because rg's searcher strips a leading BOM.
@@ -92,7 +93,7 @@ paths with `fmgrep status --json | jq -r '.files[]'`.
 ### Layout
 
 Integers are little-endian, of the widths below, with no alignment and no
-padding. The header is 88 bytes:
+padding. The header is 96 bytes:
 
 | offset | width | holds |
 |---|---|---|
@@ -108,6 +109,7 @@ padding. The header is 88 bytes:
 | 64 | 8 | shards: the number of `blobs` |
 | 72 | 8 | bytes of `corpus_root`; 0 when absent |
 | 80 | 8 | bytes of the served commit; 0 when absent |
+| 88 | 8 | bytes of `why_no_commit`; 0 when absent |
 
 The sections follow, in this order, each right after the one before:
 
@@ -119,6 +121,7 @@ The sections follow, in this order, each right after the one before:
 | label ends | 8 per shard | where each label ends in the label text |
 | `corpus_root` | its length | UTF-8 |
 | served commit | its length | UTF-8: the VCS, one space, the id |
+| `why_no_commit` | its length | UTF-8: why the index records no served commit |
 | label text | the last label end | the `blobs` labels, joined |
 | path text | the last path end | the `files` paths, joined, by id |
 
@@ -129,9 +132,20 @@ shards for `blobs` and `blob_lens`.
 
 The served commit section holds `git 1a2b...`: the VCS, one space, then
 the full commit id. It is empty, with a length of 0, when the index
-records no commit. Format 8 has had this section from the start, so an
-index written before fmgrep filled it reads as one with no commit, and an
-fmgrep that left it empty reads past one that is UTF-8.
+records no commit.
+
+The `why_no_commit` section holds the reason that the build's note gave
+for recording no commit, as text: `the checkout holds a submodule
+(agents/internal)`. It is empty, with a length of 0, when the index
+records a commit and for an index without `--store-docs`, which never runs
+git. `fmgrep status` of the index prints it, and `--json` has it as
+`why_no_commit`. It is not a promise about the text: the words are
+git's and fmgrep's, and can name paths of the machine that built the
+index.
+
+Format 9 added the `why_no_commit` length and section to format 8, which
+no release wrote: an index of format 8 is refused by its number, and
+re-indexing writes format 9.
 
 ### Checks
 
@@ -139,7 +153,7 @@ A load maps `manifest.bin` and reads its header, then its tables. It
 refuses, with exit 2:
 
 - a file that does not start with the magic;
-- a `format` other than 8, read before anything else, naming the remedy:
+- a `format` other than 9, read before anything else, naming the remedy:
   re-run `fmgrep index`. Old indexes are refused, never upgraded. An
   index of format 7 or older has a `manifest.json` instead, and is refused
   by the format that file records;
@@ -150,12 +164,13 @@ refuses, with exit 2:
   read ahead only once the magic and the format are known and the file
   holds every table the header counts;
 - path or label ends that go back, or label ends inside a character;
-- a `corpus_root`, served commit or label that is not UTF-8;
+- a `corpus_root`, served commit, `why_no_commit` or label that is not UTF-8;
 - a served commit that is not a VCS name (lowercase ASCII letters and
   digits), one space and an id of lowercase hex digits;
 - a `corpus_root` that is present with `store_docs`, or that is absent or
   relative without it;
 - a served commit without `store_docs`;
+- a `why_no_commit` without `store_docs`, or beside a served commit;
 - `bom_bytes > num_bytes`;
 - labels that do not partition `0..num_docs`, or a `blobs.shard` whose
   length is not the sum of `blob_lens`.
@@ -589,7 +604,8 @@ replace refs and no fetch) and records HEAD only when all of these hold:
 
 The build then prints `note: the index holds commit <id>`; otherwise
 `note: the index records no served commit (<why>)`, and the manifest has
-no `commit`. An index without `--store-docs` never runs git.
+no `commit` and keeps the same `<why>` as `why_no_commit`. An index
+without `--store-docs` never runs git.
 
 With `--require-served-commit`, a build that would record no commit
 fails instead. It prints `error: the index cannot record its served

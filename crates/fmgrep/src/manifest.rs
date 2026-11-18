@@ -13,7 +13,7 @@ pub use files::{Checked, FileTable, Lens, partition_ids};
 
 /// On-disk manifest format written by `index`; every other format is
 /// refused (re-run `index`).
-pub const MANIFEST_FORMAT: u32 = 8;
+pub const MANIFEST_FORMAT: u32 = 9;
 
 /// The manifest, in the layout of [`bin`].
 pub const MANIFEST_BIN: &str = "manifest.bin";
@@ -76,6 +76,12 @@ pub struct Manifest {
     /// for byte. Only a `store_docs` index records one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<Commit>,
+    /// Why the index records no served commit, as the note of the build
+    /// said it. Only a `store_docs` index without a commit can hold one:
+    /// a files-layout index never has a commit to record, and an index
+    /// built with `--require-served-commit` is not written without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why_no_commit: Option<String>,
 }
 
 /// A version-control commit.
@@ -106,6 +112,7 @@ impl Manifest {
             blob_lens: Vec::new(),
             corpus_root: Some(root.display().to_string()),
             commit: None,
+            why_no_commit: None,
         }
     }
 
@@ -245,8 +252,8 @@ fn foreign(path: &Path, format: Option<u32>) -> String {
 
 /// The checks of a manifest's values that its encoding does not hold:
 /// `corpus_root` present iff not `store_docs`, and absolute; a `commit`
-/// only with `store_docs`; `bom_bytes`
-/// within `num_bytes`; each table as long as the list it describes.
+/// only with `store_docs`; a `why_no_commit` only with `store_docs` and no
+/// `commit`; `bom_bytes` within `num_bytes`; each table as long as the list it describes.
 fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
     match (manifest.store_docs, &manifest.corpus_root) {
         (false, Some(root)) if Path::new(root).is_absolute() => {}
@@ -268,6 +275,16 @@ fn validate(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
         return Err(format!(
             "error: {} reads documents from files but records a commit; refusing a tampered index",
             manifest_path.display()
+        ));
+    }
+    if manifest.why_no_commit.is_some() && (manifest.commit.is_some() || !manifest.store_docs) {
+        return Err(format!(
+            "error: {} records why it has no commit but {}; refusing a tampered index",
+            manifest_path.display(),
+            match manifest.commit {
+                Some(_) => "records a commit",
+                None => "reads documents from files",
+            },
         ));
     }
     if manifest.bom_bytes > manifest.num_bytes {
@@ -393,6 +410,7 @@ mod tests {
             blob_lens: blobs.iter().map(|b| b.len() as u64).collect(),
             corpus_root: None,
             commit: None,
+            why_no_commit: None,
         }
     }
 
@@ -431,6 +449,7 @@ mod tests {
             blob_lens: vec![11],
             corpus_root: Some("/corpus".into()),
             commit: None,
+            why_no_commit: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         // The order of the JSON that an older fmgrep wrote as manifest.json;
@@ -456,7 +475,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
             at += pos + key.len();
         }
-        assert!(json.starts_with("{\"format\":8,"), "{json}");
+        assert!(json.starts_with("{\"format\":9,"), "{json}");
         for gone in ["engine", "index_name", "num_files_indexed"] {
             assert!(!json.contains(&format!("\"{gone}\"")), "{gone}: {json}");
         }
@@ -482,6 +501,55 @@ mod tests {
         let json = serde_json::to_string(&served).unwrap();
         let tail = format!("\"blob_lens\":[11],\"commit\":{{\"vcs\":\"git\",\"id\":\"{id}\"}}}}");
         assert!(json.ends_with(&tail), "the commit is the last key: {json}");
+        let unserved = Manifest {
+            commit: None,
+            why_no_commit: Some("the checkout holds a submodule (sub)".into()),
+            ..served
+        };
+        let json = serde_json::to_string(&unserved).unwrap();
+        let tail = "\"blob_lens\":[11],\"why_no_commit\":\"the checkout holds a submodule (sub)\"}";
+        assert!(
+            json.ends_with(tail),
+            "the reason follows the commit: {json}"
+        );
+    }
+
+    /// The reason that an index records no commit reads back, and is
+    /// refused beside a commit or without stored docs.
+    #[test]
+    fn a_reason_reads_back_and_needs_stored_docs_and_no_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("idx");
+        stage(&dir, &[b"hello"], &[b"blob"]);
+        let why = "a.c differs from HEAD";
+        rewrite(&dir, |m| m.why_no_commit = Some(why.into()));
+        assert_eq!(
+            read_manifest(&dir).unwrap().why_no_commit.as_deref(),
+            Some(why)
+        );
+        rewrite(&dir, |m| {
+            m.commit = Some(Commit {
+                vcs: "git".into(),
+                id: "1a2b".into(),
+            })
+        });
+        let err = read_manifest(&dir).unwrap_err();
+        assert!(
+            err.contains("records why it has no commit but records a commit")
+                && err.contains("tampered"),
+            "{err}"
+        );
+        rewrite(&dir, |m| {
+            m.commit = None;
+            m.store_docs = false;
+            m.corpus_root = Some("/corpus".into());
+        });
+        let err = read_manifest(&dir).unwrap_err();
+        assert!(
+            err.contains("records why it has no commit but reads documents from files")
+                && err.contains("tampered"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -563,7 +631,7 @@ mod tests {
         // Every other layout fails at the explicit format check — never a
         // flag or size error, never a silent rebuild.
         let tmp = tempfile::tempdir().unwrap();
-        for format in [1u32, 2, 3, 4, 5, 7, 9, 12] {
+        for format in [1u32, 2, 3, 4, 5, 7, 8, 12] {
             let dir = tmp.path().join(format!("idx{format}"));
             stage(&dir, &[b"hello"], &[b"blob"]);
             patch(&dir, 8, &format.to_le_bytes());
@@ -572,7 +640,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "error: unsupported manifest format {format} in {} (want 8); re-run `index` with this binary",
+                    "error: unsupported manifest format {format} in {} (want 9); re-run `index` with this binary",
                     dir.join(MANIFEST_BIN).display()
                 )
             );
@@ -586,14 +654,14 @@ mod tests {
         let json = tmp.path().join(MANIFEST_JSON);
         let want = |format: &str| {
             format!(
-                "error: unsupported manifest format{format} in {} (want 8); re-run `index` with this binary",
+                "error: unsupported manifest format{format} in {} (want 9); re-run `index` with this binary",
                 json.display()
             )
         };
         for (raw, format) in [
             (r#"{"format":7,"store_docs":true,"files":[]}"#, " 7"),
             (r#"{"format":1,"engine":"fmgrep"}"#, " 1"),
-            (r#"{"format":8}"#, ""),
+            (r#"{"format":9}"#, ""),
             (r#"{"files":[]}"#, ""),
             ("not json", ""),
         ] {

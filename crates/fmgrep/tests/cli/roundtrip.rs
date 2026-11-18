@@ -307,6 +307,10 @@ fn status_prints_the_manifest_of_the_index() {
         if !store_docs {
             want_keys.push("corpus_root");
         }
+        // The corpus is in no git checkout: the reason there is no commit.
+        if store_docs {
+            want_keys.push("why_no_commit");
+        }
         // Then what a search uses, and what its check did.
         let facts = [
             "uses", "note", "learned", "warned", "stale", "added", "gone", "ignores", "record",
@@ -314,6 +318,12 @@ fn status_prints_the_manifest_of_the_index() {
         want_keys.extend(facts);
         assert_eq!(m.as_object().unwrap().len(), want_keys.len(), "{text}");
         assert_eq!(m["uses"], dotdir.to_str().unwrap());
+        let why = m.get("why_no_commit").and_then(|w| w.as_str());
+        assert_eq!(
+            why.is_some_and(|w| w.ends_with(" is in no git checkout")),
+            store_docs,
+            "{text}"
+        );
         let learned = if store_docs { "stored" } else { "not_due" };
         assert_eq!((&m["learned"], &m["note"]), (&learned.into(), &().into()));
         let ignores = if store_docs {
@@ -330,7 +340,7 @@ fn status_prints_the_manifest_of_the_index() {
             at.is_sorted(),
             "{store_docs}: the keys keep their order: {text}"
         );
-        assert_eq!(m["format"], 8);
+        assert_eq!(m["format"], 9);
         for (key, of) in [
             ("store_docs", "store_docs"),
             ("num_docs", "num_files"),
@@ -376,6 +386,10 @@ fn status_prints_the_manifest_of_the_index() {
                 "record: none saved".into(),
             ]);
         } else {
+            want.push(format!(
+                "why_no_commit: {}",
+                m["why_no_commit"].as_str().unwrap()
+            ));
             want.push("changes: none: the index holds the files".into());
         }
         assert_eq!(text.lines().collect::<Vec<_>>(), want, "{store_docs}");
@@ -546,7 +560,7 @@ fn an_index_of_format_7_is_refused_by_its_number() {
     std::fs::write(index.join("blobs.shard"), b"").unwrap();
     let at = index.display().to_string();
     let want = format!(
-        "error: unsupported manifest format 7 in {at}/manifest.json (want 8); re-run `index` with this binary\n"
+        "error: unsupported manifest format 7 in {at}/manifest.json (want 9); re-run `index` with this binary\n"
     );
     for args in [
         &["--index", &at, "printk"][..],

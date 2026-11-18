@@ -4,7 +4,7 @@
 //! words, viewed in place over the bytes of the file. No field is aligned
 //! and there is no padding.
 //!
-//! Header, 88 bytes ([`OnDisk`]):
+//! Header, 96 bytes ([`OnDisk`]):
 //!
 //! | offset | width | field |
 //! |---|---|---|
@@ -20,6 +20,7 @@
 //! | 64 | 8 | shards: the number of blobs, u64 |
 //! | 72 | 8 | bytes of `corpus_root`, u64; 0 when absent |
 //! | 80 | 8 | bytes of the served commit, u64; 0 when absent |
+//! | 88 | 8 | bytes of `why_no_commit`, u64; 0 when absent |
 //!
 //! Then the sections, in this order, each right after the one before:
 //!
@@ -31,8 +32,9 @@
 //! 5. `corpus_root`, UTF-8;
 //! 6. the served commit, UTF-8: the VCS, one space, then the commit id in
 //!    lowercase hex (`git 1a2b...`);
-//! 7. the label text: the `blobs` labels, joined;
-//! 8. the path text: the `files` paths, joined, by id.
+//! 7. `why_no_commit`, UTF-8: why the index records no served commit;
+//! 8. the label text: the `blobs` labels, joined;
+//! 9. the path text: the `files` paths, joined, by id.
 //!
 //! The file ends where the path text ends. The reader checks the magic,
 //! then the format, before anything else. zerocopy checks that each table
@@ -77,9 +79,10 @@ struct OnDisk {
     num_shards: U64,
     root_len: U64,
     commit_len: U64,
+    why_len: U64,
 }
 
-const _: () = assert!(size_of::<OnDisk>() == 88);
+const _: () = assert!(size_of::<OnDisk>() == 96);
 
 /// Whether `vcs` and `id` make a served commit this layout holds: a VCS
 /// name of lowercase ASCII letters and digits, and an id of lowercase hex
@@ -124,6 +127,7 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
         }
         Some(c) => format!("{} {}", c.vcs, c.id),
     };
+    let why = m.why_no_commit.as_deref().unwrap_or_default();
     let root = m.corpus_root.as_deref().unwrap_or_default();
     let head = OnDisk {
         prefix: Prefix {
@@ -140,6 +144,7 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
         num_shards: U64::new(m.blobs.len() as u64),
         root_len: U64::new(root.len() as u64),
         commit_len: U64::new(commit.len() as u64),
+        why_len: U64::new(why.len() as u64),
     };
     out.write_all(head.as_bytes())?;
     write_words(out, m.doc_lens.iter().copied())?;
@@ -148,6 +153,7 @@ pub fn encode(m: &Manifest, out: &mut impl Write) -> io::Result<()> {
     write_words(out, ends_of(m.blobs.iter()))?;
     out.write_all(root.as_bytes())?;
     out.write_all(commit.as_bytes())?;
+    out.write_all(why.as_bytes())?;
     for label in &m.blobs {
         out.write_all(label.as_bytes())?;
     }
@@ -251,6 +257,7 @@ pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, Stri
     let (label_ends, rest) = words(rest, head.num_shards).ok_or_else(|| short("label ends"))?;
     let (root, rest) = split(rest, head.root_len).ok_or_else(|| short("corpus_root"))?;
     let (commit, rest) = split(rest, head.commit_len).ok_or_else(|| short("served commit"))?;
+    let (why, rest) = split(rest, head.why_len).ok_or_else(|| short("why_no_commit"))?;
     let labels_len = last_end(label_ends, "shard label").map_err(&bad)?;
     let paths_len = last_end(path_ends, "path").map_err(&bad)?;
     let (labels, paths) = split(rest, labels_len).ok_or_else(|| short("shard labels"))?;
@@ -283,6 +290,7 @@ pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, Stri
             }
         },
     };
+    let why = utf8(why, "a why_no_commit")?;
     let labels = utf8(labels, "a shard label")?;
     let label_ends = with_zero(label_ends);
     cuts(labels, &label_ends, "shard label").map_err(&bad)?;
@@ -309,6 +317,7 @@ pub fn decode(bytes: impl Bytes + 'static, path: &Path) -> Result<Manifest, Stri
         corpus_root: (!root.is_empty()).then(|| root.to_owned()),
         files,
         commit,
+        why_no_commit: (!why.is_empty()).then(|| why.to_owned()),
     })
 }
 

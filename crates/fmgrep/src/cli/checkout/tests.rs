@@ -8,7 +8,7 @@ const ID: &str = "0123456789abcdef0123456789abcdef01234567";
 /// and `id`.
 fn status(vcs: &str, id: &str) -> ServeStatus {
     serde_json::from_value(serde_json::json!({
-        "format": 8,
+        "format": 9,
         "store_docs": true,
         "files": 1,
         "num_bytes": 1,
@@ -102,7 +102,7 @@ fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
     let index = top.join(".fmgrep");
     for (store_docs, root) in [(false, &top), (true, &index)] {
         let status: ServeStatus = serde_json::from_value(serde_json::json!({
-            "format": 8,
+            "format": 9,
             "store_docs": store_docs,
             "files": 1,
             "num_bytes": 1,

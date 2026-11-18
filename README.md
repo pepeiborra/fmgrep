@@ -143,7 +143,7 @@ and what changed since it was built:
 ```console
 $ fmgrep status
 a search here uses the local index /home/me/ghc/.fmgrep
-format: 8
+format: 9
 store_docs: false
 num_docs: 26787
 num_bytes: 88781005
@@ -177,11 +177,12 @@ line). `fmgrep status --server ADDR` takes `--server` as a search does.
 
 `fmgrep index --store-docs` of the top of a git checkout records the
 served commit, or says in a note why it cannot
-([Dependencies](#dependencies)). With `--require-served-commit` it fails
-with that reason instead, exits 2, and leaves no index. A reason that git
-alone can tell, such as an edited file, fails before the index reads a
-file. Build a server's index with it when every client must be able to
-search its own changes.
+([Dependencies](#dependencies)); the manifest keeps that reason, and
+`fmgrep status` of the index prints it as `why_no_commit`. With
+`--require-served-commit` it fails with that reason instead, exits 2, and
+leaves no index. A reason that git alone can tell, such as an edited file,
+fails before the index reads a file. Build a server's index with it when
+every client must be able to search its own changes.
 
 For many searches in a row, keep the index loaded in a server:
 

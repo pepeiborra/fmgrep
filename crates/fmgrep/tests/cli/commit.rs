@@ -1,7 +1,7 @@
 //! Which commit a `--store-docs` index records as served, on real git
 //! repositories.
 
-use crate::git::{Sandbox, commit_of};
+use crate::git::{Sandbox, commit_of, why_of};
 
 const FILES: [(&str, &str); 3] = [
     ("a.c", "printk a\n"),
@@ -16,6 +16,22 @@ fn note(stderr: &str) -> String {
     notes[0].to_owned()
 }
 
+/// The reason in the note of a build that records no commit.
+fn reason(stderr: &str) -> String {
+    let note = note(stderr);
+    note.strip_prefix("note: the index records no served commit (")
+        .and_then(|w| w.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{note}"))
+        .to_owned()
+}
+
+/// The index records no commit, and its manifest keeps the reason that the
+/// note of its build gave, word for word, which `status` prints.
+fn unrecorded(index: &std::path::Path, stderr: &str, name: &str) {
+    assert_eq!(commit_of(index), None, "{name}");
+    assert_eq!(why_of(index), Some(reason(stderr)), "{name}");
+}
+
 #[test]
 fn a_clean_checkout_records_its_head() {
     let s = Sandbox::new();
@@ -27,6 +43,7 @@ fn a_clean_checkout_records_its_head() {
         format!("note: the index holds commit {head}")
     );
     assert_eq!(commit_of(&index), Some(head));
+    assert_eq!(why_of(&index), None);
 }
 
 /// A change made to a checkout.
@@ -97,7 +114,7 @@ fn a_changed_checkout_records_no_commit() {
         let (index, stderr) = s.index(&repo, &format!("idx-{name}"));
         let want = format!("note: the index records no served commit ({why})");
         assert_eq!(note(&stderr), want, "{name}");
-        assert_eq!(commit_of(&index), None, "{name}");
+        unrecorded(&index, &stderr, name);
     }
 }
 
@@ -112,7 +129,7 @@ fn only_the_top_of_a_checkout_records_a_commit() {
         repo.display()
     );
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 
     let plain = s.path("plain");
     s.write(&plain, &FILES);
@@ -123,14 +140,15 @@ fn only_the_top_of_a_checkout_records_a_commit() {
         plain.display()
     );
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 
     let unborn = s.path("unborn");
     s.write(&unborn, &FILES);
     s.git(&unborn, &["init", "-q", "-b", "main"]);
-    let (_, stderr) = s.index(&unborn, "idx-unborn");
+    let (index, stderr) = s.index(&unborn, "idx-unborn");
     let want = "note: the index records no served commit (the checkout has no commit yet)";
     assert_eq!(note(&stderr), want);
+    unrecorded(&index, &stderr, "unborn");
 }
 
 /// A file that git converts on checkout differs from its blob, though git
@@ -161,7 +179,7 @@ fn a_converted_file_records_no_commit() {
         let (index, stderr) = s.index(&repo, &format!("idx-{name}"));
         let want = "note: the index records no served commit (a.c differs from its blob in HEAD)";
         assert_eq!(note(&stderr), want, "{name}");
-        assert_eq!(commit_of(&index), None, "{name}");
+        unrecorded(&index, &stderr, name);
     }
 }
 
@@ -177,7 +195,7 @@ fn an_ignore_rule_from_outside_records_no_commit() {
         let (index, stderr) = s.index(repo, &format!("idx-{name}"));
         let want = format!("note: the index records no served commit ({why})");
         assert_eq!(note(&stderr), want, "{name}");
-        assert_eq!(commit_of(&index), None, "{name}");
+        unrecorded(&index, &stderr, name);
     };
     let outside = |path: &std::path::Path| {
         format!(
@@ -289,6 +307,7 @@ fn a_plain_index_records_no_commit() {
     assert!(out.status.success());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("note:"));
     assert_eq!(commit_of(&s.path("idx")), None);
+    assert_eq!(why_of(&s.path("idx")), None);
 }
 
 const REQUIRE: &str = "--require-served-commit";
@@ -332,12 +351,8 @@ fn required(
     reset();
     let (code, stderr) = build(s, dir, &format!("idx-{name}"), &[], path);
     assert_eq!(code, Some(0), "{name}: {stderr}");
-    let note = note(&stderr);
-    let why = note
-        .strip_prefix("note: the index records no served commit (")
-        .and_then(|w| w.strip_suffix(')'))
-        .unwrap_or_else(|| panic!("{name}: {note}"))
-        .to_owned();
+    let why = reason(&stderr);
+    unrecorded(&s.path(&format!("idx-{name}")), &stderr, name);
     let error = format!("error: the index cannot record its served commit: {why}\n");
     let mut runs = vec![format!("req-{name}")];
     if early {
@@ -670,7 +685,7 @@ fn a_file_staged_after_git_status_records_no_commit() {
     assert_eq!(s.git(&repo, &["diff", "--cached", "--name-only"]), "a.c\n");
     let want = "note: the index records no served commit (a.c differs from its blob in HEAD)";
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&s.path("idx")), None);
+    unrecorded(&s.path("idx"), &stderr, "");
 }
 
 /// A file moved away from the walk and put back before the second git
@@ -694,7 +709,7 @@ fn a_file_moved_away_from_the_walk_records_no_commit() {
     assert_eq!(s.git(&repo, &["status", "--porcelain"]), "");
     let want = "note: the index records no served commit (the folder dir changed during the build)";
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&s.path("idx")), None);
+    unrecorded(&s.path("idx"), &stderr, "");
 }
 
 /// Git's replace refs are not followed: a checkout reset to a replaced
@@ -716,7 +731,7 @@ fn a_replaced_head_records_no_commit() {
     let (index, stderr) = s.index(&repo, "idx");
     let want = "note: the index records no served commit (a.c differs from HEAD)";
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 }
 
 /// A file that git turns binary on checkout is left out of the index,
@@ -739,7 +754,7 @@ fn a_file_made_binary_on_checkout_records_no_commit() {
     assert!(stderr.contains("skipped 1 non-text file(s)"), "{stderr}");
     let want = "note: the index records no served commit (nul.c differs from its blob in HEAD)";
     assert_eq!(note(&stderr), want);
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 }
 
 /// A blob that git cannot read gives git's own reason.
@@ -764,7 +779,7 @@ fn an_unreadable_blob_says_why_git_failed() {
         "{note}"
     );
     assert!(!note.contains("has no blob"), "{note}");
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 }
 
 /// A tracked ignore file that a filter changes on checkout holds rules
@@ -791,7 +806,7 @@ fn an_ignore_file_converted_on_checkout_records_no_commit() {
         note(&stderr),
         format!("note: the index records no served commit ({why})")
     );
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 }
 
 /// An ignore file edited for the walk and restored for git status gave the
@@ -813,7 +828,7 @@ fn an_ignore_file_edited_during_the_build_records_no_commit() {
         note(&stderr),
         format!("note: the index records no served commit ({why})")
     );
-    assert_eq!(commit_of(&s.path("idx")), None);
+    unrecorded(&s.path("idx"), &stderr, "");
 }
 
 /// Leading blanks belong to a gitignore pattern: ` #v.c` is a rule for the
@@ -832,7 +847,7 @@ fn a_pattern_after_blanks_outside_records_no_commit() {
         note(&stderr),
         format!("note: the index records no served commit ({why})")
     );
-    assert_eq!(commit_of(&index), None);
+    unrecorded(&index, &stderr, "");
 }
 
 /// A server's `status` reports the format and the served commit of a
@@ -845,12 +860,12 @@ fn status_reports_the_served_commit() {
     let (index, _) = s.index(&repo, "idx");
     let (_server, addr) = s.serve(&index, &[]);
     let status = s.status(&addr);
-    assert_eq!(status["format"], 8);
+    assert_eq!(status["format"], 9);
     assert_eq!(status["commit"]["vcs"], "git");
     assert_eq!(status["commit"]["id"], s.head(&repo));
     let lines = s.status_lines(&addr);
     let commit = format!("commit: git {}", s.head(&repo));
-    assert_eq!(lines[1], "format: 8", "{lines:?}");
+    assert_eq!(lines[1], "format: 9", "{lines:?}");
     assert_eq!(lines.last(), Some(&commit), "{lines:?}");
     let plain = s.path("plain").display().to_string();
     let out = s.run(&repo, &["index", ".", "--output", &plain]);
