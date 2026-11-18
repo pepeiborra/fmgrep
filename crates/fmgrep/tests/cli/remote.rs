@@ -490,7 +490,9 @@ fn a_served_commit_of_another_vcs_is_not_compared() {
 /// A server that reports no served commit. From the tree it serves: no
 /// warning from a files-layout server, which reads that tree; the warning
 /// from a `--store-docs` server, whose stored docs ignore the edits made
-/// there. From another checkout: the warning; from no checkout: none.
+/// there. From another checkout: the warning; from no checkout: none. The
+/// warning says why: the reason that the build of a `--store-docs` index
+/// gave, or that only such an index records a commit.
 #[test]
 fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
     let s = Sandbox::new();
@@ -519,13 +521,125 @@ fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
         assert!(out.status.success(), "{}", stderr(&out));
         stderr(&out)
     };
-    let why = |addr: &str| ignored(&format!("the server at {addr} reports no served commit"));
+    let why = |addr: &str, because: &str| {
+        ignored(&format!(
+            "the server at {addr} reports no served commit: {because}"
+        ))
+    };
+    let edited = "a.c differs from HEAD";
+    let only = "only a --store-docs index records one";
     assert_eq!(search(&origin, &files), "");
-    assert_eq!(search(&stored, &docs), why(&docs));
+    assert_eq!(search(&stored, &docs), why(&docs, edited));
+    assert_eq!(search(&client, &docs), why(&docs, edited));
+    assert_eq!(search(&client, &files), why(&files, only));
     for addr in [&files, &docs] {
-        assert_eq!(search(&client, addr), why(addr));
         assert_eq!(search(&home, addr), "");
     }
+}
+
+/// Each cause that an index has no served commit reaches the client's
+/// warning word for word, and the server's status: a submodule, a dirty
+/// tree, an ignore file outside the checkout, a file that differs from its
+/// blob, and a directory in no checkout. An index that records a commit
+/// has no reason, and its client no warning.
+#[test]
+fn the_warning_says_why_the_server_serves_no_commit() {
+    let s = Sandbox::new();
+    let client = s.repo("client", &FILES);
+    let search = |addr: &str| {
+        let out = s
+            .fmgrep(&client)
+            .args(["--server", addr, "-l", "printk"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        stderr(&out)
+    };
+    let warning = |addr: &str, why: &str| {
+        ignored(&format!(
+            "the server at {addr} reports no served commit: {why}"
+        ))
+    };
+    // A checked out submodule, as in a checkout of a large project.
+    let inner = s.repo("inner", &[("x.c", "printk x\n")]);
+    let submodule = s.repo("with-submodule", &FILES);
+    let url = inner.display().to_string();
+    let add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"];
+    s.git(&submodule, &[&add[..], &[&url, "agents/internal"]].concat());
+    s.commit(&submodule, "submodule");
+    let dirty = s.repo("dirty", &FILES);
+    s.write(&dirty, &[("a.c", "printk edited\n")]);
+    let outside = s.repo("outside", &FILES);
+    s.write(&outside, &[(".git/info/exclude", "*.h\n")]);
+    let filtered = s.repo("filtered", &FILES);
+    s.write(&filtered, &[(".gitattributes", "*.c filter=up\n")]);
+    s.commit(&filtered, "attributes");
+    s.git(&filtered, &["config", "filter.up.smudge", "tr a-z A-Z"]);
+    s.git(&filtered, &["config", "filter.up.clean", "tr A-Z a-z"]);
+    std::fs::remove_file(filtered.join("a.c")).unwrap();
+    s.git(&filtered, &["checkout", "--", "a.c"]);
+    let bare = s.path("no-checkout");
+    s.write(&bare, &FILES);
+    let bare = std::fs::canonicalize(bare).unwrap();
+    let exclude = format!(
+        "the ignore file {} outside the checkout has a pattern",
+        outside.join(".git/info/exclude").display()
+    );
+    let cases = [
+        (
+            &submodule,
+            "the checkout holds a submodule (agents/internal)".to_owned(),
+        ),
+        (&dirty, "a.c differs from HEAD".to_owned()),
+        (&outside, exclude),
+        (&filtered, "a.c differs from its blob in HEAD".to_owned()),
+        (&bare, format!("{} is in no git checkout", bare.display())),
+    ];
+    for (i, (dir, why)) in cases.iter().enumerate() {
+        let (index, built) = s.index(dir, &format!("idx-{i}"));
+        let note = format!("note: the index records no served commit ({why})");
+        assert!(built.lines().any(|l| l == note), "{why}: {built}");
+        let (_server, addr) = s.serve(&index, &[]);
+        assert_eq!(search(&addr), warning(&addr, why), "{why}");
+        // From no checkout there is nothing to ignore.
+        let home = std::fs::canonicalize(s.path("home")).unwrap();
+        let out = s
+            .fmgrep(&home)
+            .args(["--server", &addr, "-l", "printk"])
+            .output()
+            .unwrap();
+        assert_eq!(stderr(&out), "", "{why}");
+        // The server's status and the index's say it too.
+        assert_eq!(s.status(&addr)["why_no_commit"], why.as_str());
+        let line = format!("why_no_commit: {why}");
+        assert_eq!(s.status_lines(&addr).last(), Some(&line), "{why}");
+        assert_eq!(crate::git::why_of(&index).as_ref(), Some(why));
+    }
+}
+
+/// An index that records a commit gives no reason: its client's search
+/// prints no warning, and `status --server` shows the commit and no
+/// reason.
+#[test]
+fn a_server_of_a_served_commit_gives_no_reason() {
+    let r = Remote::new(&FILES);
+    let out = r.search(&r.client, &["-l", "printk"]);
+    assert!(
+        !stderr(&out).contains("local changes are ignored"),
+        "{}",
+        stderr(&out)
+    );
+    let status = r.s.status(&r.addr);
+    assert_eq!(status["commit"]["id"], r.commit.as_str());
+    assert!(status.get("why_no_commit").is_none(), "{status}");
+    let lines = r.s.status_lines(&r.addr);
+    let commit = format!("commit: git {}", r.commit);
+    let n = lines.len();
+    assert_eq!(
+        lines[n - 2..],
+        [commit.as_str(), "why_no_commit: none"],
+        "{lines:?}"
+    );
 }
 
 /// A checkout at another path than the served tree: PATH arguments and

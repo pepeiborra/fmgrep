@@ -62,6 +62,18 @@ pub fn pin_of(status: &ServeStatus) -> Option<&str> {
     git_commit(&commit.vcs, &commit.id).then_some(commit.id.as_str())
 }
 
+/// What follows "reports no served commit": why the server serves none,
+/// when it says. A `store_docs` index gives the reason that its build
+/// had; a files layout never has a commit; an index of neither (made by
+/// hand) says nothing.
+fn why_none(status: &ServeStatus) -> String {
+    match (status.store_docs, &status.why_no_commit) {
+        (_, Some(why)) => format!(": {why}"),
+        (false, None) => ": only a --store-docs index records one".to_owned(),
+        (true, None) => String::new(),
+    }
+}
+
 /// How a search from canonical `cwd` through `server`, of `status`, treats
 /// the checkout.
 pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
@@ -73,7 +85,10 @@ pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
         let served = !status.store_docs
             && std::fs::canonicalize(&status.root).is_ok_and(|t| cwd.starts_with(t));
         return match (served, top) {
-            (false, Some(_)) => Plan::Degraded(format!("{server} reports no served commit")),
+            (false, Some(_)) => Plan::Degraded(format!(
+                "{server} reports no served commit{}",
+                why_none(status)
+            )),
             _ => Plan::Plain,
         };
     };

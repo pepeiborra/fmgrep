@@ -79,7 +79,7 @@ fn serve_stdio_matches_query() {
             .map(|k| k.as_str())
             .collect();
         keys.sort_unstable();
-        let want = [
+        let mut want = vec![
             "files",
             "format",
             "index_size_bytes",
@@ -88,7 +88,17 @@ fn serve_stdio_matches_query() {
             "root",
             "store_docs",
         ];
+        // The corpus is in no git checkout: the reason there is no commit.
+        if store_docs {
+            want.push("why_no_commit");
+        }
         assert_eq!(keys, want, "store_docs={store_docs}");
+        let why = status.get("why_no_commit").and_then(|w| w.as_str());
+        assert_eq!(
+            why.is_some_and(|w| w.ends_with(" is in no git checkout")),
+            store_docs,
+            "store_docs={store_docs}"
+        );
         let docs = match store_docs {
             true => index.clone(),
             false => PathBuf::from(read_manifest(&index).unwrap().corpus_root.unwrap()),

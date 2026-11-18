@@ -72,7 +72,10 @@ The causes include:
 - more than 10,000 files differ or would be searched;
 - the server reports no served commit (a `--store-docs` index that
   recorded none, or a files-layout server searched from outside its
-  tree), or one that is not a full git commit id.
+  tree), or one that is not a full git commit id. The warning then says
+  why: the reason that the index build gave (`the server at ADDR reports
+  no served commit: the checkout holds a submodule (agents/internal)`),
+  or that only a `--store-docs` index records one.
 
 [protocol.md](protocol.md#from-a-checkout) has the full list. Every
 search checks again, and warns again.

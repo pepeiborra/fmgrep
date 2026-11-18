@@ -90,7 +90,7 @@ output is not UTF-8, `bytes` (standard base64) replaces `text`.
 > {"jsonrpc":"2.0","id":4,"method":"query","params":{"terms":["greet"],"mode":"files"}}
 < {"jsonrpc":"2.0","id":4,"result":{"text":"README.md\napp/Main.hs\nsrc/Lib.hs\n","report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":26,"total_matches":3,"docs_matched":3,"counts_exact":false}]}}}
 > {"jsonrpc":"2.0","id":5,"method":"status"}
-< {"jsonrpc":"2.0","id":5,"result":{"format":8,"store_docs":false,"files":3,"num_bytes":197,"index_size_bytes":34456,"load_us":4305,"root":"/src/demo"}}
+< {"jsonrpc":"2.0","id":5,"result":{"format":9,"store_docs":false,"files":3,"num_bytes":197,"index_size_bytes":34456,"load_us":4305,"root":"/src/demo"}}
 ```
 
 `root` is where the server reads the documents: the tree, or the index
@@ -100,8 +100,17 @@ older than this field leaves it out. `commit`, as `{"vcs":"git","id":"<40
 hex>"}`, is the served commit: the commit whose files a `--store-docs`
 index holds ([index-format.md](index-format.md#served-commit)). It is
 absent when the index records none, and from every index that reads the
-tree. `fmgrep status --server ADDR` prints them as `format: 8` and
-`commit: git <id>`, and `none` for a field the reply leaves out.
+tree. `why_no_commit` is a string: why a `--store-docs` index records no
+served commit, as the note of its build said it (`the checkout holds a
+submodule (agents/internal)`). It is absent when the index records a
+commit, from every index that reads the tree, and from a server older
+than this field; a client ignores it where it does not know it. The text
+is the build's: it can name paths of the server's machine (the indexed
+directory, its git checkout, the global excludes file), as `root` does.
+Build with `--require-served-commit` to serve no index without a commit.
+`fmgrep status --server ADDR` prints them as `format: 9`, `commit: git
+<id>` and `why_no_commit: <why>`, and `none` for a field the reply leaves
+out.
 
 ### Streamed output
 
@@ -236,7 +245,7 @@ Counting semantics:
 | -32601 | unknown method | `unknown method "nope"` |
 | -32602 | bad params | `` invalid params: missing field `terms` `` |
 | -32000 | the search failed | `` error: invalid regex pattern "(": regex parse error: ... `` |
-| -32001 | `format` or `commit` is not this server's | `this server serves commit 81b12d8... of index format 8` |
+| -32001 | `format` or `commit` is not this server's | `this server serves commit 81b12d8... of index format 9` |
 
 The `id` is echoed, or null when the request has none that can be read.
 Serving continues after any error.
@@ -338,7 +347,12 @@ handed to git): PATHs and the cwd still resolve against the top of the
 checkout, and the query carries the served commit. A server that
 reports no served commit makes a search fall back from any checkout
 when it serves a `--store-docs` index, and from a checkout outside its
-tree when it serves a files-layout index. A files-layout server reads
+tree when it serves a files-layout index. The warning then names the
+server and says why it serves no commit: `the server at ADDR reports no
+served commit: <why>`, with the server's `why_no_commit`, or `only a
+--store-docs index records one` for a files-layout server. A
+`--store-docs` server that gives no reason (an index made by hand) gets
+the words before the colon alone. A files-layout server reads
 its tree, so a search from inside that tree gets the tree as it is and
 does not fall back. A server that reports a served commit makes a
 search from a cwd in no checkout fall back too. For a server with no

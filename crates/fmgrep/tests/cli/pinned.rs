@@ -214,7 +214,8 @@ fn a_server_of_another_index_of_the_commit_answers_right() {
     let (_files, addr) = r.s.serve(&r.s.path("idx-files"), &["--no-watch"]);
     proxy.point(&addr);
     let why = format!(
-        "the server at {} (FMGREP_SERVER) reports no served commit",
+        "the server at {} (FMGREP_SERVER) reports no served commit: only a --store-docs index \
+         records one",
         proxy.addr
     );
     for methods in [

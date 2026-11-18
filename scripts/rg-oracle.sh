@@ -199,7 +199,7 @@ served() {
     # The tree holds .git, and stored docs that record no commit ignore its
     # edits: the client says so.
     if [[ "$STORE_DOCS" == true ]]; then
-        grep -vF "warning: local changes are ignored (the server at $ADDR reports no served commit)" \
+        grep -vF "warning: local changes are ignored (the server at $ADDR reports no served commit" \
             "$WORK/srv.err" > "$WORK/srv.rest" || true
         mv "$WORK/srv.rest" "$WORK/srv.err"
     fi

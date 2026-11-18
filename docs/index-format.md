@@ -139,7 +139,9 @@ for recording no commit, as text: `the checkout holds a submodule
 (agents/internal)`. It is empty, with a length of 0, when the index
 records a commit and for an index without `--store-docs`, which never runs
 git. `fmgrep status` of the index prints it, and `--json` has it as
-`why_no_commit`. It is not a promise about the text: the words are
+`why_no_commit`. A server's `status` reports it, and a client that cannot
+compare its checkout for want of a served commit says it
+([protocol.md](protocol.md#from-a-checkout)). It is not a promise about the text: the words are
 git's and fmgrep's, and can name paths of the machine that built the
 index.
 
