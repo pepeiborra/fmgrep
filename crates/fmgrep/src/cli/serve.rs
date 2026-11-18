@@ -14,6 +14,7 @@ use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{Ask, Skip};
 use crate::manifest::{Checked, Commit, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
+use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
 use crate::remote::{Conn, RpcError};
 use crate::sharded::DocfmIndex;
@@ -52,6 +53,54 @@ impl Rendered {
             bytes,
             report,
         }
+    }
+}
+
+const FRAME: usize = 64 << 10;
+/// Room for the longest header in front of a frame.
+const HEAD: usize = 8;
+
+/// `rendered` output: `<len>\n<len bytes>` frames of at most [`FRAME`] bytes,
+/// each one write.
+struct Frames<'a> {
+    out: &'a mut dyn Write,
+    buf: Vec<u8>,
+}
+
+impl<'a> Frames<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        let mut buf = Vec::with_capacity(HEAD + FRAME);
+        buf.resize(HEAD, 0);
+        Self { out, buf }
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        let len = self.buf.len() - HEAD;
+        if len == 0 {
+            return Ok(());
+        }
+        let head = format!("{len}\n");
+        let start = HEAD - head.len();
+        self.buf[start..HEAD].copy_from_slice(head.as_bytes());
+        let sent = self.out.write_all(&self.buf[start..]);
+        self.buf.truncate(HEAD);
+        sent
+    }
+}
+
+impl Write for Frames<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        let n = b.len().min(HEAD + FRAME - self.buf.len());
+        self.buf.extend_from_slice(&b[..n]);
+        if self.buf.len() == HEAD + FRAME {
+            self.emit()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit()?;
+        self.out.flush()
     }
 }
 
@@ -145,6 +194,19 @@ impl Served<'_> {
         let answered = match p.mode {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
             // Output so far precedes an error, as in a local search.
+            _ if p.stream && p.rendered => {
+                let mut frames = Frames::new(out);
+                let rendered = render(p, false, &mut frames, run);
+                let sent = frames.flush();
+                rendered.and_then(|report| {
+                    sent.map_err(|e| format!("{WRITE_FAILED} matches: {e}"))?;
+                    Ok(Answer::Rendered(Rendered {
+                        text: None,
+                        bytes: None,
+                        report,
+                    }))
+                })
+            }
             _ if p.stream => {
                 let mut frames = FileFrames::new(out);
                 let report = run(&mut frames);
@@ -280,6 +342,7 @@ fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String
                 _ if !p.skip.is_empty() && (p.commit.is_none() || !p.stream) => {
                     Some("skip needs commit and stream".to_owned())
                 }
+                _ if p.rendered && !p.stream => Some("rendered needs stream".to_owned()),
                 _ if p.skip.len() > MAX_SKIP => Some(format!(
                     "skip lists {} files; the limit is {MAX_SKIP}",
                     p.skip.len()
@@ -515,6 +578,36 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
     ask_on(conn, "status")
 }
 
+/// `p` (with `stream` and `rendered`) answered by the server: its output
+/// copied to `out` as it comes, as a local search prints it, then the
+/// report. The search fails as a local one does when it searched no file.
+pub fn rendered(
+    conn: &mut Conn,
+    p: &QueryParams,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<OutputReport, String> {
+    let sent =
+        serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
+    // The report alone is printed by this client under `--json`.
+    let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
+    let mut pipe = Pipe::new(&mut *out);
+    let result = conn.call("query", sent, &mut |frame| match printed {
+        true => pipe.raw(frame),
+        false => Ok(()),
+    })?;
+    pipe.finish()?;
+    let report = match p.mode {
+        Mode::Counts => conn.decode(result)?,
+        _ => conn.decode::<Rendered>(result)?.report,
+    };
+    let report = super::searched(report, p)?;
+    match printed {
+        true => Ok(report),
+        false => render(p, json, out, |_| Ok(report)),
+    }
+}
+
 /// `p` (with `stream`) answered by the server: each event to `sink`, then
 /// the report.
 pub fn remote(
@@ -532,3 +625,6 @@ pub fn remote(
         _ => Ok(conn.decode::<Rendered>(result)?.report),
     }
 }
+
+#[cfg(test)]
+mod tests;

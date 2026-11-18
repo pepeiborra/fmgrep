@@ -410,10 +410,21 @@ fn client(
     p.stream = true;
     p.format = Some(MANIFEST_FORMAT);
     let answered = match ours {
-        None => render(&p, json, out, |sink| {
-            serve::remote(&mut conn, &p, sink).and_then(|report| searched(report, &p))
-        }),
-        Some((top, (skip, local))) => merged(&mut conn, p, &top, skip, &local, json, out),
+        // The client's own files go between the server's: it needs each
+        // file of the server's in a frame of its own.
+        Some((top, (skip, local))) if !local.files.is_empty() => {
+            merged(&mut conn, p, &top, skip, &local, json, out)
+        }
+        // The server's files only, those on the skip list (deleted
+        // files) left out: its output is the search's.
+        ours => {
+            // Counts have no output to copy.
+            p.rendered = p.mode != Mode::Counts;
+            if let Some((_, (skip, _))) = ours {
+                p.skip = skip;
+            }
+            serve::rendered(&mut conn, &p, json, out)
+        }
     };
     answered
         .map(Outcome::Query)

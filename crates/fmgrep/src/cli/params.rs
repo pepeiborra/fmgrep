@@ -61,6 +61,11 @@ pub struct QueryParams {
     /// term's start and end, each matching file) before the response.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
+    /// With `stream`: send what a local search prints, in frames of up to
+    /// 64 KiB, in place of one frame per event. A client that prints the
+    /// server's output as it is has no use for the events.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rendered: bool,
     /// `lines` and `only`: print rg's statistics after each term's output.
     #[serde(default, skip_serializing_if = "is_false")]
     pub stats: bool,
@@ -158,6 +163,7 @@ impl Default for QueryParams {
             cwd: String::new(),
             filename: true,
             stream: false,
+            rendered: false,
             stats: false,
             format: None,
             commit: None,

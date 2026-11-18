@@ -372,18 +372,19 @@ fn frame(payload: &str) -> String {
 fn a_server_error_after_output_keeps_the_output() {
     let error =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"error: boom\"}}\n";
-    let sent = [
-        frame("{\"term\":\"printk\"}\n"),
-        frame("{\"doc\":\"a\",\"path\":\"a\",\"stats\":[1,1,6]}\nhello!"),
-        error.to_owned(),
-    ]
-    .concat();
-    let cut = [frame("{\"term\":\"printk\"}\n"), "60\n{\"doc\"".to_owned()].concat();
+    // A client that has no file of its own to merge asks for the server's
+    // output as it prints, in frames of bytes.
+    let sent = [frame("hel"), frame("lo!"), error.to_owned()].concat();
+    let cut = [frame("hello!"), "60\n{\"doc\"".to_owned()].concat();
     // A length no frame can have allocates nothing before its bytes.
     let huge = format!("{}\n{{\"doc\"", usize::MAX);
     for (reply, printed, error) in [
         (sent.as_bytes(), &b"hello!"[..], "server: boom"),
-        (cut.as_bytes(), b"", "{addr}: connection closed mid-frame"),
+        (
+            cut.as_bytes(),
+            b"hello!",
+            "{addr}: connection closed mid-frame",
+        ),
         (huge.as_bytes(), b"", "{addr}: connection closed mid-frame"),
     ] {
         let status = status_reply(Some(crate::manifest::MANIFEST_FORMAT));
@@ -418,6 +419,76 @@ fn a_client_leaving_mid_stream_leaves_the_server_serving() {
     assert_eq!(counted, printed(&index, &["-c"], &["printk"]));
     client(&addr, &["--shutdown"]).unwrap();
     server.join().unwrap().unwrap();
+}
+
+/// `rendered`: the frames hold what the local search prints, cut at 64 KiB.
+#[test]
+fn rendered_frames_carry_what_a_local_search_prints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = stage_big(tmp.path(), 16_000);
+    let whole = |params: &str| {
+        let request =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"query","params":{{{params}}}}}"#);
+        let got = serve_stdio(&index, &[&request]);
+        got[0]["result"]["text"]
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    };
+    for mode in ["lines", "files", "count"] {
+        let params = format!(r#""terms":["printk"],"mode":"{mode}""#);
+        let got = serve_frames(
+            &index,
+            &[&streamed(&format!(r#"{params},"rendered":true"#))],
+        );
+        let (frames, response) = &got[0];
+        assert_eq!(frames.concat(), whole(&params), "{mode}");
+        assert!(response["result"].get("text").is_none(), "{response}");
+        let sizes: Vec<usize> = frames.iter().map(Vec::len).collect();
+        assert!(
+            sizes[..sizes.len() - 1].iter().all(|&n| n == 64 << 10),
+            "{sizes:?}"
+        );
+        if mode == "lines" {
+            assert!(sizes.len() > 10, "{sizes:?}");
+        }
+    }
+    // It needs `stream`.
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["printk"],"mode":"lines","rendered":true}}"#;
+    let got = serve_stdio(&index, &[request]);
+    assert_eq!(got[0]["error"]["code"], -32602, "{got:?}");
+    assert_eq!(
+        got[0]["error"]["message"],
+        "invalid params: rendered needs stream"
+    );
+}
+
+/// A pinned query that searched no file still sends what a local search
+/// prints before its error (statistics, rg's summary), and the report says
+/// that no file was searched.
+#[test]
+fn a_rendered_search_of_no_file_sends_what_a_local_search_prints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), true);
+    let id = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    pin(&index, id);
+    for (mode, ends) in [
+        ("lines", " seconds total\n"),
+        ("only", " seconds total\n"),
+        ("json_matches", "\"type\":\"summary\"}\n"),
+    ] {
+        let request = streamed(&format!(
+            r#""terms":["printk"],"mode":"{mode}","stats":true,"rendered":true,"globs":["a.c"],"commit":"{id}","skip":["a.c"]"#
+        ));
+        let got = serve_frames(&index, &[&request]);
+        let sent = String::from_utf8(got[0].0.concat()).unwrap();
+        assert!(sent.trim_end().ends_with(ends.trim_end()), "{mode}: {sent}");
+        assert_eq!(
+            got[0].1["result"]["report"]["none_searched"], true,
+            "{mode}"
+        );
+    }
 }
 
 /// A reply much smaller than the server's output buffer still reaches a
