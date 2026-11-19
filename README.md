@@ -34,69 +34,22 @@ or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
 
 ## Dependencies
 
-To build fmgrep you need only Rust (above). To run a search you need no
-other program: fmgrep does not call `rg`.
+To run a search you need nothing beyond fmgrep. It does not call `rg`.
+Two programs are optional.
 
-`fmgrep index --store-docs` of the top of a git checkout runs `git` to
-learn which commit the stored files are (the served commit,
-[docs/index-format.md](docs/index-format.md#served-commit)). Without git
-the index records no commit, and says why. A search through a server that
-reports a served commit runs `git` in the client's checkout; without git
-it prints the server's answer alone, with a warning that local changes
-are ignored.
-
-[Watchman](https://facebook.github.io/watchman/), the file watcher, is a
-soft dependency of a search: a search works without it, with the same
-answers. `fmgrep serve` needs it, unless given `--no-watch` or a
-`--store-docs` index ([Usage](#usage)).
-
-* **What fmgrep uses it for.** A search must notice the files changed
-  since the index was built. On a tree of 50,000 files or more, it asks
-  watchman which files changed, instead of checking every file. `fmgrep
-  index` and a search of such a tree start the watchman daemon when none
-  runs, in CI and in containers too, and ask it to watch the tree. The
-  daemon keeps running after fmgrep exits, with its watch: on AOSP
-  (1.25 M files), about 710 MB of memory and 312,000 inotify watches. A
-  search keeps a small record per tree in `~/.cache/fmgrep`. Below 50,000
-  files a search of a local index never contacts watchman: checking
-  every file is faster. A search through a server from a checkout asks
-  watchman at any checkout size, to learn what changed since git last
-  compared the checkout with the served commit: it starts the daemon
-  when none runs and asks it to watch the whole checkout, and keeps one
-  record per checkout and served commit, and one pin per checkout and
-  server.
-  `fmgrep serve` checks before every query, not once, so it asks watchman
-  at any tree size, unless given `--no-watch`: it starts the daemon and
-  asks it to watch even a small tree. On Linux that makes each served
-  query 1.1 to 3.2 ms slower: a query that took 0.4 ms takes 2.1 ms. On
-  macOS the ask costs each served query about 38 ms (on a tree of 60,000
-  files, where a query with `--no-watch` took 0.17 ms). Details:
-  [docs/index-format.md](docs/index-format.md#watchman).
-* **Without watchman**, each search of such a tree checks every file
-  itself and prints one warning line, `warning: watchman cannot say what
-  changed (cannot run watchman (...); install watchman); checked every
-  file`. The answers are the same; the search is slower. Whole search for
-  an identifier found in 8 to 19 files, p50 of 15, files in the page
-  cache, on an AWS i4i.4xlarge (Ubuntu 24.04, watchman v2026.11.09,
-  November 2026):
-
-  | search | Linux kernel, 96k files | Chromium, 461k | AOSP, 1.25 M |
-  |---|--:|--:|--:|
-  | asks watchman | 7.5 ms | 23 ms | 104 ms |
-  | checks every file | 76 ms | 106 ms | 786 ms |
-
-  The second row is the first search after an index: it asks watchman
-  for its clock, a few milliseconds, then checks every file. A search
-  without watchman checks every file the same way. `fmgrep serve`
-  without watchman exits 2 at its start, and says why, unless given
-  `--no-watch` or a `--store-docs` index.
-* To keep fmgrep away from watchman, set `WATCHMAN_SOCK` to a path where
-  no daemon listens: fmgrep then starts no daemon, and each search checks
-  every file and prints a warning that gives the socket
-  ([docs/tuning.md](docs/tuning.md#search)). fmgrep no longer reads
-  `FMGREP_JOURNAL`, which fmgrep 0.1.0 used for this. `fmgrep serve
-  --no-watch` contacts no watchman at any tree size; without `--no-watch`,
-  a server refuses to start with such a socket.
+* [Watchman](https://facebook.github.io/watchman/) is a file watcher.
+  On a tree of 50,000 files or more, a search asks it which files
+  changed since the index. Without it, such a search checks every file
+  and prints a warning. The answers are the same. On the Linux kernel,
+  the search takes 76 ms instead of 7.5 ms. `fmgrep serve` needs
+  watchman, unless given `--no-watch` or a `--store-docs` index. See
+  [docs/watchman.md](docs/watchman.md).
+* fmgrep needs `git` only for a shared server of a git checkout.
+  `fmgrep index --store-docs` runs it to learn which commit it indexed.
+  A search from a checkout runs it to find the local changes. Without
+  git, the index records no commit. A client without git prints the
+  server's answer without its own local changes, and warns. See
+  [docs/shared-server.md](docs/shared-server.md).
 
 ## Usage
 
@@ -294,6 +247,8 @@ A count-augmented n-gram index provides the same two operations at similar cost,
 ## Links
 
 - [AGENTS.md](AGENTS.md): using fmgrep from a coding agent
+- [docs/watchman.md](docs/watchman.md): what fmgrep asks of watchman, and
+  what a search costs without it
 - [docs/shared-server.md](docs/shared-server.md): a shared server, searched
   from each developer's checkout
 - [docs/protocol.md](docs/protocol.md): the serve protocol and `--json`
