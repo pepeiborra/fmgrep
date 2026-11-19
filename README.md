@@ -53,18 +53,13 @@ Two programs are optional.
 
 ## Usage
 
-Index a tree once, at its root:
+Index a tree once, at its root. Then search from anywhere below it, and
+the nearest `.fmgrep` index is used. Add `.fmgrep` to `.gitignore`.
 
 ```console
 $ fmgrep index .
 skipped 70 non-text file(s) (binary or NUL); set FMGREP_VERBOSE=1 or pass --verbose to list them
 indexed 26787 files (88781005 bytes) -> ./.fmgrep in 1997 ms
-```
-
-The index lives in `./.fmgrep`; add it to `.gitignore`. Search from
-anywhere below the root, as with `rg`:
-
-```console
 $ fmgrep initHscEnv
 compiler/GHC.hs
 615:    initHscEnv mb_top_dir
@@ -78,75 +73,39 @@ compiler/GHC/Driver/Main/Hsc.hs
 143:initHscEnv mb_top_dir = do
 ```
 
-* The nearest enclosing `.fmgrep` index is used.
-* Without a PATH only the cwd's subtree is searched, and paths print and
-  `-g` globs match relative to the cwd, as in rg; from outside the indexed
-  tree the whole tree is searched, relative to its root. PATH arguments are
-  rg's: relative to the cwd, and their files print as rg prints them.
-* Common rg flags work (`-i`, `-l`, `-c`, `-o`, `-A/-B/-C`, `-U`, `-g`, `--iglob`, `--stats`, PATH arguments); `fmgrep --help` lists them.
-* `--stats` prints rg's statistics after the matched lines of each TERM.
-  Files and bytes searched count the indexed files that the PATHs, globs
-  and cwd keep; a narrowed search also counts their UTF-8 byte-order marks,
-  which rg leaves out. The total time runs from the start of the query, not
-  of the process. `-c`, `--count-matches` and `-l` refuse `--stats`; with
-  `--json` it prints nothing more.
-* In colour, the matches of a file's first 1,000 matched lines are
-  coloured, as rg colours them; past those, lines print with their path
-  and line number in colour and their matches plain. `-o` colours every
-  match. Under `-U`, adjacent matched lines print as one block, and a
-  block that starts in the first 1,000 matched lines is coloured whole.
-* `index`, `serve` and `status` are commands when they are the first word.
-  To search for one of these words, put `--` or any flag first:
-  `fmgrep -- status`, `fmgrep -n status`.
+`fmgrep` behaves like `rg`, with the same output and exit status. These
+are the differences.
 
-To see which index or server a search here uses, what that index holds,
-and what changed since it was built:
+* **It needs an index, and searches only what the index holds.** It
+  never finds a hidden, ignored, symlinked or binary file, even when you
+  name it as a PATH or match it with `-g`. A PATH outside the indexed
+  tree is an error. A search also finds matches in a file edited or
+  added since the index.
+* **A TERM is a literal, not a regex.** `'a.b'` is three bytes. Write
+  `/a.b/` for a regex, or pass `--regex` to make every TERM one. Several
+  TERMs print one `== TERM ==` section each. `--and`, `--or` and
+  `--expr` combine TERMs to choose the files, then print the lines of
+  every TERM ([Expressions](#expressions)).
+* **A word that names no file is a TERM, not a PATH.**
+  `fmgrep HscEnv nope.txt` also searches for `nope.txt`. `rg` fails with
+  exit 2.
+* **Fewer flags.** These work: `-i`, `-U`, `-g`, `--iglob`, `-c`, `-l`,
+  `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`, `--color` and
+  `--stats`. Other flags of `rg`, such as `-F`, `-w`, `-v`, `-e`, `-t`,
+  `-m`, `--hidden`, `--no-ignore` and `--sort`, fail with exit 2.
+  `fmgrep --help` lists the flags that work.
+* **It does not search stdin or read a `RIPGREP_CONFIG_PATH` file.**
+* **`--json` prints a counts report.** `--json --matches` prints the
+  events of `rg`.
+* **`index`, `serve` and `status` are commands** when they are the first
+  word. Put `--` first to search for one of them.
 
-```console
-$ fmgrep status
-a search here uses the local index /home/me/ghc/.fmgrep
-format: 9
-store_docs: false
-num_docs: 26787
-num_bytes: 88781005
-bom_bytes: 6
-index_size_bytes: 76771936
-build_time_us: 1997204
-index_started_ns: 1763061773123456789
-shards: 1
-corpus_root: /home/me/ghc
-changes: fewer than 50000 files: checked every file
-since the index: 2 stale, 1 added, 0 gone
-ignore files changed since the index: none
-record: none saved
-```
+[docs/usage.md](docs/usage.md) gives each difference with the commands
+that show it. It also covers `fmgrep status`, `--stats` and colour.
+`status` says which index or server a search uses, and what changed
+since.
 
-Status runs the check of what changed that a search runs, as a search
-runs it, and prints what that check did, in the search's words: on a
-tree of 50,000 files or more it may take a watchman token, start
-watchman, ask it to watch the tree and save the record of the search
-([watchman](docs/index-format.md#watchman)); where watchman cannot say,
-it checks every file. The lines a search warns about it print once, on
-stdout. Status does not load the index's shards, so it does not find a
-damaged shard; a search does.
-
-`fmgrep status --json` prints the manifest as one JSON line, with the file
-list ([fields](docs/index-format.md#manifestbin)). `fmgrep status` chooses
-as a search does: a local index found by walking up wins over
-`FMGREP_SERVER`, and the first line gives the note the search warns.
-Where a server answers, status prints its reply (`--json`: as one JSON
-line). `fmgrep status --server ADDR` takes `--server` as a search does.
-
-`fmgrep index --store-docs` of the top of a git checkout records the
-served commit, or says in a note why it cannot
-([Dependencies](#dependencies)); the manifest keeps that reason, and
-`fmgrep status` of the index prints it as `why_no_commit`. With
-`--require-served-commit` it fails with that reason instead, exits 2, and
-leaves no index. A reason that git alone can tell, such as an edited file,
-fails before the index reads a file. Build a server's index with it when
-every client must be able to search its own changes.
-
-For many searches in a row, keep the index loaded in a server:
+To search many times in a row, keep the index loaded in a server.
 
 ```console
 $ fmgrep serve --listen 127.0.0.1:7777 &
@@ -158,28 +117,10 @@ compiler/GHC/Driver/Main/Hsc.hs
 $ fmgrep --server 127.0.0.1:7777 --shutdown
 ```
 
-`--server` takes every search flag but `--index` and prints what the local
-search would; the server answers ([details](docs/protocol.md#--server)).
-`FMGREP_SERVER=127.0.0.1:7777` does the same for every search that finds
-no `.fmgrep` by walking up from the cwd. An index found wins, and the
-search says so on stderr with a line that starts `warning: Using local
-index`.
-Before each query the server asks [watchman](https://facebook.github.io/watchman/)
-what changed in the tree, so it needs watchman installed; when no daemon
-runs, watchman's client starts one. To serve a tree that does not change
-(a fixed commit), or without watchman, pass `--no-watch`. A
-`--store-docs` index never reads the tree, so serving it never needs
-watchman.
-
-### A shared server for a team's checkouts
-
-One machine can serve a large git tree to a whole team: it builds the
-index of a clean checkout with `fmgrep index --store-docs` and runs
-`fmgrep serve`. Each developer sets `FMGREP_SERVER` and searches from
-their own checkout; the client searches the files that differ from the
-served commit itself and takes the rest from the server.
-[docs/shared-server.md](docs/shared-server.md) gives the setup, the
-warning that local changes are ignored, and the limits.
+With `FMGREP_SERVER=127.0.0.1:7777` set, every search that finds no
+`.fmgrep` index goes to that server. To share one server of a git
+checkout with a team, index it with `fmgrep index --store-docs`. See
+[docs/shared-server.md](docs/shared-server.md).
 
 ## Expressions
 
@@ -203,9 +144,7 @@ fmgrep index .              # index the current folder
 
 `index` takes the files `rg --files` lists (`.gitignore`, `.ignore` and
 `.rgignore` apply; hidden files and symlinks are skipped), minus binary
-files. A search never reads a file the index skips: where rg searches a
-hidden or ignored file named as a PATH or matched by a `-g` glob, fmgrep
-finds nothing.
+files.
 
 A search reads every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
@@ -247,6 +186,8 @@ A count-augmented n-gram index provides the same two operations at similar cost,
 ## Links
 
 - [AGENTS.md](AGENTS.md): using fmgrep from a coding agent
+- [docs/usage.md](docs/usage.md): how a search differs from rg, and what
+  `status` and `serve` do
 - [docs/watchman.md](docs/watchman.md): what fmgrep asks of watchman, and
   what a search costs without it
 - [docs/shared-server.md](docs/shared-server.md): a shared server, searched
