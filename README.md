@@ -212,6 +212,7 @@ holds the literal. That has three consequences.
 - [docs/protocol.md](docs/protocol.md): the serve protocol and `--json`
   report (unstable)
 - [BENCHMARKS.md](BENCHMARKS.md): method and full results
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release
 - [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md)
 
 ## License
