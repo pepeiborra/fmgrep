@@ -2,7 +2,7 @@
 
 fmgrep is ripgrep over a persistent index with efficient support for AND/OR expressions.
 
-`rg` reads every file of the tree on every search. With the files in the page cache, that takes a
+`rg` scans every file of the tree on every search. With the files in the page cache, that takes a
 median 503 ms on the Chromium repo: not too bad for one search, but a lot for a coding agent that
 runs hundreds. fmgrep indexes the tree once, allowing it to resolve queries much faster following
 the same format and conventions as `rg`.
@@ -146,14 +146,14 @@ fmgrep index .              # index the current folder
 `.rgignore` apply; hidden files and symlinks are skipped), minus binary
 files.
 
-A search reads every file it prints, and a regex every candidate. By
+A search scans every file it prints, and a regex every candidate. By
 default it opens them in the tree, so answers stay current: edited and new
-files are read in full; after many edits, remove `.fmgrep` and re-index.
+files are scanned in full; after many edits, remove `.fmgrep` and re-index.
 
 | fmgrep / rg | linux | chromium | aosp |
 |---|--:|--:|--:|
 | index size | 1.11 GB / - | 2.22 GB / - | 12.00 GB / - |
-| files read per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
+| files scanned per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
 | literal p50 | 4.08 / 114 ms | 24.9 / 494 ms | 10.6 / 1560 ms |
 | regex p50 | 8.23 / 118 ms | 30.1 / 500 ms | 13.2 / 1580 ms |
 
@@ -199,9 +199,9 @@ finds hold the n-grams, not necessarily the pattern, so it scans each one to
 confirm. An FM-index looks up a literal whole, so every file it finds
 holds the literal. That has three consequences.
 
-* A literal search reads only the files it prints lines from, and `-l`
-  reads none. The exception is a file edited since the index, which is
-  read in full.
+* A literal search scans only the files it prints lines from, and `-l`
+  scans none. The exception is a file edited since the index, which is
+  scanned in full.
 * There are no posting lists to intersect, except for the sides of an AND.
 * The index is never lowercased to support `-i`. It holds the text as
   written, and a `-i` term walks its case variants through the index.
