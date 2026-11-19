@@ -1,8 +1,17 @@
 # fmgrep
 
 fmgrep is ripgrep over a persistent index with efficient support for AND/OR expressions.
-`fmgrep index` builds an FM-index of a source tree once; after that a search prints what `rg` would
-print, but without scanning the whole tree.  The index is mapped from disk and used in place.
+
+`rg` reads every file of the tree on every search. With the files in the page cache, that takes a
+median 503 ms on the Chromium repo: not too bad for one search, but a lot for a coding agent that
+runs hundreds. fmgrep indexes the tree once, allowing it to resolve queries much faster following
+the same format and conventions as `rg`.
+
+An `fmgrep` server answers a query in the Chromium repo in a median 12.8 ms, 39X faster than `rg`,
+16 times faster than [tgrep](https://github.com/microsoft/tgrep), and 4.6 times faster than
+[elgrep](https://github.com/eliosai/sngram). With no server, the median query takes 38 ms. The index
+takes 35 s to build and is 0.78X the size of the repo (medians over all queries; method and every
+row in [BENCHMARKS.md](BENCHMARKS.md)).
 
 ## Status
 
@@ -281,7 +290,6 @@ A count-augmented n-gram index provides the same two operations at similar cost,
  * in a client/server setup, the server could never scan any documents at all, and instead tell the client what to scan.
 
  The tradeoff is a larger index (1.5X to 2X) and a higher RSS.
-
 
 ## Links
 
