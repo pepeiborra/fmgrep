@@ -165,23 +165,47 @@ instance ([docs/benchmark.md](docs/benchmark.md#ec2)).
 
 ## How it works
 
-The goal of a regexp search engine is to avoid scanning a regexp over all the documents in the source tree, which is infeasible for very large corpuses. To achieve this, most modern regexp search engines build an inverted index of posting lists keyed by n-grams. Instead, fmgrep builds an [FM-index](https://en.wikipedia.org/wiki/FM-index), a kind of compressed suffix array; this idea was originally coined and pursued by Nathan Hawkes (@nhawkes) at Meta. 
+An indexed search engine avoids scanning a regex over every file of a
+large tree. Most build an inverted index of posting lists keyed
+by n-grams. fmgrep builds an
+[FM-index](https://en.wikipedia.org/wiki/FM-index) instead. This idea was
+originally coined and pursued by Nathan Hawkes (@nhawkes) at Meta. 
+fmgrep keeps the Burrows-Wheeler transform of the tree, with the id of the 
+file at sampled rows ([crates/docfm](crates/docfm/README.md)). The
+index is mapped from disk and used in place, so a search touches only
+the pages it needs.
 
-An FM-index provides two main operations: 
+An FM-index provides two main operations.
 
-* `locate`: returns the posting list of a pattern in `O(ocurrences)` time,
-* `count`: how many times the pattern occurs in the tree in `O(pattern)` time,
+* `count` says how many times a pattern occurs in the tree. It takes
+  time proportional to the length of the pattern, whatever the size of
+  the tree.
+* `locate` says which files hold the pattern. It takes time proportional
+  to the number of occurrences of the pattern in the tree. 
 
-`locate` is faster than scanning when the number of ocurrences is smaller than the number of documents, which we can find out with `count`; if not, we fall back to a regexp scan of all the candidates. `count` is also useful for planning AND and OR queries, e.g. start from the least common side for ANDs.
+fmgrep answers a literal with `locate`, which also gives its count in
+each file. An AND `count`s each side and `locate`s the rarest, 
+It then either `locate`s or scans each other side, whichever costs less. 
+When a PATH or a glob narrows a literal search, fmgrep scans those files if
+that costs less than locating.
 
-A count-augmented n-gram index provides the same two operations at similar cost, with one crucial difference: patterns need to be broken in n-grams. With an FM index this is not the case for literals and most regular expressions, and therefore a match is never a false positive, which means that:
- * we end up scanning far fewer documents than the n-gram based approach 
- * we never need to intersect posting lists (other than for AND queries)
- * `-l` literal queries do not scan any documents at all
- * the index is never lowercased to support `-i` queries
- * in a client/server setup, the server could never scan any documents at all, and instead tell the client what to scan.
+To answer a regex from the index, fmgrep takes the longest literal that every
+match holds, or walks the regex over the index as an automaton. Either
+gives candidate files, which are then scanned: in the worst case, a regex
+that gives the index nothing to narrow makes every file a candidate.
 
- The tradeoff is a larger index (1.5X to 2X) and a higher RSS.
+By comparison, an n-gram index must break a pattern into n-grams. The files it 
+finds hold the n-grams, not necessarily the pattern, so it scans each one to
+confirm. An FM-index looks up a literal whole, so every file it finds
+holds the literal. That has three consequences.
+
+* A literal search reads only the files it prints lines from, and `-l`
+  reads none. The exception is a file edited since the index, which is
+  read in full.
+* There are no posting lists to intersect, except for the sides of an AND.
+* The index is never lowercased to support `-i`. It holds the text as
+  written, and a `-i` term walks its case variants through the index.
+  The case variants are those of Unicode simple case folding.
 
 ## Links
 
