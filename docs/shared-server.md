@@ -23,8 +23,22 @@ commit: git 81b12d888b2bce896b8745567cfb620cfaf73e1b
 server$ fmgrep serve /srv/repo --listen 0.0.0.0:7777 &
 ```
 
-Serving a `--store-docs` index never reads the tree, so it needs no
-watchman.
+A `--store-docs` index keeps a copy of every file. Serving it never
+reads the tree, so it needs no watchman. It answers as of the time of
+indexing. It is 1.7 to 1.8 times the size of the text
+([BENCHMARKS.md](../BENCHMARKS.md)).
+
+To learn the commit, `fmgrep index --store-docs` runs `git` at the top
+of a git checkout. If git is missing, or the files are not exactly the
+commit's, the index records no commit and prints a note that says why.
+The manifest keeps the reason, and `fmgrep status` prints it as
+`why_no_commit`.
+
+Pass `--require-served-commit` to make a missing commit an error. The
+build then exits 2 with the reason and leaves no index. Git alone can
+tell some reasons, such as an edited file. Then the build fails before
+it reads a file. Use it when every client must be able to search its own
+changes.
 
 ## Search from a checkout
 
@@ -42,6 +56,8 @@ The output is what a local index of the checkout would print. To print
 it, the client asks git where the checkout differs from the served
 commit (edits, new and deleted files, commits on top, another branch).
 It searches those files itself and asks the server to leave them out.
+Without git on the client, it prints the server's answer, which lacks
+the client's own changes, with a warning that they are ignored.
 The first search asks git; later ones ask
 [watchman](watchman.md) what changed since, and without it
 every search asks git. Later searches also skip the server's status
