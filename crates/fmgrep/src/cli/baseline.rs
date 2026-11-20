@@ -15,9 +15,9 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::params::QueryParams;
 use crate::checkout::{Local, changes, resolve};
 use crate::diagnostic::Diagnostic;
+use crate::filter::PathFilter;
 use crate::source::{Of, Remembered, Unsaid, remember, remembered, unsaid};
 use crate::vcs;
 use crate::wire::MAX_SKIP;
@@ -31,11 +31,11 @@ use crate::wire::MAX_SKIP;
 /// under `FMGREP_VERBOSE`): the note that keeps it quiet is returned, to
 /// keep once the warning is printed. What the search leaves out, and its
 /// warnings and notes, go to `left_out`, in the order found, also when it
-/// fails. `p` is the search, for the note.
+/// fails. `filter` is the search's, for the note.
 pub fn skip_list(
     top: &Path,
     commit: &str,
-    p: &QueryParams,
+    filter: Option<&PathFilter>,
     left_out: &mut Vec<Diagnostic>,
 ) -> Result<(Vec<String>, Local, Option<Unsaid>), String> {
     let of = Of::commit(commit);
@@ -58,7 +58,7 @@ pub fn skip_list(
                     "watchman since the baseline",
                     &skip,
                     &local,
-                    p,
+                    filter,
                     left_out,
                 );
                 return Ok((skip, local, None));
@@ -87,7 +87,7 @@ pub fn skip_list(
                 "git, as watchman cannot say",
                 &skip,
                 &local,
-                p,
+                filter,
                 left_out,
             );
             return Ok((skip, local, said));
@@ -126,7 +126,7 @@ pub fn skip_list(
         source,
         &skip,
         &local,
-        p,
+        filter,
         left_out,
     );
     Ok((skip, local, None))
@@ -134,7 +134,7 @@ pub fn skip_list(
 
 /// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
 /// checkout at `top` came from (`source`), its size, the files of
-/// `local` that the client searches for `p` (those that its PATHs, globs
+/// `local` that the client searches for `filter` (those that its PATHs, globs
 /// and cwd keep, as `--stats` counts them), the served commit `commit`,
 /// and the record of `of`, when one is saved.
 #[allow(clippy::too_many_arguments)]
@@ -145,18 +145,16 @@ fn note(
     source: &'static str,
     skip: &[String],
     local: &Local,
-    p: &QueryParams,
+    filter: Option<&PathFilter>,
     left_out: &mut Vec<Diagnostic>,
 ) {
     if !crate::verbose::verbose() {
         return;
     }
     let record = of.and_then(|of| crate::source::record_path(top, of));
-    let (n, bytes) = match p.filter() {
-        Ok(Some(f)) => {
-            (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i]))
-        }
-        _ => (local.files.len(), local.bytes),
+    let (n, bytes) = match filter {
+        Some(f) => (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i])),
+        None => (local.files.len(), local.bytes),
     };
     left_out.push(Diagnostic::LocalChanges {
         source,

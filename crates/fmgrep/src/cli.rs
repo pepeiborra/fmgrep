@@ -9,7 +9,7 @@ mod baseline;
 mod frames;
 mod locate;
 mod merge;
-mod params;
+pub(crate) mod params;
 mod print;
 mod serve;
 mod status;
@@ -693,7 +693,10 @@ fn answer(
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
-            match baseline::skip_list(&top, &commit, &p, &mut attempt.entries) {
+            // Only the verbose note counts the files that a filter keeps.
+            let filter = crate::verbose::verbose().then(|| p.filter().ok().flatten());
+            let filter = filter.flatten();
+            match baseline::skip_list(&top, &commit, filter.as_ref(), &mut attempt.entries) {
                 Ok((skip, local, unsaid)) => {
                     attempt.said = unsaid;
                     ours = Some((top, (skip, local)));
@@ -781,7 +784,9 @@ fn merged(
     out: &mut dyn Write,
     attempt: &mut Try,
 ) -> Result<OutputReport, String> {
-    let part = merge::part(&p, top, local, &mut attempt.entries)?;
+    let manifest = Manifest::empty(top);
+    let req = p.request(Path::new(""), &manifest, Some(top))?;
+    let part = merge::part(&req, p.stats, top, local, &mut attempt.entries)?;
     p.skip = skip;
     render(&p, json, out, |sink| {
         let mut both = merge::Merge::new(sink, &part);
