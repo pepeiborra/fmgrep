@@ -1,6 +1,6 @@
 use super::{Plan, plan, short};
-use crate::cli::Server;
-use crate::cli::serve::ServeStatus;
+use crate::remote::Server;
+use crate::wire::ServeStatus;
 
 const ID: &str = "0123456789abcdef0123456789abcdef01234567";
 

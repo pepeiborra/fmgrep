@@ -6,7 +6,6 @@ use clap::Parser;
 
 mod args;
 mod baseline;
-mod checkout;
 mod frames;
 mod locate;
 mod merge;
@@ -15,15 +14,16 @@ mod print;
 mod serve;
 mod status;
 
+use crate::checkout;
 use crate::events::JsonSink;
 use crate::filter::SearchPath;
 use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, MANIFEST_FORMAT, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::run_query;
-use crate::remote::Conn;
+use crate::remote::{Conn, Server};
 use crate::sink::{Discard, MatchSink};
-use crate::wire::{IndexSummary, OutputReport};
+use crate::wire::{IndexSummary, OutputReport, ServeStatus};
 use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
@@ -332,19 +332,12 @@ fn warn(line: &str) {
     crate::held::line(&format!("warning: {line}"));
 }
 
-/// A server's address, and whether `FMGREP_SERVER` gave it.
-struct Server {
-    addr: String,
-    env: bool,
-}
-
-impl std::fmt::Display for Server {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.env {
-            true => write!(f, "the server at {} (FMGREP_SERVER)", self.addr),
-            false => write!(f, "the server at {}", self.addr),
-        }
-    }
+/// The one warning of a search whose local changes are ignored.
+fn degraded(why: &str) {
+    warn(&format!(
+        "local changes are ignored ({why}); these results are the server's alone; use \
+         --ignore-local-changes to avoid this warning"
+    ));
 }
 
 /// A search through `server`, on `conn`. With `ignore`
@@ -375,7 +368,7 @@ fn client(
     let top = checkout::top(&cwd);
     let had =
         (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
-    let mut search = |conn: &mut Conn, status: &serve::ServeStatus, p: QueryParams| {
+    let mut search = |conn: &mut Conn, status: &ServeStatus, p: QueryParams| {
         answer(server, conn, status, &cwd, ignore, p, typed, json, out)
     };
     let status = match &had {
@@ -391,7 +384,7 @@ fn client(
                     checkout::short(id)
                 ));
             }
-            let tried = search(&mut conn, &serve::ServeStatus::pinned(id), p.clone());
+            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone());
             if !crate::held::holding() || tried.is_ok() {
                 crate::held::release();
                 return tried;
@@ -462,7 +455,7 @@ fn asked(server: &Server, why: &str) {
 fn answer(
     server: &Server,
     conn: &mut Conn,
-    status: &serve::ServeStatus,
+    status: &ServeStatus,
     cwd: &Path,
     ignore: bool,
     mut p: QueryParams,
@@ -483,14 +476,14 @@ fn answer(
             p.scope(Some(&top));
             match baseline::skip_list(&top, &commit, &p) {
                 Ok(changes) => ours = Some((top, changes)),
-                Err(why) => checkout::degraded(&why),
+                Err(why) => degraded(&why),
             }
             p.commit = Some(commit);
         }
         plan => {
             let pinned = match plan {
                 checkout::Plan::Degraded(why) => {
-                    checkout::degraded(&why);
+                    degraded(&why);
                     checkout::top(cwd).zip(status.commit.as_ref())
                 }
                 checkout::Plan::Ignored => checkout::top(cwd).zip(status.commit.as_ref()),

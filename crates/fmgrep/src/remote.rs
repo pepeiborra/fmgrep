@@ -123,3 +123,18 @@ impl Conn {
             .map_err(|e| format!("error: {}: unexpected result: {e}", self.addr))
     }
 }
+
+/// A server's address, and whether `FMGREP_SERVER` gave it.
+pub struct Server {
+    pub addr: String,
+    pub env: bool,
+}
+
+impl std::fmt::Display for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.env {
+            true => write!(f, "the server at {} (FMGREP_SERVER)", self.addr),
+            false => write!(f, "the server at {}", self.addr),
+        }
+    }
+}

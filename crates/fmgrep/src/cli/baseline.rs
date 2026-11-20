@@ -15,10 +15,11 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::checkout::{Local, changes, resolve, short};
-use super::params::{MAX_SKIP, QueryParams};
+use super::params::QueryParams;
+use crate::checkout::{Local, changes, resolve, short};
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
+use crate::wire::MAX_SKIP;
 
 /// The skip list of the checkout at `top` against the served commit
 /// `commit`, and the files of it this client searches; or why the
@@ -192,7 +193,7 @@ fn since(
         }
         // Gone, or below a symlink now: it may have been a directory of
         // tracked files.
-        if super::checkout::lstat(top, &p).is_none() {
+        if crate::checkout::lstat(top, &p).is_none() {
             skip.push(format!("{p}/"));
         }
         skip.push(p);

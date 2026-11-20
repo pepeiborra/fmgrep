@@ -5,10 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::Server;
-use super::params::MAX_SKIP;
-use super::serve::ServeStatus;
+use crate::remote::Server;
 use crate::vcs;
+use crate::wire::{MAX_SKIP, ServeStatus};
 
 #[cfg(test)]
 mod tests;
@@ -530,12 +529,4 @@ pub struct Local {
     pub bytes: u64,
     /// Each file's bytes, less a leading UTF-8 BOM.
     pub lens: Vec<u64>,
-}
-
-/// The one warning of a search whose local changes are ignored.
-pub fn degraded(why: &str) {
-    super::warn(&format!(
-        "local changes are ignored ({why}); these results are the server's alone; use \
-         --ignore-local-changes to avoid this warning"
-    ));
 }
