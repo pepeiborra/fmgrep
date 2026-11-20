@@ -579,3 +579,77 @@ fn and_or_count_terms_without_their_paths() {
         "error: --or needs at least two terms"
     );
 }
+
+#[test]
+fn e_gives_the_patterns_and_every_positional_is_a_path() {
+    // -e takes its value even when it starts with a hyphen, as in rg.
+    for words in [
+        &["-e", "-x"][..],
+        &["--regexp", "-x"],
+        &["--regexp=-x"],
+        &["-e-x"],
+        &["-e", "-x", "src"],
+    ] {
+        assert_eq!(params(words).terms, ["-x"], "{words:?}");
+    }
+    assert_eq!(
+        search(&["-e", "a", "src", "Cargo.toml"]).split().unwrap(),
+        (vec!["a".into()], vec!["src".into(), "Cargo.toml".into()])
+    );
+    // With -e, the first positional is a PATH too, so a TERM among them is
+    // no PATH.
+    assert_eq!(
+        err(&["-e", "a", "nosuch"]),
+        "error: nosuch: No such file or directory"
+    );
+    // Several make one search of any of them: the `--or` expression.
+    assert_eq!(
+        params(&["-e", "a", "-e", "b+"]),
+        params(&["--or", "a", "b+"])
+    );
+    assert_eq!(
+        params(&["-e", "a", "-e", "b+", "src"]),
+        params(&[
+            "--expr-json",
+            r#"{"or":[{"term":"a"},{"regex":"b+"}]}"#,
+            "src"
+        ])
+    );
+    assert_eq!(
+        params(&["-F", "-e", "a.b", "-e", "foo("]),
+        params(&["--expr-json", r#"{"or":[{"term":"a.b"},{"term":"foo("}]}"#])
+    );
+    assert_eq!(
+        params(&["-e", "", "-e", "a"]).expr,
+        Some(Expr::Or(vec![
+            Expr::Regex(String::new()),
+            Expr::Term("a".into())
+        ]))
+    );
+    // One is the search of that pattern, as the positional is.
+    assert_eq!(params(&["-e", "a.b"]), params(&["a.b"]));
+    assert_eq!(
+        params(&["-e", "a", "-e", "a"]).expr,
+        params(&["--or", "a", "a"]).expr
+    );
+    // --and and --or take the patterns of -e.
+    assert_eq!(
+        params(&["--and", "-e", "a", "-e", "b+"]),
+        params(&["--and", "a", "b+"])
+    );
+    assert_eq!(
+        err(&["--and", "-e", "a"]),
+        "error: --and needs at least two terms"
+    );
+    // The smart case of -e reads the pattern.
+    assert!(params(&["-S", "-e", "foo", "-e", "bar"]).ignore_case);
+    assert!(!params(&["-S", "-e", "foo", "-e", "Bar"]).ignore_case);
+    for words in [
+        &["-e", "a", "--expr", AND_TEXT][..],
+        &["-e", "a", "--expr-json", AND_JSON],
+        &["--server", "a:1", "--shutdown", "-e", "a"],
+    ] {
+        let e = err(words);
+        assert!(e.starts_with("error: "), "{words:?}: {e}");
+    }
+}

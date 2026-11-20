@@ -133,6 +133,16 @@ pub struct Search {
     /// A regex, as in rg
     #[arg(value_name = "TERM")]
     pub terms: Vec<String>,
+    /// A pattern to search for; every -e is one, and a line matching any is
+    /// printed
+    #[arg(
+        short = 'e',
+        long = "regexp",
+        value_name = "PATTERN",
+        allow_hyphen_values = true,
+        conflicts_with_all = ["expr", "expr_json"]
+    )]
+    pub patterns: Vec<String>,
     /// Read every TERM as a literal
     #[arg(
         short = 'F',
@@ -201,7 +211,7 @@ pub struct Search {
     /// Stop the server (--server only)
     #[arg(
         long,
-        conflicts_with_all = ["index", "terms", "expr", "expr_json", "and", "or"],
+        conflicts_with_all = ["index", "terms", "patterns", "expr", "expr_json", "and", "or"],
         help_heading = "Server"
     )]
     pub shutdown: bool,
@@ -331,7 +341,8 @@ impl Search {
         if self.smart_case {
             p.ignore_case = smart_case_folds(self.sources(&p).iter().map(String::as_str));
         }
-        if self.and || self.or {
+        // Several -e patterns are one search of any of them, as in rg.
+        if self.and || self.or || self.patterns.len() > 1 {
             let op = if self.and { "--and" } else { "--or" };
             if p.terms.len() < 2 {
                 return Err(format!("error: {op} needs at least two terms"));
@@ -403,11 +414,12 @@ impl Search {
     /// PATHs, else the trailing ones after the first that name files or
     /// directories.
     fn split(&self) -> Result<(Vec<String>, Vec<String>), String> {
-        if self.expr.is_some() || self.expr_json.is_some() {
+        // Under -e or an expression, every positional is a PATH.
+        if self.expr.is_some() || self.expr_json.is_some() || !self.patterns.is_empty() {
             if let Some(t) = self.terms.iter().find(|t| !Path::new(t).exists()) {
                 return Err(format!("error: {t}: No such file or directory"));
             }
-            return Ok((Vec::new(), self.terms.clone()));
+            return Ok((self.patterns.clone(), self.terms.clone()));
         }
         let n = (self.terms.iter().skip(1).rev())
             .take_while(|t| Path::new(t).exists())
