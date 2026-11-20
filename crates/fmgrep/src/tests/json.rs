@@ -158,15 +158,23 @@ fn json_counts_mode_prints_the_report() {
 }
 
 /// Without `--json` the counts-only mode has no matches to print, so it
-/// prints its numbers: one line per term, in argv order.
+/// prints its numbers: one line for a pattern, and for several the line of
+/// their expression, then one line per pattern, in argv order.
 #[test]
-fn human_approx_counts_prints_a_line_per_term() {
+fn human_approx_counts_prints_a_line_per_pattern() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
+        let counts = |terms: &[&str]| printed(&index, &["--approx-counts"], terms);
         assert_eq!(
-            printed(&index, &["--approx-counts"], &["printk", "aa"]),
-            "printk: 4 matches in 2 files\naa: 3 matches in 1 file\n",
+            counts(&["printk"]),
+            "printk: 4 matches in 2 files\n",
+            "store_docs={store_docs}"
+        );
+        assert_eq!(counts(&["aa"]), "aa: 3 matches in 1 file\n");
+        assert_eq!(
+            printed(&index, &["--approx-counts", "--or"], &["printk", "aa"]),
+            "printk OR aa: 7 matches in 2 files\n  printk: 4 matches\n  aa: 3 matches\n",
             "store_docs={store_docs}"
         );
     }

@@ -5,7 +5,7 @@
 //! cargo install fmgrep
 //! fmgrep index                        # writes ./.fmgrep
 //! fmgrep HscEnv                       # as rg HscEnv
-//! fmgrep -l 'Dyn[A-Z]\w+'             # a TERM is a regex; -F makes it a literal
+//! fmgrep -l 'Dyn[A-Z]\w+'             # a PATTERN is a regex; -F makes it a literal
 //! fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)'
 //! ```
 //!

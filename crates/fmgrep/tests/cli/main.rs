@@ -98,7 +98,8 @@ fn do_index(docs: &Path, store_docs: bool) -> PathBuf {
     index
 }
 
-/// `--index <index> --json [-F] -- <terms>`.
+/// `--index <index> --json [-F] -- <term>`; for several terms, `--or` and
+/// `-e` of each: one search of any of them.
 fn query_argv(index: &Path, fixed: bool, terms: &[&str]) -> Vec<String> {
     let mut argv = vec![
         "--index".to_string(),
@@ -108,12 +109,17 @@ fn query_argv(index: &Path, fixed: bool, terms: &[&str]) -> Vec<String> {
     if fixed {
         argv.push("-F".into());
     }
-    argv.push("--".into());
-    argv.extend(terms.iter().map(|t| t.to_string()));
+    match terms {
+        [one] => argv.extend(["--".to_string(), one.to_string()]),
+        _ => {
+            argv.push("--or".into());
+            argv.extend(terms.iter().flat_map(|t| ["-e".to_string(), t.to_string()]));
+        }
+    }
     argv
 }
 
-/// `(total_matches, docs_matched)` per term of a `--json` report.
+/// `(total_matches, docs_matched)` of a `--json` report.
 fn counts(stdout: &[u8]) -> Vec<(u64, u64)> {
     let report: serde_json::Value = serde_json::from_slice(stdout).expect("report JSON");
     let queries = report["queries"].as_array().expect("queries");
@@ -123,6 +129,16 @@ fn counts(stdout: &[u8]) -> Vec<(u64, u64)> {
             let n = |k: &str| q[k].as_u64().unwrap();
             (n("total_matches"), n("docs_matched"))
         })
+        .collect()
+}
+
+/// `total_matches` of each leaf of the expression a `--or` report counts.
+fn leaf_totals(stdout: &[u8]) -> Vec<u64> {
+    let report: serde_json::Value = serde_json::from_slice(stdout).expect("report JSON");
+    let leaves = report["queries"][0]["leaves"].as_array().expect("leaves");
+    leaves
+        .iter()
+        .map(|l| l["total_matches"].as_u64().unwrap())
         .collect()
 }
 

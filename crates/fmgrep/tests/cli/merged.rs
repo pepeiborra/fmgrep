@@ -450,19 +450,19 @@ fn an_interleaved_change_set_answers_as_a_local_index_in_every_mode() {
         ("", &["-c", "printk"]),
         ("", &["--count-matches", "printk"]),
         ("", &["--json", "--matches", "printk"]),
-        ("", &["--json", "printk", "other"]),
+        ("", &["--json", "-e", "printk", "-e", "other"]),
         ("", &["--approx-counts", "printk"]),
-        ("", &["--and", "printk", "other"]),
-        ("", &["--or", "printk", "zzz"]),
+        ("", &["--and", "-e", "printk", "-e", "other"]),
+        ("", &["--or", "-e", "printk", "-e", "zzz"]),
         ("", &["--expr", "printk AND (other OR again)"]),
-        ("", &["printk", "other"]),
+        ("", &["-e", "printk", "-e", "other"]),
         ("", &["-l", "printk", "a.c", "dir"]),
         ("dir", &["printk"]),
         ("dir", &["-l", "printk", "../y.c"]),
         ("", &["-l", "-g", "*.c", "printk"]),
         ("", &["-l", "--iglob", "DIR/**", "printk"]),
         ("", &["--color", "always", "--heading", "printk"]),
-        ("", &["--stats", "printk", "other"]),
+        ("", &["--stats", "-e", "printk", "-e", "other"]),
         ("", &["--stats", "--no-heading", "-o", "pr.ntk"]),
         ("", &["--stats", "-C1", "--color", "always", "printk"]),
         ("", &["--stats", "--expr", "printk AND other"]),
@@ -474,7 +474,11 @@ fn an_interleaved_change_set_answers_as_a_local_index_in_every_mode() {
         ("", &["-g", "*.none", "printk"]),
         ("", &["("]),
     ] {
-        r.same(rel, args);
+        // Only these are refused: a table of searches that fail alike on
+        // both sides would test nothing.
+        let refused = args == ["("] || args == ["-g", "*.none", "printk"];
+        let code = r.same(rel, args);
+        assert!(refused || code != Some(2), "{rel} {args:?} failed");
     }
 }
 
