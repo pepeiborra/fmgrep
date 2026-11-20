@@ -90,6 +90,46 @@ fn a_term_is_a_regex_and_f_makes_it_a_literal() {
     assert_eq!(text(&["-l", "--and", "a.b", "foo\\("]), "a.txt\n");
 }
 
+/// As in rg, `-e` gives a pattern, and several make one search: the lines
+/// that match any, with no section per pattern.
+#[test]
+fn several_e_patterns_are_one_output() {
+    let (_tmp, docs) = stage_files(&[
+        ("a.txt", b"call foo(bar)\nx a.b y\naxb\n/a.b/\n-x dash\n"),
+        ("b.txt", b"nothing\n"),
+    ]);
+    let index_dir = do_index(&docs, false);
+    let index = index_dir.display().to_string();
+    let search =
+        |args: &[&str]| run(&[&["--index", &index, "--no-heading", "-N"][..], args].concat());
+    let text = |args: &[&str]| String::from_utf8_lossy(&search(args).stdout).into_owned();
+    assert_eq!(
+        text(&["-e", "foo\\(", "-e", "a\\.b"]),
+        "a.txt:call foo(bar)\na.txt:x a.b y\na.txt:/a.b/\n"
+    );
+    assert_eq!(
+        text(&["-F", "-e", "foo(", "-e", "a.b"]),
+        "a.txt:call foo(bar)\na.txt:x a.b y\na.txt:/a.b/\n"
+    );
+    // The first of the patterns that matches wins, as in rg.
+    assert_eq!(text(&["-o", "-e", "fo", "-e", "foo"]), "a.txt:fo\n");
+    assert_eq!(text(&["-c", "-e", "foo", "-e", "axb"]), "a.txt:2\n");
+    assert_eq!(
+        text(&["-l", "-e", "axb", "-e", "nothing"]),
+        "a.txt\nb.txt\n"
+    );
+    // A pattern that starts with a hyphen is no flag after -e.
+    assert_eq!(text(&["-e", "-x"]), "a.txt:-x dash\n");
+    // --and and --or take their patterns from -e.
+    assert_eq!(text(&["-l", "--and", "-e", "foo", "-e", "axb"]), "a.txt\n");
+    assert_eq!(text(&["-l", "--and", "-e", "foo", "-e", "nothing"]), "");
+    // One that is no regex fails the search, with the way out.
+    let bad = search(&["-e", "foo", "-e", "bar("]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(stderr(&bad).contains("unclosed group"), "{}", stderr(&bad));
+    assert!(stderr(&bad).contains("pass -F"), "{}", stderr(&bad));
+}
+
 #[test]
 fn index_refuses_to_overwrite_and_reports_argv_errors() {
     let (_tmp, docs) = stage();
