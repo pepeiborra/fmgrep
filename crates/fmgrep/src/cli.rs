@@ -6,7 +6,6 @@ use clap::Parser;
 
 mod args;
 mod baseline;
-mod checkout;
 mod frames;
 mod locate;
 mod merge;
@@ -15,15 +14,18 @@ mod print;
 mod serve;
 mod status;
 
+use crate::checkout;
+use crate::diagnostic::Diagnostic;
 use crate::events::JsonSink;
+use crate::fetch::Ask;
 use crate::filter::SearchPath;
 use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, MANIFEST_FORMAT, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
-use crate::query::run_query;
-use crate::remote::Conn;
+use crate::query::{answer as answer_local, load};
+use crate::remote::{Conn, Server};
 use crate::sink::{Discard, MatchSink};
-use crate::wire::{IndexSummary, OutputReport};
+use crate::wire::{IndexSummary, OutputReport, ServeStatus};
 use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
@@ -320,11 +322,38 @@ fn local(
     rebase(&mut p, typed, tree.as_deref())?;
     p.scope(tree.as_deref());
     let req = p.request(&found.index_dir, &manifest, root_of(&found, &manifest))?;
-    let report = render(&p, json, out, |sink| run_query(&req, sink));
+    let report = render(&p, json, out, |sink| {
+        let mut left_out = Vec::new();
+        let loaded = load(
+            req.index_dir,
+            req.manifest,
+            req.corpus_root,
+            Ask::Load,
+            None,
+            &mut left_out,
+        );
+        print_diagnostics(std::mem::take(&mut left_out));
+        let (index, mut loaded) = loaded?;
+        loaded.note_stale(&req.manifest.files);
+        let report = answer_local(&index, &mut loaded, &req, sink, &mut left_out);
+        print_diagnostics(left_out);
+        tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
+        report
+    });
     drop(req);
     // Off the exit path: dropping a large tree's paths costs milliseconds.
     let _ = std::thread::Builder::new().spawn(move || drop(manifest));
     report.map(Outcome::Query)
+}
+
+/// What a load or a search left out, on stderr: the one place that prints
+/// entries, in the order they were found. In a search through a server that
+/// holds its lines they join the held ones, so that they print or drop with
+/// them, in the order of the lines they sit between.
+fn print_diagnostics(left_out: Vec<Diagnostic>) {
+    for d in left_out {
+        crate::held::line(&d.to_string());
+    }
 }
 
 /// `line` on stderr, as a warning.
@@ -332,19 +361,12 @@ fn warn(line: &str) {
     crate::held::line(&format!("warning: {line}"));
 }
 
-/// A server's address, and whether `FMGREP_SERVER` gave it.
-struct Server {
-    addr: String,
-    env: bool,
-}
-
-impl std::fmt::Display for Server {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.env {
-            true => write!(f, "the server at {} (FMGREP_SERVER)", self.addr),
-            false => write!(f, "the server at {}", self.addr),
-        }
-    }
+/// The one warning of a search whose local changes are ignored.
+fn degraded(why: &str) {
+    warn(&format!(
+        "local changes are ignored ({why}); these results are the server's alone; use \
+         --ignore-local-changes to avoid this warning"
+    ));
 }
 
 /// A search through `server`, on `conn`. With `ignore`
@@ -375,7 +397,7 @@ fn client(
     let top = checkout::top(&cwd);
     let had =
         (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
-    let mut search = |conn: &mut Conn, status: &serve::ServeStatus, p: QueryParams| {
+    let mut search = |conn: &mut Conn, status: &ServeStatus, p: QueryParams| {
         answer(server, conn, status, &cwd, ignore, p, typed, json, out)
     };
     let status = match &had {
@@ -391,7 +413,7 @@ fn client(
                     checkout::short(id)
                 ));
             }
-            let tried = search(&mut conn, &serve::ServeStatus::pinned(id), p.clone());
+            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone());
             if !crate::held::holding() || tried.is_ok() {
                 crate::held::release();
                 return tried;
@@ -462,7 +484,7 @@ fn asked(server: &Server, why: &str) {
 fn answer(
     server: &Server,
     conn: &mut Conn,
-    status: &serve::ServeStatus,
+    status: &ServeStatus,
     cwd: &Path,
     ignore: bool,
     mut p: QueryParams,
@@ -483,14 +505,14 @@ fn answer(
             p.scope(Some(&top));
             match baseline::skip_list(&top, &commit, &p) {
                 Ok(changes) => ours = Some((top, changes)),
-                Err(why) => checkout::degraded(&why),
+                Err(why) => degraded(&why),
             }
             p.commit = Some(commit);
         }
         plan => {
             let pinned = match plan {
                 checkout::Plan::Degraded(why) => {
-                    checkout::degraded(&why);
+                    degraded(&why);
                     checkout::top(cwd).zip(status.commit.as_ref())
                 }
                 checkout::Plan::Ignored => checkout::top(cwd).zip(status.commit.as_ref()),
@@ -563,7 +585,10 @@ fn merged(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<OutputReport, String> {
-    let part = merge::part(&p, top, local)?;
+    let mut left_out = Vec::new();
+    let part = merge::part(&p, top, local, &mut left_out);
+    print_diagnostics(left_out);
+    let part = part?;
     p.skip = skip;
     render(&p, json, out, |sink| {
         let mut both = merge::Merge::new(sink, &part);

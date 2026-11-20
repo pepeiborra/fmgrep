@@ -1084,3 +1084,109 @@ fn a_file_over_2_gib_is_skipped_with_a_warning() {
     );
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("indexed 1 file (7 bytes)"));
 }
+
+/// A file new since the index that cannot be read, or that docfm cannot
+/// hold, is left out of the answer and named on stderr, as rg names a file
+/// it cannot open.
+#[cfg(unix)]
+#[test]
+fn a_new_file_that_cannot_be_read_is_skipped_with_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk\n")]);
+    let index_dir = do_index(&docs, false);
+    let shut = docs.join("new.c");
+    std::fs::write(&shut, b"printk\n").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let huge = std::fs::File::create(docs.join("huge.log")).unwrap();
+    huge.set_len(1 << 31).unwrap();
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let index = index_dir.display().to_string();
+    let out = run(&["--index", &index, "printk"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.c:printk\n");
+    let docs = docs.canonicalize().unwrap().display().to_string();
+    let mut lines: Vec<String> = stderr(&out).lines().map(str::to_owned).collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        [
+            format!("warning: skipping {docs}/huge.log: over 2147483646 bytes"),
+            format!(
+                "warning: skipping {docs}/new.c: cannot read (Permission denied (os error 13))"
+            ),
+        ]
+    );
+}
+
+/// A file new since the index that two walks of one load both find is
+/// named once: a changed ignore file makes the load walk its directory
+/// again, after the walk of the changed directories.
+#[cfg(unix)]
+#[test]
+fn a_new_file_that_two_walks_find_is_named_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk\n"), (".ignore", b"*.gen\n")]);
+    let index_dir = do_index(&docs, false);
+    std::fs::write(docs.join(".ignore"), b"*.gen\n*.tmp\n").unwrap();
+    let shut = docs.join("new.c");
+    std::fs::write(&shut, b"printk\n").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let index = index_dir.display().to_string();
+    let out = run(&["--index", &index, "printk"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.c:printk\n");
+    let named: Vec<String> = stderr(&out)
+        .lines()
+        .filter(|l| l.starts_with("warning: skipping"))
+        .map(str::to_owned)
+        .collect();
+    let docs = docs.canonicalize().unwrap().display().to_string();
+    assert_eq!(
+        named,
+        [format!(
+            "warning: skipping {docs}/new.c: cannot read (Permission denied (os error 13))"
+        )],
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A directory new since the index that cannot be listed is named on
+/// stderr, and the answer is the one without what is under it.
+#[cfg(unix)]
+#[test]
+fn a_new_directory_that_cannot_be_listed_is_named_with_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk\n")]);
+    let index_dir = do_index(&docs, false);
+    let shut = docs.join("newdir");
+    std::fs::create_dir(&shut).unwrap();
+    std::fs::write(shut.join("e.c"), b"printk\n").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&shut).is_ok();
+    let index = index_dir.display().to_string();
+    let out = run(&["--index", &index, "printk"]);
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.c:printk\n");
+    let shut = shut.canonicalize().unwrap();
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "warning: cannot list {}: Permission denied (os error 13); files under it may be \
+             missing from the answer\n",
+            shut.display()
+        )
+    );
+}

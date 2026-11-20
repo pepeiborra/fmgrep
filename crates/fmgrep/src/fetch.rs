@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{Checked, DOCS_SHARD, FileTable, Lens, Manifest, shard_offsets};
 use crate::source::{Files, Index, Learned, Recorded, Stamps};
 
@@ -299,9 +300,9 @@ impl DocStore {
     /// Re-check what watchman and the saved baseline name instead of
     /// [`Self::stat_all`] and discovery, when they can say; stored docs
     /// need no check.
-    pub fn replay(&self, files: Checked<'_>) -> Learned {
+    pub fn replay(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) -> Learned {
         match &self.source {
-            Source::Files(f) => f.replay(files, &self.lens),
+            Source::Files(f) => f.replay(files, &self.lens, left_out),
             Source::Shard { .. } => Learned::Stored,
         }
     }
@@ -316,9 +317,11 @@ impl DocStore {
 
     /// Before a served query, re-check what watchman reports as changed
     /// since the last query; nothing for stored docs, or unless asked to.
-    pub fn recheck(&self, files: Checked<'_>) {
-        if let Source::Files(f) = &self.source {
-            f.recheck(files, &self.lens);
+    /// Whether it re-checked.
+    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) -> bool {
+        match &self.source {
+            Source::Files(f) => f.recheck(files, &self.lens, left_out),
+            Source::Shard { .. } => false,
         }
     }
 
@@ -348,9 +351,17 @@ impl DocStore {
 
     /// Register the text files under the root that ascending `files` does
     /// not list; nothing for stored docs.
-    pub fn discover(&self, files: Checked<'_>) {
+    pub fn discover(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) {
         if let Source::Files(f) = &self.source {
-            f.discover(files, &self.lens);
+            f.discover(files, &self.lens, left_out);
+        }
+    }
+
+    /// Under verbose, note the added files: after the caller prints what a
+    /// check or a discovery left out; nothing for stored docs.
+    pub fn note_added(&self) {
+        if let Source::Files(f) = &self.source {
+            f.note_added();
         }
     }
 
@@ -540,6 +551,7 @@ impl Source {
         doc_idx: usize,
         lo: u64,
         len: usize,
+        left_out: &mut Vec<Diagnostic>,
     ) -> Result<Option<Vec<u8>>, String> {
         let mut buf = fetch_buffer(&mut worker.pool, &mut worker.pool_bytes, len);
         match self {
@@ -554,7 +566,7 @@ impl Source {
             }
             Source::Files(f) => match files.path(doc_idx)? {
                 Some(rel) => Ok(f.read(doc_idx, rel, buf)),
-                None => Ok(f.read_added(doc_idx)),
+                None => Ok(f.read_added(doc_idx, left_out)),
             },
         }
     }
@@ -683,7 +695,8 @@ type Emit<'a, T> = dyn FnMut(usize, &[u8], T) -> Result<(), String> + 'a;
 /// Cache state, counters and mapped values do not
 /// depend on the thread count; one batch is resident at a time. Empty docs
 /// (not stale) map over `&[]` with no I/O. An excluded file is skipped; a
-/// missing or short shard, or an `emit` error, aborts loudly.
+/// missing or short shard, or an `emit` error, aborts loudly. An added file
+/// that cannot be read adds an entry to `left_out`, in path order.
 pub fn fetch_stream_parallel<T: Send>(
     docs: &mut DocStore,
     files: &FileTable,
@@ -691,6 +704,7 @@ pub fn fetch_stream_parallel<T: Send>(
     max_threads: usize,
     map: &(dyn Fn(usize, &[u8]) -> T + Sync),
     emit: &mut Emit<'_, T>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<(), String> {
     debug_assert!({
         let paths = docs.paths(files);
@@ -734,12 +748,16 @@ pub fn fetch_stream_parallel<T: Send>(
                 .map(|&(doc_idx, lo, len)| {
                     let w = &workers[rayon::current_thread_index().unwrap_or(0)];
                     let mut w = w.lock().unwrap_or_else(PoisonError::into_inner);
-                    let got = docs.source.read(&mut w, files, doc_idx, lo, len)?;
+                    let mut left = Vec::new();
+                    let got = docs
+                        .source
+                        .read(&mut w, files, doc_idx, lo, len, &mut left)?;
                     drop(w);
-                    Ok(got.map(|bytes| {
+                    let got = got.map(|bytes| {
                         let v = map(doc_idx, &bytes);
                         (bytes, v)
-                    }))
+                    });
+                    Ok((got, left))
                 })
                 .collect()
         });
@@ -762,7 +780,9 @@ pub fn fetch_stream_parallel<T: Send>(
                 }
                 Slot::Empty => emit(doc_idx, &[], map(doc_idx, &[]))?,
                 Slot::Range(..) => {
-                    if let Some((bytes, v)) = read.next().expect("one read per planned range") {
+                    let (got, left) = read.next().expect("one read per planned range");
+                    left_out.extend(left);
+                    if let Some((bytes, v)) = got {
                         emit(doc_idx, &bytes, v)?;
                         store_or_pool(docs, &mut workers, &mut cursor, doc_idx, bytes);
                     }

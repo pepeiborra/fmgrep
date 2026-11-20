@@ -38,7 +38,11 @@ pub fn check(index_dir: &Path, manifest: &Manifest, root: Option<&Path>) -> Resu
     keep();
     let files = &manifest.files;
     let none = tracing::Span::none();
-    let learned = std::thread::scope(|s| check_changes(s, &none, &docs, files, None))?;
+    let mut left_out = Vec::new();
+    let learned =
+        std::thread::scope(|s| check_changes(s, &none, &docs, files, None, &mut left_out));
+    super::print_diagnostics(left_out);
+    let learned = learned?;
     let stale = note_stale(&mut docs, files);
     let record = docs.checkpoint(files)?;
     Ok(Facts {

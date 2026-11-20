@@ -8,6 +8,8 @@ use super::super::tests::Fix;
 use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
+use crate::diagnostic::Diagnostic;
+#[cfg(unix)]
 use crate::manifest::{Checked, FileTable};
 #[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
@@ -53,7 +55,7 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     }
     let mut files = open_files(&fix);
     files.exclude(&root.join("idx"));
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["b.c", "new/deep/n.c"]);
     assert_eq!(
         files.snapshot().added[0],
@@ -61,7 +63,9 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
         "added ids follow the manifest's"
     );
     assert_eq!(
-        files.read_added(fix.files.len() + 1).as_deref(),
+        files
+            .read_added(fix.files.len() + 1, &mut Vec::new())
+            .as_deref(),
         Some(&b"printk"[..])
     );
 }
@@ -73,16 +77,48 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     write(&fix.path, "x.c", b"printk");
     write(&fix.path, "y.c", b"printk");
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(files.snapshot().added, [1, 2]);
     let epoch = files.epoch();
     std::fs::write(fix.path.join("x.c"), b"printk\0").unwrap();
     std::fs::remove_file(fix.path.join("y.c")).unwrap();
-    assert_eq!(files.read_added(1), None);
-    assert_eq!(files.read_added(2), None);
-    assert_eq!(files.read_added(3), None, "no such slot");
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(files.read_added(2, &mut left_out), None);
+    assert_eq!(files.read_added(3, &mut left_out), None, "no such slot");
     assert!(files.snapshot().added.is_empty() && files.epoch() != epoch);
     assert_eq!(files.known.state[0].load(Ordering::Acquire) & WARNED, 0);
+    assert!(left_out.is_empty(), "no news");
+}
+
+/// A file found at load that cannot be read when a query reads it is named
+/// and dropped.
+#[cfg(unix)]
+#[test]
+fn read_of_an_added_file_that_became_unreadable_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    write(&fix.path, "x.c", b"printk");
+    let files = open_files(&fix);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
+    assert_eq!(files.snapshot().added, [1]);
+    let shut = fix.path.join("x.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(
+        left_out,
+        [Diagnostic::Skipped {
+            path: shut,
+            why: "cannot read (Permission denied (os error 13))".to_owned(),
+        }]
+    );
+    assert!(files.snapshot().added.is_empty());
 }
 
 #[test]
@@ -92,10 +128,10 @@ fn added_utf16_file_is_found_and_read_as_utf8() {
     write(&fix.path, "u.c", &crate::binary::utf16le("printk ü\r\n"));
     write(&fix.path, "z.c", &crate::binary::utf16le("printk\0"));
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["u.c"]);
     assert_eq!(
-        files.read_added(1).as_deref(),
+        files.read_added(1, &mut Vec::new()).as_deref(),
         Some("printk ü\r\n".as_bytes())
     );
 }
@@ -125,12 +161,23 @@ fn stage_recorded(
 /// The fixture's files, with its record unless `walk_all`, after discovery.
 #[cfg(unix)]
 fn discovered(fix: &Fix, manifest: Checked<'_>, walk_all: bool) -> Files {
+    discovered_with(fix, manifest, walk_all, &mut Vec::new())
+}
+
+/// [`discovered`], with what discovery left out in `left_out`.
+#[cfg(unix)]
+fn discovered_with(
+    fix: &Fix,
+    manifest: Checked<'_>,
+    walk_all: bool,
+    left_out: &mut Vec<Diagnostic>,
+) -> Files {
     let mut files = open_files(fix);
     if !walk_all {
         let index = fix.path.parent().unwrap();
         files.record(super::super::Recorded::open(index).unwrap().unwrap());
     }
-    files.discover(manifest, &vec![0; manifest.len()]);
+    files.discover(manifest, &vec![0; manifest.len()], left_out);
     files
 }
 
@@ -216,7 +263,7 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     assert_eq!(
         files
             .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens),
+            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new()),
         Ok(1)
     );
     assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");
@@ -289,4 +336,48 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(files.known.kind(1), IGNORED);
     assert!(files.snapshot().gone.is_empty());
+}
+
+/// A directory that cannot be listed is named by each kind of load that
+/// walks it: the full walk, the walk of the changed directories from a
+/// record, and the walk of what watchman reports.
+#[cfg(unix)]
+#[test]
+fn a_new_dir_that_cannot_be_listed_is_named_by_each_kind_of_load() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now();
+    let fix = stage_recorded(tmp.path(), &[b"printk"], &[("sub/s.bin", b"\0")], now);
+    write(&fix.path, "nd/e.c", b"printk");
+    write(&fix.path, "top.c", b"printk");
+    let shut = fix.path.join("nd");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&shut).is_ok();
+    let (mut full, mut recorded, mut replay) = (Vec::new(), Vec::new(), Vec::new());
+    discovered_with(&fix, fix.paths(), true, &mut full);
+    discovered_with(&fix, fix.paths(), false, &mut recorded);
+    let mut replayed = open_files(&fix);
+    replayed.record(
+        super::super::Recorded::open(fix.path.parent().unwrap())
+            .unwrap()
+            .unwrap(),
+    );
+    let record = replayed.known.recorded.clone().unwrap();
+    let reported = ["top.c".to_owned()];
+    let kept = replayed
+        .known
+        .replay(&record, &reported, fix.paths(), &fix.lens, &mut replay);
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    let want = [Diagnostic::Unlisted {
+        dir: shut,
+        why: "Permission denied (os error 13)".to_owned(),
+    }];
+    assert_eq!(full, want, "full walk");
+    assert_eq!(recorded, want, "from a record");
+    assert_eq!(kept, Ok(1));
+    assert_eq!(replay, want, "replay");
 }

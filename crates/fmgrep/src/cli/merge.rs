@@ -6,8 +6,9 @@ use std::path::Path;
 
 use grep_printer::Stats;
 
-use super::checkout::Local;
 use super::params::QueryParams;
+use crate::checkout::Local;
+use crate::diagnostic::Diagnostic;
 use crate::manifest::Manifest;
 use crate::query::{answer, listed};
 use crate::sink::{DocMatches, MatchSink};
@@ -65,7 +66,12 @@ impl MatchSink for Keep {
 
 /// `p` answered over the client's files `local` under `top`, which no
 /// index describes.
-pub fn part(p: &QueryParams, top: &Path, local: &Local) -> Result<Part, String> {
+pub fn part(
+    p: &QueryParams,
+    top: &Path,
+    local: &Local,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<Part, String> {
     let manifest = Manifest::empty(top);
     let (index, mut loaded) = listed(top, &local.files)?;
     let req = p.request(Path::new(""), &manifest, Some(top))?;
@@ -76,7 +82,7 @@ pub fn part(p: &QueryParams, top: &Path, local: &Local) -> Result<Part, String> 
         _ => (local.files.len(), local.bytes),
     };
     let mut keep = Keep::default();
-    let report = answer(&index, &mut loaded, &req, &mut keep)?;
+    let report = answer(&index, &mut loaded, &req, &mut keep, left_out)?;
     Ok(Part {
         terms: keep.terms,
         report,

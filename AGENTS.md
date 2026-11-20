@@ -65,6 +65,9 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `manifest.bin is truncated`, or another error naming `manifest.bin` | the index is damaged: remove `.fmgrep`, re-index |
 | `warning: excluding PATH: is missing` | deleted since indexing; skipped |
 | `warning: skipping PATH: over 2147483646 bytes` | too large to index; search it with rg |
+| `warning: cannot list DIR: Permission denied (...); files under it may be missing from the answer` | a directory new since the index, or one that changed, that this process cannot list: the files new under it are not searched; fix its permissions, or search it with rg |
+| `warning: git status: could not open directory 'DIR/': Permission denied; untracked files under it are not searched` | through a shared server, a directory of this checkout that git cannot open: its untracked files are not searched, and its tracked files are answered as the server has them; fix its permissions |
+| `warning: skipping PATH: cannot read (...)` | a file new since the index that this process cannot read: it is not searched; fix its permissions, or search it with rg |
 | `note: N file(s) changed since indexing` | searches read them in full; re-index |
 | `warning: watchman cannot say what changed (...)` | answers are right but each search checks every file; do what the line says |
 | `error: cannot use watchman for DIR (...)` | `fmgrep serve` needs watchman; install it, or pass `--no-watch` for a tree that does not change |

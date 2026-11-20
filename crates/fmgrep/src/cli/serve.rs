@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::frames::{FileFrames, Frame};
-use super::params::{MAX_SKIP, Mode, QueryParams};
+use super::params::{Mode, QueryParams};
 use super::{Outcome, print, render};
 use crate::expr::{REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{Ask, Skip};
-use crate::manifest::{Checked, Commit, DOCS_SHARD, Manifest};
+use crate::manifest::{Checked, DOCS_SHARD, Manifest};
 use crate::output::WRITE_FAILED;
 use crate::output::writer::Pipe;
 use crate::query::{Loaded, answer, load};
@@ -20,7 +20,7 @@ use crate::remote::{Conn, RpcError};
 use crate::sharded::DocfmIndex;
 use crate::sink::{Discard, MatchSink};
 use crate::source::DOCS_STAMPS;
-use crate::wire::OutputReport;
+use crate::wire::{MAX_SKIP, OutputReport, ServeStatus};
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -111,52 +111,6 @@ enum Answer {
     Rendered(Rendered),
 }
 
-/// `status` result.
-#[derive(Serialize, Deserialize)]
-pub struct ServeStatus {
-    /// The manifest format of the served index; absent from a server older
-    /// than this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<u32>,
-    pub store_docs: bool,
-    files: usize,
-    num_bytes: u64,
-    index_size_bytes: u64,
-    load_us: u64,
-    /// The documents' directory: the tree, or the index directory holding `docs.shard`.
-    pub root: String,
-    /// The served commit: the commit whose files a `store_docs` index holds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub commit: Option<Commit>,
-    /// Why a `store_docs` index records no served commit: the reason that
-    /// its build gave. Absent when there is a commit, for a files layout,
-    /// and from a server older than this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub why_no_commit: Option<String>,
-}
-
-impl ServeStatus {
-    /// The status that a pin of the served git commit `id` stands for. A
-    /// search from a checkout through a server that serves a commit reads
-    /// only its format and its commit; the root here is empty.
-    pub fn pinned(id: &str) -> Self {
-        Self {
-            format: Some(crate::manifest::MANIFEST_FORMAT),
-            store_docs: true,
-            files: 0,
-            num_bytes: 0,
-            index_size_bytes: 0,
-            load_us: 0,
-            root: String::new(),
-            commit: Some(Commit {
-                vcs: "git".to_owned(),
-                id: id.to_owned(),
-            }),
-            why_no_commit: None,
-        }
-    }
-}
-
 /// What `serve` serves.
 pub struct ServeRequest<'a> {
     pub index_dir: &'a Path,
@@ -213,11 +167,21 @@ impl Served<'_> {
                 code: QUERY_FAILED,
                 message,
             })?;
-        self.docs.recheck(self.files);
+        let mut left_out = Vec::new();
+        let checked = self.docs.recheck(self.files, &mut left_out);
+        super::print_diagnostics(left_out);
+        if checked {
+            self.docs.note_added();
+        }
         // Until the next query sets its own.
         self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
-        let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
+        let mut run = |sink: &mut dyn MatchSink| {
+            let mut left_out = Vec::new();
+            let report = answer(index, loaded, &req, sink, &mut left_out);
+            super::print_diagnostics(left_out);
+            report
+        };
         let answered = match p.mode {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
             // Output so far precedes an error, as in a local search.
@@ -491,13 +455,18 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         true => Ask::EachQuery,
         false => Ask::Never,
     };
-    let (index, mut docs) = load(
+    let mut left_out = Vec::new();
+    let loaded = load(
         req.index_dir,
         req.manifest,
         req.corpus_root,
         ask,
         Some(files),
-    )?;
+        &mut left_out,
+    );
+    super::print_diagnostics(left_out);
+    let (index, mut docs) = loaded?;
+    docs.note_stale(&req.manifest.files);
     if let Some(cause) = docs.refusal() {
         return Err(format!(
             "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \

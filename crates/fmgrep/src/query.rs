@@ -7,6 +7,7 @@ use grep_printer::Stats;
 use crate::regex_pattern;
 
 use crate::blobs::BlobSlots;
+use crate::diagnostic::Diagnostic;
 use crate::expr::Expr;
 use crate::fetch::{Ask, DocStore, Paths, Skip, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
@@ -81,8 +82,22 @@ impl Loaded {
     }
 
     /// Before a served query, re-check what changed since the last one.
-    pub fn recheck(&self, files: Checked<'_>) {
-        self.docs.recheck(files);
+    /// Whether it re-checked.
+    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) -> bool {
+        self.docs.recheck(files, left_out)
+    }
+
+    /// Under verbose, note the added docs, after what a recheck left out is
+    /// printed.
+    pub fn note_added(&self) {
+        self.docs.note_added();
+    }
+
+    /// Note the added docs, begin the first query and note the stale docs:
+    /// how many of the indexed `files` are stale. After the load, once its
+    /// warnings are printed.
+    pub fn note_stale(&mut self, files: &FileTable) -> usize {
+        note_stale(&mut self.docs, files)
     }
 
     /// Leave out `skip`'s files until the next call.
@@ -116,13 +131,16 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 /// the index load the files layout re-checks what watchman names, else
 /// stats every doc and discovers added files; `ask` says when watchman is
 /// asked, at load and in [`Loaded::recheck`]. `checked` is the manifest's
-/// paths when the caller has checked them already, as a server has.
+/// paths when the caller has checked them already, as a server has. What the
+/// check leaves out goes to `left_out`, also when the load fails. The caller
+/// then calls [`note_stale`], after it prints those.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
     corpus_root: Option<&Path>,
     ask: Ask,
     checked: Option<Checked<'_>>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<(DocfmIndex, Loaded), String> {
     let load_start = Instant::now();
     let load = tracing::info_span!("load").entered();
@@ -133,31 +151,33 @@ pub fn load(
     let hooks = crate::tests::Hooks::here();
     let load_id = load.id();
     // Plain threads: fixed blocking passes that overlap the load.
-    let (index, fresh, wait) = std::thread::scope(|scope| {
+    let (index, fresh, wait, found) = std::thread::scope(|scope| {
         let fresh = scope.spawn(move || {
             // A new thread is in no span: name the parent.
             let check = tracing::info_span!(parent: load_id, "check");
             let _span = check.enter();
             #[cfg(test)]
             hooks.apply();
-            check_changes(scope, &check, docs_ref, files, checked)
+            let mut found = Vec::new();
+            let fresh = check_changes(scope, &check, docs_ref, files, checked, &mut found);
+            (fresh, found)
         });
         let index =
             tracing::info_span!("index").in_scope(|| DocfmIndex::load(&blobs, &manifest.doc_lens));
         let wait = tracing::info_span!("wait").entered();
-        let fresh = fresh.join().expect("the stat pass panicked");
-        (index, fresh, wait)
+        let (fresh, found) = fresh.join().expect("the stat pass panicked");
+        (index, fresh, wait, found)
     });
     drop(wait);
+    left_out.extend(found);
     fresh?;
     let index = index.map_err(|e| format!("error: {e}"))?;
-    let mut loaded = Loaded {
+    let loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
         band: boolean::ReadBand::DEFAULT,
         locate_us: read::locate_us(None),
     };
-    note_stale(&mut loaded.docs, &manifest.files);
     covers(index.num_files_indexed(), manifest)?;
     Ok((index, loaded))
 }
@@ -165,13 +185,15 @@ pub fn load(
 /// The check of what changed since the index, as [`load`] runs it beside
 /// the index load: the re-check of what watchman names, else the stat
 /// pass, with discovery on a thread of `scope`, in `span`. `checked` is
-/// the manifest's paths when the caller has checked them already.
+/// the manifest's paths when the caller has checked them already. What the
+/// check leaves out goes to `left_out`: the replay's, then discovery's.
 pub fn check_changes<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     span: &tracing::Span,
     docs: &'env DocStore,
     files: &'env FileTable,
     checked: Option<Checked<'env>>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<Learned, String> {
     // Stored docs need no path here.
     if docs.stored() {
@@ -183,13 +205,22 @@ pub fn check_changes<'scope, 'env>(
         None => files.checked()?,
     };
     // A server that refuses to serve needs no stat pass.
-    let learned = docs.replay(files);
+    let learned = docs.replay(files, left_out);
     if matches!(learned, Learned::Answered { .. }) || docs.refusal().is_some() {
         return Ok(learned);
     }
     let span = span.clone();
-    scope.spawn(move || span.in_scope(|| docs.discover(files)));
+    let discovery = scope.spawn(move || {
+        let mut found = Vec::new();
+        span.in_scope(|| docs.discover(files, &mut found));
+        found
+    });
     docs.stat_all(files);
+    left_out.extend(
+        discovery
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+    );
     Ok(learned)
 }
 
@@ -207,10 +238,11 @@ pub fn open<'m>(
     Ok((docs, blobs))
 }
 
-/// After the check of what changed, as [`load`] ends: begin the first
-/// query of `docs` and note its stale docs. How many of the indexed
-/// `files` are stale.
+/// After the check of what changed, as [`load`] ends: note the added docs,
+/// begin the first query of `docs` and note its stale docs. How many of the
+/// indexed `files` are stale.
 pub fn note_stale(docs: &mut DocStore, files: &FileTable) -> usize {
+    docs.note_added();
     docs.begin();
     let stale = docs.stale().partition_point(|&id| id < files.len());
     if stale > 0 {
@@ -233,16 +265,20 @@ pub fn listed(root: &Path, files: &[String]) -> Result<(DocfmIndex, Loaded), Str
     Ok((DocfmIndex::empty(), loaded))
 }
 
-/// [`load`] then [`answer`].
+/// [`load`], [`note_stale`], then [`answer`]; what they leave out is dropped.
+#[cfg(test)]
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
+    let mut left_out = Vec::new();
     let (index, mut loaded) = load(
         req.index_dir,
         req.manifest,
         req.corpus_root,
         Ask::Load,
         None,
+        &mut left_out,
     )?;
-    let report = answer(&index, &mut loaded, req, sink);
+    loaded.note_stale(&req.manifest.files);
+    let report = answer(&index, &mut loaded, req, sink, &mut left_out);
     tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
     report
 }
@@ -254,10 +290,11 @@ pub fn answer(
     loaded: &mut Loaded,
     req: &QueryRequest<'_>,
     sink: &mut dyn MatchSink,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<OutputReport, String> {
     let query = tracing::info_span!("query").entered();
     let mut report = match req.expr {
-        Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink)?,
+        Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink, left_out)?,
         None => {
             let terms: Vec<Term<'_>> = req
                 .terms
@@ -268,7 +305,7 @@ pub fn answer(
                     pattern: spelled(t, req.regex, req.mode.ignore_case),
                 })
                 .collect();
-            answer_terms(index, loaded, req, &terms, sink)?
+            answer_terms(index, loaded, req, &terms, sink, left_out)?
         }
     };
     drop(query);
@@ -407,6 +444,7 @@ fn answer_terms(
     req: &QueryRequest<'_>,
     terms: &[Term<'_>],
     sink: &mut dyn MatchSink,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<OutputReport, String> {
     let manifest = req.manifest;
     let num_docs = manifest.files.len();
@@ -612,6 +650,7 @@ fn answer_terms(
                     stats: &f.stats,
                 })
             },
+            left_out,
         )?;
         if emit {
             for &(i, c) in &exact[next_exact..] {

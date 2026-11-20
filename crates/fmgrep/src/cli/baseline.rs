@@ -15,10 +15,12 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::checkout::{Local, changes, resolve, short};
-use super::params::{MAX_SKIP, QueryParams};
+use super::params::QueryParams;
+use crate::checkout::{Local, changes, resolve, short};
+use crate::diagnostic::Diagnostic;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
+use crate::wire::MAX_SKIP;
 
 /// The skip list of the checkout at `top` against the served commit
 /// `commit`, and the files of it this client searches; or why the
@@ -42,7 +44,7 @@ pub fn skip_list(
         } => match since(top, baseline, &extra, changed) {
             Ok(skip) => {
                 remember(top, &of, token, skip.clone(), extra);
-                let local = resolve(top, &skip, commit)?;
+                let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
                 note(
                     top,
                     Some(&of),
@@ -59,9 +61,9 @@ pub fn skip_list(
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = changes(top, commit)?;
+            let skip = printed(|left_out| changes(top, commit, left_out))?;
             let took = asked.elapsed();
-            let local = resolve(top, &skip, commit)?;
+            let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
@@ -96,14 +98,14 @@ pub fn skip_list(
     let listed = settings(top);
     let git = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
-    let skip = changes(top, commit)?;
+    let skip = printed(|left_out| changes(top, commit, left_out))?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env()});
         remember(top, &of, token, skip.clone(), extra);
     }
-    let local = resolve(top, &skip, commit)?;
+    let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
     let next = match same {
         true => "later searches ask watchman",
         false => "git's config files changed while git ran; the next search asks git again",
@@ -116,6 +118,16 @@ pub fn skip_list(
     let source = "git, a new baseline";
     note(top, same.then_some(&of), commit, source, &skip, &local, p);
     Ok((skip, local))
+}
+
+/// What `find` leaves out of the checkout's files, printed as soon as it
+/// returns, before the lines of the search that follow: in a search that
+/// holds its lines these join them, in this order.
+fn printed<T>(find: impl FnOnce(&mut Vec<Diagnostic>) -> T) -> T {
+    let mut left_out = Vec::new();
+    let found = find(&mut left_out);
+    super::print_diagnostics(left_out);
+    found
 }
 
 /// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
@@ -192,7 +204,7 @@ fn since(
         }
         // Gone, or below a symlink now: it may have been a directory of
         // tracked files.
-        if super::checkout::lstat(top, &p).is_none() {
+        if crate::checkout::lstat(top, &p).is_none() {
             skip.push(format!("{p}/"));
         }
         skip.push(p);

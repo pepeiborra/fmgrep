@@ -227,8 +227,15 @@ answer, a load stats every document against its `(size, mtime)` stamp
   excluded, with one warning per process;
 - a file the walk's rules find that the index does not list is added:
   scanned in full and printed in path order among the indexed files, with
-  no warning. The load stats the directories in `dirs.stamps`, lists only
-  those whose stamp moved, and walks new directories below them in full;
+  no warning; one that cannot be read, or is over 2 GiB (the bound the
+  index applies), is left out with one `warning: skipping PATH: why` per
+  process, as an indexed file that cannot be read is; a directory it
+  cannot list is named by one `warning: cannot list DIR: why; files under
+  it may be missing from the answer` per process, and what is new under
+  it is not searched. Both warnings cover the whole tree, whatever the
+  PATH or `-g` of the search. The load stats the directories in
+  `dirs.stamps`, lists only those whose stamp moved, and walks new
+  directories below them in full;
 - a file the walk skipped as non-text is sniffed again whenever its
   directory is listed: one rewritten in place as text is found once its
   directory's stamp moves, or when watchman reports it as changed;
