@@ -29,12 +29,41 @@ pub(crate) fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| w.to_string()).collect()
 }
 
-/// `head flags [-- terms]`.
+/// Whether `flags` combine several patterns into one expression.
+fn combines(flags: &[&str]) -> bool {
+    flags.iter().any(|f| matches!(*f, "--and" | "--or"))
+}
+
+/// The PATTERNs of `terms`, then its PATHs: the trailing words that name a
+/// file or directory, but not the first word.
+pub(crate) fn patterns_and_paths<'a>(terms: &'a [&'a str]) -> (&'a [&'a str], &'a [&'a str]) {
+    let paths = (terms.iter().skip(1).rev())
+        .take_while(|t| **t == "-" || Path::new(t).exists())
+        .count();
+    terms.split_at(terms.len() - paths)
+}
+
+/// `head flags [-- pattern PATH...]`: the command line has one PATTERN. With
+/// `--and` or `--or`, each of the patterns of `terms` is an `-e` PATTERN.
 pub(crate) fn words(head: &[&str], flags: &[&str], terms: &[&str]) -> Vec<String> {
     let mut words = argv(&[head, flags].concat());
-    if !terms.is_empty() {
-        words.push("--".into());
-        words.extend(argv(terms));
+    let (patterns, paths) = patterns_and_paths(terms);
+    match patterns {
+        [] => {}
+        _ if combines(flags) => {
+            for t in patterns {
+                words.extend(argv(&["-e", t]));
+            }
+            words.push("--".into());
+        }
+        [_] => words.push("--".into()),
+        _ => panic!("one search has one PATTERN: {patterns:?}"),
+    }
+    if combines(flags) {
+        words.extend(argv(paths));
+    } else {
+        words.extend(argv(patterns));
+        words.extend(argv(paths));
     }
     words
 }
@@ -53,8 +82,23 @@ pub(crate) fn printed(index: &Path, flags: &[&str], terms: &[&str]) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// The report of `--index <index> <flags> -- <terms>`.
+/// The report of `--index <index> <flags> -- <terms>`. A search of the
+/// command line has one PATTERN, or one expression: several `terms` that
+/// `flags` do not combine are searched one after the other, and their
+/// queries reported in turn, as a request of several terms reports them.
 pub(crate) fn query(index: &Path, flags: &[&str], terms: &[&str]) -> Result<OutputReport, String> {
+    let (patterns, paths) = patterns_and_paths(terms);
+    if patterns.len() > 1 && !combines(flags) {
+        let mut all: Option<OutputReport> = None;
+        for pattern in patterns {
+            let report = query(index, flags, &[&[*pattern], paths].concat())?;
+            match &mut all {
+                None => all = Some(report),
+                Some(all) => all.queries.extend(report.queries),
+            }
+        }
+        return Ok(all.expect("several terms"));
+    }
     let index = index.display().to_string();
     match dispatch(words(&["--index", &index], flags, terms))? {
         Outcome::Query(r) => Ok(r),

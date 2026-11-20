@@ -162,7 +162,14 @@ mod tests {
         for id in CORPORA {
             for q in query_set(id).queries {
                 let args = crate::rows::fmgrep_args(&q);
-                let patterns = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
+                // One leaf follows `--`; several are each `-e` of `--and`.
+                let patterns: Vec<&String> = match args.iter().position(|a| a == "--") {
+                    Some(at) => args[at + 1..].iter().collect(),
+                    None => (args.windows(2))
+                        .filter(|w| w[0] == "-e")
+                        .map(|w| &w[1])
+                        .collect(),
+                };
                 let fixed = args.iter().any(|a| a == "-F");
                 let leaves = leaves(&q);
                 assert_eq!(patterns.len(), leaves.len(), "{id} {q:?}");

@@ -621,20 +621,20 @@ fn serve_tcp_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
         let (addr, server) = spawn_server(&index, FIXED);
-        let terms = ["printk", "aa", "pr[i1]ntk"];
-
-        let (_, json) = client(&addr, &[&["--json", "--"][..], &terms].concat()).unwrap();
-        let report: OutputReport = serde_json::from_str(json.trim_end()).unwrap();
-        assert_eq!(
-            serde_json::to_string(&report).unwrap(),
-            json.trim_end(),
-            "store_docs={store_docs}"
-        );
-        assert_eq!(
-            timeless(report),
-            timeless(query_it(&index, false, &terms)),
-            "store_docs={store_docs}"
-        );
+        for term in ["printk", "aa", "pr[i1]ntk"] {
+            let (_, json) = client(&addr, &["--json", "--", term]).unwrap();
+            let report: OutputReport = serde_json::from_str(json.trim_end()).unwrap();
+            assert_eq!(
+                serde_json::to_string(&report).unwrap(),
+                json.trim_end(),
+                "store_docs={store_docs} {term}"
+            );
+            assert_eq!(
+                timeless(report),
+                timeless(query_it(&index, false, &[term])),
+                "store_docs={store_docs} {term}"
+            );
+        }
 
         let (_, human) = client(&addr, &["-i", "--approx-counts", "--", "PRINTK"]).unwrap();
         assert_eq!(
@@ -678,8 +678,9 @@ fn a_server_reads_patterns_and_fixed_strings_as_a_local_search_does() {
         &["-c", "--", ""],
         &["-i", "-S", "--", "PRINTK"],
         &["-S", "--", "printk"],
-        &["--and", "--", "printk", "pr.ntk"],
-        &["-F", "--and", "--", "printk", "pr.ntk"],
+        &["--and", "-e", "printk", "-e", "pr.ntk"],
+        &["-F", "--and", "-e", "printk", "-e", "pr.ntk"],
+        &["-e", "printk", "-e", "pr.ntk"],
     ] {
         let local = output(&words_of(&index, words), false).unwrap();
         let served = client(&addr, words).unwrap().1;
@@ -824,18 +825,14 @@ fn serve_reads_a_moved_tree_through_its_dotdir() {
     assert_eq!(result_report(&response), want);
 }
 
-/// `total_matches` per term over `addr`, and the report they came from.
-fn served_report(addr: &str, terms: &[&str]) -> (Vec<u64>, String) {
-    let mut words = vec!["--json", "--"];
-    words.extend(terms);
-    let (_, json) = client(addr, &words).unwrap();
-    let report: OutputReport = serde_json::from_str(json.trim_end()).unwrap();
-    let totals = report.queries.iter().map(|q| q.total_matches).collect();
-    (totals, json)
-}
-
+/// `total_matches` of each of `terms`, searched in turn over `addr`.
 fn served_totals(addr: &str, terms: &[&str]) -> Vec<u64> {
-    served_report(addr, terms).0
+    let total = |term: &&str| {
+        let (_, json) = client(addr, &["--json", "--", term]).unwrap();
+        let report: OutputReport = serde_json::from_str(json.trim_end()).unwrap();
+        report.queries[0].total_matches
+    };
+    terms.iter().map(total).collect()
 }
 
 /// A private daemon that watches `corpus`, which servers started on this
@@ -1249,7 +1246,7 @@ fn served_searches_honour_the_filter() {
             (&["-g", "*.c", "-l"][..], &["printk"][..]),
             (&["--iglob", "*.H", "-n"], &["printk"]),
             (
-                &["-g", "!sub", "--json", "--approx-counts"],
+                &["-g", "!sub", "--json", "--approx-counts", "--or"],
                 &["printk", "al[a-z]ha"],
             ),
             (&["-c"], &["printk", &sub]),
