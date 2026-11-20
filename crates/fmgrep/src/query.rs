@@ -550,7 +550,7 @@ fn answer_terms(
                 file_us,
                 locate_us: loaded.locate_us,
             };
-            let reads = read::read_instead(
+            let (reads, plan) = read::read_instead(
                 index,
                 &readable,
                 c,
@@ -559,6 +559,7 @@ fn answer_terms(
                 costs,
                 req.plans,
             );
+            left_out.extend(plan.map(|text| Diagnostic::Plan { text }));
             failed.map_or(Ok(reads), Err)?
         }
         _ => probes.iter().map(|_| None).collect(),
@@ -623,12 +624,14 @@ fn answer_terms(
         }
         paths.sort(&mut scan);
         if let Some(plan) = plans.get(i) {
-            crate::held::text(&format!(
-                "plan: term {term:?}: {plan}; {} files located, {} candidates, {} files read\n",
-                exact.len(),
-                candidates.len(),
-                scan.len()
-            ));
+            left_out.push(Diagnostic::Plan {
+                text: format!(
+                    "plan: term {term:?}: {plan}; {} files located, {} candidates, {} files read\n",
+                    exact.len(),
+                    candidates.len(),
+                    scan.len()
+                ),
+            });
         }
         // Every path the term may print is checked before its first line.
         if emit {

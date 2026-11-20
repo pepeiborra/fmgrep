@@ -77,15 +77,6 @@ pub fn once(seen: Option<&'static AtomicBool>, line: &str) {
     });
 }
 
-/// `text`, whole lines, on stderr, or held: the plan that
-/// `FMGREP_VERBOSE=2` prints of the client's own part of a search.
-pub fn text(text: &str) {
-    HELD.with_borrow_mut(|held| match held {
-        Some(lines) => lines.push((text.to_owned(), None, None)),
-        None => eprint!("{text}"),
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,8 +90,7 @@ mod tests {
         assert!(holding());
         line("warning: held");
         once(Some(&SEEN), "warning: once");
-        text("plan:\n");
-        assert_eq!(HELD.with_borrow(|h| h.as_ref().map(Vec::len)), Some(3));
+        assert_eq!(HELD.with_borrow(|h| h.as_ref().map(Vec::len)), Some(2));
         discard();
         assert!(!holding() && !SEEN.load(Ordering::Relaxed));
         SEEN.store(true, Ordering::Relaxed);

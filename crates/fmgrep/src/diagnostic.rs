@@ -17,6 +17,10 @@ pub enum Diagnostic {
     /// An untracked directory that git status could not open, so that it
     /// lists none of the files in it. `dir` is as git writes it: `nd/`.
     Unopened { dir: String, why: String },
+    /// The planner's account of a search under `FMGREP_VERBOSE=2`: whole
+    /// lines, each ending in a newline. It is text because the planner
+    /// renders it from values that the query owns.
+    Plan { text: String },
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -41,6 +45,7 @@ impl fmt::Display for Diagnostic {
                 "warning: git status: could not open directory '{dir}': {why}; untracked files \
                  under it are not searched"
             ),
+            Self::Plan { text } => f.write_str(text.strip_suffix('\n').unwrap_or(text)),
         }
     }
 }
