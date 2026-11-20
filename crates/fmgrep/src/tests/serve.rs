@@ -661,6 +661,47 @@ fn serve_tcp_round_trip() {
     }
 }
 
+/// What the client sends for a pattern, a text under -F and the empty
+/// pattern is what a local search answers.
+#[test]
+fn a_server_reads_patterns_and_fixed_strings_as_a_local_search_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), true);
+    let (addr, server) = spawn_server(&index, FIXED);
+    for words in [
+        &["--", "pr.ntk"][..],
+        &["-F", "--", "pr.ntk"],
+        &["-F", "--", "printk"],
+        &["--", "^a+$"],
+        &["-F", "--", ""],
+        &["--", ""],
+        &["-c", "--", ""],
+        &["-i", "-S", "--", "PRINTK"],
+        &["-S", "--", "printk"],
+        &["--and", "--", "printk", "pr.ntk"],
+        &["-F", "--and", "--", "printk", "pr.ntk"],
+    ] {
+        let local = output(&words_of(&index, words), false).unwrap();
+        let served = client(&addr, words).unwrap().1;
+        assert_eq!(served.as_bytes(), local.as_slice(), "{words:?}");
+    }
+    assert!(client(&addr, &["--", "("]).is_err());
+    let hint = client(&addr, &["--", "("]).err().unwrap();
+    assert!(
+        hint.ends_with("hint: to search for the text as it is, pass -F"),
+        "{hint}"
+    );
+    assert!(client(&addr, &["-F", "--", "("]).is_ok());
+    client(&addr, &["--shutdown"]).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+fn words_of(index: &Path, words: &[&str]) -> Vec<String> {
+    let mut all = argv(&["--index", &index.display().to_string()]);
+    all.extend(argv(words));
+    all
+}
+
 #[test]
 fn server_errors_surface_on_the_client() {
     let tmp = tempfile::tempdir().unwrap();
