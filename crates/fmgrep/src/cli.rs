@@ -830,7 +830,7 @@ fn dispatch_in(
             print::line(out, e.to_string().trim_end())?;
             return Ok(Outcome::Done);
         }
-        Err(e) => return Err(e.to_string().trim_end().to_owned()),
+        Err(e) => return Err(refusal(&e).unwrap_or_else(|| e.to_string().trim_end().to_owned())),
     };
     let verbose = matches!(&cli.command, Some(Command::Index(a)) if a.verbose);
     crate::verbose::set_verbose(verbose).map_err(|e| format!("error: {e}"))?;
@@ -848,6 +848,27 @@ fn dispatch_in(
         Some(Command::Serve(a)) => serve(a, input, out),
         Some(Command::Status(a)) => status(a, env, out),
         None => search(&cli.search, env, input, out, tty, printing),
+    }
+}
+
+/// The error of an rg flag that no index can honour, which clap met as an
+/// unknown argument of a search: what the index lacks, and rg to use instead.
+/// `fmgrep index --hidden` is clap's error: rg builds no index.
+fn refusal(e: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if e.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    // The usage line is `fmgrep [OPTIONS] ...` for a search, `fmgrep index ...`
+    // for a subcommand.
+    let usage = e.get(ContextKind::Usage).map(ToString::to_string);
+    let word = usage.as_deref().and_then(|u| u.split_whitespace().nth(2));
+    if word.is_some_and(|w| !w.starts_with(['[', '<'])) {
+        return None;
+    }
+    match e.get(ContextKind::InvalidArg)? {
+        ContextValue::String(flag) => args::unindexable(flag),
+        _ => None,
     }
 }
 
