@@ -3,7 +3,8 @@ use super::*;
 #[test]
 fn regex_marker_runs_every_term_as_pattern_verbatim() {
     // Under --regex even a `/.../`-wrapped term is a pattern verbatim: the
-    // marker wins over the slash convention.
+    // marker wins over the slash convention. A pattern that is nothing but
+    // a literal counts as the literal does.
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let folder = stage_corpus(
@@ -12,13 +13,16 @@ fn regex_marker_runs_every_term_as_pattern_verbatim() {
         );
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let out = query_it(&output, true, &["/printk/", "pr[i1]ntk", "aa"]);
+        let out = query_it(&output, true, &["/printk/", "pr[i1]ntk", "(aa)", "aa"]);
         assert_eq!(out.queries[0].term, "/printk/", "store_docs={store_docs}");
         assert_eq!(out.queries[0].total_matches, 0, "store_docs={store_docs}");
         assert_eq!(out.queries[1].total_matches, 2, "store_docs={store_docs}");
-        // Non-overlapping: `aa` on `aaaa` is 2.
+        // Non-overlapping: `(aa)` on `aaaa` is 2.
         assert_eq!(out.queries[2].total_matches, 2, "store_docs={store_docs}");
         assert_eq!(out.queries[2].docs_matched, 1, "store_docs={store_docs}");
+        // A plain literal is the literal: overlapping, as the index counts.
+        assert_eq!(out.queries[3].total_matches, 3, "store_docs={store_docs}");
+        assert!(!out.queries[3].counts_exact);
     }
 }
 
@@ -102,7 +106,7 @@ fn regex_fetches_only_unpruned_candidates() {
     );
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    let out = query_it(&output, true, &["printk", "pr[i1]ntk", "missing"]);
+    let out = query_it(&output, true, &["pr[i1]ntk", "pr[i1]ntk", "missing"]);
     assert_eq!(out.queries[0].total_matches, 2);
     assert_eq!(out.queries[0].docs_matched, 1);
     assert_eq!(out.queries[1].total_matches, 2);
@@ -114,7 +118,7 @@ fn regex_fetches_only_unpruned_candidates() {
         query_it(&output, true, &["missing"]).queries[0].total_matches,
         0
     );
-    let err = query_it_err(&output, true, &["printk"]);
+    let err = query_it_err(&output, true, &["pr[i1]ntk"]);
     assert!(
         err.contains("cannot read") && err.contains(DOCS_SHARD),
         "got: {err}"
@@ -128,7 +132,7 @@ fn regex_fetches_only_unpruned_candidates() {
     assert_eq!(swapped.len(), shard.len());
     std::fs::write(output.join(DOCS_SHARD), &swapped).unwrap();
     assert_eq!(
-        query_it(&output, true, &["printk"]).queries[0].total_matches,
+        query_it(&output, true, &["pr[i1]ntk"]).queries[0].total_matches,
         0,
         "regex must follow the swapped bytes"
     );
@@ -138,6 +142,40 @@ fn regex_fetches_only_unpruned_candidates() {
         2,
         "literal must stay blob-pinned"
     );
+}
+
+#[test]
+fn a_plain_literal_pattern_reads_no_file() {
+    // Under `--regex` a pattern that is nothing but a literal is located
+    // as a bare term is: `-l` and the counts need no shard, where a pattern
+    // with a class reads every candidate.
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[("a.c", b"printk hello a.b"), ("b.c", b"nothing a.b")],
+    );
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, true);
+    std::fs::rename(output.join(DOCS_SHARD), output.join("hidden")).unwrap();
+    for (plain, files) in [
+        ("printk", "a.c\n"),
+        ("a\\.b", "a.c\nb.c\n"),
+        ("hello a\\.b", "a.c\n"),
+    ] {
+        assert_eq!(printed(&output, &["-l", "--regex"], &[plain]), files);
+    }
+    // So is a regex leaf of an expression, whose answer is the same.
+    assert_eq!(
+        printed(&output, &["-l", "--expr", "/printk/ AND /a\\.b/"], &[]),
+        "a.c\n"
+    );
+    // A class, an alternation and a metacharacter read the candidates.
+    for regex in ["pr[i1]ntk", "printk|nothing", "a.b"] {
+        let err = query(&output, &["-l", "--regex"], &[regex]).unwrap_err();
+        assert!(err.contains("cannot read"), "{regex}: {err}");
+    }
+    let err = query(&output, &["-l", "--expr", "/printk/ AND /pr[i1]ntk/"], &[]).unwrap_err();
+    assert!(err.contains("cannot read"), "{err}");
 }
 
 /// Files-layout and stored-docs indexes of `files`, then `a.c` made unopenable:
@@ -171,10 +209,12 @@ fn literal_pattern_counts_without_fetch() {
     let q = &out.queries[0];
     assert_eq!(q.total_matches, per_doc.iter().sum::<u64>());
     assert_eq!(q.docs_matched, per_doc.iter().filter(|&&c| c > 0).count());
-    assert!(!q.counts_exact);
-    // A stored-docs index keeps reading its live docs.shard.
+    // The pattern is a plain literal: the index's count, which is rg's here.
+    assert!(q.counts_exact);
+    // A stored-docs index keeps reading its live docs.shard for a pattern
+    // that is more than a literal.
     std::fs::rename(shard.join(DOCS_SHARD), shard.join("hidden")).unwrap();
-    assert!(query_it_err(&shard, false, &["/printk\\(/"]).contains("cannot read"));
+    assert!(query_it_err(&shard, false, &["/printk\\(+/"]).contains("cannot read"));
 }
 
 #[test]
@@ -183,7 +223,7 @@ fn non_literal_patterns_still_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     let (output, _) = unreadable_files_index(tmp.path(), &files);
     // The only doc matches every term: a zero proves the fetch.
-    for term in ["/aa/", "/caf\u{e9}/", "/a\nb/"] {
+    for term in ["/(aa)/", "/(caf\u{e9})/", "/a\nb/"] {
         assert_eq!(
             query_it(&output, false, &[term]).queries[0].total_matches,
             0,
@@ -343,9 +383,11 @@ fn batch_drive_matches_per_term_answers() {
     let want = [
         ("printk", 3u64, 2usize),
         ("/pr[i1]ntk/", 3, 2),
-        // Literals count overlapping, regexes do not.
+        // Literals count overlapping, regexes do not; a pattern that is
+        // nothing but a literal is one.
         ("aa", 3, 1),
-        ("/aa/", 2, 1),
+        ("/aa/", 3, 1),
+        ("/(aa)/", 2, 1),
         ("/no|tail/", 1, 1),
         ("missing", 0, 0),
     ];

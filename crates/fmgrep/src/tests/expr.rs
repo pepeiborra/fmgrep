@@ -263,6 +263,10 @@ fn expr_single_leaf_equals_its_term() {
         let index = stage(tmp.path(), store_docs);
         for (leaf, term) in [
             (t("printk"), "printk"),
+            // A regex that is a literal is answered as the term is: the
+            // same counts, exactness and files.
+            (re("printk"), "printk"),
+            (re("alpha"), "alpha"),
             (re("pr[i1]ntk"), "/pr[i1]ntk/"),
             (t("alpha"), "alpha"),
         ] {
