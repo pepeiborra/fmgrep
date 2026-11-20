@@ -193,6 +193,32 @@ fn a_pattern_that_needs_a_nul_is_refused_as_in_rg() {
     assert_eq!(printed(&output, &["-c"], &["[\\x00-\\x01]"]), "");
 }
 
+#[test]
+fn an_inline_flag_survives_ignore_case_and_smart_case() {
+    // `(?-i)` turns -i off inside the pattern: it must not be folded again,
+    // however the pattern is given.
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[
+            ("a.c", b"FOO BAR\nxx"),
+            ("b.c", b"foo bar\nxx"),
+            ("c.c", b"Foo bar\nxx"),
+        ],
+    );
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, true);
+    for (flags, args, files) in [
+        (&["-l", "-i"][..], &["(?-i)FOO"][..], "a.c\n"),
+        (&["-l", "-S"], &["(?-i)foo"], "b.c\n"),
+        (&["-l", "-i", "--and"], &["(?-i)FOO", "xx"], "a.c\n"),
+        (&["-l", "-i", "--expr", "/(?-i)FOO/ AND xx"], &[], "a.c\n"),
+        (&["-l", "-i"], &["\\((?-i)f"], ""),
+    ] {
+        assert_eq!(printed(&output, flags, args), files, "{flags:?} {args:?}");
+    }
+}
+
 /// Files-layout and stored-docs indexes of `files`, then `a.c` made unopenable:
 /// it still stats as indexed, but a fetch excludes it.
 fn unreadable_files_index(tmp: &Path, files: &[(&str, &[u8])]) -> (PathBuf, PathBuf) {

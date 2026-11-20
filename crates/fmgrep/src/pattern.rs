@@ -151,6 +151,64 @@ pub fn plain_literal(pattern: &str) -> Option<String> {
     (!text.is_empty() && !text.contains(['\n', '\0'])).then(|| text.to_owned())
 }
 
+/// Whether rg's smart case reads `patterns` case-insensitively: some literal
+/// holds a letter in them, and no uppercase one does. A class such as `\S`,
+/// `\p{Lu}` or `\W` is no literal; the pattern `\.` is. A pattern that does
+/// not parse says nothing here: the search reports it.
+pub fn smart_case_folds<'a>(patterns: impl IntoIterator<Item = &'a str>) -> bool {
+    use regex_syntax::ast::{Ast, ClassSet, ClassSetItem, Literal};
+    #[derive(Default)]
+    struct Seen {
+        any_literal: bool,
+        any_uppercase: bool,
+    }
+    impl Seen {
+        fn literal(&mut self, lit: &Literal) {
+            self.any_literal = true;
+            self.any_uppercase |= lit.c.is_uppercase();
+        }
+        fn set(&mut self, set: &ClassSet) {
+            match set {
+                ClassSet::Item(item) => self.item(item),
+                ClassSet::BinaryOp(op) => {
+                    self.set(&op.lhs);
+                    self.set(&op.rhs);
+                }
+            }
+        }
+        fn item(&mut self, item: &ClassSetItem) {
+            match item {
+                ClassSetItem::Literal(lit) => self.literal(lit),
+                ClassSetItem::Range(range) => {
+                    self.literal(&range.start);
+                    self.literal(&range.end);
+                }
+                ClassSetItem::Bracketed(class) => self.set(&class.kind),
+                ClassSetItem::Union(union) => union.items.iter().for_each(|i| self.item(i)),
+                _ => {}
+            }
+        }
+        fn ast(&mut self, ast: &Ast) {
+            match ast {
+                Ast::Literal(lit) => self.literal(lit),
+                Ast::ClassBracketed(class) => self.set(&class.kind),
+                Ast::Repetition(rep) => self.ast(&rep.ast),
+                Ast::Group(group) => self.ast(&group.ast),
+                Ast::Alternation(alt) => alt.asts.iter().for_each(|a| self.ast(a)),
+                Ast::Concat(concat) => concat.asts.iter().for_each(|a| self.ast(a)),
+                _ => {}
+            }
+        }
+    }
+    let mut seen = Seen::default();
+    for pattern in patterns {
+        if let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) {
+            seen.ast(&ast);
+        }
+    }
+    seen.any_literal && !seen.any_uppercase
+}
+
 /// One regex compiled once, plus the literals the FM-index prunes it with.
 pub struct PreparedPattern {
     re: regex::bytes::Regex,

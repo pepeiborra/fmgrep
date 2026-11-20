@@ -9,7 +9,7 @@ use clap::{Args, ColorChoice, Parser, Subcommand};
 
 use super::params::{Color, Context, Mode, QueryParams};
 use crate::expr::Expr;
-use crate::pattern::plain_literal;
+use crate::pattern::{plain_literal, smart_case_folds};
 
 const SEARCH_NOTE: &str = "\
 A search reads the .fmgrep of the nearest enclosing directory. A TERM is a
@@ -144,8 +144,14 @@ pub struct Search {
     #[arg(long, hide = true)]
     pub regex: bool,
     /// Match case-insensitively
-    #[arg(short, long)]
+    #[arg(short, long, overrides_with_all = ["case_sensitive", "smart_case"])]
     pub ignore_case: bool,
+    /// Match case-sensitively (the default)
+    #[arg(short = 's', long, overrides_with_all = ["ignore_case", "smart_case"])]
+    pub case_sensitive: bool,
+    /// Ignore case unless a TERM holds an uppercase letter
+    #[arg(short = 'S', long, overrides_with_all = ["ignore_case", "case_sensitive"])]
+    pub smart_case: bool,
     /// Let a match span lines
     #[arg(short = 'U', long)]
     pub multiline: bool,
@@ -322,6 +328,9 @@ impl Search {
             ..QueryParams::default()
         };
         p.filter()?;
+        if self.smart_case {
+            p.ignore_case = smart_case_folds(self.sources(&p).iter().map(String::as_str));
+        }
         if self.and || self.or {
             let op = if self.and { "--and" } else { "--or" };
             if p.terms.len() < 2 {
@@ -360,6 +369,24 @@ impl Search {
             p.stats = self.stats && matches!(mode, Mode::Lines | Mode::Only);
         }
         Ok(p)
+    }
+
+    /// The patterns the search reads, as regexes: the TERMs, the leaves of an
+    /// expression, a literal escaped.
+    fn sources(&self, p: &QueryParams) -> Vec<String> {
+        let escaped = |t: &String| match p.regex {
+            true => t.clone(),
+            false => regex::escape(t),
+        };
+        let mut sources: Vec<String> = p.terms.iter().map(escaped).collect();
+        for leaf in p.expr.iter().flat_map(Expr::leaves) {
+            match leaf {
+                Expr::Term(t) => sources.push(regex::escape(t)),
+                Expr::Regex(r) => sources.push(r.clone()),
+                Expr::And(_) | Expr::Or(_) => {}
+            }
+        }
+        sources
     }
 
     /// The PATHs, as typed.
