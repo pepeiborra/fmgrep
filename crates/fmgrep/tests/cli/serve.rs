@@ -84,6 +84,41 @@ fn tcp_server_flag_equals_local_search() {
             stderr(&out),
             "error: nosuch: No such file or directory (os error 2)\n"
         );
+        // A PATH that holds no file the server's index has is named by the
+        // server, and the client says so as a local search does. Only an
+        // index of a tree, not stored documents, knows where a PATH is.
+        if !store_docs {
+            let hidden = docs.join(".hidden.c");
+            std::fs::write(&hidden, "printk hidden\n").unwrap();
+            let out = run(&["--server", addr, "printk", &hidden.display().to_string()]);
+            assert_eq!(out.status.code(), Some(2), "{store_docs}");
+            assert_eq!(
+                stderr(&out),
+                format!(
+                    "error: {}: not in the index (hidden, ignored, binary, a symlink, or new to a \
+                     --store-docs index); search it with rg\n",
+                    hidden.display()
+                )
+            );
+            std::fs::remove_file(&hidden).unwrap();
+            // A binary file added since the index is named too, and a
+            // directory in which rg reads nothing is no error.
+            let new = docs.join("new.dat");
+            std::fs::write(&new, b"printk\0new\n").unwrap();
+            let out = run(&["--server", addr, "printk", &new.display().to_string()]);
+            assert_eq!(out.status.code(), Some(2), "{store_docs}");
+            assert!(
+                stderr(&out).contains("not in the index"),
+                "{}",
+                stderr(&out)
+            );
+            std::fs::remove_file(&new).unwrap();
+            let empty = docs.join("emptydir");
+            std::fs::create_dir(&empty).unwrap();
+            let out = run(&["--server", addr, "printk", &empty.display().to_string()]);
+            assert_eq!((out.status.code(), stderr(&out)), (Some(1), String::new()));
+            std::fs::remove_dir(&empty).unwrap();
+        }
         // Several patterns are one search of any of them.
         let any = [&["--json", "--or"][..], &TERMS.map(|t| ["-e", t]).concat()].concat();
         let local = ok(&[&["--index", &index][..], &any].concat());

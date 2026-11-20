@@ -301,6 +301,9 @@ pub fn answer(
     };
     drop(query);
     tracing::info_span!("save").in_scope(|| loaded.docs.checkpoint(&req.manifest.files))?;
+    if let Some(f) = &req.filter {
+        report.unindexed = f.unindexed(|p| loaded.docs.holds(&req.manifest.files, p))?;
+    }
     let matched = |q: &QueryReport| q.total_matches > 0 || q.docs_matched > 0;
     if let Some(f) = &req.filter
         && !report.queries.iter().any(matched)
@@ -709,6 +712,7 @@ fn answer_terms(
         num_files_indexed: manifest.num_docs,
         queries,
         none_searched: false,
+        unindexed: Vec::new(),
     })
 }
 

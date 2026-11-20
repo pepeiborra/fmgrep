@@ -79,6 +79,23 @@ impl PathFilter {
         }))
     }
 
+    /// The PATHs as typed that `holds` finds no file of: it is given each
+    /// PATH, as a path from the root of the tree, and says whether the index
+    /// or the added files have a file at it or below it. A search with no
+    /// PATH has none.
+    pub fn unindexed(
+        &self,
+        mut holds: impl FnMut(&str) -> Result<bool, String>,
+    ) -> Result<Vec<String>, String> {
+        let mut lacking = Vec::new();
+        for p in self.paths.iter().filter(|p| !p.name.is_empty()) {
+            if !holds(&p.path)? {
+                lacking.push(p.name.clone());
+            }
+        }
+        Ok(lacking)
+    }
+
     /// Whether a glob filters, not only PATHs.
     pub fn globs(&self) -> bool {
         !self.rules.is_empty()

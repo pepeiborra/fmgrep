@@ -657,6 +657,7 @@ pub fn answer_expr(
         num_files_indexed: manifest.num_docs,
         queries: vec![report],
         none_searched: false,
+        unindexed: Vec::new(),
     })
 }
 

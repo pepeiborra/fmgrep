@@ -934,6 +934,105 @@ fn stdin_is_never_read_and_a_dash_is_a_plain_path() {
     assert_eq!(said(&out), (Some(0), "printk dash\n".into(), "".into()));
 }
 
+/// A PATH that exists, though the index skips it, is an error: rg searches
+/// it, an index cannot. The other PATHs are searched, and the exit is 2.
+#[cfg(unix)]
+#[test]
+fn a_path_the_index_skips_is_an_error() {
+    let (_tmp, docs) = stage_files(&[
+        ("a.c", b"printk a\n"),
+        (".hidden.c", b"printk hidden\n"),
+        ("bin.dat", b"printk\0binary\n"),
+    ]);
+    // Older than 2 s, so that the index records its stamp: a newer one is
+    // unknown, and every search warns.
+    let ignore = std::fs::File::create(docs.join(".ignore")).unwrap();
+    std::io::Write::write_all(&mut &ignore, b"build/\n").unwrap();
+    ignore
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(10))
+        .unwrap();
+    std::fs::create_dir(docs.join("build")).unwrap();
+    std::fs::write(docs.join("build/out.c"), "printk built\n").unwrap();
+    std::os::unix::fs::symlink("a.c", docs.join("link.c")).unwrap();
+    // Directories in which rg reads nothing either: it exits 1 there.
+    std::fs::create_dir_all(docs.join("emptydir")).unwrap();
+    std::fs::create_dir_all(docs.join("onlykeep")).unwrap();
+    std::fs::write(docs.join("onlykeep/.keep"), "").unwrap();
+    std::fs::create_dir_all(docs.join("onlybin")).unwrap();
+    std::fs::write(docs.join("onlybin/b.dat"), b"printk\0binary\n").unwrap();
+    std::fs::create_dir_all(docs.join("gone")).unwrap();
+    std::fs::write(docs.join("gone/g.c"), "printk gone\n").unwrap();
+    // The files layout knows its tree; the stored documents of an index
+    // outside the tree do not, and the tests of the library cover them.
+    {
+        let store_docs = false;
+        let index = do_index(&docs, store_docs).display().to_string();
+        let found = |args: &[&str]| {
+            let args = [&["--index", &index][..], args].concat();
+            let out = run_in(&docs, &args);
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr(&out),
+            )
+        };
+        let skipped = |path: &str| {
+            format!(
+                "error: {path}: not in the index (hidden, ignored, binary, a symlink, or new to \
+                 a --store-docs index); search it with rg\n"
+            )
+        };
+        // A binary file added since the index is no file of it either.
+        std::fs::write(docs.join("new.dat"), b"printk\0new\n").unwrap();
+        for path in [
+            ".hidden.c",
+            "build",
+            "build/out.c",
+            "bin.dat",
+            "link.c",
+            "new.dat",
+        ] {
+            let want = (Some(2), "".into(), skipped(path));
+            assert_eq!(found(&["printk", path]), want, "{store_docs} {path}");
+        }
+        assert_eq!(
+            found(&["printk", "a.c", ".hidden.c"]),
+            (Some(2), "a.c:printk a\n".into(), skipped(".hidden.c")),
+            "{store_docs}"
+        );
+        // rg finds nothing in these either, and exits 1 without a word.
+        for dir in ["emptydir", "onlykeep", "onlybin"] {
+            let want = (Some(1), "".into(), "".into());
+            assert_eq!(found(&["printk", dir]), want, "{store_docs} {dir}");
+        }
+        // The error is the search's, and the report is printed first.
+        let (code, out, said) = found(&["--json", "printk", "build"]);
+        assert_eq!((code, said), (Some(2), skipped("build")));
+        assert!(out.contains("\"unindexed\":[\"build\"]"), "{out}");
+        // A PATH the index holds, or the tree, is no error.
+        assert_eq!(found(&["-l", "printk", "a.c"]).0, Some(0), "{store_docs}");
+        assert_eq!(found(&["-l", "printk", "."]).0, Some(0), "{store_docs}");
+        // So is one whose indexed files are all deleted; the search only
+        // warns of the files it lacks, as every search does.
+        std::fs::remove_file(docs.join("gone/g.c")).unwrap();
+        for dir in ["gone", "gone/"] {
+            let (code, out, said) = found(&["printk", dir]);
+            assert_eq!((code, out.as_str()), (Some(1), ""), "{store_docs} {dir}");
+            assert!(!said.contains("error:"), "{said}");
+        }
+        // On a case-insensitive file system, a PATH in another case exists but
+        // names no file of the index, and the error says so.
+        if docs.join("A.C").exists() {
+            let (code, _, said) = found(&["printk", "A.C"]);
+            assert_eq!(code, Some(2));
+            assert!(
+                said.contains("spelled in another case than on disk (a.c)"),
+                "{said}"
+            );
+        }
+    }
+}
+
 /// Each expectation is rg 15.2.0's from the same directory.
 #[test]
 fn no_path_searches_the_cwd_subtree_as_rg() {

@@ -122,6 +122,53 @@ fn each_uncommitted_change_answers_as_a_local_index() {
     }
 }
 
+/// A PATH the index skips is an error, through the server as in a local
+/// index of the checkout: the server names what it lacks, and the client
+/// drops the PATHs that hold one of its own files.
+#[test]
+fn a_path_the_index_skips_is_an_error_as_in_a_local_index() {
+    let r = Remote::new(&FILES);
+    type Named = (&'static str, &'static [&'static str]);
+    let cases: [(Change, Named); 7] = [
+        (
+            |_, _| {},
+            ("nothing changed", &[".hidden.c", "bin.dat", "a.c"]),
+        ),
+        (
+            |r, c| r.s.write(c, &[("x.log", "printk log\n")]),
+            ("an ignored file", &["x.log"]),
+        ),
+        (
+            |r, c| r.s.write(c, &[("dir/n.c", "printk n\n")]),
+            ("a new file", &["dir/n.c", "dir"]),
+        ),
+        (
+            |r, c| r.s.write(c, &[("e.c", "printk\0now\n")]),
+            ("turned binary", &["e.c", "dir"]),
+        ),
+        (
+            |r, c| r.s.write(c, &[("bin.dat", "printk text\n")]),
+            ("turned text", &["bin.dat"]),
+        ),
+        (
+            |_, c| std::os::unix::fs::symlink("e.c", c.join("ln.c")).unwrap(),
+            ("a symlink", &["ln.c", "e.c"]),
+        ),
+        (
+            |_, c| std::fs::remove_file(c.join("dir/b.c")).unwrap(),
+            ("deleted", &["dir/b.c", "dir/sub"]),
+        ),
+    ];
+    for (change, (_name, paths)) in cases {
+        reset(&r);
+        change(&r, &r.client);
+        for path in paths {
+            r.same("", &["printk", path]);
+            r.same("", &["-l", "printk", "a.c", path]);
+        }
+    }
+}
+
 /// A checkout whose HEAD moved from the served commit: commits on top, a
 /// branch, a stash, a rebase, a merge conflict, HEAD behind the commit,
 /// a soft reset. The paths where the two commits differ are searched
