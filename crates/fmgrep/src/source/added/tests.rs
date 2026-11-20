@@ -276,7 +276,7 @@ fn recorded_discovery_follows_a_renamed_dir() {
 
 #[cfg(unix)]
 #[test]
-fn skipped_file_turned_text_is_found_once_named_or_listed() {
+fn skipped_file_turned_text_is_found_once_reported_or_listed() {
     let tmp = tempfile::tempdir().unwrap();
     let now = std::time::SystemTime::now();
     let fix = stage_recorded(tmp.path(), &[b"printk"], &[("kb/k.bin", b"printk\0")], now);
@@ -285,11 +285,15 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     let files = discovered(&fix, fix.paths(), false);
     assert!(live(&files).is_empty(), "its unchanged dir is not listed");
     let recorded = files.known.recorded.clone().unwrap();
-    let named = ["kb/k.bin".to_owned()];
+    let reported = ["kb/k.bin".to_owned()];
     assert_eq!(
-        files
-            .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new()),
+        files.known.replay(
+            &recorded,
+            &reported,
+            fix.paths(),
+            &fix.lens,
+            &mut Vec::new()
+        ),
         Ok(1)
     );
     assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");

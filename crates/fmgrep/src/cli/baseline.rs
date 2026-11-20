@@ -91,7 +91,7 @@ pub fn skip_list(
     };
     // The inputs before git reads them: one that moves while git runs
     // makes the next search ask git again. Git lists its settings again
-    // once it is done: when they differ, a file may have come to be named
+    // once it is done: when they differ, a file may have come to be listed
     // after the first list, and its stamp is in no list; no record is
     // saved.
     let asked = Instant::now();

@@ -88,10 +88,10 @@ pub fn request_watch(root: &Path, files: usize) {
     }
 }
 
-/// Re-checking a named path costs about 7 µs, the stat pass about 1 µs a
-/// doc: past this many named paths the stat pass is cheaper. Never below
-/// 64, where either costs microseconds.
-pub fn named_cap(docs: usize) -> usize {
+/// Re-checking a path that watchman reported costs about 7 µs, the stat pass
+/// about 1 µs a doc: past this many reported paths the stat pass is cheaper.
+/// Never below 64, where either costs microseconds.
+pub fn reported_cap(docs: usize) -> usize {
     (docs / 8).max(64)
 }
 
@@ -202,7 +202,7 @@ struct Record {
     of: String,
     token: Token,
     /// Ascending root-relative paths that may differ from the index; `None`
-    /// when more than [`named_cap`] do.
+    /// when more than [`reported_cap`] do.
     baseline: Option<Vec<String>>,
     /// What else a search through a server checks before it builds on the
     /// baseline.
@@ -629,7 +629,7 @@ fn later(
 ) -> Result<Asked, (String, Option<Token>)> {
     let token = w.mark(root).map_err(|why| (why, None))?;
     let Some(baseline) = &record.baseline else {
-        over(named_cap(docs));
+        over(reported_cap(docs));
         return Ok(Asked {
             token: Some(token),
             ..Asked::default()

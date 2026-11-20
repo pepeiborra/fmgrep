@@ -242,8 +242,9 @@ impl DocSearch {
         let (m, searcher) = (&slot.matcher, &mut slot.searcher);
         let (matched, stats, printed, count) = match &mut slot.printer {
             Printer::Lines(p, rest) => {
-                let named = matches!(self.output, QueryOutput::Matches(Print { path: true, .. }));
-                let path = named.then_some(path);
+                let with_path =
+                    matches!(self.output, QueryOutput::Matches(Print { path: true, .. }));
+                let path = with_path.then_some(path);
                 p.get_mut().start(path);
                 let rest_sink = rest.as_mut().map(|r| {
                     r.get_mut().start(path);

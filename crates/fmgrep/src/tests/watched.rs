@@ -213,11 +213,11 @@ fn found(daemon: &Daemon, index: &Path, flags: &[&str], terms: &[&str]) -> Strin
     on_time(daemon, || printed(index, flags, terms))
 }
 
-/// [`printed`], by [`tried`], for a change that only watchman names: a
+/// [`printed`], by [`tried`], for a change that only watchman reports: a
 /// late search checks every file, which finds a binary file rewritten as
 /// text, or a directory moved in with an old stamp, only once a directory
 /// above it is listed (docs/index-format.md). Its answer may differ.
-fn named(daemon: &Daemon, index: &Path, flags: &[&str], terms: &[&str]) -> String {
+fn answered(daemon: &Daemon, index: &Path, flags: &[&str], terms: &[&str]) -> String {
     tried(daemon, || printed(index, flags, terms)).0
 }
 
@@ -884,7 +884,7 @@ fn a_dir_swapped_in_is_listed_down_to_its_files() {
     };
     std::fs::remove_dir_all(folder.join("a")).unwrap();
     std::fs::rename(folder.join("b"), folder.join("a")).unwrap();
-    let newer = named(&daemon, &output, &["-l"], &["newer"]);
+    let newer = answered(&daemon, &output, &["-l"], &["newer"]);
     assert_eq!(newer, "a/sub/f.c\n");
     assert_eq!(
         baseline(tmp.path()),
@@ -894,7 +894,7 @@ fn a_dir_swapped_in_is_listed_down_to_its_files() {
 }
 
 #[test]
-fn named_changes_answer_like_a_fresh_index() {
+fn reported_changes_answer_like_a_fresh_index() {
     let tmp = tempfile::tempdir().unwrap();
     let docs: &[(&str, &[u8])] = &[
         (".ignore", b"ig/\n"),
@@ -920,7 +920,7 @@ fn named_changes_answer_like_a_fresh_index() {
     std::fs::rename(at("r.c"), at("r2.c")).unwrap();
     assert!(replayed(&daemon, &stale), "{:?}", notes());
     let want = "a.c\nb.c\nkb/k.dat\nnew/deep/n.c\nr2.c\nsub/keep.c\nsub/mv2/m.c\n";
-    assert_eq!(named(&daemon, &stale, &["-l"], &["printk"]), want);
+    assert_eq!(answered(&daemon, &stale, &["-l"], &["printk"]), want);
     put(&folder, "kb/k.dat", b"printk\0binary");
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
@@ -1042,7 +1042,7 @@ fn watchman_answers_like_the_stat_pass() {
     std::fs::remove_file(folder.join("d.c")).unwrap();
     assert!(replayed(&daemon, &stale), "{:?}", notes());
     let want = "a.c\nb.c\nig.c\nkb/k.dat\nmv2/m.c\nnew/deep/n.c\nr2.c\nt/deep/x.c\n";
-    assert_eq!(named(&daemon, &stale, &["-l"], &["printk"]), want);
+    assert_eq!(answered(&daemon, &stale, &["-l"], &["printk"]), want);
     put(&folder, "kb/k.dat", b"printk\0binary");
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
@@ -1088,7 +1088,7 @@ fn watchman_skips_the_stat_pass() {
     );
     assert!(matches!(learned, Learned::Answered { .. }), "{:?}", notes());
     docs.begin();
-    assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is named");
+    assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is reported");
     docs.stat_all(manifest.files.checked().unwrap());
     docs.begin();
     assert_eq!(docs.stale(), [0], "the stat pass: the tampered stamp");
