@@ -564,7 +564,10 @@ the repository that holds the root (the nearest directory with a `.git` or
 a `.jj`) are left out, as rg does not read them; and the global git
 excludes file, by absolute path. The stamp
 `len = u64::MAX, mtime_ns = i64::MAX` records an absent file; the other
-sentinel and the 2 s rule are those of `dirs.stamps`.
+sentinel and the 2 s rule are those of `dirs.stamps`. An ignore file
+stamped within 2 s of the index start has its directory walked again at
+every load, but is not counted as changed: no warning, and `status` does
+not list it.
 
 ## docs.shard
 

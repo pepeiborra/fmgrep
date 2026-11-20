@@ -225,3 +225,24 @@ fn a_new_ignore_file_in_a_changed_dir_is_a_scope() {
         "only a changed dir is checked"
     );
 }
+
+/// An ignore file written just before the index has a stamp no stat can
+/// vouch for: every load walks its directory again, as for a racy dir,
+/// but does not call it changed.
+#[cfg(unix)]
+#[test]
+fn a_racy_ignore_file_is_walked_again_but_not_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("outer/root");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("a.c"), b"x\n").unwrap();
+    std::fs::write(root.join("sub/b.c"), b"x\n").unwrap();
+    crate::tests::support::backdate(&tmp.path().join("outer"));
+    std::fs::write(root.join("sub/.ignore"), b"b.c\n").unwrap();
+    let walk =
+        crate::for_each_index_doc(&root, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
+    write_walk(tmp.path(), &walk, std::time::SystemTime::now()).unwrap();
+    let recorded = Recorded::open(tmp.path()).unwrap().unwrap();
+    let got = recorded.ignore_scopes(&root, &[]);
+    assert_eq!((got.scopes, got.moved), (vec!["sub".to_owned()], vec![]));
+}
