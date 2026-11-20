@@ -225,6 +225,13 @@ impl Known {
         }
     }
 
+    /// Add the directories a walk could not list to `out`, once each.
+    fn left_out_unlisted(&self, unlisted: Vec<(PathBuf, String)>, out: &mut Vec<Diagnostic>) {
+        for (dir, why) in unlisted {
+            self.left_out_once(Diagnostic::Unlisted { dir, why }, out);
+        }
+    }
+
     /// Stat `id` against its stamp, an ignored doc only if `force`: why it
     /// is gone, if it is.
     fn stat(&self, id: usize, files: Checked<'_>, lens: &[u64], force: bool) -> Option<String> {
@@ -376,7 +383,8 @@ impl Known {
         let walked = crate::walk::walk_changed(root, listed.clone(), self.exclude.as_deref(), {
             move |rel| prune.is_dir(rel)
         });
-        self.add(&self.text_only(root, added::unlisted(walked, files), left_out));
+        self.left_out_unlisted(walked.unlisted, left_out);
+        self.add(&self.text_only(root, added::unlisted(walked.files, files), left_out));
         scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed)));
         self.discover_scopes(scopes, files, lens, left_out);
         self.complete.store(true, Ordering::Release);
