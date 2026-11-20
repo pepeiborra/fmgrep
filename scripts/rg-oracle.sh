@@ -5,6 +5,12 @@
 # Stages a fixture tree, indexes it into its .fmgrep, then compares our stdout
 # (from the root; PATH and no-PATH cases from sub/, finding the index by
 # walking up) and exit status with rg's for every output flag combination.
+# Both tools are given the same words wherever rg takes them: the pattern
+# after `--` and then the PATHs, or -e patterns, or a PATH that does not
+# exist. A PATH that exists and that the index lacks (hidden, binary, a
+# symlink, ignored) is an error only ours gives: its lines are rg's over the
+# other PATHs, and its exit is 2. A directory in which rg reads nothing (empty,
+# or holding only hidden or binary files) is no error: rg exits 1 there too.
 # Sibling names are chosen so rg's per-directory DFS (`--sort path`) and our
 # sorted relative paths agree (`a.txt` vs `a/b.txt` would not).
 #
@@ -165,7 +171,7 @@ spawn_serve() {
 
 RG_COMMON=(-a --sort path)
 # --iglob: rg adds them after every -g, so a case's own globs cannot undo them.
-RG_SKIP=(--iglob '!k.dat')
+RG_SKIP=(--iglob '!k.dat' --iglob '!nul.dat')
 TERM=alpha
 # A case runs ours from $CORPUS$AT with PATHS, rg from the root over RG_PATHS
 # unless RG_HERE runs it beside us with PATHS; WANT overrides WARNINGS.
@@ -219,21 +225,24 @@ served() {
     fi
 }
 
-# One case: name, our flags, rg's flags (both space-separated), term.
+# One case: name, our flags, rg's flags (both space-separated), term. Both
+# tools get the same words: the term after --, then the PATHs; or, when
+# EONLY is set, no term, for the flags hold the patterns (-e).
 check() {
-    local name="$1" mine="$2" theirs="$3" term="${4-$TERM}" rgrc
+    local name="$1" mine="$2" theirs="$3" term="${4-$TERM}" rgrc pat=(-- "${4-$TERM}")
+    [[ -z "${EONLY:-}" ]] || pat=()
     RC=0
     # shellcheck disable=SC2086
-    ( cd "$CORPUS$AT" && "$BIN" $mine -- "$term" $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+    ( cd "$CORPUS$AT" && "$BIN" $mine ${pat[@]+"${pat[@]}"} $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
     set +e
     if [[ -n "$RG_HERE" ]]; then
         # shellcheck disable=SC2086
-        ( cd "$CORPUS$AT" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $PATHS < /dev/null ) > "$WORK/theirs"
+        ( cd "$CORPUS$AT" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" ${pat[@]+"${pat[@]}"} $PATHS < /dev/null ) > "$WORK/theirs"
         rgrc=$?
     else
         # rg prints ./ before the paths of RG_PATHS=.; ours are root-relative.
         # shellcheck disable=SC2086
-        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" -- "$term" $RG_PATHS < /dev/null ) | sed 's|\./||g' > "$WORK/theirs"
+        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $theirs "${RG_SKIP[@]}" ${pat[@]+"${pat[@]}"} $RG_PATHS < /dev/null ) | sed 's|\./||g' > "$WORK/theirs"
         rgrc="${PIPESTATUS[0]}"
     fi
     set -e
@@ -257,7 +266,12 @@ check() {
         FAILED=$((FAILED + 1))
     fi
     # shellcheck disable=SC2086
-    served "$name" $mine -- "$term" $PATHS
+    served "$name" $mine ${pat[@]+"${pat[@]}"} $PATHS
+}
+
+# A case whose flags hold the patterns (-e): the same flags for both tools.
+check_e() {
+    EONLY=1 check "$@"
 }
 
 # A filter case in lines and -l: name, our flags, rg's flags, rg's PATHs
@@ -278,6 +292,44 @@ refused() {
     WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
     check "$@"
     WANT=""
+}
+
+# A PATH that exists and that the index lacks (hidden, binary, a symlink,
+# ignored): rg searches it and an index cannot, so ours is an error and exit
+# 2, with the lines that rg prints for the other PATHs alone: name, our
+# flags, those PATHs (none when empty; directories, so that rg names the
+# files as ours does), the PATH the index lacks.
+unindexed() {
+    local name="$1" mine="$2" good="$3" bad="$4" b ok=1
+    RC=0
+    # shellcheck disable=SC2086
+    ( cd "$CORPUS" && "$BIN" $mine -- "$TERM" $good $bad ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
+    : > "$WORK/theirs"
+    if [[ -n "$good" ]]; then
+        set +e
+        # shellcheck disable=SC2086
+        ( cd "$CORPUS" && rg "${RG_COMMON[@]}" $mine "${RG_SKIP[@]}" -- "$TERM" $good < /dev/null ) > "$WORK/theirs"
+        set -e
+    fi
+    for b in $bad; do
+        grep -q "^error: $b: not in the index" "$WORK/err" || ok=0
+    done
+    if [[ "$RC" != 2 || "$ok" != 1 ]]; then
+        echo "FAIL $PASS$name  (exit $RC, want 2 and an error for each of: $bad)"
+        cat "$WORK/err"
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    elif diff -u "$WORK/theirs" "$WORK/ours" > "$WORK/diff"; then
+        echo "ok   $PASS$name"
+        OK=$((OK + 1))
+    else
+        echo "FAIL $PASS$name  (ours: $mine $good $bad | rg: $mine $good)"
+        cat "$WORK/diff"
+        FAIL=1
+        FAILED=$((FAILED + 1))
+    fi
+    # shellcheck disable=SC2086
+    served "$name" $mine -- "$TERM" $good $bad
 }
 
 # A case from sub/ in lines and -l, rg beside us with the same PATHs: name,
@@ -455,18 +507,18 @@ check_expr() {
     OURS=()
 }
 
-# OURS: `--$1` over the leaves: a regex leaf as it is, a pattern as in rg;
-# a literal leaf as it is under FIXED=-F, else escaped, as the leaf of a
-# regex search would be. FIXED=-F needs leaves that are all literals.
+# OURS: `--$1` and each leaf after -e: a regex leaf as it is, a pattern as
+# in rg; a literal leaf as it is under FIXED=-F, else escaped, as the leaf
+# of a regex search would be. FIXED=-F needs leaves that are all literals.
 terms() {
     local op="$1" tok
     shift 2
-    OURS=("--$op" ${FIXED:+"$FIXED"} --)
+    OURS=("--$op" ${FIXED:+"$FIXED"})
     for tok in "$@"; do
         if [[ "$tok" == t:* && -z "${FIXED:-}" ]]; then
-            OURS+=("$(printf '%s' "${tok#t:}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')")
+            OURS+=(-e "$(printf '%s' "${tok#t:}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')")
         else
-            OURS+=("${tok#?:}")
+            OURS+=(-e "${tok#?:}")
         fi
     done
 }
@@ -805,7 +857,18 @@ printf 'alpha whitelisted\n' > "$CORPUS/.wl.txt"
 printf 'alpha nested ignore\n' > "$CORPUS/ns/g.log"
 printf 'alpha soon ignored\n' > "$CORPUS/n.md"
 # Patterns with a meaning to a regex, and the text that each reads as one.
-printf 'a.b\naxb\na+b\nfoo(bar)\n/usr/lib/x\n/a.b/\nC++ code\necho $HOME\nx.unwrap()\nif a || b\narr[0] arr0\nStgClosure *\nfoo upper Foo\nFOO BAR\ncall (Foo) (foo)\n' > "$CORPUS/p.txt"
+printf 'a.b\naxb\na+b\nfoo(bar)\n/usr/lib/x\n/a.b/\nC++ code\necho $HOME\nx.unwrap()\nif a || b\narr[0] arr0\nStgClosure *\nfoo upper Foo\nFOO BAR\ncall (Foo) (foo)\n-dash alpha\n' > "$CORPUS/p.txt"
+# What rg searches when it is a PATH, and an index never holds: a hidden file,
+# a binary file (nul.dat, which rg's cases skip), and a symlink.
+printf 'alpha hidden\n' > "$CORPUS/.hid"
+printf 'alpha\0binary\n' > "$CORPUS/sub/nul.dat"
+ln -s a.txt "$CORPUS/link.txt"
+# Directories in which rg reads nothing either, so that a search of one is no
+# error but finds nothing, as in rg: an empty one, one holding only a hidden
+# file, and one holding only a binary file.
+mkdir -p "$CORPUS/emptydir" "$CORPUS/onlykeep" "$CORPUS/onlybin"
+: > "$CORPUS/onlykeep/.keep"
+printf 'alpha\0binary\n' > "$CORPUS/onlybin/nul.dat"
 find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
 if [[ "$REMOTE" == true ]]; then
     rm -rf "$CORPUS/.git"
@@ -963,7 +1026,7 @@ for pat in 'one.beta' 'alpha.*zz'; do
     check "dotall-off     [$pat]" "--heading -n -U"       "--heading -n -U"    "$pat"
 done
 
-# A TERM is a regex, as in rg: metacharacters, slashes, the empty pattern.
+# A PATTERN is a regex, as in rg: metacharacters, slashes, the empty pattern.
 for pat in 'a.b' 'a|alpha' '^foo' 'foo$' 'x+b' 'a\.b' '\w+\(' 'C\+\+' '\$HOME' 'a \|\| b' 'arr\[0\]' \
     '[a-c]x' '/usr/' '/a.b/' '/a\.b/' 'StgClosure \*' '(?i)FOO' ''; do
     check "regex-lines    [$pat]" "--heading -n"    "--heading -n"    "$pat"
@@ -1056,17 +1119,17 @@ check_expr "expr-multi     [/alpha one\nbeta/ OR zz]" "--heading -n -U" "--headi
 check_expr "expr-multi-files [/alpha 1\n/ AND 3]"     "-U -l" "-U -l"      'and{' 'r:alpha 1\n' t:3 '}'
 
 # --and / --or: the same truth through the term flags.
-flag_cases "--and alpha beta"               ""        and t:alpha t:beta
-flag_cases "--or alpha printk"              ""        or t:alpha t:printk
-flag_cases "--and alpha /\w+ one/"          ""        and t:alpha 'r:\w+ one'
-flag_cases "--or alpha beta head"           ""        or t:alpha t:beta t:head
-flag_cases "--and zeta first"               ""        and t:zeta t:first
-flag_cases "--and 'alpha \w+' beta"        ""        and 'r:alpha \w+' r:beta
-flag_cases "--and alpha be+ta"              ""        and t:alpha r:be+ta
-FIXED=-F flag_cases "-F --or alpha printk"   ""        or t:alpha t:printk
-check_flags "flags-ci-lines [--and ALPHA one]"          "--heading -n -i" "--heading -n -i" and t:ALPHA t:one
-check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"           and t:ALPHA t:one
-check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "--heading -n -U" "--heading -n -U" or 'r:alpha one\nbeta' t:zz
+flag_cases "--and -e alpha -e beta"            ""        and t:alpha t:beta
+flag_cases "--or -e alpha -e printk"           ""        or t:alpha t:printk
+flag_cases "--and -e alpha -e /\w+ one/"       ""        and t:alpha 'r:\w+ one'
+flag_cases "--or -e alpha -e beta -e head"     ""        or t:alpha t:beta t:head
+flag_cases "--and -e zeta -e first"            ""        and t:zeta t:first
+flag_cases "--and -e 'alpha \w+' -e beta"      ""        and 'r:alpha \w+' r:beta
+flag_cases "--and -e alpha -e be+ta"           ""        and t:alpha r:be+ta
+FIXED=-F flag_cases "-F --or -e alpha -e printk"   ""        or t:alpha t:printk
+check_flags "flags-ci-lines [--and -e ALPHA -e one]"          "--heading -n -i" "--heading -n -i" and t:ALPHA t:one
+check_flags "flags-ci-files [--and -e ALPHA -e one]"          "-i -l" "-l -i"           and t:ALPHA t:one
+check_flags "flags-multi    [--or -e /alpha one\nbeta/ -e zz]" "--heading -n -U" "--heading -n -U" or 'r:alpha one\nbeta' t:zz
 
 # -g, --iglob and PATHs; from the root, then from sub/ with and without PATHs.
 filtered "glob-txt      " "-g *.txt"                  "-g *.txt"                  . tb
@@ -1111,6 +1174,118 @@ alone "cwd-countm     " "--count-matches" "--count-matches"   ""
 alone "cwd-flat       " "--no-heading -n" "--no-heading -n"   ""
 alone "cwd-ctx        " "--heading -n -C 1" "--heading -n -C 1" ""
 alone "cwd-only       " "--heading -n -o" "--heading -n -o"   ""
+
+# -e gives the patterns, as in rg: several are one search of any of them, and
+# every positional is a PATH. Both tools get the same flags. A pattern may
+# start with a hyphen; --regexp= is the empty pattern.
+for mode in "--heading -n" "--no-heading -n" -c --count-matches -l "--heading -n -o" "--heading -n -C 1" \
+    "--no-heading -N" "--heading -n --color always"; do
+    check_e "e-two [$mode]"       "$mode -e alpha -e beta"      "$mode -e alpha -e beta"
+    check_e "e-regex [$mode]"     "$mode -e a.b -e x+b"         "$mode -e a.b -e x+b"
+    check_e "e-one [$mode]"       "$mode -e alpha"              "$mode -e alpha"
+done
+for pat in "-e alpha -e alpha" "-e -dash" "-e al -e alpha" "-e alpha -e al" "--regexp=alpha -e beta" \
+    "-ealpha -ebeta" "-e alpha --regexp=" "--regexp= --regexp=" "-e \\w+two -e ^foo" "-e (?i)FOO -e x"; do
+    check_e "e-lines [$pat]" "--heading -n $pat" "--heading -n $pat"
+    check_e "e-count [$pat]" "-c $pat"           "-c $pat"
+    check_e "e-only  [$pat]" "-o --no-heading -n $pat" "-o --no-heading -n $pat"
+done
+for pat in "-e a.b -e foo(" "-e FOO -e ALPHA" "-e a.b -e (a)"; do
+    check_e "e-fixed [$pat]" "-F --heading -n $pat" "-F --heading -n $pat"
+    check_e "e-fixed-ci [$pat]" "-F -i --no-heading -n $pat" "-F -i --no-heading -n $pat"
+done
+for flags in -i -s -S "-i -s" "-S -i"; do
+    check_e "e-case [$flags]" "--heading -n $flags -e alpha -e Beta" "--heading -n $flags -e alpha -e Beta"
+    check_e "e-case-up [$flags]" "--heading -n $flags -e ALPHA -e Beta" "--heading -n $flags -e ALPHA -e Beta"
+done
+check_e e-multi        "--heading -n -U -e one\\nbeta -e zz" "--heading -n -U -e one\\nbeta -e zz"
+check_e e-multi-ci     "--heading -n -U -i -e ONE\\nBETA -e zz" "--heading -n -U -i -e ONE\\nBETA -e zz"
+check_e e-multi-count  "-U -c -e one\\nbeta -e zz" "-U -c -e one\\nbeta -e zz"
+# A pattern that does not compile fails the search, whichever -e it is.
+for pat in "-e foo( -e alpha" "-e alpha -e a{2" "-e alpha -e (a)\\1"; do
+    EONLY=1 refused "e-error [$pat]" "-n $pat" "-n $pat"
+    EONLY=1 refused "e-error-c [$pat]" "-c $pat" "-c $pat"
+done
+# Searches that read no tb.txt, which turned binary, warn of one file fewer.
+NOTB=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+WANT=$NOTB
+PATHS="a.txt sub"
+RG_PATHS="a.txt sub"
+check_e "e-paths [a.txt sub]" "--heading -n -e alpha -e beta" "--heading -n -e alpha -e beta"
+check_e "e-paths-l [a.txt sub]" "-l -e alpha -e beta" "-l -e alpha -e beta"
+PATHS="-- a.txt"
+RG_PATHS="-- a.txt"
+check_e "e-dashdash-path" "-n -e alpha -e beta" "-n -e alpha -e beta"
+PATHS=""
+RG_PATHS=.
+WANT=""
+pathed_e() {
+    AT=/sub
+    PATHS="$3"
+    RG_HERE=1
+    [[ "${4:-}" == tb ]] || WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    check_e "$1 [lines]" "--heading -n $2" "--heading -n $2"
+    check_e "$1 [-l]" "-l $2" "-l $2"
+    AT=""
+    PATHS=""
+    RG_HERE=""
+    WANT=""
+}
+pathed_e "e-sub-file    " "-e alpha -e beta" "../a.txt"
+pathed_e "e-sub-files   " "-e alpha -e beta" "../a.txt ../h.txt"
+pathed_e "e-sub-dot     " "-e alpha -e beta" "."
+pathed_e "e-sub-glob    " "-g !*.txt -e alpha -e beta" "../sub c.txt"
+pathed_e "e-sub-cwd     " "-e alpha -e beta" ""
+
+# A PATH that does not exist: rg prints its error, searches the other PATHs
+# and exits 2. Both tools get the same words, from sub/ and from the root.
+# Nothing is searched when no PATH exists, so such a search warns of nothing.
+pathed "missing-last   " ""  "../a.txt nosuch"
+pathed "missing-first  " ""  "nosuch ../a.txt"
+pathed "missing-between" ""  "../a.txt nosuch ../h.txt"
+pathed "missing-two    " ""  "nosuch nope ../a.txt"
+pathed "missing-dir    " ""  "../a.txt ../nosuch/dir/"
+pathed "missing-glob   " "-g *.txt" "../a.txt nosuch"
+pathed_e "e-missing     " "-e alpha -e beta" "../a.txt nosuch"
+WANT=0 pathed "missing-only   " ""  "nosuch" tb
+WANT=0 pathed "missing-all    " ""  "nosuch nope" tb
+WANT=0 pathed_e "e-missing-only" "-e alpha -e beta" "nosuch" tb
+PATHS="a.txt nosuch"
+RG_PATHS="a.txt nosuch"
+WANT=$NOTB
+check missing-root     "--heading -n" "--heading -n"
+check missing-root-l   "-l"           "-l"
+check missing-root-c   "-c"           "-c"
+PATHS=""
+RG_PATHS=.
+WANT=""
+# The word after -- is the pattern, and a hyphen starts it.
+check dash-pattern      "-n" "-n" "-dash"
+PATHS="a.txt"
+RG_PATHS="a.txt"
+WANT=$NOTB
+check dash-pattern-path "-n" "-n" "-dash"
+PATHS=""
+RG_PATHS=.
+WANT=""
+# A PATH that exists and that the index lacks is an error, ours alone: rg
+# searches it. Our lines and exit 2 are rg's over the other PATHs. The
+# directories are given so that rg prints their files' names as ours does.
+# A directory in which rg finds nothing is no error, and exits 1 as rg does,
+# alone or beside a directory that has lines.
+pathed "empty-dir      " "" "../emptydir"
+pathed "empty-hidden   " "" "../onlykeep"
+pathed "empty-binary   " "" "../onlybin"
+pathed "empty-and-dir  " "" "../emptydir ../onlybin ../sub"
+unindexed "unindexed-hidden" "-n --no-heading" "sub" ".hid"
+unindexed "unindexed-binary" "-n --no-heading" "sub" "sub/nul.dat"
+unindexed "unindexed-link  " "-n --no-heading" "sub" "link.txt"
+unindexed "unindexed-count " "-c" "sub" ".hid"
+unindexed "unindexed-files " "-l" "sub" ".hid"
+unindexed "unindexed-only  " "" "" ".hid"
+unindexed "unindexed-two   " "-n --no-heading" "sub" ".hid link.txt"
+[[ ! -e "$CORPUS/ig" ]] || unindexed "unindexed-ignored" "-n --no-heading" "sub" "ig"
+[[ ! -e "$CORPUS/ig" ]] || unindexed "unindexed-ignored-l" "-l" "sub" "ig"
 }
 
 
@@ -1151,7 +1326,7 @@ if [[ "$STORE_DOCS" == false || "$REMOTE" == true ]]; then
         printf 'ig/\nn.md\n' > "$CORPUS/.gitignore"
     fi
     printf 'alpha never seen\n' > "$CORPUS/ig/new.txt"
-    RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt')
+    RG_SKIP=(--iglob '!bin.dat' --iglob '!tb.txt' --iglob '!nul.dat')
     # One query sees gone.txt added; the cases see it deleted.
     if [[ -n "$ADDR" && -n "$DAEMON" ]]; then
         ( cd "$CORPUS" && "$BIN" --server "$ADDR" -c -- alpha ) > /dev/null
