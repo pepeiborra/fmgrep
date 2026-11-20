@@ -190,7 +190,7 @@ pub(crate) fn run_entries(
         Ok(l) => l,
         Err(e) => return (Err(e), left_out),
     };
-    loaded.note_stale(&req.manifest.files);
+    loaded.note_stale(&req.manifest.files, &mut left_out);
     let report = crate::query::answer(
         &index,
         &mut loaded,

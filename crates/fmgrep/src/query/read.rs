@@ -295,7 +295,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(loaded.locate_us, locate_us(None));
-            loaded.measure_locate(&fm);
+            loaded.measure_locate(&fm, &mut Vec::new());
             (fm, loaded.locate_us)
         };
         let tmp = tempfile::tempdir().unwrap();

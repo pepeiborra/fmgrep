@@ -1089,7 +1089,7 @@ fn watchman_skips_the_stat_pass() {
     assert!(matches!(learned, Learned::Answered { .. }), "{:?}", notes());
     docs.begin();
     assert_eq!(docs.stale(), [0usize; 0], "watchman: no doc is reported");
-    docs.stat_all(manifest.files.checked().unwrap());
+    docs.stat_all(manifest.files.checked().unwrap(), &mut Vec::new());
     docs.begin();
     assert_eq!(docs.stale(), [0], "the stat pass: the tampered stamp");
 }

@@ -291,9 +291,9 @@ impl DocStore {
     }
 
     /// Joined before it returns: the stale set is known on return.
-    pub fn stat_all(&self, files: Checked<'_>) {
+    pub fn stat_all(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) {
         if let Source::Files(f) = &self.source {
-            f.stat_all(files, &self.lens);
+            f.stat_all(files, &self.lens, left_out);
         }
     }
 
@@ -359,9 +359,9 @@ impl DocStore {
 
     /// Under verbose, note the added files: after the caller prints what a
     /// check or a discovery left out; nothing for stored docs.
-    pub fn note_added(&self) {
+    pub fn note_added(&self, left_out: &mut Vec<Diagnostic>) {
         if let Source::Files(f) = &self.source {
-            f.note_added();
+            f.note_added(left_out);
         }
     }
 
@@ -591,7 +591,7 @@ impl Source {
                 Ok(Some(buf))
             }
             Source::Files(f) => match files.path(doc_idx)? {
-                Some(rel) => Ok(f.read(doc_idx, rel, buf)),
+                Some(rel) => Ok(f.read(doc_idx, rel, buf, left_out)),
                 None => Ok(f.read_added(doc_idx, left_out)),
             },
         }

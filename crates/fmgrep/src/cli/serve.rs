@@ -169,10 +169,10 @@ impl Served<'_> {
             })?;
         let mut left_out = Vec::new();
         let checked = self.docs.recheck(self.files, &mut left_out);
-        super::print_diagnostics(left_out);
         if checked {
-            self.docs.note_added();
+            self.docs.note_added(&mut left_out);
         }
+        super::print_diagnostics(left_out);
         // Until the next query sets its own.
         self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
@@ -464,9 +464,12 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         Some(files),
         &mut left_out,
     );
-    super::print_diagnostics(left_out);
+    let loaded = loaded.map(|(index, mut docs)| {
+        docs.note_stale(&req.manifest.files, &mut left_out);
+        (index, docs)
+    });
+    super::print_diagnostics(std::mem::take(&mut left_out));
     let (index, mut docs) = loaded?;
-    docs.note_stale(&req.manifest.files);
     if let Some(cause) = docs.refusal() {
         return Err(format!(
             "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \
@@ -477,8 +480,9 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }
-    docs.measure_band(req.manifest);
-    docs.measure_locate(&index);
+    docs.measure_band(req.manifest, &mut left_out);
+    docs.measure_locate(&index, &mut left_out);
+    super::print_diagnostics(left_out);
     Ok(Served {
         index,
         docs,

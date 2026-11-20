@@ -58,22 +58,21 @@ pub struct Loaded {
 
 impl Loaded {
     /// Plan ANDs from this machine's warm read cost, measured now.
-    pub fn measure_band(&mut self, manifest: &Manifest) {
-        self.band = boolean::warm_band(&mut self.docs, manifest);
+    pub fn measure_band(&mut self, manifest: &Manifest, left_out: &mut Vec<Diagnostic>) {
+        self.band = boolean::warm_band(&mut self.docs, manifest, left_out);
     }
 
     /// Price a locate from this machine's warm locates, measured now; under
     /// verbose, note both costs.
-    pub fn measure_locate(&mut self, index: &DocfmIndex) {
+    pub fn measure_locate(&mut self, index: &DocfmIndex, left_out: &mut Vec<Diagnostic>) {
         let start = Instant::now();
         self.locate_us = read::locate_us(index.locate_us());
         if crate::verbose::verbose() {
-            eprintln!(
-                "note: a read costs {:.1} µs per file, a locate {:.3} µs per occurrence (sampled in {} µs)",
-                self.band.min_us,
-                self.locate_us,
-                start.elapsed().as_micros()
-            );
+            left_out.push(Diagnostic::Costs {
+                read_us: self.band.min_us,
+                locate_us: self.locate_us,
+                sampled_us: start.elapsed().as_micros(),
+            });
         }
     }
 
@@ -90,15 +89,15 @@ impl Loaded {
 
     /// Under verbose, note the added docs, after what a recheck left out is
     /// printed.
-    pub fn note_added(&self) {
-        self.docs.note_added();
+    pub fn note_added(&self, left_out: &mut Vec<Diagnostic>) {
+        self.docs.note_added(left_out);
     }
 
     /// Note the added docs, begin the first query and note the stale docs:
     /// how many of the indexed `files` are stale. After the load, once its
     /// warnings are printed.
-    pub fn note_stale(&mut self, files: &FileTable) -> usize {
-        note_stale(&mut self.docs, files)
+    pub fn note_stale(&mut self, files: &FileTable, left_out: &mut Vec<Diagnostic>) -> usize {
+        note_stale(&mut self.docs, files, left_out)
     }
 
     /// Leave out `skip`'s files until the next call.
@@ -216,7 +215,7 @@ pub fn check_changes<'scope, 'env>(
         span.in_scope(|| docs.discover(files, &mut found));
         found
     });
-    docs.stat_all(files);
+    docs.stat_all(files, left_out);
     left_out.extend(
         discovery
             .join()
@@ -242,14 +241,12 @@ pub fn open<'m>(
 /// After the check of what changed, as [`load`] ends: note the added docs,
 /// begin the first query of `docs` and note its stale docs. How many of the
 /// indexed `files` are stale.
-pub fn note_stale(docs: &mut DocStore, files: &FileTable) -> usize {
-    docs.note_added();
+pub fn note_stale(docs: &mut DocStore, files: &FileTable, left_out: &mut Vec<Diagnostic>) -> usize {
+    docs.note_added(left_out);
     docs.begin();
     let stale = docs.stale().partition_point(|&id| id < files.len());
     if stale > 0 {
-        eprintln!(
-            "note: {stale} file(s) changed since indexing are scanned in full by every query; re-run index"
-        );
+        left_out.push(Diagnostic::Stale { n: stale });
     }
     stale
 }
@@ -278,7 +275,7 @@ pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<Out
         None,
         &mut left_out,
     )?;
-    loaded.note_stale(&req.manifest.files);
+    loaded.note_stale(&req.manifest.files, &mut left_out);
     let report = answer(&index, &mut loaded, req, sink, &mut left_out);
     tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
     report

@@ -43,7 +43,9 @@ pub fn check(index_dir: &Path, manifest: &Manifest, root: Option<&Path>) -> Resu
         std::thread::scope(|s| check_changes(s, &none, &docs, files, None, &mut left_out));
     super::print_diagnostics(left_out);
     let learned = learned?;
-    let stale = note_stale(&mut docs, files);
+    let mut notes = Vec::new();
+    let stale = note_stale(&mut docs, files, &mut notes);
+    super::print_diagnostics(notes);
     let record = docs.checkpoint(files)?;
     Ok(Facts {
         learned,

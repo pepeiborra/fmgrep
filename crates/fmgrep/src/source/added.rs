@@ -89,10 +89,10 @@ impl super::Files {
 
     /// Under verbose, note how many added files every query scans in full.
     /// After the caller prints what the check left out.
-    pub fn note_added(&self) {
+    pub fn note_added(&self, left_out: &mut Vec<Diagnostic>) {
         let n = self.known.added().live().count();
         if n > 0 && crate::verbose::verbose() {
-            eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
+            left_out.push(Diagnostic::Added { n });
         }
     }
 }
@@ -220,18 +220,22 @@ impl Known {
                 _ => {}
             }
         }
-        parallel(&skipped, |&id| {
-            let path = root.join(&files[id]);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if !m.is_file() || self.ignored(&files[id], false) => self.set(id, IGNORED),
-                Ok(_) => {
-                    if let Some(why) = self.stat(id, files, lens, true) {
-                        self.exclude(id, &path, &why);
-                    }
+        let whys = parallel(&skipped, |&id| {
+            match std::fs::symlink_metadata(root.join(&files[id])) {
+                Ok(m) if !m.is_file() || self.ignored(&files[id], false) => {
+                    self.set(id, IGNORED);
+                    None
                 }
-                Err(_) => {}
+                Ok(_) => self.stat(id, files, lens, true),
+                Err(_) => None,
             }
         });
+        // In doc order, whichever thread ended first.
+        for (&id, why) in skipped.iter().zip(whys) {
+            if let Some(why) = why {
+                self.exclude(id, &root.join(&files[id]), &why, left_out);
+            }
+        }
         parallel(&back, |&id| self.stat(id, files, lens, true));
         let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile(rel, &found);

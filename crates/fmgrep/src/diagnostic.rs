@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// A warning about how a load checked what changed since the index: why it
 /// checked every file, or why it could not keep what it learned. A server
@@ -70,7 +71,7 @@ impl fmt::Display for Check {
 }
 
 /// A case that the answer lacks something for, and the reason.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Diagnostic {
     /// A file left out of the answer: it cannot be read, is over 2 GiB, or
     /// cannot be looked at.
@@ -85,6 +86,36 @@ pub enum Diagnostic {
     /// lines, each ending in a newline. It is text because the planner
     /// renders it from values that the query owns.
     Plan { text: String },
+    /// An indexed file left out of the answer: it is missing, cannot be
+    /// read or statted, or is no longer text.
+    Excluded { path: PathBuf, why: String },
+    /// Over half of the `files` indexed files are missing under `root`:
+    /// one entry for all of them.
+    MostlyGone {
+        gone: usize,
+        files: usize,
+        root: PathBuf,
+    },
+    /// Under `FMGREP_VERBOSE`: `n` indexed files changed since indexing.
+    Stale { n: usize },
+    /// Under `FMGREP_VERBOSE`: `n` files were added since indexing.
+    Added { n: usize },
+    /// Under `FMGREP_VERBOSE`: what a read and a locate cost on this
+    /// machine, and how long the sample took.
+    Costs {
+        read_us: f64,
+        locate_us: f64,
+        sampled_us: u128,
+    },
+    /// Under `FMGREP_VERBOSE`: what a re-check took from watchman, and its
+    /// cost. `served` words it for a server's query.
+    Rechecked {
+        reported: usize,
+        kept: usize,
+        served: bool,
+        ask: Duration,
+        apply: Duration,
+    },
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -110,6 +141,45 @@ impl fmt::Display for Diagnostic {
                  under it are not searched"
             ),
             Self::Plan { text } => f.write_str(text.strip_suffix('\n').unwrap_or(text)),
+            Self::Excluded { path, why } => {
+                write!(f, "warning: excluding {}: {why}", path.display())
+            }
+            Self::MostlyGone { gone, files, root } => write!(
+                f,
+                "warning: excluding {gone} of {files} indexed files, missing under {}",
+                root.display()
+            ),
+            Self::Stale { n } => write!(
+                f,
+                "note: {n} file(s) changed since indexing are scanned in full by every query; \
+                 re-run index"
+            ),
+            Self::Added { n } => write!(
+                f,
+                "note: {n} file(s) added since indexing are scanned in full by every query"
+            ),
+            Self::Costs {
+                read_us,
+                locate_us,
+                sampled_us,
+            } => write!(
+                f,
+                "note: a read costs {read_us:.1} µs per file, a locate {locate_us:.3} µs per \
+                 occurrence (sampled in {sampled_us} µs)"
+            ),
+            Self::Rechecked {
+                reported,
+                kept,
+                served,
+                ask,
+                apply,
+            } => {
+                let what = match served {
+                    true => format!("watchman reported {reported} path(s) changed, {kept} kept"),
+                    false => crate::source::named(*reported, *kept),
+                };
+                write!(f, "note: {what} (ask {ask:.1?}, apply {apply:.1?})")
+            }
         }
     }
 }
@@ -172,6 +242,72 @@ mod tests {
         ];
         for (check, line) in cases {
             assert_eq!(check.to_string(), line);
+        }
+    }
+
+    /// The notes and warnings of a load read as the lines a search has
+    /// always printed.
+    #[test]
+    fn the_lines_of_a_load_read_as_before() {
+        use std::time::Duration;
+        let ms = Duration::from_micros(1500);
+        let cases = [
+            (
+                Diagnostic::Excluded {
+                    path: "/src/a.c".into(),
+                    why: "is missing".into(),
+                },
+                "warning: excluding /src/a.c: is missing",
+            ),
+            (
+                Diagnostic::MostlyGone {
+                    gone: 3,
+                    files: 4,
+                    root: "/src".into(),
+                },
+                "warning: excluding 3 of 4 indexed files, missing under /src",
+            ),
+            (
+                Diagnostic::Stale { n: 2 },
+                "note: 2 file(s) changed since indexing are scanned in full by every query; \
+                 re-run index",
+            ),
+            (
+                Diagnostic::Added { n: 5 },
+                "note: 5 file(s) added since indexing are scanned in full by every query",
+            ),
+            (
+                Diagnostic::Costs {
+                    read_us: 12.34,
+                    locate_us: 0.7,
+                    sampled_us: 90,
+                },
+                "note: a read costs 12.3 µs per file, a locate 0.700 µs per occurrence \
+                 (sampled in 90 µs)",
+            ),
+            (
+                Diagnostic::Rechecked {
+                    reported: 3,
+                    kept: 2,
+                    served: false,
+                    ask: ms,
+                    apply: ms,
+                },
+                "note: watchman and the baseline named 3 path(s), 2 kept (ask 1.5ms, apply 1.5ms)",
+            ),
+            (
+                Diagnostic::Rechecked {
+                    reported: 3,
+                    kept: 2,
+                    served: true,
+                    ask: ms,
+                    apply: ms,
+                },
+                "note: watchman reported 3 path(s) changed, 2 kept (ask 1.5ms, apply 1.5ms)",
+            ),
+        ];
+        for (d, line) in cases {
+            assert_eq!(d.to_string(), line);
         }
     }
 
