@@ -13,7 +13,9 @@ fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
     let docs =
         crate::fetch::DocStore::open(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
-    let learned = docs.replay(manifest.files.checked().unwrap(), &mut Vec::new());
+    let mut found = Vec::new();
+    let learned = docs.replay(manifest.files.checked().unwrap(), &mut found);
+    crate::tests::note_entries(&found);
     matches!(learned, Learned::Answered { .. })
 }
 
@@ -966,7 +968,7 @@ fn edits_before_the_first_search_and_between_searches_answer_like_a_fresh_index(
     put(&folder, "x/y/z/.ignore", b"k.c\n");
     let want = "a.c\nb.c\ng.gen\nmv2/m.c\nnew/deep/n.c\np/q/r.c\nsub/s.c\nsub/t.c\n";
     assert_eq!(found(&daemon, &stale, &["-l"], &["printk"]), want);
-    assert_eq!(notes(), [ONCE]);
+    assert_eq!(notes(), [ONCE.to_owned(), ignores_changed(2)]);
     let differ = [
         "a.c",
         "b.c",
@@ -1162,7 +1164,6 @@ fn status_takes_a_token_then_asks_watchman_and_leaves_a_search_warm() {
     std::fs::write(folder.join("b.c"), b"printk now\n").unwrap();
     let first = status_by(&daemon, &output);
     assert_eq!(daemon.sent(), TAKES);
-    assert_eq!(notes(), [ONCE], "{first}");
     let saved = records(tmp.path());
     assert_eq!(saved.len(), 1, "{first}");
     for line in [

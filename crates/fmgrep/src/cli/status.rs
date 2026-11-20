@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::print;
+use crate::diagnostic::Diagnostic;
 use crate::fetch::Ask;
 use crate::manifest::Manifest;
 use crate::query::{self, check_changes, note_stale};
-use crate::source::{Learned, keep, kept, named, not_due};
+use crate::source::{Learned, named, not_due};
 
 /// What the check did and found, as `--json` prints it too.
 #[derive(Serialize)]
@@ -35,27 +36,45 @@ pub struct Facts {
 /// lines it warns are kept, not printed; its notes print on stderr.
 pub fn check(index_dir: &Path, manifest: &Manifest, root: Option<&Path>) -> Result<Facts, String> {
     let (mut docs, _blobs) = query::open(index_dir, manifest, root, Ask::Load)?;
-    keep();
     let files = &manifest.files;
     let none = tracing::Span::none();
-    let mut left_out = Vec::new();
-    let learned =
-        std::thread::scope(|s| check_changes(s, &none, &docs, files, None, &mut left_out));
-    super::print_diagnostics(left_out);
-    let learned = learned?;
-    let mut notes = Vec::new();
-    let stale = note_stale(&mut docs, files, &mut notes);
-    super::print_diagnostics(notes);
-    let record = docs.checkpoint(files)?;
+    let mut found = Vec::new();
+    let learned = std::thread::scope(|s| check_changes(s, &none, &docs, files, None, &mut found));
+    let learned = match learned {
+        Ok(learned) => learned,
+        Err(e) => {
+            settle(found);
+            return Err(e);
+        }
+    };
+    let stale = note_stale(&mut docs, files, &mut found);
+    let record = docs.checkpoint(files, &mut found);
+    let warned = settle(found);
+    let record = record?;
     Ok(Facts {
         learned,
-        warned: kept(),
+        warned,
         stale,
         added: docs.stale().len() - stale,
         gone: docs.gone(),
         ignores: docs.ignores(),
         record,
     })
+}
+
+/// What the check found, in the order found: the warnings of the check are
+/// returned as the lines of `status`, the rest printed on stderr.
+fn settle(found: Vec<Diagnostic>) -> Vec<String> {
+    let mut warned = Vec::new();
+    let mut rest = Vec::new();
+    for d in found {
+        match d {
+            Diagnostic::Check(check) => warned.push(check.to_string()),
+            d => rest.push(d),
+        }
+    }
+    super::print_diagnostics(rest);
+    warned
 }
 
 /// One line per fact: how the check learned what changed, then what it

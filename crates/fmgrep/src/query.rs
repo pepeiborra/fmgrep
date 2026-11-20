@@ -299,7 +299,8 @@ pub fn answer(
         }
     };
     drop(query);
-    tracing::info_span!("save").in_scope(|| loaded.docs.checkpoint(&req.manifest.files))?;
+    tracing::info_span!("save")
+        .in_scope(|| loaded.docs.checkpoint(&req.manifest.files, left_out))?;
     if let Some(f) = &req.filter {
         report.unindexed = f.unindexed(|p| loaded.docs.holds(&req.manifest.files, p))?;
     }

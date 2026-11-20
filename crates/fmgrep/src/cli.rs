@@ -500,6 +500,8 @@ fn local(
 /// holds its lines they join the held ones, so that they print or drop with
 /// them, in the order of the lines they sit between.
 fn print_diagnostics(left_out: Vec<Diagnostic>) {
+    #[cfg(test)]
+    crate::tests::note_entries(&left_out);
     for d in left_out {
         crate::held::line(&d.to_string());
     }

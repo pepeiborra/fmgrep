@@ -116,6 +116,10 @@ pub enum Diagnostic {
         ask: Duration,
         apply: Duration,
     },
+    /// A warning of the check of what changed since the index.
+    Check(Check),
+    /// A server's note once watchman answers again after a warning.
+    AnswersAgain,
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -141,6 +145,13 @@ impl fmt::Display for Diagnostic {
                  under it are not searched"
             ),
             Self::Plan { text } => f.write_str(text.strip_suffix('\n').unwrap_or(text)),
+            Self::Check(check) => write!(f, "warning: {check}"),
+            Self::AnswersAgain => {
+                write!(
+                    f,
+                    "note: each query re-checks only what watchman reports again"
+                )
+            }
             Self::Excluded { path, why } => {
                 write!(f, "warning: excluding {}: {why}", path.display())
             }
@@ -309,6 +320,21 @@ mod tests {
         for (d, line) in cases {
             assert_eq!(d.to_string(), line);
         }
+    }
+
+    /// A check's warning is a warning line; a server's note is a note.
+    #[test]
+    fn a_check_warns_and_a_server_notes() {
+        let over = Diagnostic::Check(Check::Over { cap: 64 });
+        assert_eq!(
+            over.to_string(),
+            "warning: more than 64 paths may differ from the index; checked every file \
+             (re-run index)"
+        );
+        assert_eq!(
+            Diagnostic::AnswersAgain.to_string(),
+            "note: each query re-checks only what watchman reports again"
+        );
     }
 
     #[test]
