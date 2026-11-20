@@ -91,7 +91,7 @@ if [[ -n "$CORPUS_DIR" ]]; then
 fi
 
 cargo build --release --locked -p fmgrep >&2
-BIN="$ROOT/target/release/fmgrep"
+BIN="${CARGO_TARGET_DIR:-$ROOT/target}/release/fmgrep"
 
 WORK="$(mktemp -d)"
 SERVER=""
@@ -221,7 +221,7 @@ served() {
 
 # One case: name, our flags, rg's flags (both space-separated), term.
 check() {
-    local name="$1" mine="$2" theirs="$3" term="${4:-$TERM}" rgrc
+    local name="$1" mine="$2" theirs="$3" term="${4-$TERM}" rgrc
     RC=0
     # shellcheck disable=SC2086
     ( cd "$CORPUS$AT" && "$BIN" $mine -- "$term" $PATHS ) > "$WORK/ours" 2> "$WORK/err" || RC=$?
@@ -269,6 +269,14 @@ filtered() {
     check "$1 [lines]" "--heading -n $2" "--heading -n $3"
     check "$1 [-l]" "$2 -l" "-l $3"
     RG_PATHS=.
+    WANT=""
+}
+
+# A case that the search refuses, with exit 2, before it reads the file that
+# turned binary: one warning fewer than the stale pass says.
+refused() {
+    WANT=$((WARNINGS > 0 ? WARNINGS - 1 : 0))
+    check "$@"
     WANT=""
 }
 
@@ -447,16 +455,19 @@ check_expr() {
     OURS=()
 }
 
-# OURS: `--$1` over the leaves as terms, `r:x` spelled /x/, or x if our flags $2 hold --regex.
+# OURS: `--$1` over the leaves: a regex leaf as it is, a pattern as in rg;
+# a literal leaf as it is under FIXED=-F, else escaped, as the leaf of a
+# regex search would be. FIXED=-F needs leaves that are all literals.
 terms() {
-    local op="$1" mine="$2" tok
+    local op="$1" tok
     shift 2
-    OURS=("--$op" --)
+    OURS=("--$op" ${FIXED:+"$FIXED"} --)
     for tok in "$@"; do
-        case "$tok" in
-        t:*) OURS+=("${tok#t:}") ;;
-        r:*) if [[ " $mine " == *" --regex "* ]]; then OURS+=("${tok#r:}"); else OURS+=("/${tok#r:}/"); fi ;;
-        esac
+        if [[ "$tok" == t:* && -z "${FIXED:-}" ]]; then
+            OURS+=("$(printf '%s' "${tok#t:}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')")
+        else
+            OURS+=("${tok#?:}")
+        fi
     done
 }
 
@@ -518,11 +529,14 @@ ours() {
 
 # One --corpus pair: and|or, then two leaves.
 pair() {
-    local op="$1" fail="" untimed='del(.index_time_us, .queries[].latency_us)' name flag docs sum served rc=0 exact total label
+    local op="$1" fail="" untimed='del(.index_time_us, .queries[].latency_us)' unnamed='del(.index_time_us, .queries[].latency_us, .queries[].term, .queries[].leaves[]?.term)' name flag docs sum served rc=0 exact total label
     name="$(tr '[:lower:]' '[:upper:]' <<< "$op")"
     MFLAGS=""
     parse "$op{" "$2" "$3" '}'
+    # Two literals go with -F; a literal beside a regex, escaped.
+    [[ "$2$3" != *r:* ]] && FIXED=-F || FIXED=""
     terms "$op" "" "$2" "$3"
+    FIXED=""
     tr '\n' '\0' < "$WORK/members" > "$WORK/members0"
     cp "$WORK/members" "$WORK/theirs-l"
     for flag in -l -c --count-matches; do
@@ -542,7 +556,8 @@ pair() {
     exact="$(jq '.queries[0] | if has("counts_exact") then .counts_exact else true end' <<< "$served")"
     total="$(jq '.queries[0].total_matches' <<< "$served")"
     [[ "$exact" != true || "$total" == "$sum" ]] || fail+=" total_matches"
-    [[ "$("$BIN" --server "$ADDR" --json "${OURS[@]}" | jq -c "$untimed")" == "$(jq -c "$untimed" <<< "$served")" ]] || fail+=" flags-server"
+    # The flags name a leaf that is nothing but a literal as that literal.
+    [[ "$("$BIN" --server "$ADDR" --json "${OURS[@]}" | jq -c "$unnamed")" == "$(jq -c "$unnamed" <<< "$served")" ]] || fail+=" flags-server"
     label="$(jq -r '.queries[0].term' <<< "$served")"
     ours "$WORK/text-l" -l --expr "$label"
     cmp -s "$WORK/ours-l" "$WORK/text-l" || fail+=" text"
@@ -563,9 +578,9 @@ globbed() {
     local g args=() rc=0 src=0 rgrc=0 fail=""
     for g in "$@"; do args+=(-g "$g"); done
     args=(${GLOB_FLAGS[@]+"${GLOB_FLAGS[@]}"} ${args[@]+"${args[@]}"})
-    "$BIN" --index "$IDX" -l "${args[@]}" --regex '^' > "$WORK/raw" 2> /dev/null || rc=$?
+    "$BIN" --index "$IDX" -l "${args[@]}" '^' > "$WORK/raw" 2> /dev/null || rc=$?
     LC_ALL=C sort "$WORK/raw" > "$WORK/ours-g"
-    "$BIN" --server "$ADDR" -l "${args[@]}" --regex '^' > "$WORK/raw" 2> /dev/null || src=$?
+    "$BIN" --server "$ADDR" -l "${args[@]}" '^' > "$WORK/raw" 2> /dev/null || src=$?
     LC_ALL=C sort "$WORK/raw" > "$WORK/srv-g"
     # No PATH: rg exits 2 only then when the globs exclude every file.
     ( cd "$CORPUS" && rg -a -l "${args[@]}" '^' < /dev/null ) > "$WORK/raw" 2> /dev/null || rgrc=$?
@@ -609,7 +624,7 @@ pathset() {
             r == "" { print s $0; next } $0 == r { print t; next }
             index($0, r "/") == 1 { print s substr($0, length(r) + 2) }' "$WORK/files"
     done; } | LC_ALL=C sort -u > "$WORK/spelled"
-    local args=(${globs[@]+"${globs[@]}"} --regex '^' "$@")
+    local args=(${globs[@]+"${globs[@]}"} '^' "$@")
     local rg_args=(${globs[@]+"${globs[@]}"} -- '^' "$@")
     ( cd "$here" && "$BIN" --index "$IDX" -l "${args[@]}" ) > "$WORK/raw" 2> /dev/null || rc=$?
     LC_ALL=C sort "$WORK/raw" > "$WORK/ours-p"
@@ -725,7 +740,7 @@ if [[ -n "$CORPUS_DIR" ]]; then
 
     if [[ "$STORE_DOCS" == true ]]; then
         echo "skip PATH sets: this index records no tree"
-        unscoped -g '*.cabal' --regex '^'
+        unscoped -g '*.cabal' '^'
     else
         pathset 'GHC/*.hs' -- .
         pathset -- GHC/Core
@@ -789,6 +804,8 @@ printf 'alpha generated\n' > "$CORPUS/s.gen"
 printf 'alpha whitelisted\n' > "$CORPUS/.wl.txt"
 printf 'alpha nested ignore\n' > "$CORPUS/ns/g.log"
 printf 'alpha soon ignored\n' > "$CORPUS/n.md"
+# Patterns with a meaning to a regex, and the text that each reads as one.
+printf 'a.b\naxb\na+b\nfoo(bar)\n/usr/lib/x\n/a.b/\nC++ code\necho $HOME\nx.unwrap()\nif a || b\narr[0] arr0\nStgClosure *\nfoo upper Foo\nFOO BAR\ncall (Foo) (foo)\n' > "$CORPUS/p.txt"
 find "$CORPUS" "$WORK/tree" -exec touch -h -t 202001010000 {} +
 if [[ "$REMOTE" == true ]]; then
     rm -rf "$CORPUS/.git"
@@ -854,11 +871,11 @@ check context-no-head  "--no-heading -n -C 1"       "--no-heading -n -C 1"
 check context-no-num   "--no-heading -N -C 1"       "--no-heading -N -C 1"
 check only-no-heading  "-o --no-heading -n"         "--no-heading -n -o"
 check only-context     "--heading -n -o -C 1"       "--heading -n -o -C 1"
-check regex-lines      "--heading -n --regex"       "--heading -n"                'alpha \w+'
-check regex-only       "--heading -n --regex -o"    "--heading -n -o"             'alpha \w+'
+check regex-lines      "--heading -n"       "--heading -n"                'alpha \w+'
+check regex-only       "--heading -n -o"    "--heading -n -o"             'alpha \w+'
 
-# -i: our bare terms are literals, so the fixture terms carry no metachar and
-# `rg -i` is the same question. The last two pin the Unicode fold classes.
+# -i: the fixture terms carry no metachar, so they are the same question for
+# a regex and a literal. The last two pin the Unicode fold classes.
 for term in alpha ALPHA Alpha printk PRINTK class; do
     check "ci-lines       [$term]" "--heading -n -i"    "--heading -n -i"    "$term"
     check "ci-only        [$term]" "--heading -n -i -o" "--heading -n -i -o" "$term"
@@ -866,82 +883,152 @@ for term in alpha ALPHA Alpha printk PRINTK class; do
     check "ci-countm      [$term]" "-i --count-matches" "--count-matches -i" "$term"
     check "ci-files       [$term]" "-i -l"              "-l -i"              "$term"
 done
-check ci-regex-lines   "--heading -n --regex -i"    "--heading -n -i"             'alpha \w+'
-check ci-regex-only    "--heading -n --regex -i -o" "--heading -n -i -o"          'ALPHA \w+'
+check ci-regex-lines   "--heading -n -i"    "--heading -n -i"             'alpha \w+'
+check ci-regex-only    "--heading -n -i -o" "--heading -n -i -o"          'ALPHA \w+'
 
 # -i x -U: the multiline test runs on the FOLDED pattern, so a term reaches
 # rg's multiline core under -i exactly where it does without it.
 for pat in 'alpha one\nbeta' 'ALPHA ONE\nBETA' '\nBeta' 'alpha\z' 'PRINTK' '(?s)alpha.*\z'; do
-    check "ci-multi-lines [$pat]" "--heading -n --regex -i -U"    "--heading -n -i -U"      "$pat"
-    check "ci-multi-only  [$pat]" "--heading -n --regex -i -U -o" "--heading -n -i -U -o"   "$pat"
-    check "ci-multi-count [$pat]" "--regex -i -U -c"              "-i -U -c"                "$pat"
-    check "ci-multi-countm[$pat]" "--regex -i -U --count-matches" "-i -U --count-matches"   "$pat"
-    check "ci-multi-files [$pat]" "--regex -i -U -l"              "-i -U -l"                "$pat"
+    check "ci-multi-lines [$pat]" "--heading -n -i -U"    "--heading -n -i -U"      "$pat"
+    check "ci-multi-only  [$pat]" "--heading -n -i -U -o" "--heading -n -i -U -o"   "$pat"
+    check "ci-multi-count [$pat]" "-i -U -c"              "-i -U -c"                "$pat"
+    check "ci-multi-countm[$pat]" "-i -U --count-matches" "-i -U --count-matches"   "$pat"
+    check "ci-multi-files [$pat]" "-i -U -l"              "-i -U -l"                "$pat"
 done
 # A bare term holding a terminator: -U lifts the refusal, -i folds it.
-check ci-multi-bare    "--heading -n -i -U"         "-i -U -F --heading -n"       'ALPHA ONE
+check ci-multi-fixed   "--heading -n -i -U -F"      "-i -U -F --heading -n"       'ALPHA ONE
+beta'
+check ci-multi-bare    "--heading -n -i -U"         "-i -U --heading -n"          'ALPHA ONE
 beta'
 
 # A leading BOM never shows in the text, the columns or the counts.
 for pat in '^alpha' 'alpha' '^' '$'; do
-    check "bom-lines      [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
-    check "bom-only       [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
-    check "bom-count      [$pat]" "--regex -c"              "-c"               "$pat"
-    check "bom-countm     [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
-    check "bom-files      [$pat]" "--regex -l"              "-l"               "$pat"
+    check "bom-lines      [$pat]" "--heading -n"    "--heading -n"     "$pat"
+    check "bom-only       [$pat]" "--heading -n -o" "--heading -n -o"  "$pat"
+    check "bom-count      [$pat]" "-c"              "-c"               "$pat"
+    check "bom-countm     [$pat]" "--count-matches" "--count-matches"  "$pat"
+    check "bom-files      [$pat]" "-l"              "-l"               "$pat"
 done
 
 # Zero-width matches, including the unterminated last line of d.txt.
 for pat in '$' 'a*$' '^' 'x*' 'x$'; do
-    check "eol-lines      [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
-    check "eol-only       [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
-    check "eol-count      [$pat]" "--regex -c"              "-c"               "$pat"
-    check "eol-countm     [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
-    check "eol-files      [$pat]" "--regex -l"              "-l"               "$pat"
-    check "eol-context    [$pat]" "--heading -n --regex -C 1" "--heading -n -C 1" "$pat"
+    check "eol-lines      [$pat]" "--heading -n"    "--heading -n"     "$pat"
+    check "eol-only       [$pat]" "--heading -n -o" "--heading -n -o"  "$pat"
+    check "eol-count      [$pat]" "-c"              "-c"               "$pat"
+    check "eol-countm     [$pat]" "--count-matches" "--count-matches"  "$pat"
+    check "eol-files      [$pat]" "-l"              "-l"               "$pat"
+    check "eol-context    [$pat]" "--heading -n -C 1" "--heading -n -C 1" "$pat"
 done
 
 # -U/--multiline. rg only searches whole documents when the pattern can hold
 # a terminator (a \n in a literal or class, or any anchor); every other term
 # keeps the line scan even under -U, so both paths are checked here.
 for pat in 'alpha one\nbeta' '\nbeta' 'head\nalpha last' 'alpha last\z' 'alpha[^x]*\nzz' 'alpha 1\n' 'a\n?' '(?s)$' '(?s)alpha.*\z'; do
-    check "multi-lines    [$pat]" "--heading -n --regex -U"    "--heading -n -U"       "$pat"
-    check "multi-only     [$pat]" "--heading -n --regex -U -o" "--heading -n -U -o"    "$pat"
-    check "multi-count    [$pat]" "--regex -U -c"              "-U -c"                 "$pat"
-    check "multi-countm   [$pat]" "--regex -U --count-matches" "-U --count-matches"    "$pat"
-    check "multi-files    [$pat]" "--regex -U -l"              "-U -l"                 "$pat"
-    check "multi-context  [$pat]" "--heading -n --regex -U -C 1" "--heading -n -U -C 1"  "$pat"
-    check "multi-color    [$pat]" "--heading -n --regex -U --color always" "--heading -n -U --color always" "$pat"
-    check "multi-flat     [$pat]" "--regex -U --no-heading -N" "--no-heading -N -U"    "$pat"
+    check "multi-lines    [$pat]" "--heading -n -U"    "--heading -n -U"       "$pat"
+    check "multi-only     [$pat]" "--heading -n -U -o" "--heading -n -U -o"    "$pat"
+    check "multi-count    [$pat]" "-U -c"              "-U -c"                 "$pat"
+    check "multi-countm   [$pat]" "-U --count-matches" "-U --count-matches"    "$pat"
+    check "multi-files    [$pat]" "-U -l"              "-U -l"                 "$pat"
+    check "multi-context  [$pat]" "--heading -n -U -C 1" "--heading -n -U -C 1"  "$pat"
+    check "multi-color    [$pat]" "--heading -n -U --color always" "--heading -n -U --color always" "$pat"
+    check "multi-flat     [$pat]" "-U --no-heading -N" "--no-heading -N -U"    "$pat"
 done
 
 # The same terms under -U that rg keeps on its line scan, plus the anchored
 # ones, which take the multiline path and merge adjacent matched lines.
 for pat in 'alpha' '^alpha' 'alpha$' 'x*' '$'; do
-    check "multi-line-core[$pat]" "--heading -n --regex -U"    "--heading -n -U"       "$pat"
-    check "multi-lc-only  [$pat]" "--heading -n --regex -U -o" "--heading -n -U -o"    "$pat"
-    check "multi-lc-count [$pat]" "--regex -U -c"              "-U -c"                 "$pat"
-    check "multi-lc-countm[$pat]" "--regex -U --count-matches" "-U --count-matches"    "$pat"
-    check "multi-lc-ctx   [$pat]" "--heading -n --regex -U -C 1" "--heading -n -U -C 1"  "$pat"
+    check "multi-line-core[$pat]" "--heading -n -U"    "--heading -n -U"       "$pat"
+    check "multi-lc-only  [$pat]" "--heading -n -U -o" "--heading -n -U -o"    "$pat"
+    check "multi-lc-count [$pat]" "-U -c"              "-U -c"                 "$pat"
+    check "multi-lc-countm[$pat]" "-U --count-matches" "-U --count-matches"    "$pat"
+    check "multi-lc-ctx   [$pat]" "--heading -n -U -C 1" "--heading -n -U -C 1"  "$pat"
 done
 
 # Anchorless / short-anchor patterns: the automaton candidate route.
 for pat in '[a-z]+ha' '(alp|bet)a' 'al[a-z]{3}'; do
-    check "auto-lines     [$pat]" "--heading -n --regex"    "--heading -n"     "$pat"
-    check "auto-only      [$pat]" "--heading -n --regex -o" "--heading -n -o"  "$pat"
-    check "auto-count     [$pat]" "--regex -c"              "-c"               "$pat"
-    check "auto-countm    [$pat]" "--regex --count-matches" "--count-matches"  "$pat"
-    check "auto-files     [$pat]" "--regex -l"              "-l"               "$pat"
+    check "auto-lines     [$pat]" "--heading -n"    "--heading -n"     "$pat"
+    check "auto-only      [$pat]" "--heading -n -o" "--heading -n -o"  "$pat"
+    check "auto-count     [$pat]" "-c"              "-c"               "$pat"
+    check "auto-countm    [$pat]" "--count-matches" "--count-matches"  "$pat"
+    check "auto-files     [$pat]" "-l"              "-l"               "$pat"
 done
 # The same route under -U, where the plan follows the multiline flags.
-check auto-multi       "--heading -n --regex -U" "--heading -n -U"   '[a-z]+ 1\n[a-z]+ 2'
-check auto-multi-only  "--heading -n --regex -U -o" "--heading -n -U -o" '[a-z]+ 1\n[a-z]+ 2'
+check auto-multi       "--heading -n -U" "--heading -n -U"   '[a-z]+ 1\n[a-z]+ 2'
+check auto-multi-only  "--heading -n -U -o" "--heading -n -U -o" '[a-z]+ 1\n[a-z]+ 2'
 
 # --multiline-dotall: `.` spans the terminator only with it.
 for pat in 'one.beta' 'alpha.*zz'; do
-    check "dotall-lines   [$pat]" "--heading -n --regex -U --multiline-dotall" "--heading -n -U --multiline-dotall" "$pat"
-    check "dotall-only    [$pat]" "--heading -n --regex -U --multiline-dotall -o" "--heading -n -U --multiline-dotall -o" "$pat"
-    check "dotall-off     [$pat]" "--heading -n --regex -U"       "--heading -n -U"    "$pat"
+    check "dotall-lines   [$pat]" "--heading -n -U --multiline-dotall" "--heading -n -U --multiline-dotall" "$pat"
+    check "dotall-only    [$pat]" "--heading -n -U --multiline-dotall -o" "--heading -n -U --multiline-dotall -o" "$pat"
+    check "dotall-off     [$pat]" "--heading -n -U"       "--heading -n -U"    "$pat"
+done
+
+# A TERM is a regex, as in rg: metacharacters, slashes, the empty pattern.
+for pat in 'a.b' 'a|alpha' '^foo' 'foo$' 'x+b' 'a\.b' '\w+\(' 'C\+\+' '\$HOME' 'a \|\| b' 'arr\[0\]' \
+    '[a-c]x' '/usr/' '/a.b/' '/a\.b/' 'StgClosure \*' '(?i)FOO' ''; do
+    check "regex-lines    [$pat]" "--heading -n"    "--heading -n"    "$pat"
+    check "regex-count    [$pat]" "-c"              "-c"              "$pat"
+    check "regex-countm   [$pat]" "--count-matches" "--count-matches" "$pat"
+    check "regex-files    [$pat]" "-l"              "-l"              "$pat"
+    check "regex-only     [$pat]" "--heading -n -o" "--heading -n -o" "$pat"
+done
+# A pattern that needs a NUL is refused as rg refuses it (binary detection
+# makes one impossible to match); a class or an alternative loses the NUL.
+# rg runs without -a here: its binary detection is what refuses them.
+RG_COMMON=(--sort path)
+for pat in '\x00' 'a\x00b' '[\x00]' '\x00*' '\x00a|b'; do
+    refused "nul-error      [$pat]" "-n" "-n" "$pat"
+    refused "nul-error-c    [$pat]" "-c" "-c" "$pat"
+done
+for pat in 'a|\x00' '[\x00-\x01]' '[^a]\x01?'; do
+    check "nul-class      [$pat]" "--heading -n" "--heading -n" "$pat"
+    check "nul-class-c    [$pat]" "-c"           "-c"           "$pat"
+done
+RG_COMMON=(-a --sort path)
+# A pattern that does not compile: exit 2 and nothing on stdout, in every mode.
+# The search stops before it reads the file that turned binary.
+for pat in 'foo(' '[a' '*a' 'a{2' 'a\' '(?P<n>' 'x{2,1}' '(a)\1' '\p{Nope}'; do
+    refused "regex-error    [$pat]" "-n" "-n" "$pat"
+    refused "regex-error-l  [$pat]" "-l" "-l" "$pat"
+    refused "regex-error-c  [$pat]" "-c" "-c" "$pat"
+done
+# -F: every character is itself, in every mode, with -i and across lines.
+for pat in 'foo(' 'a.b' 'a+b' 'C++' 'x.unwrap()' '/a.b/' 'a || b' '$HOME' 'arr[0]' 'StgClosure *' '' alpha; do
+    check "fixed-lines    [$pat]" "--heading -n -F"    "--heading -n -F"    "$pat"
+    check "fixed-count    [$pat]" "-F -c"              "-F -c"              "$pat"
+    check "fixed-countm   [$pat]" "-F --count-matches" "-F --count-matches" "$pat"
+    check "fixed-files    [$pat]" "-F -l"              "-F -l"              "$pat"
+    check "fixed-only     [$pat]" "--heading -n -F -o" "--heading -n -F -o" "$pat"
+    check "fixed-ci       [$pat]" "--heading -n -F -i" "--heading -n -F -i" "$pat"
+done
+check fixed-multi      "--heading -n -F -U"         "--heading -n -F -U"          'alpha one
+beta'
+check fixed-multi-ci   "--heading -n -F -U -i"      "--heading -n -F -U -i"       'ALPHA ONE
+beta'
+check ci-regex-dot     "--heading -n -i"            "--heading -n -i"             'A.B'
+refused ci-regex-error "-i -n"                      "-i -n"                       'FOO('
+check ci-fixed-paren   "--heading -n -i -F"         "--heading -n -i -F"          'FOO('
+check ci-empty         "-i -c"                      "-i -c"                       ''
+# -s, -S and -i: the last of them wins; smart case reads the pattern as rg does.
+for flags in -s -i -S "-i -s" "-s -i" "-i -S" "-S -i" "-s -S" "-S -s"; do
+    for pat in alpha Alpha ALPHA 'alpha \w+' 'Alpha \w+' '\w+ shout' '[A-Z]lpha' 'a.pha' 'A.pha' '\p{Lu}lpha' 'a\.b' 'A\.b'; do
+        check "case [$flags] [$pat]" "--heading -n $flags" "--heading -n $flags" "$pat"
+    done
+done
+# An inline flag beats -i and smart case: (?-i) keeps the case it is given,
+# as a pattern, as a leaf of --and and --or, and as a leaf of --expr.
+for flags in -i -S "-i -S" -s; do
+    for pat in '(?-i)FOO' '(?-i)foo' '\((?-i)f' '(?-i:FOO) BAR' '(?i)foo' 'foo (?-i)Foo'; do
+        check "inline-flag [$flags] [$pat]" "--heading -n $flags" "--heading -n $flags" "$pat"
+    done
+done
+check_flags "inline-and [-i (?-i)FOO BAR]" "--heading -n -i" "--heading -n -i" and 'r:(?-i)FOO' 'r:BAR'
+check_flags "inline-or  [-i (?-i)FOO zeta]" "-l -i" "-l -i" or 'r:(?-i)FOO' 'r:zeta'
+check_expr "expr-inline [-i (?-i)FOO AND BAR]" "--heading -n -i" "--heading -n -i" 'and{' 'r:(?-i)FOO' 'r:BAR' '}'
+for flags in "-S -F" "-F -i" "-i -F -s" "-S -F -i" "-F -s -S"; do
+    for pat in alpha Alpha 'alpha one' 'Alpha up' 'a.b' 'A.b'; do
+        check "case-fixed [$flags] [$pat]" "--heading -n $flags" "--heading -n $flags" "$pat"
+    done
 done
 
 # Expressions: AND, OR, nesting, regex leaves, an empty intersection.
@@ -964,7 +1051,9 @@ flag_cases "--or alpha printk"              ""        or t:alpha t:printk
 flag_cases "--and alpha /\w+ one/"          ""        and t:alpha 'r:\w+ one'
 flag_cases "--or alpha beta head"           ""        or t:alpha t:beta t:head
 flag_cases "--and zeta first"               ""        and t:zeta t:first
-flag_cases "--regex --and 'alpha \w+' beta" "--regex" and 'r:alpha \w+' r:beta
+flag_cases "--and 'alpha \w+' beta"        ""        and 'r:alpha \w+' r:beta
+flag_cases "--and alpha be+ta"              ""        and t:alpha r:be+ta
+FIXED=-F flag_cases "-F --or alpha printk"   ""        or t:alpha t:printk
 check_flags "flags-ci-lines [--and ALPHA one]"          "--heading -n -i" "--heading -n -i" and t:ALPHA t:one
 check_flags "flags-ci-files [--and ALPHA one]"          "-i -l" "-l -i"           and t:ALPHA t:one
 check_flags "flags-multi    [--or /alpha one\nbeta/ zz]" "--heading -n -U" "--heading -n -U" or 'r:alpha one\nbeta' t:zz
