@@ -349,7 +349,7 @@ pub fn answer_expr(
     }
     let start = Instant::now();
     let mut probe_us = plan.probe_us + sample_us;
-    let verbose = crate::verbose::plans();
+    let verbose = req.plans;
     let mut leaf_us = Vec::new();
     let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
     for a in answers {
