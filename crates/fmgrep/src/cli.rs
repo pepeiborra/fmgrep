@@ -237,8 +237,10 @@ fn reach(server: &Server, start: Option<&Path>) -> Result<Reached, String> {
     Err(format!("error: cannot reach {server}: {e}"))
 }
 
-/// A search: what [`choose`] and [`reach`] pick from the cwd. A TERM that
-/// is not a regex says how to search for it as it is.
+/// A search: what [`choose`] and [`reach`] pick from the cwd. A PATTERN that
+/// is not a regex says how to search for it as it is. As in rg, a PATH that
+/// does not exist is an error that leaves the others searched, and the
+/// search exits 2 whatever it found.
 fn search(
     s: &Search,
     env: Env,
@@ -248,7 +250,22 @@ fn search(
     printing: bool,
 ) -> Result<Outcome, String> {
     let patterns = !s.fixed_strings && s.expr.is_none() && s.expr_json.is_none();
-    let found = find(s, env, input, out, tty, printing);
+    let (typed, mut errors) = existing_paths(&s.paths());
+    let found = find(
+        s,
+        env,
+        input,
+        out,
+        tty,
+        printing,
+        &typed,
+        !errors.is_empty(),
+    );
+    // A PATH that exists, with no file the index or the added files hold:
+    // rg would search it, an index cannot.
+    if let Ok(Outcome::Query(r)) = &found {
+        errors.extend(r.unindexed.iter().filter_map(|t| unindexed_error(t)));
+    }
     // A pattern /x/ matches its slashes too, as in rg; v0.1.0 read it as x.
     // Each such pattern that found nothing says so, in a search of several.
     if patterns && let Ok(Outcome::Query(r)) = &found {
@@ -262,7 +279,7 @@ fn search(
             );
         }
     }
-    found.map_err(|e| match e {
+    let found = found.map_err(|e| match e {
         // A NUL is no matter of syntax: -F would not help.
         e if patterns
             && e.contains("invalid regex pattern")
@@ -271,7 +288,76 @@ fn search(
             format!("{e}\nhint: to search for the text as it is, pass -F")
         }
         e => e,
+    });
+    match found {
+        Ok(done) if errors.is_empty() => Ok(done),
+        Ok(_) => Err(errors.join("\n")),
+        Err(e) => {
+            errors.extend(Some(e).filter(|e| !e.is_empty()));
+            Err(errors.join("\n"))
+        }
+    }
+}
+
+/// The error for the PATH `t`, which exists and holds no file the index or the
+/// added files hold; none for a directory in which rg would read nothing
+/// either (empty, or holding only hidden, ignored or binary files), where the
+/// search simply found nothing.
+fn unindexed_error(t: &str) -> Option<String> {
+    let path = std::path::Path::new(t);
+    if path.is_dir() && !crate::walk::rg_reads_in(path) {
+        return None;
+    }
+    Some(match respelled(t) {
+        Some(real) => format!(
+            "error: {t}: spelled in another case than on disk ({real}); the index holds names as \
+             they are"
+        ),
+        None => format!(
+            "error: {t}: not in the index (hidden, ignored, binary, a symlink, or new to a \
+             --store-docs index); search it with rg"
+        ),
     })
+}
+
+/// Where the PATH `t` is on disk, when `t` differs from it only in case, as on
+/// a case-insensitive file system: its last components, as spelled there.
+fn respelled(t: &str) -> Option<String> {
+    use std::path::Component::Normal;
+    let typed = std::path::Path::new(t);
+    // A symlink is another name, not another case.
+    if std::fs::symlink_metadata(typed).ok()?.is_symlink() {
+        return None;
+    }
+    let real = std::fs::canonicalize(typed).ok()?;
+    let mut spelled = Vec::new();
+    let mut other = false;
+    for (a, b) in typed.components().rev().zip(real.components().rev()) {
+        let (Normal(a), Normal(b)) = (a, b) else {
+            break;
+        };
+        if !a.eq_ignore_ascii_case(b) {
+            return None;
+        }
+        other |= a != b;
+        spelled.push(b.to_string_lossy());
+    }
+    spelled.reverse();
+    other.then(|| spelled.join("/"))
+}
+
+/// The PATHs `told` that exist, and the errors, one for each that does
+/// not: rg's words, with `error:` before them.
+fn existing_paths(told: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut existing = Vec::new();
+    let mut errors = Vec::new();
+    for t in told {
+        match std::fs::metadata(t) {
+            Ok(_) => existing.push(t.clone()),
+            Err(e) => errors.push(format!("error: {t}: {e}")),
+        }
+    }
+    (existing, errors)
 }
 
 /// Whether the pattern `t` found nothing: its own section if it has one,
@@ -290,7 +376,9 @@ fn found_nothing(r: &OutputReport, t: &str) -> bool {
     (r.queries.iter()).all(|q| q.total_matches == 0 && q.docs_matched == 0)
 }
 
-/// [`search`] without the hint.
+/// [`search`] without the hint, of the PATHs `typed` that exist; `missing`
+/// when some PATH does not.
+#[allow(clippy::too_many_arguments)]
 fn find(
     s: &Search,
     env: Env,
@@ -298,6 +386,8 @@ fn find(
     out: &mut dyn Write,
     tty: bool,
     printing: bool,
+    typed: &[String],
+    missing: bool,
 ) -> Result<Outcome, String> {
     if s.shutdown {
         let addr = s
@@ -307,7 +397,10 @@ fn find(
         return serve::shutdown(addr);
     }
     let mut p = s.params(input, printing, tty)?;
-    let typed = s.paths()?;
+    // Every PATH is missing: no search is left to run, and the caller says why.
+    if typed.is_empty() && missing {
+        return Err(String::new());
+    }
     p.cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -318,14 +411,14 @@ fn find(
         Err(e) if s.index.is_none() && env().is_err() => return Err(e),
         Err(_) if ignore => return Err(NEEDS_SERVER.to_owned()),
         // No index: `local` fails to find it again, inside its spans.
-        Err(_) => return local(s.index.as_deref(), p, &typed, s.json, out),
+        Err(_) => return local(s.index.as_deref(), p, typed, s.json, out),
     };
     // With `ignore`, a server that cannot be reached is an error.
     let fallback = (!ignore).then_some(cwd);
     let (found, note) = match choice {
         Choice::Index { found, note } => (found, note),
         Choice::Server(server) => match reach(&server, fallback)? {
-            Reached::Conn(conn) => return client(&server, conn, ignore, p, &typed, s.json, out),
+            Reached::Conn(conn) => return client(&server, conn, ignore, p, typed, s.json, out),
             Reached::Index { found, note } => (found, Some(note)),
         },
     };
@@ -343,7 +436,7 @@ fn find(
         ));
     }
     // `local` finds the index again, inside its spans.
-    local(s.index.as_deref(), p, &typed, s.json, out)
+    local(s.index.as_deref(), p, typed, s.json, out)
 }
 
 /// Why a search with `--ignore-local-changes` fails that no server answers.
@@ -737,7 +830,7 @@ fn dispatch_in(
             print::line(out, e.to_string().trim_end())?;
             return Ok(Outcome::Done);
         }
-        Err(e) => return Err(e.to_string().trim_end().to_owned()),
+        Err(e) => return Err(refusal(&e).unwrap_or_else(|| e.to_string().trim_end().to_owned())),
     };
     let verbose = matches!(&cli.command, Some(Command::Index(a)) if a.verbose);
     crate::verbose::set_verbose(verbose).map_err(|e| format!("error: {e}"))?;
@@ -755,6 +848,27 @@ fn dispatch_in(
         Some(Command::Serve(a)) => serve(a, input, out),
         Some(Command::Status(a)) => status(a, env, out),
         None => search(&cli.search, env, input, out, tty, printing),
+    }
+}
+
+/// The error of an rg flag that no index can honour, which clap met as an
+/// unknown argument of a search: what the index lacks, and rg to use instead.
+/// `fmgrep index --hidden` is clap's error: rg builds no index.
+fn refusal(e: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if e.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    // The usage line is `fmgrep [OPTIONS] ...` for a search, `fmgrep index ...`
+    // for a subcommand.
+    let usage = e.get(ContextKind::Usage).map(ToString::to_string);
+    let word = usage.as_deref().and_then(|u| u.split_whitespace().nth(2));
+    if word.is_some_and(|w| !w.starts_with(['[', '<'])) {
+        return None;
+    }
+    match e.get(ContextKind::InvalidArg)? {
+        ContextValue::String(flag) => args::unindexable(flag),
+        _ => None,
     }
 }
 

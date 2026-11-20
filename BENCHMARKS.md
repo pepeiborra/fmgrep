@@ -114,7 +114,7 @@ never clones it; see [docs/benchmark.md](docs/benchmark.md#aosp).
 A query `A AND B` prints the lines matching `A` or `B` in the files that
 hold both.
 
-- **fmgrep**: one `fmgrep --server ADDR -n --no-heading --and A B`
+- **fmgrep**: one `fmgrep --server ADDR -n --no-heading --and -e A -e B`
   request; the index gives each side's files and intersects them before any
   file is read.
 - **rg**: one pipe, `rg -l --null A | xargs -0 -r rg -l --null B |

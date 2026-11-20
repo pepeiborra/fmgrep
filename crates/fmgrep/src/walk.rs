@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::binary::{MAX_DOC_BYTES, Skip, Text, text};
+use crate::binary::{MAX_DOC_BYTES, Skip, Text, read_text, text};
 use crate::verbose::verbose;
 
 /// Documents one read batch holds: bounded by count AND by bytes, so a batch
@@ -366,6 +366,17 @@ fn unlisted_of(e: &ignore::Error) -> (PathBuf, String) {
 /// in [`Walked::unlisted`].
 pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Walked {
     walk_changed(root, vec![under.to_path_buf()], exclude, |_| false)
+}
+
+/// Whether rg, told to search the directory `dir`, would read a file in it:
+/// the walk lists one that is not binary, hidden or ignored. The directory
+/// itself is never filtered, as in rg, whatever its name or its rules. A
+/// file too large or unreadable counts: rg reads it and says why it cannot.
+pub fn rg_reads_in(dir: &Path) -> bool {
+    builder(dir).build().flatten().any(|entry| {
+        entry.file_type().is_some_and(|t| t.is_file())
+            && !matches!(read_text(entry.path()), Err(None))
+    })
 }
 
 /// [`walk_paths`] under `under`, or none once it lists more than `limit`

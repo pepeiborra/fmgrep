@@ -261,7 +261,8 @@ impl Remote {
     /// `args` from `rel` below the client's top, through the server and
     /// as the oracle: the same stdout, timings and the index's own figures
     /// aside, the same exit status, and on stderr the same error or none.
-    pub fn same(&self, rel: &str, args: &[&str]) {
+    /// The status is returned.
+    pub fn same(&self, rel: &str, args: &[&str]) -> Option<i32> {
         let want = self.oracle(rel, args);
         let got = self.search(&self.client.join(rel), args);
         // The copy's index warns that it holds a changed ignore file.
@@ -277,6 +278,7 @@ impl Remote {
             "{rel} {args:?}: {}",
             stderr(&want)
         );
+        want.status.code()
     }
 }
 

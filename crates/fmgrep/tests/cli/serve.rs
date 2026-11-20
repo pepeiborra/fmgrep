@@ -77,8 +77,52 @@ fn tcp_server_flag_equals_local_search() {
             assert_eq!(code(&["--server", addr, "--", term]), want, "{term}");
             assert_eq!(code(&["--index", &index, "--", term]), want, "{term}");
         }
-        let all = [&["--json", "--"][..], &TERMS].concat();
-        assert_eq!(client(addr, &all), query(&index, &TERMS), "{store_docs}");
+        // A PATH that does not exist is the client's error, as in a local search.
+        let out = run(&["--server", addr, "printk", "nosuch"]);
+        assert_eq!(out.status.code(), Some(2), "{store_docs}");
+        assert_eq!(
+            stderr(&out),
+            "error: nosuch: No such file or directory (os error 2)\n"
+        );
+        // A PATH that holds no file the server's index has is named by the
+        // server, and the client says so as a local search does. Only an
+        // index of a tree, not stored documents, knows where a PATH is.
+        if !store_docs {
+            let hidden = docs.join(".hidden.c");
+            std::fs::write(&hidden, "printk hidden\n").unwrap();
+            let out = run(&["--server", addr, "printk", &hidden.display().to_string()]);
+            assert_eq!(out.status.code(), Some(2), "{store_docs}");
+            assert_eq!(
+                stderr(&out),
+                format!(
+                    "error: {}: not in the index (hidden, ignored, binary, a symlink, or new to a \
+                     --store-docs index); search it with rg\n",
+                    hidden.display()
+                )
+            );
+            std::fs::remove_file(&hidden).unwrap();
+            // A binary file added since the index is named too, and a
+            // directory in which rg reads nothing is no error.
+            let new = docs.join("new.dat");
+            std::fs::write(&new, b"printk\0new\n").unwrap();
+            let out = run(&["--server", addr, "printk", &new.display().to_string()]);
+            assert_eq!(out.status.code(), Some(2), "{store_docs}");
+            assert!(
+                stderr(&out).contains("not in the index"),
+                "{}",
+                stderr(&out)
+            );
+            std::fs::remove_file(&new).unwrap();
+            let empty = docs.join("emptydir");
+            std::fs::create_dir(&empty).unwrap();
+            let out = run(&["--server", addr, "printk", &empty.display().to_string()]);
+            assert_eq!((out.status.code(), stderr(&out)), (Some(1), String::new()));
+            std::fs::remove_dir(&empty).unwrap();
+        }
+        // Several patterns are one search of any of them.
+        let any = [&["--json", "--or"][..], &TERMS.map(|t| ["-e", t]).concat()].concat();
+        let local = ok(&[&["--index", &index][..], &any].concat());
+        assert_eq!(client(addr, &any), timeless(&local.stdout), "{store_docs}");
         let verbose = fmgrep()
             .args(["--server", addr, "printk"])
             .env("FMGREP_VERBOSE", "1")
@@ -294,7 +338,7 @@ fn served_paths_print_as_the_local_search() {
 
 /// The client prints each file the server sends in a frame of its own:
 /// the same bytes as a local search, for a file whose output passes
-/// 64 KiB, in colour, with several terms and as rg's JSON events.
+/// 64 KiB, in colour, with several patterns and as rg's JSON events.
 #[test]
 fn served_files_print_as_the_local_search_in_every_mode() {
     let big: String = (0..6000).map(|i| format!("printk line {i}\n")).collect();
@@ -312,13 +356,14 @@ fn served_files_print_as_the_local_search_in_every_mode() {
             &["--heading", "-n", "printk"],
             &["--color", "always", "--heading", "printk"],
             &["-C1", "aa"],
-            &["printk", "aa"],
-            &["-c", "printk", "aa"],
+            &["--or", "-e", "printk", "-e", "aa"],
+            &["-c", "--or", "-e", "printk", "-e", "aa"],
+            &["-e", "printk", "-e", "aa"],
             &["--count-matches", "printk"],
             &["-l", "aa"],
             &["-o", "a+"],
-            &["--and", "printk", "aa"],
-            &["--json", "--matches", "printk", "aa"],
+            &["--and", "-e", "printk", "-e", "aa"],
+            &["--json", "--matches", "--or", "-e", "printk", "-e", "aa"],
             &["--json", "-l", "printk"],
         ] {
             let local = run(&[&["--index", &index][..], args].concat());
@@ -479,7 +524,7 @@ fn fmgrep_server_alone_prints_the_help() {
     let out = run_env(tmp.path(), &closed_port(), &[]);
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        stderr(&out).contains("Usage: fmgrep [OPTIONS] [TERM]..."),
+        stderr(&out).contains("Usage: fmgrep [OPTIONS] PATTERN [PATH]..."),
         "{}",
         stderr(&out)
     );

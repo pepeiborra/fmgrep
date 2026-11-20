@@ -86,14 +86,11 @@ fn every_mode_sees_only_filtered_documents() {
         let tmp = tempfile::tempdir().unwrap();
         let (all, kept) = trees(tmp.path(), store_docs);
         for flags in MODES {
-            for terms in [
-                &["printk"][..],
-                &["al[a-z]ha"],
-                &["printk", "alpha"],
-                &["^"],
-            ] {
+            for terms in [&["printk"][..], &["al[a-z]ha"], &["^"]] {
                 same(&all, &kept, &FILTER, flags, terms);
             }
+            let either = [flags, &["--or"]].concat();
+            same(&all, &kept, &FILTER, &either, &["printk", "alpha"]);
         }
         for flags in [
             &["--iglob", "*.C", "--iglob", "!Z.C"][..],
@@ -237,6 +234,82 @@ fn absolute_paths_print_as_typed() {
     }
 }
 
+/// A PATH that exists and holds no file of the index, nor an added one, is
+/// named in the report: rg searches it, an index cannot.
+#[cfg(unix)]
+#[test]
+fn a_path_that_holds_no_indexed_file_is_named() {
+    let said = |path: &str| {
+        format!(
+            "error: {path}: not in the index (hidden, ignored, binary, a symlink, or new to a \
+             --store-docs index); search it with rg"
+        )
+    };
+    let files: [(&str, &[u8]); 6] = [
+        ("a.c", b"printk one\n"),
+        ("sub/c.c", b"printk three\n"),
+        (".hidden.c", b"printk hidden\n"),
+        (".ignore", b"ignored/\n"),
+        ("ignored/i.c", b"printk ignored\n"),
+        ("bin.c", b"printk\0binary\n"),
+    ];
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let all = dotted_tree(tmp.path(), "all", &files, store_docs);
+        std::os::unix::fs::symlink("a.c", all.join("link.c")).unwrap();
+        // Directories in which rg reads nothing either.
+        std::fs::create_dir(all.join("empty")).unwrap();
+        std::fs::create_dir_all(all.join("keep")).unwrap();
+        std::fs::write(all.join("keep/.keep"), "").unwrap();
+        std::fs::create_dir_all(all.join("bins")).unwrap();
+        std::fs::write(all.join("bins/b.dat"), b"printk\0binary\n").unwrap();
+        let at = |p: &str| all.join(p).display().to_string();
+        let search = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| at(p)).collect();
+            let terms: Vec<&str> = ["printk"]
+                .into_iter()
+                .chain(paths.iter().map(String::as_str))
+                .collect();
+            query(&all, &["-l"], &terms)
+        };
+        // A file or a directory the index holds is searched, as is the tree.
+        for held in ["a.c", "sub", "sub/c.c", "."] {
+            assert!(search(&[held]).is_ok(), "{store_docs} {held}");
+        }
+        // Each kind that the index skips is named, as typed, and the PATHs
+        // that hold files are searched all the same.
+        for skipped in [".hidden.c", "ignored", "ignored/i.c", "bin.c", "link.c"] {
+            let error = search(&[skipped]).err().unwrap();
+            assert_eq!(error, said(&at(skipped)), "{store_docs} {skipped}");
+        }
+        // A directory in which rg finds nothing is no error: the search
+        // finds nothing too.
+        for nothing in ["empty", "keep", "bins"] {
+            assert!(search(&[nothing]).is_ok(), "{store_docs} {nothing}");
+        }
+        let both = search(&["a.c", ".hidden.c", "empty", "ignored"])
+            .err()
+            .unwrap();
+        assert_eq!(
+            both,
+            format!("{}\n{}", said(&at(".hidden.c")), said(&at("ignored"))),
+            "{store_docs}"
+        );
+        // A file added since the index is held, as the files layout reads it;
+        // a stored-docs index never looks, and says so in the same words.
+        std::fs::write(all.join("new.c"), "printk new\n").unwrap();
+        std::fs::write(all.join(".new.c"), "printk new\n").unwrap();
+        assert_eq!(search(&["new.c"]).is_ok(), !store_docs, "{store_docs}");
+        assert!(search(&[".new.c"]).is_err(), "{store_docs}");
+        // A file deleted since the index is no PATH at all.
+        std::fs::remove_file(all.join("a.c")).unwrap();
+        let index = all.join(INDEX_DIR).display().to_string();
+        let gone = dispatch(argv(&["--index", &index, "-l", "printk", &at("a.c")]));
+        let gone = gone.err().unwrap_or_default();
+        assert!(gone.contains("No such file"), "{store_docs} {gone}");
+    }
+}
+
 #[test]
 fn a_single_file_path_prints_no_file_name() {
     for store_docs in LAYOUTS {
@@ -282,7 +355,12 @@ fn filtered_answers_match_on_a_multi_shard_index() {
         assert!(read_manifest(&all.join(INDEX_DIR)).unwrap().blobs.len() > 2);
         let sub = |tree: &Path| tree.join("sub").display().to_string();
         for flags in MODES {
-            for terms in [&["printk"][..], &["al[a-z]ha"], &["printk", "alpha"]] {
+            for (more, terms) in [
+                (&[][..], &["printk"][..]),
+                (&[], &["al[a-z]ha"]),
+                (&["--or"], &["printk", "alpha"]),
+            ] {
+                let flags = &[flags, more].concat()[..];
                 same(&all, &kept, &["-g", "sub/**"], flags, terms);
                 same(&all, &kept, &["-g", "/sub/*"], flags, terms);
                 let pathed = |tree: &Path| {
@@ -313,9 +391,15 @@ fn reading_instead_of_locating_answers_alike() {
         for band in [(0.0, 0.0), (f64::INFINITY, f64::INFINITY)] {
             crate::tests::BAND.set(Some(band));
             for flags in MODES {
-                for terms in [&["printk"][..], &["printk", "al[a-z]ha"]] {
-                    same(&all, &kept, &["-g", "sub/**"], flags, terms);
-                }
+                same(&all, &kept, &["-g", "sub/**"], flags, &["printk"]);
+                let either = [flags, &["--or"]].concat();
+                same(
+                    &all,
+                    &kept,
+                    &["-g", "sub/**"],
+                    &either,
+                    &["printk", "al[a-z]ha"],
+                );
             }
             crate::tests::BAND.set(None);
         }

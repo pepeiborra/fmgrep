@@ -47,7 +47,7 @@ response line each, after any [frames](#streamed-output).
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `terms` | [string] | required unless `expr` is given | each a literal, or a regex when `regex` is true |
+| `terms` | [string] | required unless `expr` is given | each a literal, or a regex when `regex` is true; the CLI sends one, and several `-e` as an `or` expression |
 | `expr` | Expr | absent | one expression instead of `terms` |
 | `regex` | bool | false | every term is a regex; the CLI sends true, and false for `-F` |
 | `ignore_case` | bool | false | `-i` |
@@ -213,6 +213,7 @@ caps nesting at 60.
 | `num_files_indexed` | documents in the index |
 | `queries` | one `QueryReport` per term, in order, or one for the expression |
 | `none_searched` | present, as `true`, only when a query with `commit` found that its PATHs, cwd and globs keep it from every file it answers for; such a query does not fail, as its client searches other files too |
+| `unindexed` | present only when a PATH of the request, as typed, has no file at it or below it that the index or the added files hold: a hidden, ignored, binary or symlinked one. The query does not fail; the CLI prints an error for each and exits 2, but for a directory in which rg would read no file either (empty, or only hidden, ignored or binary files), which is no error. A client that searches files of its own drops a PATH that holds one of them |
 
 `QueryReport`:
 
@@ -263,9 +264,9 @@ Serving continues after any error.
 
 ## --server
 
-`fmgrep --server ADDR [OPTIONS] TERM...` takes every search flag but
+`fmgrep --server ADDR [OPTIONS] PATTERN [PATH]...` (or `-e PATTERN... [PATH]...`) takes every search flag but
 `--index` and prints what the local search prints. It sends one `query`
-(all terms, or the expression) with `stream: true` and `rendered: true`,
+(the pattern, several `-e` as one `or` expression, or the expression) with `stream: true` and `rendered: true`,
 and copies the frames to its stdout; only a search that must put files of
 its own between the server's ([From a checkout](#from-a-checkout)) asks
 for a frame per file, and prints each through its own writer. `--json`
@@ -467,9 +468,10 @@ text becomes `{"bytes": <base64>}`), `end` with the file's stats, and a
 final `summary`. It streams, one fetch batch at a time. Deviations, all
 deliberate:
 
-1. N terms produce N concatenated streams in argv order, each closed by
-   its own `summary`. A foreign event type would break rg-schema consumers
-   worse than a repeated one.
+1. N terms of a request produce N concatenated streams in order, each
+   closed by its own `summary`. A foreign event type would break rg-schema
+   consumers worse than a repeated one. The CLI sends one pattern, or one
+   expression for several `-e`, so its stream has one.
 2. `summary.stats.elapsed` is the term's latency, and `elapsed_total` its
    wall clock.
 3. `binary_offset` is always null, because binary files are skipped at

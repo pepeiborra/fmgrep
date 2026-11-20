@@ -12,17 +12,44 @@ use crate::expr::Expr;
 use crate::pattern::{plain_literal, smart_case_folds};
 
 const SEARCH_NOTE: &str = "\
-A search reads the .fmgrep of the nearest enclosing directory. A TERM is a
-regex, as in rg; -F makes it a literal. Put -- first to search for a TERM
-named index, serve or status. Trailing TERMs naming files or directories
-are PATHs, as in rg. With --expr every argument is a PATH, a word is a
-literal and /x/ is a regex.
+A search reads the .fmgrep of the nearest enclosing directory. The first
+argument is the PATTERN, a regex as in rg; -F makes it a literal. Every
+other argument is a PATH, and one that does not exist is an error, as in
+rg. -e gives the PATTERNs instead, and then every argument is a PATH. Put
+-- first to search for a PATTERN named index, serve or status. With --expr
+every argument is a PATH, a word is a literal and /x/ is a regex.
 Without a PATH only the cwd's subtree is searched, as in rg; from outside the
 indexed tree, all of it.
 
 Environment:
   FMGREP_SERVER=HOST:PORT  with no --server, --index or enclosing .fmgrep,
                            search through that server";
+
+/// Why an index cannot honour rg's `flag`, which asks for what it does not
+/// hold, as the error of that flag; None for any other flag.
+pub fn unindexable(flag: &str) -> Option<String> {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let reason = match name {
+        "--hidden" | "-." => "hidden files are not indexed",
+        "-u" | "--unrestricted" => "hidden and ignored files are not indexed",
+        "--no-ignore"
+        | "--no-ignore-vcs"
+        | "--no-ignore-dot"
+        | "--no-ignore-parent"
+        | "--no-ignore-global"
+        | "--no-ignore-exclude"
+        | "--no-ignore-files" => "ignored files are not indexed",
+        "-L" | "--follow" => "symlinks are not indexed",
+        "-a" | "--text" | "--binary" => "binary files are not indexed",
+        "-z" | "--search-zip" => "files are indexed as they are on disk, not decompressed",
+        "--pre" | "--pre-glob" => "files are indexed as they are on disk, not preprocessed",
+        "-E" | "--encoding" => "files are indexed as bytes, and fmgrep decodes none",
+        _ => return None,
+    };
+    Some(format!(
+        "error: {name} cannot work on an index: {reason}; use rg"
+    ))
+}
 
 const ENV: &str = "\
 Environment:
@@ -44,6 +71,7 @@ const MODES: [&str; 6] = [
     bin_name = "fmgrep",
     version,
     about = "ripgrep-style search over a persistent FM-index",
+    override_usage = "fmgrep [OPTIONS] PATTERN [PATH]...\n       fmgrep [OPTIONS] -e PATTERN... [PATH]...\n       fmgrep <COMMAND>",
     after_help = SEARCH_NOTE,
     no_binary_name = true,
     propagate_version = true,
@@ -130,17 +158,26 @@ pub struct StatusArgs {
 
 #[derive(Args)]
 pub struct Search {
-    /// A regex, as in rg
-    #[arg(value_name = "TERM")]
-    pub terms: Vec<String>,
-    /// Read every TERM as a literal
+    /// A regex, as in rg, then the PATHs to search
+    #[arg(value_name = "PATTERN|PATH")]
+    pub positionals: Vec<String>,
+    /// A PATTERN; every -e is one, and a line matching any is printed
+    #[arg(
+        short = 'e',
+        long = "regexp",
+        value_name = "PATTERN",
+        allow_hyphen_values = true,
+        conflicts_with_all = ["expr", "expr_json"]
+    )]
+    pub patterns: Vec<String>,
+    /// Read every PATTERN as a literal
     #[arg(
         short = 'F',
         long,
         conflicts_with_all = ["regex", "expr", "expr_json"]
     )]
     pub fixed_strings: bool,
-    /// Accepted for v0.1.0: every TERM is a regex now
+    /// Accepted for v0.1.0: every PATTERN is a regex now
     #[arg(long, hide = true)]
     pub regex: bool,
     /// Match case-insensitively
@@ -149,7 +186,7 @@ pub struct Search {
     /// Match case-sensitively (the default)
     #[arg(short = 's', long, overrides_with_all = ["ignore_case", "smart_case"])]
     pub case_sensitive: bool,
-    /// Ignore case unless a TERM holds an uppercase letter
+    /// Ignore case unless a PATTERN holds an uppercase letter
     #[arg(short = 'S', long, overrides_with_all = ["ignore_case", "case_sensitive"])]
     pub smart_case: bool,
     /// Let a match span lines
@@ -158,10 +195,10 @@ pub struct Search {
     /// Under -U, let . match a line terminator
     #[arg(long)]
     pub multiline_dotall: bool,
-    /// Documents holding every TERM
+    /// Documents holding every -e PATTERN
     #[arg(long, conflicts_with = "or")]
     pub and: bool,
-    /// Documents holding any TERM
+    /// Documents holding any -e PATTERN
     #[arg(long)]
     pub or: bool,
     /// Documents an expression picks: 'a AND (b OR /c+/)'
@@ -201,7 +238,7 @@ pub struct Search {
     /// Stop the server (--server only)
     #[arg(
         long,
-        conflicts_with_all = ["index", "terms", "expr", "expr_json", "and", "or"],
+        conflicts_with_all = ["index", "positionals", "patterns", "expr", "expr_json", "and", "or"],
         help_heading = "Server"
     )]
     pub shutdown: bool,
@@ -280,7 +317,7 @@ pub struct Search {
     /// Print matched lines (the default without --json)
     #[arg(long, overrides_with_all = MODES, help_heading = "Protocol (unstable)")]
     pub matches: bool,
-    /// The index's own counts per TERM
+    /// The index's own counts per PATTERN
     #[arg(long, overrides_with_all = MODES, help_heading = "Protocol (unstable)")]
     pub approx_counts: bool,
     /// The expression as JSON; - reads stdin
@@ -312,7 +349,7 @@ impl Search {
             _ if self.matches || (printing && !self.json) => Mode::Lines,
             _ => Mode::Counts,
         };
-        let (terms, paths) = self.split()?;
+        let (terms, paths) = self.split();
         let mut p = QueryParams {
             terms,
             expr: self.expr(input)?,
@@ -331,10 +368,13 @@ impl Search {
         if self.smart_case {
             p.ignore_case = smart_case_folds(self.sources(&p).iter().map(String::as_str));
         }
-        if self.and || self.or {
+        // Several -e patterns are one search of any of them, as in rg.
+        if self.and || self.or || p.terms.len() > 1 {
             let op = if self.and { "--and" } else { "--or" };
             if p.terms.len() < 2 {
-                return Err(format!("error: {op} needs at least two terms"));
+                return Err(format!(
+                    "error: {op} needs at least two patterns, each given with -e: fmgrep {op} -e A -e B"
+                ));
             }
             // A pattern that is nothing but a literal is a term, as the
             // server plans it: the report names it as typed.
@@ -389,31 +429,27 @@ impl Search {
         sources
     }
 
-    /// The PATHs, as typed.
-    pub fn paths(&self) -> Result<Vec<String>, String> {
-        Ok(self.split()?.1)
+    /// The PATHs, as typed, those that name no file too.
+    pub fn paths(&self) -> Vec<String> {
+        self.split().1
     }
 
-    /// The TERMs, as typed; none under an expression.
+    /// The PATTERNs, as typed; none under an expression.
     pub fn typed_terms(&self) -> Vec<String> {
-        self.split().map(|(terms, _)| terms).unwrap_or_default()
+        self.split().0
     }
 
-    /// The positionals as TERMs and PATHs: under an expression all are
-    /// PATHs, else the trailing ones after the first that name files or
-    /// directories.
-    fn split(&self) -> Result<(Vec<String>, Vec<String>), String> {
-        if self.expr.is_some() || self.expr_json.is_some() {
-            if let Some(t) = self.terms.iter().find(|t| !Path::new(t).exists()) {
-                return Err(format!("error: {t}: No such file or directory"));
-            }
-            return Ok((Vec::new(), self.terms.clone()));
+    /// The positionals as PATTERNs and PATHs, as rg reads them. With -e, or
+    /// under an expression, every positional is a PATH. Else the first is
+    /// the PATTERN, whatever it is, and the rest are PATHs.
+    fn split(&self) -> (Vec<String>, Vec<String>) {
+        if self.expr.is_some() || self.expr_json.is_some() || !self.patterns.is_empty() {
+            return (self.patterns.clone(), self.positionals.clone());
         }
-        let n = (self.terms.iter().skip(1).rev())
-            .take_while(|t| Path::new(t).exists())
-            .count();
-        let (terms, paths) = self.terms.split_at(self.terms.len() - n);
-        Ok((terms.to_vec(), paths.to_vec()))
+        match self.positionals.split_first() {
+            Some((pattern, paths)) => (vec![pattern.clone()], paths.to_vec()),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 
     fn expr(&self, input: &mut dyn BufRead) -> Result<Option<Expr>, String> {

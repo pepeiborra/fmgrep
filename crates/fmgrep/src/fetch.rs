@@ -374,6 +374,32 @@ impl DocStore {
         }
     }
 
+    /// Whether the query has a file at `path`, or below it when it is a
+    /// directory, among the indexed docs that are not gone and the added
+    /// ones: a PATH that holds none names a file that no index has.
+    pub fn holds(&self, files: &FileTable, path: &str) -> Result<bool, String> {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return Ok(true);
+        }
+        let n = files.len();
+        let at = files.partition_point(0..n, |p| p < path)?;
+        if files.path(at)? == Some(path) && !self.is_gone(at) {
+            return Ok(true);
+        }
+        let below = format!("{path}/");
+        let mut id = files.partition_point(at..n, |p| p < below.as_str())?;
+        while files.path(id)?.is_some_and(|p| p.starts_with(&below)) {
+            if !self.is_gone(id) {
+                return Ok(true);
+            }
+            id += 1;
+        }
+        let live = |slot: usize| self.unscreened.binary_search(&(n + slot)).is_ok();
+        Ok((self.added.iter().enumerate())
+            .any(|(slot, p)| live(slot) && (p == path || p.starts_with(&below))))
+    }
+
     /// Start a query: drop the cache and its counters, and learn which docs
     /// are stale or gone.
     pub fn begin(&mut self) {
