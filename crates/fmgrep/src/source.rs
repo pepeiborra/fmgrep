@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use rayon::prelude::*;
 
 use crate::Stamp;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Check, Diagnostic};
 use crate::manifest::{Checked, FileTable};
 
 mod added;
@@ -440,18 +440,7 @@ impl Known {
 /// queries if `served`.
 fn ignores_changed(n: usize, served: bool) {
     static SEEN: AtomicBool = AtomicBool::new(false);
-    let (files, dirs) = match n {
-        1 => ("file", "its directory"),
-        _ => ("files", "their directories"),
-    };
-    let each = if served { "query" } else { "search" };
-    journal::warn(
-        &SEEN,
-        &format!(
-            "{n} ignore {files} changed since the index; each {each} reads {dirs} again \
-             (re-run index to make searches fast again)"
-        ),
-    );
+    journal::warn(&SEEN, &Check::IgnoresChanged { n, served });
 }
 
 /// Added file `rel`, or its topmost ancestor the walk did not record: a
@@ -532,7 +521,7 @@ pub struct Files {
     /// Whether `files` ascend, checked once.
     sorted: OnceLock<bool>,
     /// The warning a server printed last, until watchman answers again.
-    said: Mutex<Option<String>>,
+    said: Mutex<Option<Check>>,
     /// Why a server cannot use watchman at all, found at its start.
     refusal: Mutex<Option<String>>,
 }
@@ -672,7 +661,7 @@ impl Files {
 
     /// A server's start that took no token says why: its first query
     /// prints a warning only when the reason differs.
-    fn degraded(&self, why: String) {
+    fn degraded(&self, why: Check) {
         if self.known.each_query {
             *self.said.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
         }
@@ -720,7 +709,7 @@ impl Files {
         files: Checked<'_>,
         lens: &[u64],
         left_out: &mut Vec<Diagnostic>,
-    ) -> Option<String> {
+    ) -> Option<Check> {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         let asked = std::time::Instant::now();
         let again = journal::again(root, last.as_ref());

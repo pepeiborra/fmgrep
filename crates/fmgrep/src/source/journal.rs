@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostic::Check;
+
 #[cfg(unix)]
 mod watchman;
 
@@ -219,8 +221,8 @@ pub struct Asked {
     pub token: Option<Token>,
     /// What may differ, unsorted; `None`: check every file.
     pub paths: Option<Vec<String>>,
-    /// Why watchman could not answer, as stderr says it.
-    pub why: Option<String>,
+    /// Why watchman could not answer.
+    pub why: Option<Check>,
     /// Why watchman cannot be used at all, when a later ask would fail as
     /// well (not installed, no daemon on `WATCHMAN_SOCK`, a network
     /// filesystem); set instead of `why` when the caller refuses on it.
@@ -236,8 +238,8 @@ pub struct Again {
     pub keep: bool,
     /// What changed since the last token, unsorted; `None`: check every file.
     pub paths: Option<Vec<String>>,
-    /// Why every file is checked, as stderr says it.
-    pub why: Option<String>,
+    /// Why every file is checked.
+    pub why: Option<Check>,
 }
 
 /// `$XDG_CACHE_HOME/fmgrep`, else `$HOME/.cache/fmgrep`; tests use only
@@ -868,9 +870,10 @@ static KEPT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// `line` on stderr, once per process for each `seen`; kept instead once
 /// [`keep`] was called.
-pub(super) fn warn(seen: &'static AtomicBool, line: &str) {
+pub(super) fn warn(seen: &'static AtomicBool, check: &Check) {
+    let line = check.to_string();
     #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.clone()));
     if seen.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -878,7 +881,7 @@ pub(super) fn warn(seen: &'static AtomicBool, line: &str) {
         true => KEPT
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(line.to_owned()),
+            .push(line),
         false => crate::held::once(Some(seen), &format!("warning: {line}")),
     }
 }
@@ -899,10 +902,10 @@ pub fn kept() -> Vec<String> {
 }
 
 /// `line` on stderr, as a warning, every time: a server's.
-pub fn say(line: &str) {
+pub fn say(check: &Check) {
     #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
-    eprintln!("warning: {line}");
+    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(check.to_string()));
+    eprintln!("warning: {check}");
 }
 
 /// What a server prints once watchman answers after a warning.
@@ -915,26 +918,27 @@ pub fn answers_again() {
     eprintln!("note: {ANSWERS_AGAIN}");
 }
 
-pub fn cannot(why: &str) -> String {
-    format!("watchman cannot say what changed ({why}); checked every file")
+pub fn cannot(why: &str) -> Check {
+    Check::Cannot {
+        why: why.to_owned(),
+    }
 }
 
 /// Every file was checked once, for reason `why`, and a token taken: later
 /// searches ask watchman, or a server's next query if `served`.
-fn once(why: &str, served: bool) -> String {
-    let next = match served {
-        true => "the next query asks watchman",
-        false => "later searches ask watchman",
-    };
-    format!("checked every file once ({why}); {next}")
+fn once(why: &str, served: bool) -> Check {
+    Check::Once {
+        why: why.to_owned(),
+        served,
+    }
 }
 
-/// No usable answer from watchman on a tree worth asking about: the line.
-pub fn cannot_answer(why: &str) -> String {
+/// No usable answer from watchman on a tree worth asking about.
+pub fn cannot_answer(why: &str) -> Check {
     static SEEN: AtomicBool = AtomicBool::new(false);
-    let line = cannot(why);
-    warn(&SEEN, &line);
-    line
+    let check = cannot(why);
+    warn(&SEEN, &check);
+    check
 }
 
 /// This search, or server start if `served`, took a token, but checked
@@ -949,24 +953,21 @@ fn cannot_save(what: std::fmt::Arguments<'_>) {
     static SEEN: AtomicBool = AtomicBool::new(false);
     warn(
         &SEEN,
-        &format!("cannot save {what}; the next search checks again"),
+        &Check::CannotSave {
+            what: what.to_string(),
+        },
     );
 }
 
 /// More paths may differ than re-checking them beats the stat pass.
 pub fn over(cap: usize) {
     static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        &format!(
-            "more than {cap} paths may differ from the index; checked every file (re-run index)"
-        ),
-    );
+    warn(&SEEN, &Check::Over { cap });
 }
 
-/// A server's query after more than `cap` paths changed: the line.
-pub fn over_since(cap: usize) -> String {
-    format!("more than {cap} paths changed since the last query; checked every file")
+/// A server's query after more than `cap` paths changed.
+pub fn over_since(cap: usize) -> Check {
+    Check::OverSince { cap }
 }
 
 #[cfg(test)]
