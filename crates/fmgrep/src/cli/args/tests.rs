@@ -337,6 +337,10 @@ fn and_or_flags_equal_their_expr_json() {
         r#"{"or":[{"term":"/a/"},{"term":"b.c"}]}"#,
     );
     same(
+        &["-F", "--or", "a", ""],
+        r#"{"or":[{"term":"a"},{"regex":""}]}"#,
+    );
+    same(
         &["--or", "a", "", "c"],
         r#"{"or":[{"term":"a"},{"regex":""},{"term":"c"}]}"#,
     );

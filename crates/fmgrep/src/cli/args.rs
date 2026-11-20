@@ -329,10 +329,11 @@ impl Search {
             }
             // A pattern that is nothing but a literal is a term, as the
             // server plans it: the report names it as typed.
+            // The empty pattern matches every line; the term of it, none.
             let leaf = |t: String| match (self.fixed_strings, plain_literal(&t)) {
-                (true, _) => Expr::Term(t),
+                (true, _) if !t.is_empty() => Expr::Term(t),
                 (false, Some(literal)) => Expr::Term(literal),
-                (false, None) => Expr::Regex(t),
+                (_, _) => Expr::Regex(t),
             };
             let leaves = std::mem::take(&mut p.terms).into_iter().map(leaf).collect();
             p.expr = Some(if self.and {
