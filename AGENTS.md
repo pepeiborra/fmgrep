@@ -13,7 +13,8 @@ fmgrep index .                  # once: writes ./.fmgrep (add it to .gitignore)
 fmgrep HscEnv                   # lines as rg prints them; -n adds line numbers
 fmgrep -l HscEnv                # files only; -c counts lines per file
 fmgrep -i hscenv                # case-insensitive
-fmgrep '/Dyn[A-Z]\w+/'          # /../ is a regex; --regex makes every TERM one
+fmgrep 'Dyn[A-Z]\w+'            # a TERM is a regex, as in rg
+fmgrep -F 'foo('                # -F: a literal, as in rg
 fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)' -l
 ```
 
@@ -28,8 +29,9 @@ fmgrep --server 127.0.0.1:7777 --shutdown
 
 ## Pitfalls
 
-- A TERM is a **literal**, not a regex: `fmgrep 'a.b'` finds the three
-  bytes `a.b`. Write `/a.b/` or pass `--regex` for a pattern.
+- A TERM is a regex, as in rg. Pass `-F` for text such as `foo(` or `a.b`.
+  The patterns rg takes with `-e`, `-w`, `-x`, `-v`, `-f` and `-P` are not
+  supported: those flags fail with exit 2.
 - As in rg, without a PATH only the cwd's subtree is searched, with printed
   paths and `-g` globs relative to the cwd: from `compiler/`,
   `fmgrep -g 'GHC/*.hs' HscEnv` searches `compiler/GHC/*.hs` and prints
