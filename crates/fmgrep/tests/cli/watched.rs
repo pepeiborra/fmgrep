@@ -399,7 +399,7 @@ fn a_config_file_without_settings_is_stamped() {
 /// is done, saves no record when they differ, and says so; the next
 /// search asks git again and sees what that file sets.
 #[test]
-fn a_config_file_named_while_git_runs_is_seen() {
+fn a_config_file_listed_while_git_runs_is_seen() {
     let r = Remote::new(&FILES);
     if r.daemon.is_none() {
         return;

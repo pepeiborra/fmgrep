@@ -25,7 +25,7 @@ fn table(v: &[&str]) -> FileTable {
 }
 
 /// `(path, name)` pairs.
-fn named(paths: &[(&str, &str)]) -> Vec<SearchPath> {
+fn given(paths: &[(&str, &str)]) -> Vec<SearchPath> {
     paths
         .iter()
         .map(|&(path, name)| SearchPath {
@@ -38,7 +38,7 @@ fn named(paths: &[(&str, &str)]) -> Vec<SearchPath> {
 /// `paths` typed as their root-relative paths, from the root.
 fn filter(globs: &[&str], iglobs: &[&str], fold: bool, paths: &[&str]) -> PathFilter {
     let paths: Vec<_> = paths.iter().map(|&p| (p, p)).collect();
-    let paths = named(&paths);
+    let paths = given(&paths);
     PathFilter::new(&strings(globs), &strings(iglobs), fold, &paths, "/r")
         .unwrap()
         .unwrap()
@@ -46,7 +46,7 @@ fn filter(globs: &[&str], iglobs: &[&str], fold: bool, paths: &[&str]) -> PathFi
 
 /// `paths` typed in `cwd`.
 fn from(cwd: &str, globs: &[&str], paths: &[(&str, &str)]) -> PathFilter {
-    PathFilter::new(&strings(globs), &[], false, &named(paths), cwd)
+    PathFilter::new(&strings(globs), &[], false, &given(paths), cwd)
         .unwrap()
         .unwrap()
 }
@@ -327,7 +327,7 @@ fn files_print_under_the_first_path_that_keeps_them() {
 }
 
 #[test]
-fn the_cwd_of_a_search_without_paths_is_an_unnamed_path() {
+fn the_cwd_of_a_search_without_paths_is_the_default_path() {
     let cwd = |globs: &[&str]| from("/r/sub", globs, &[("sub", "")]);
     assert_eq!(
         kept(&cwd(&[])),
@@ -443,7 +443,7 @@ fn the_cover_holds_every_kept_file() {
     ];
     for globs in sets {
         for (cwd, paths) in roots {
-            let f = PathFilter::new(&strings(globs), &[], false, &named(paths), cwd);
+            let f = PathFilter::new(&strings(globs), &[], false, &given(paths), cwd);
             let f = f.unwrap().unwrap();
             let mut keep = f.keeper();
             let ctx = format!("{globs:?} {cwd} {paths:?}");
