@@ -37,21 +37,47 @@ outside the indexed tree, a search covers the whole tree, relative to
 its root. A PATH is relative to the cwd, and its files print as rg
 prints them. Files print in path order.
 
-### A TERM is a literal
+### A TERM is a regex
 
-`fmgrep 'a.b'` finds the three bytes `a.b`. `rg` reads `a.b` as a regex,
-so it finds `axb` too. Write `/a.b/` for a regex, or pass `--regex` to
-make every TERM one. The regex syntax is that of rg's default engine,
-the Rust regex crate. There is no `-P`, `-F` or `-e`.
+A TERM is a regex, as in rg. The syntax is that of rg's default engine,
+the Rust regex crate. `-F` makes it the text it is, and `-i`, `-s`, `-S`
+and `-U` work as in rg.
+
+| search | rg | fmgrep |
+|---|---|---|
+| `a.b` | finds `a.b` and `axb` | the same |
+| `-F a.b` | finds `a.b` | the same |
+| `'foo('` | `regex parse error`, exit 2 | the same, and a hint to pass `-F` |
+| `-F 'foo('` | finds `foo(bar)` | the same |
+| `/usr/` | finds `/usr/lib` | the same: the slashes are text |
+| `''` | every line | the same |
+| `'a\x00b'` (a NUL) | `pattern contains "\0" but it is impossible to match`, exit 2 | the same |
+
+A pattern with no regex syntax in it, such as `HscEnv`, is answered
+from the index as a literal is. `-F` does so for any text. A pattern
+with a `.`, a bracket or a `+` reads every file that may match, so use
+`-F` for code such as `foo(` or `a.b`. A search for `/a.b/` that finds
+nothing says that the slashes are part of the pattern.
+
+`--and` and `--or` read each TERM as a regex too, or as text under `-F`.
+Under `--expr`, a word is still a literal and `/re/` a regex, and `-F`
+is refused ([Expressions](../README.md#expressions)). `--regex` is
+accepted from v0.1.0 and does nothing.
+
+rg wraps each pattern in a group, so it accepts a few patterns with an
+unbalanced `)`, such as `)(\d#?`. fmgrep refuses them with a parse error.
+
+`-P` and `--engine` do not exist: there is one engine. `-e`, `-f`, `-w`,
+`-x` and `-v` are refused.
 
 Several TERMs are searched one after the other, and each prints under a
 `== TERM ==` line. In rg, `-e A -e B` is one search. `--and`, `--or` and
-`--expr` pick files, then print the lines of every TERM in them
-([Expressions](../README.md#expressions)).
+`--expr` pick files, then print the lines of every TERM in them.
 
 Trailing arguments that name an existing file or directory are PATHs, as
-in rg. One that does not exist is a TERM. So `fmgrep HscEnv nope.txt`
-also searches for `nope.txt`, and exits 0. `rg` exits 2 with an error.
+in rg, whatever they look like: `/tmp/` is a PATH. One that does not exist
+is a TERM. So `fmgrep HscEnv nope.txt` also searches for `nope.txt`, and
+exits 0. `rg` exits 2 with an error.
 
 `index`, `serve` and `status` are commands when they are the first word.
 To search for one of these words, put `--` or any flag first:
@@ -59,14 +85,14 @@ To search for one of these words, put `--` or any flag first:
 
 ### Flags
 
-These work as in rg: `-i`, `-U`, `--multiline-dotall`, `-g`, `--iglob`,
-`--glob-case-insensitive`, `-c`, `--count-matches`, `-l`, `-o`, `-A`,
-`-B`, `-C`, `-n`, `-N`, `--heading`, `--no-heading`, `--color` and
-`--stats`. `fmgrep --help` lists them. Any other flag of rg is refused
-with `error: unexpected argument` and exit 2. These are some of them:
+These work as in rg: `-F`, `-i`, `-s`, `-S`, `-U`,
+`--multiline-dotall`, `-g`, `--iglob`, `--glob-case-insensitive`, `-c`,
+`--count-matches`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
+`--no-heading`, `--color` and `--stats`. `fmgrep --help` lists them. Any
+other flag of rg is refused with `error: unexpected argument` and exit 2.
+These are some of them:
 
-- patterns: `-e`, `-f`, `-F`, `-w`, `-x`, `-v`, `-s`, `-S`, `-P`,
-  `--engine`
+- patterns: `-e`, `-f`, `-w`, `-x`, `-v`, `-P`, `--engine`
 - files: `--hidden`, `--no-ignore`, `-u`, `-t`, `-T`, `--type-add`,
   `-L`, `-d`, `--max-filesize`, `--files`, `--files-without-match`,
   `-a`, `-z`
