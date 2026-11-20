@@ -86,14 +86,11 @@ fn every_mode_sees_only_filtered_documents() {
         let tmp = tempfile::tempdir().unwrap();
         let (all, kept) = trees(tmp.path(), store_docs);
         for flags in MODES {
-            for terms in [
-                &["printk"][..],
-                &["al[a-z]ha"],
-                &["printk", "alpha"],
-                &["^"],
-            ] {
+            for terms in [&["printk"][..], &["al[a-z]ha"], &["^"]] {
                 same(&all, &kept, &FILTER, flags, terms);
             }
+            let either = [flags, &["--or"]].concat();
+            same(&all, &kept, &FILTER, &either, &["printk", "alpha"]);
         }
         for flags in [
             &["--iglob", "*.C", "--iglob", "!Z.C"][..],
@@ -282,7 +279,12 @@ fn filtered_answers_match_on_a_multi_shard_index() {
         assert!(read_manifest(&all.join(INDEX_DIR)).unwrap().blobs.len() > 2);
         let sub = |tree: &Path| tree.join("sub").display().to_string();
         for flags in MODES {
-            for terms in [&["printk"][..], &["al[a-z]ha"], &["printk", "alpha"]] {
+            for (more, terms) in [
+                (&[][..], &["printk"][..]),
+                (&[], &["al[a-z]ha"]),
+                (&["--or"], &["printk", "alpha"]),
+            ] {
+                let flags = &[flags, more].concat()[..];
                 same(&all, &kept, &["-g", "sub/**"], flags, terms);
                 same(&all, &kept, &["-g", "/sub/*"], flags, terms);
                 let pathed = |tree: &Path| {
@@ -313,9 +315,15 @@ fn reading_instead_of_locating_answers_alike() {
         for band in [(0.0, 0.0), (f64::INFINITY, f64::INFINITY)] {
             crate::tests::BAND.set(Some(band));
             for flags in MODES {
-                for terms in [&["printk"][..], &["printk", "al[a-z]ha"]] {
-                    same(&all, &kept, &["-g", "sub/**"], flags, terms);
-                }
+                same(&all, &kept, &["-g", "sub/**"], flags, &["printk"]);
+                let either = [flags, &["--or"]].concat();
+                same(
+                    &all,
+                    &kept,
+                    &["-g", "sub/**"],
+                    &either,
+                    &["printk", "al[a-z]ha"],
+                );
             }
             crate::tests::BAND.set(None);
         }

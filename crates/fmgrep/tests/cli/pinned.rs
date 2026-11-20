@@ -417,7 +417,7 @@ fn a_later_search_prints_its_plan_in_place() {
     let r = Remote::new(&FILES);
     r.s.write(&r.client, &[("a.c", "printk edited\n")]);
     let proxy = Proxy::new(&r.addr);
-    let args = ["--and", "printk", "ed+"];
+    let args = ["--and", "-e", "printk", "-e", "ed+"];
     planned(&r, &proxy, &args);
     let (got, asked) = planned(&r, &proxy, &args);
     assert_eq!(asked, ["query"]);

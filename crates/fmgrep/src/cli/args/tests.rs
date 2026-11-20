@@ -61,29 +61,24 @@ fn clap_definition_is_valid() {
 
 #[test]
 fn rg_flags_set_the_params() {
-    let cases: [(&[&str], Edit); 20] = [
+    let cases: [(&[&str], Edit); 21] = [
         (&["-i"], |p| p.ignore_case = true),
         (&["-U"], |p| p.multiline = true),
         (&["--multiline-dotall"], |p| p.dotall = true),
-        (&["a", "b|c"], |p| p.terms = vec!["a".into(), "b|c".into()]),
-        // v0.1.0's flag: a no-op now, for every TERM is a regex.
-        (&["--regex", "a", "b|c"], |p| {
-            p.terms = vec!["a".into(), "b|c".into()];
-        }),
-        (&["-F", "a", "b|c"], |p| {
+        (&["b|c"], |p| p.terms = vec!["b|c".into()]),
+        // v0.1.0's flag: a no-op now, for every PATTERN is a regex.
+        (&["--regex", "b|c"], |p| p.terms = vec!["b|c".into()]),
+        (&["-F", "b|c"], |p| {
             p.regex = false;
-            p.terms = vec!["a".into(), "b|c".into()];
+            p.terms = vec!["b|c".into()];
         }),
         (&["--fixed-strings", "a"], |p| {
             p.regex = false;
             p.terms = vec!["a".into()];
         }),
-        (&["--", "--regex", "-i"], |p| {
-            p.terms = vec!["--regex".into(), "-i".into()]
-        }),
-        (&["a", "--", "--json"], |p| {
-            p.terms = vec!["a".into(), "--json".into()]
-        }),
+        (&["--", "--regex"], |p| p.terms = vec!["--regex".into()]),
+        (&["--", "--json"], |p| p.terms = vec!["--json".into()]),
+        (&["-e", "--json"], |p| p.terms = vec!["--json".into()]),
         (&["-n"], |p| p.line_numbers = true),
         (&["-n", "-N"], |_| {}),
         (&["--heading"], |p| p.heading = true),
@@ -125,8 +120,8 @@ fn the_last_case_flag_wins_and_smart_case_reads_the_patterns() {
         (&["-S", "foo"], true),
         (&["-S", "Foo"], false),
         (&["-S", "fOo"], false),
-        (&["-S", "foo", "Bar"], false),
-        (&["-S", "foo", "bar"], true),
+        (&["-S", "-e", "foo", "-e", "Bar"], false),
+        (&["-S", "-e", "foo", "-e", "bar"], true),
         (&["-S", "foo.*\\w"], true),
         (&["-S", "\\S+"], false),
         (&["-S", "\\p{Lu}foo"], true),
@@ -139,8 +134,8 @@ fn the_last_case_flag_wins_and_smart_case_reads_the_patterns() {
         (&["-S", "-F", "\\s"], true),
         (&["-S", ""], false),
         (&["-S", "("], false),
-        (&["-S", "--and", "foo", "Bar"], false),
-        (&["-S", "--or", "foo", "bar"], true),
+        (&["-S", "--and", "-e", "foo", "-e", "Bar"], false),
+        (&["-S", "--or", "-e", "foo", "-e", "bar"], true),
         (&["-S", "--expr", "foo AND /ba+/"], true),
         (&["-S", "--expr", "foo AND Bar"], false),
         (
@@ -310,8 +305,15 @@ fn terminal_defaults_follow_rg() {
 
 #[test]
 fn banner_needs_several_terms() {
+    // A search of the command line has one PATTERN, or one expression; only
+    // a raw request carries several terms.
     assert!(!params(&["one"]).output_config().banner);
-    assert!(params(&["one", "two"]).output_config().banner);
+    assert!(!params(&["-e", "one", "-e", "two"]).output_config().banner);
+    let raw = QueryParams {
+        terms: vec!["one".into(), "two".into()],
+        ..QueryParams::default()
+    };
+    assert!(raw.output_config().banner);
 }
 
 #[test]
@@ -354,7 +356,7 @@ fn only_the_first_word_selects_a_subcommand() {
         (&["help"], &["help"]),
         (&["--", "-V"], &["-V"]),
     ] {
-        assert_eq!(search(words).terms, terms, "{words:?}");
+        assert_eq!(search(words).positionals, terms, "{words:?}");
     }
     assert_eq!(
         search(&["--index", "idx", "x"]).index,
@@ -368,32 +370,32 @@ fn and_or_flags_equal_their_expr_json() {
         assert_eq!(params(flags), params(&["--expr-json", json]), "{flags:?}");
     };
     // A pattern that is nothing but a literal is a term; any other is a regex.
-    same(&["--and", "a", "b+"], AND_JSON);
-    same(&["a", "b+", "--and"], AND_JSON);
-    same(&["--and", "--and", "a", "b+"], AND_JSON);
-    same(&["--regex", "--and", "a", "b+"], AND_JSON);
+    same(&["--and", "-e", "a", "-e", "b+"], AND_JSON);
+    same(&["-e", "a", "-e", "b+", "--and"], AND_JSON);
+    same(&["--and", "--and", "-e", "a", "-e", "b+"], AND_JSON);
+    same(&["--regex", "--and", "-e", "a", "-e", "b+"], AND_JSON);
     same(
-        &["-F", "--and", "a", "b+"],
+        &["-F", "--and", "-e", "a", "-e", "b+"],
         r#"{"and":[{"term":"a"},{"term":"b+"}]}"#,
     );
     same(
-        &["--or", "/a/", "b\\.c"],
+        &["--or", "-e", "/a/", "-e", "b\\.c"],
         r#"{"or":[{"term":"/a/"},{"term":"b.c"}]}"#,
     );
     same(
-        &["-F", "--or", "a", ""],
+        &["-F", "--or", "-e", "a", "-e", ""],
         r#"{"or":[{"term":"a"},{"regex":""}]}"#,
     );
     same(
-        &["--or", "a", "", "c"],
+        &["--or", "-e", "a", "-e", "", "-e", "c"],
         r#"{"or":[{"term":"a"},{"regex":""},{"term":"c"}]}"#,
     );
     same(
-        &["--or", "--", "-x", "--and", ""],
+        &["--or", "-e", "-x", "-e", "--and", "-e", ""],
         r#"{"or":[{"term":"-x"},{"term":"--and"},{"regex":""}]}"#,
     );
     assert_eq!(
-        params(&["-i", "-U", "-l", "--and", "a", "b+"]),
+        params(&["-i", "-U", "-l", "--and", "-e", "a", "-e", "b+"]),
         QueryParams {
             multiline: true,
             ..params(&["--expr-json", AND_JSON, "-i", "-l"])
@@ -438,10 +440,8 @@ fn rejects_bad_argv() {
         &["--and", "--expr-json", AND_JSON],
         &["--or", "--expr-json", AND_JSON],
         &["--or", "--expr", AND_TEXT],
-        &["--expr", AND_TEXT, "x"],
         &["--regex", "--expr", AND_TEXT],
         &["--expr", AND_TEXT, "--expr-json", AND_JSON],
-        &["--expr-json", AND_JSON, "x"],
         &["--expr-json", "-", "--", "x"],
         &["--regex", "--expr-json", AND_JSON],
     ] {
@@ -449,11 +449,11 @@ fn rejects_bad_argv() {
         assert!(e.starts_with("error: "), "{words:?}: {e}");
     }
     for (words, want) in [
-        (&["--and"][..], "error: --and needs at least two terms"),
-        (&["--or", "a"], "error: --or needs at least two terms"),
+        (&["--and"][..], "error: --and needs at least two patterns"),
+        (&["--or", "a"], "error: --or needs at least two patterns"),
         (
-            &["--server", "a:1", "--or", "a"],
-            "error: --or needs at least two terms",
+            &["--server", "a:1", "--or", "-e", "a"],
+            "error: --or needs at least two patterns",
         ),
         (&["--expr-json", "{"], "error: invalid --expr-json: EOF"),
         (
@@ -478,7 +478,7 @@ fn help_and_version_print_to_stdout() {
         assert!(matches!(done, Ok(Outcome::Done)), "{words:?}");
         String::from_utf8(out).unwrap()
     };
-    assert!(run(&["-h"]).contains("Usage: fmgrep [OPTIONS] [TERM]..."));
+    assert!(run(&["-h"]).contains("Usage: fmgrep [OPTIONS] PATTERN [PATH]..."));
     assert_eq!(
         run(&["-V"]),
         format!("fmgrep {}\n", env!("CARGO_PKG_VERSION"))
@@ -512,71 +512,110 @@ fn glob_flags_reach_the_params() {
     );
 }
 
-/// The TERMs and PATHs of `words`.
+/// The PATTERNs and PATHs of `words`.
 fn split(words: &[&str]) -> (Vec<String>, Vec<String>) {
     let s = search(words);
-    (params(words).terms, s.paths().unwrap())
+    (s.split().0, s.paths())
+}
+
+fn strings(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
 }
 
 #[test]
-fn trailing_existing_paths_are_paths() {
+fn the_first_positional_is_the_pattern_and_the_rest_are_paths() {
     assert_eq!(
-        split(&["a", "b", "src", "Cargo.toml"]),
-        (
-            vec!["a".into(), "b".into()],
-            vec!["src".into(), "Cargo.toml".into()]
-        )
+        split(&["a", "src", "Cargo.toml"]),
+        (strings(&["a"]), strings(&["src", "Cargo.toml"]))
     );
-    let (terms, paths) = split(&["a", "src", "b"]);
-    assert_eq!((terms.len(), paths.len()), (3, 0));
-    assert!(!params(&["a", "src"]).output_config().banner);
-}
-
-#[test]
-fn the_first_positional_is_always_a_term() {
+    // The first is always the PATTERN, a file's name or not.
     assert_eq!(
         split(&["src", "Cargo.toml"]),
-        (vec!["src".into()], vec!["Cargo.toml".into()])
+        (strings(&["src"]), strings(&["Cargo.toml"]))
     );
-    // A word with slashes is a PATH when it exists, whatever it looks like.
-    let (terms, paths) = split(&["a", "/tmp/"]);
-    assert_eq!((terms.len(), paths.len()), (1, 1));
+    // A word that names no file is a PATH too, and the search says it
+    // does not exist: it never turns into another PATTERN.
+    assert_eq!(
+        split(&["a", "src", "nosuch"]),
+        (strings(&["a"]), strings(&["src", "nosuch"]))
+    );
+    assert_eq!(split(&["a", "/tmp/"]).1, ["/tmp/"]);
+    assert_eq!(split(&["a"]), (strings(&["a"]), vec![]));
+    assert_eq!(split(&["--json"]).0, Vec::<String>::new());
+    // `--` ends the flags, and the first word after it is the PATTERN.
+    assert_eq!(
+        split(&["--", "-x", "src"]),
+        (strings(&["-x"]), strings(&["src"]))
+    );
+    assert_eq!(split(&["-i", "--", "status"]).0, ["status"]);
 }
 
 #[test]
-fn under_expr_every_positional_is_a_path() {
+fn with_e_or_under_expr_every_positional_is_a_path() {
+    assert_eq!(
+        split(&["-e", "a", "src", "Cargo.toml"]),
+        (strings(&["a"]), strings(&["src", "Cargo.toml"]))
+    );
+    assert_eq!(
+        split(&["-e", "a", "--", "-b"]),
+        (strings(&["a"]), strings(&["-b"]))
+    );
     let (terms, paths) = split(&["--expr", AND_TEXT, "src", "Cargo.toml"]);
-    assert_eq!(
-        (terms.len(), paths),
-        (0, vec!["src".into(), "Cargo.toml".into()])
-    );
+    assert_eq!((terms.len(), paths), (0, strings(&["src", "Cargo.toml"])));
     assert_eq!(split(&["--expr-json", AND_JSON, "--", "src"]).1, ["src"]);
-    assert_eq!(
-        err(&["--expr", AND_TEXT, "src", "x"]),
-        "error: x: No such file or directory"
-    );
+    // A word that names no file is no PATTERN there either.
+    assert_eq!(split(&["--expr", AND_TEXT, "src", "x"]).1, ["src", "x"]);
+}
+
+#[test]
+fn a_dash_is_a_positional_like_any_other() {
+    // Stdin is never read: the first positional is the PATTERN, the rest
+    // are PATHs, and a `-` is one that names a file only if one has the name.
+    assert_eq!(split(&["a", "-"]), (strings(&["a"]), strings(&["-"])));
+    assert_eq!(split(&["a", "-", "-"]).1, ["-", "-"]);
+    assert_eq!(split(&["-e", "a", "-"]).1, ["-"]);
+    assert_eq!(split(&["--expr", AND_TEXT, "-"]).1, ["-"]);
+    assert_eq!(split(&["--", "-"]), (strings(&["-"]), vec![]));
+    assert_eq!(split(&["-", "a"]), (strings(&["-"]), strings(&["a"])));
 }
 
 #[test]
 fn one_file_path_drops_the_file_name() {
-    let named = |words: &[&str]| params(words).filename;
-    assert!(!named(&["a", "Cargo.toml"]));
-    assert!(named(&["a", "src"]));
-    assert!(named(&["a", "Cargo.toml", "src"]));
-    assert!(named(&["a"]));
-    assert!(!named(&["--expr", AND_TEXT, "Cargo.toml"]));
+    let shows_name = |words: &[&str]| params(words).filename;
+    assert!(!shows_name(&["a", "Cargo.toml"]));
+    assert!(shows_name(&["a", "src"]));
+    assert!(shows_name(&["a", "Cargo.toml", "src"]));
+    // As rg, a PATH that does not exist counts: it was told of several.
+    assert!(shows_name(&["a", "Cargo.toml", "nosuch"]));
+    assert!(shows_name(&["a"]));
+    assert!(!shows_name(&["--expr", AND_TEXT, "Cargo.toml"]));
+    assert!(!shows_name(&["-e", "a", "Cargo.toml"]));
     assert!(!params(&["-l", "a", "Cargo.toml"]).output_config().filename);
 }
 
 #[test]
-fn and_or_count_terms_without_their_paths() {
+fn and_or_count_patterns_without_their_paths() {
     assert_eq!(
-        params(&["--and", "a", "b+", "src"]),
+        params(&["--and", "-e", "a", "-e", "b+", "src"]),
         params(&["--expr-json", AND_JSON, "src"])
     );
+    // The PATHs of rg's form are not patterns: `--and A B` is a search for
+    // A in the PATH B, and one pattern is no conjunction.
+    for words in [
+        &["--and", "a", "b+"][..],
+        &["--and", "a", "src"],
+        &["--and", "-e", "a", "src"],
+        &["--and"],
+    ] {
+        assert_eq!(
+            err(words),
+            "error: --and needs at least two patterns, each given with -e: fmgrep --and -e A -e B",
+            "{words:?}"
+        );
+    }
     assert_eq!(
-        err(&["--or", "a", "src"]),
-        "error: --or needs at least two terms"
+        err(&["--or", "-e", "a", "src"]),
+        "error: --or needs at least two patterns, each given with -e: fmgrep --or -e A -e B"
     );
 }
 
@@ -592,20 +631,10 @@ fn e_gives_the_patterns_and_every_positional_is_a_path() {
     ] {
         assert_eq!(params(words).terms, ["-x"], "{words:?}");
     }
-    assert_eq!(
-        search(&["-e", "a", "src", "Cargo.toml"]).split().unwrap(),
-        (vec!["a".into()], vec!["src".into(), "Cargo.toml".into()])
-    );
-    // With -e, the first positional is a PATH too, so a TERM among them is
-    // no PATH.
-    assert_eq!(
-        err(&["-e", "a", "nosuch"]),
-        "error: nosuch: No such file or directory"
-    );
     // Several make one search of any of them: the `--or` expression.
     assert_eq!(
         params(&["-e", "a", "-e", "b+"]),
-        params(&["--or", "a", "b+"])
+        params(&["--or", "-e", "a", "-e", "b+"])
     );
     assert_eq!(
         params(&["-e", "a", "-e", "b+", "src"]),
@@ -630,20 +659,12 @@ fn e_gives_the_patterns_and_every_positional_is_a_path() {
     assert_eq!(params(&["-e", "a.b"]), params(&["a.b"]));
     assert_eq!(
         params(&["-e", "a", "-e", "a"]).expr,
-        params(&["--or", "a", "a"]).expr
+        params(&["--or", "-e", "a", "-e", "a"]).expr
     );
-    // --and and --or take the patterns of -e.
-    assert_eq!(
-        params(&["--and", "-e", "a", "-e", "b+"]),
-        params(&["--and", "a", "b+"])
-    );
-    assert_eq!(
-        err(&["--and", "-e", "a"]),
-        "error: --and needs at least two terms"
-    );
-    // The smart case of -e reads the pattern.
+    // The smart case of -e reads the patterns.
     assert!(params(&["-S", "-e", "foo", "-e", "bar"]).ignore_case);
     assert!(!params(&["-S", "-e", "foo", "-e", "Bar"]).ignore_case);
+    // A PATTERN given by -e is no flag of an expression, and the reverse.
     for words in [
         &["-e", "a", "--expr", AND_TEXT][..],
         &["-e", "a", "--expr-json", AND_JSON],

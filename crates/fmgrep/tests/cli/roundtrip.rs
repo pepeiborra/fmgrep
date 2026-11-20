@@ -11,14 +11,17 @@ fn human_output_is_readable() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("indexed 3 files"));
     let index = index_dir.display().to_string();
-    let out = run(&["--index", &index, "printk", "missing"]);
+    let out = run(&["--index", &index, "printk"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.starts_with("== printk ==\na.bin:printk hello printk\n"),
+        stdout.starts_with("a.bin:printk hello printk\n"),
         "{stdout}"
     );
-    assert!(stdout.ends_with("\n== missing ==\n"), "{stdout}");
+    assert!(
+        !stdout.contains("=="),
+        "one pattern prints no banner: {stdout}"
+    );
     let out = run(&["--index", &index, "missing"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
@@ -27,7 +30,7 @@ fn human_output_is_readable() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a.bin:1\nb.bin:1\n");
 }
 
-/// A TERM is a regex, as in rg; `-F` makes it the text it is.
+/// A PATTERN is a regex, as in rg; `-F` makes it the text it is.
 #[test]
 fn a_term_is_a_regex_and_f_makes_it_a_literal() {
     let (_tmp, docs) = stage_files(&[
@@ -51,17 +54,21 @@ fn a_term_is_a_regex_and_f_makes_it_a_literal() {
         "{}",
         stderr(&none)
     );
-    // A search of several patterns says it of each one that found nothing.
-    let some = search(&["foo", "/a.c/", "/a.b/"]);
+    // Several patterns are one search: it says so when it found nothing,
+    // and a search that counts says it of each pattern that counted none.
+    let some = search(&["-e", "foo", "-e", "/a.c/", "-e", "/a.b/"]);
     assert!(some.status.success());
+    assert_eq!(stderr(&some), "");
+    let counted = search(&["-c", "-e", "foo", "-e", "/a.c/", "-e", "/a.b/"]);
+    assert!(counted.status.success());
     assert_eq!(
-        stderr(&some).matches("matches its slashes too").count(),
+        stderr(&counted).matches("matches its slashes too").count(),
         1,
         "{}",
-        stderr(&some)
+        stderr(&counted)
     );
-    assert!(stderr(&some).contains("/a.c/"), "{}", stderr(&some));
-    let leaf = search(&["-c", "--or", "foo", "/a.c/"]);
+    assert!(stderr(&counted).contains("/a.c/"), "{}", stderr(&counted));
+    let leaf = search(&["-c", "--or", "-e", "foo", "-e", "/a.c/"]);
     assert!(leaf.status.success());
     assert!(stderr(&leaf).contains("/a.c/"), "{}", stderr(&leaf));
     // A pattern that is not a regex is an error, with the way out.
@@ -80,14 +87,20 @@ fn a_term_is_a_regex_and_f_makes_it_a_literal() {
     let said = stderr(&nul);
     assert!(said.contains("impossible to match"), "{said}");
     assert!(!said.contains("hint:"), "{said}");
-    // v0.1.0's flag still works, and means what the bare TERM means now.
+    // v0.1.0's flag still works, and means what the bare PATTERN means now.
     assert_eq!(text(&["--regex", "a.b"]), text(&["a.b"]));
     assert_eq!(search(&["-F", "--regex", "a"]).status.code(), Some(2));
     assert_eq!(search(&["-F", "--expr", "a"]).status.code(), Some(2));
     // -F reads --and and --or leaves as literals.
-    assert_eq!(text(&["-l", "--and", "a.b", "foo("]), "");
-    assert_eq!(text(&["-l", "--and", "-F", "a.b", "foo\\("]), "");
-    assert_eq!(text(&["-l", "--and", "a.b", "foo\\("]), "a.txt\n");
+    assert_eq!(text(&["-l", "--and", "-e", "a.b", "-e", "foo("]), "");
+    assert_eq!(
+        text(&["-l", "--and", "-F", "-e", "a.b", "-e", "foo\\("]),
+        ""
+    );
+    assert_eq!(
+        text(&["-l", "--and", "-e", "a.b", "-e", "foo\\("]),
+        "a.txt\n"
+    );
 }
 
 /// As in rg, `-e` gives a pattern, and several make one search: the lines
@@ -198,7 +211,7 @@ fn shards_in_flight_do_not_change_the_index() {
                 manifest["blobs"].clone(),
                 manifest["blob_lens"].clone(),
                 manifest["index_size_bytes"].clone(),
-                counts(&query.stdout),
+                leaf_totals(&query.stdout),
             ));
         }
         assert_eq!(cells[0], cells[1], "{store_docs}");
@@ -221,7 +234,7 @@ fn missing_file_is_warned_once_and_excluded() {
             stderr.contains("warning: excluding") && stderr.contains("a.bin"),
             "{stderr}"
         );
-        assert_eq!(counts(&out.stdout), [(1, 1), (0, 0)], "{terms:?}");
+        assert_eq!(leaf_totals(&out.stdout), [1, 0], "{terms:?}");
     }
 }
 
@@ -236,7 +249,7 @@ fn a_new_ignore_file_is_applied_and_warned_once() {
     let search = |index: &Path| run(&query_argv(index, false, &["printk", "hello"]));
     let out = search(&index_dir);
     assert_eq!(stderr(&out), "");
-    assert_eq!(counts(&out.stdout), [(4, 3), (1, 1)]);
+    assert_eq!(leaf_totals(&out.stdout), [4, 1]);
     // Older than 2 s, so that the fresh index below records their stamps:
     // it records a newer one as unknown, which every load takes as changed.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
@@ -251,14 +264,14 @@ fn a_new_ignore_file_is_applied_and_warned_once() {
         let out = search(&index_dir);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stderr(&out), warning);
-        assert_eq!(counts(&out.stdout), [(2, 1), (1, 1)]);
+        assert_eq!(leaf_totals(&out.stdout), [2, 1]);
     }
     let fresh = tmp.path().join("fresh");
     let out = run(&index_argv(&docs, &fresh, false, &[]));
     assert!(out.status.success(), "index: {}", stderr(&out));
     let out = search(&fresh);
     assert_eq!(stderr(&out), "");
-    assert_eq!(counts(&out.stdout), [(2, 1), (1, 1)]);
+    assert_eq!(leaf_totals(&out.stdout), [2, 1]);
 }
 
 /// `status` runs a search's check of what changed and prints what it
@@ -589,7 +602,7 @@ fn a_damaged_path_is_refused_by_what_reads_it() {
         assert_eq!(stderr(&served), words);
         // "zz" prints b.c then c.c: nothing of it is printed.
         refused(&["--index", &index, "zz"]);
-        refused(&["--index", &index, "-l", "zz", "printk"]);
+        refused(&["--index", &index, "-l", "--or", "-e", "zz", "-e", "printk"]);
         if !store_docs {
             // The files layout reads every path at load.
             refused(&["--index", &index, "printk"]);
@@ -816,6 +829,109 @@ fn paths_resolve_from_the_cwd() {
         "{}",
         stderr(&out)
     );
+}
+
+/// As in rg, the first word is the PATTERN and the rest are PATHs. A PATH
+/// that does not exist is an error, the others are searched, and the exit
+/// is 2 whatever they found. Each expectation is rg 15.2.0's.
+#[test]
+fn a_path_that_does_not_exist_is_an_error_as_in_rg() {
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("b.h", b"printk b\n")]);
+    assert!(run_in(&docs, &["index"]).status.success());
+    let found = |args: &[&str]| {
+        let out = run_in(&docs, args);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr(&out),
+        )
+    };
+    let no = |path: &str| format!("error: {path}: No such file or directory (os error 2)\n");
+    assert_eq!(
+        found(&["printk", "nosuch"]),
+        (Some(2), "".into(), no("nosuch"))
+    );
+    assert_eq!(
+        found(&["printk", "nosuch", "a.c"]),
+        (Some(2), "a.c:printk a\n".into(), no("nosuch"))
+    );
+    assert_eq!(
+        found(&["-c", "printk", "a.c", "nosuch"]),
+        (Some(2), "a.c:1\n".into(), no("nosuch"))
+    );
+    assert_eq!(
+        found(&["printk", "nosuch", "nope"]),
+        (Some(2), "".into(), no("nosuch") + &no("nope"))
+    );
+    // A word that names no file is no pattern: -e gives it.
+    assert_eq!(
+        found(&["-e", "printk", "nosuch"]),
+        (Some(2), "".into(), no("nosuch"))
+    );
+    assert_eq!(
+        found(&["-l", "-e", "printk", "a.c"]),
+        (Some(0), "a.c\n".into(), "".into())
+    );
+    // The word after -- is the PATTERN.
+    assert_eq!(
+        found(&["-l", "--", "printk", "a.c"]),
+        (Some(0), "a.c\n".into(), "".into())
+    );
+    // The old `--and A B`: B is a PATH, and one pattern is no conjunction.
+    let (code, out, said) = found(&["--and", "printk", "b.h"]);
+    assert_eq!((code, out.as_str()), (Some(2), ""));
+    assert!(said.contains("--and needs at least two patterns"), "{said}");
+    // A search that matches nothing in the PATHs it has is 2 as well.
+    assert_eq!(
+        found(&["absent", "a.c", "nosuch"]),
+        (Some(2), "".into(), no("nosuch"))
+    );
+    // The counts report is printed, and the error follows.
+    let (code, out, said) = found(&["--json", "printk", "a.c", "nosuch"]);
+    assert_eq!((code, said), (Some(2), no("nosuch")));
+    assert!(out.contains("\"queries\""), "{out}");
+}
+
+/// A search whose stdin is a pipe holding `piped`.
+fn run_piped(dir: &Path, args: &[&str], piped: &[u8]) -> Output {
+    let mut child = fmgrep()
+        .current_dir(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fmgrep");
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), piped).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// fmgrep searches no stdin, whatever it holds, and the PATH `-` is no
+/// stdin as it is in rg: it is a PATH like any other. Without a file of that
+/// name it is the error of a missing PATH; with one, that file is searched.
+#[test]
+fn stdin_is_never_read_and_a_dash_is_a_plain_path() {
+    let said = |out: &Output| {
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        (out.status.code(), stdout, stderr(out))
+    };
+    let piped = b"printk piped\n";
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n")]);
+    assert!(run_in(&docs, &["index"]).status.success());
+    // No PATH: the tree is searched, not the pipe.
+    let out = run_piped(&docs, &["printk"], piped);
+    assert_eq!(said(&out), (Some(0), "a.c:printk a\n".into(), "".into()));
+    // The PATH `-` names no file: the error, and the pipe stays unread.
+    let out = run_piped(&docs, &["printk", "-"], piped);
+    let no = "error: -: No such file or directory (os error 2)\n";
+    assert_eq!(said(&out), (Some(2), "".into(), no.into()));
+    let out = run_piped(&docs, &["printk", "a.c", "-"], piped);
+    assert_eq!(said(&out), (Some(2), "a.c:printk a\n".into(), no.into()));
+
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk a\n"), ("-", b"printk dash\n")]);
+    assert!(run_in(&docs, &["index"]).status.success());
+    let out = run_piped(&docs, &["printk", "-"], piped);
+    assert_eq!(said(&out), (Some(0), "printk dash\n".into(), "".into()));
 }
 
 /// Each expectation is rg 15.2.0's from the same directory.
@@ -1096,7 +1212,7 @@ fn verbose_leaves_stdout_and_the_exit_status_alone() {
         &["-c", "printk"],
         &["--count-matches", "printk"],
         &["--json", "printk"],
-        &["--approx-counts", "printk", "hello"],
+        &["--approx-counts", "-e", "printk", "-e", "hello"],
         &["-C", "1", "printk"],
         &["--expr", "printk AND hello"],
         &["-c", "absent"],

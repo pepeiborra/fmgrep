@@ -237,8 +237,10 @@ fn reach(server: &Server, start: Option<&Path>) -> Result<Reached, String> {
     Err(format!("error: cannot reach {server}: {e}"))
 }
 
-/// A search: what [`choose`] and [`reach`] pick from the cwd. A TERM that
-/// is not a regex says how to search for it as it is.
+/// A search: what [`choose`] and [`reach`] pick from the cwd. A PATTERN that
+/// is not a regex says how to search for it as it is. As in rg, a PATH that
+/// does not exist is an error that leaves the others searched, and the
+/// search exits 2 whatever it found.
 fn search(
     s: &Search,
     env: Env,
@@ -248,7 +250,17 @@ fn search(
     printing: bool,
 ) -> Result<Outcome, String> {
     let patterns = !s.fixed_strings && s.expr.is_none() && s.expr_json.is_none();
-    let found = find(s, env, input, out, tty, printing);
+    let (typed, mut errors) = named_paths(&s.paths());
+    let found = find(
+        s,
+        env,
+        input,
+        out,
+        tty,
+        printing,
+        &typed,
+        !errors.is_empty(),
+    );
     // A pattern /x/ matches its slashes too, as in rg; v0.1.0 read it as x.
     // Each such pattern that found nothing says so, in a search of several.
     if patterns && let Ok(Outcome::Query(r)) = &found {
@@ -262,7 +274,7 @@ fn search(
             );
         }
     }
-    found.map_err(|e| match e {
+    let found = found.map_err(|e| match e {
         // A NUL is no matter of syntax: -F would not help.
         e if patterns
             && e.contains("invalid regex pattern")
@@ -271,7 +283,29 @@ fn search(
             format!("{e}\nhint: to search for the text as it is, pass -F")
         }
         e => e,
-    })
+    });
+    match found {
+        Ok(done) if errors.is_empty() => Ok(done),
+        Ok(_) => Err(errors.join("\n")),
+        Err(e) => {
+            errors.extend(Some(e).filter(|e| !e.is_empty()));
+            Err(errors.join("\n"))
+        }
+    }
+}
+
+/// The PATHs `told` that name a file or directory, and the errors, one
+/// for each that does not: rg's words, with `error:` before them.
+fn named_paths(told: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut named = Vec::new();
+    let mut errors = Vec::new();
+    for t in told {
+        match std::fs::metadata(t) {
+            Ok(_) => named.push(t.clone()),
+            Err(e) => errors.push(format!("error: {t}: {e}")),
+        }
+    }
+    (named, errors)
 }
 
 /// Whether the pattern `t` found nothing: its own section if it has one,
@@ -290,7 +324,9 @@ fn found_nothing(r: &OutputReport, t: &str) -> bool {
     (r.queries.iter()).all(|q| q.total_matches == 0 && q.docs_matched == 0)
 }
 
-/// [`search`] without the hint.
+/// [`search`] without the hint, of the PATHs `typed` that exist; `missing`
+/// when some PATH does not.
+#[allow(clippy::too_many_arguments)]
 fn find(
     s: &Search,
     env: Env,
@@ -298,6 +334,8 @@ fn find(
     out: &mut dyn Write,
     tty: bool,
     printing: bool,
+    typed: &[String],
+    missing: bool,
 ) -> Result<Outcome, String> {
     if s.shutdown {
         let addr = s
@@ -307,7 +345,10 @@ fn find(
         return serve::shutdown(addr);
     }
     let mut p = s.params(input, printing, tty)?;
-    let typed = s.paths()?;
+    // Every PATH is missing: no search is left to run, and the caller says why.
+    if typed.is_empty() && missing {
+        return Err(String::new());
+    }
     p.cwd = std::env::current_dir()
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -318,14 +359,14 @@ fn find(
         Err(e) if s.index.is_none() && env().is_err() => return Err(e),
         Err(_) if ignore => return Err(NEEDS_SERVER.to_owned()),
         // No index: `local` fails to find it again, inside its spans.
-        Err(_) => return local(s.index.as_deref(), p, &typed, s.json, out),
+        Err(_) => return local(s.index.as_deref(), p, typed, s.json, out),
     };
     // With `ignore`, a server that cannot be reached is an error.
     let fallback = (!ignore).then_some(cwd);
     let (found, note) = match choice {
         Choice::Index { found, note } => (found, note),
         Choice::Server(server) => match reach(&server, fallback)? {
-            Reached::Conn(conn) => return client(&server, conn, ignore, p, &typed, s.json, out),
+            Reached::Conn(conn) => return client(&server, conn, ignore, p, typed, s.json, out),
             Reached::Index { found, note } => (found, Some(note)),
         },
     };
@@ -343,7 +384,7 @@ fn find(
         ));
     }
     // `local` finds the index again, inside its spans.
-    local(s.index.as_deref(), p, &typed, s.json, out)
+    local(s.index.as_deref(), p, typed, s.json, out)
 }
 
 /// Why a search with `--ignore-local-changes` fails that no server answers.

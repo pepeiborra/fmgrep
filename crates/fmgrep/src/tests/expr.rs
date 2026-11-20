@@ -548,8 +548,9 @@ fn expr_counts_summary_lists_leaves() {
         and_flags,
         "printk AND alpha: 2 matches in 1 file\n  printk: 1 match\n  alpha: 1 match\n"
     );
+    let or_flags = printed(&index, &["--approx-counts", "--or"], &["tail", "alpha"]);
     assert_eq!(
-        printed(&index, &["--approx-counts"], &["tail", "alpha"]),
-        "tail: 1 match in 1 file\nalpha: 4 matches in 3 files\n"
+        or_flags,
+        "tail OR alpha: 5 matches in 4 files\n  tail: 1 match\n  alpha: 4 matches\n"
     );
 }
