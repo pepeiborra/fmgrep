@@ -118,6 +118,43 @@ fn others_of(hir: &regex_syntax::hir::Hir, anchor: &[u8]) -> Vec<Vec<u8>> {
     kept
 }
 
+/// The bytes `pattern` matches when it is nothing but a literal, `HscEnv`,
+/// `StgClosure \*` or `a\.b`: what `regex::escape` writes for them. Such a
+/// pattern is answered as the literal is, from the index alone. A pattern
+/// with any other part, a flag, a class, a repetition or an assertion, is
+/// not plain, nor is one that holds a newline or is not UTF-8: the regex
+/// path gives each its own error or answer. An inline flag such as `(?-i)`
+/// is no part of the bytes yet changes how they match under -i or -S, so a
+/// pattern with a `(?` is left to the regex path too; no escaped literal
+/// holds that text.
+pub fn plain_literal(pattern: &str) -> Option<String> {
+    use regex_syntax::hir::HirKind;
+    if pattern.contains("(?") {
+        return None;
+    }
+    // Only literal characters: a class is no literal, even of one
+    // character. `[a--A]` is `a` as written, and empty under -i, where
+    // the literal `a` would match `a` and `A`.
+    use regex_syntax::ast::Ast;
+    let ast = regex_syntax::ast::parse::Parser::new()
+        .parse(pattern)
+        .ok()?;
+    let literal = |a: &Ast| matches!(a, Ast::Literal(_));
+    if !(literal(&ast) || matches!(&ast, Ast::Concat(c) if c.asts.iter().all(literal))) {
+        return None;
+    }
+    let hir = regex_syntax::ParserBuilder::new()
+        .multi_line(true)
+        .build()
+        .parse(pattern)
+        .ok()?;
+    let HirKind::Literal(lit) = hir.kind() else {
+        return None;
+    };
+    let text = std::str::from_utf8(&lit.0).ok()?;
+    (!text.is_empty() && !text.contains('\n')).then(|| text.to_owned())
+}
+
 /// One regex compiled once, plus the literals the FM-index prunes it with.
 pub struct PreparedPattern {
     re: regex::bytes::Regex,
@@ -238,6 +275,11 @@ pub fn literal(p: &PreparedPattern) -> Option<&[u8]> {
     p.literal.as_deref()
 }
 
+/// Whether `p` is a literal under `-i`, walked through its case variants.
+pub fn fold_planned(p: &PreparedPattern) -> bool {
+    p.fold.is_some()
+}
+
 /// Whether the FM-index can narrow `p` at all; with `false` every document
 /// is a candidate.
 pub fn narrows(p: &PreparedPattern) -> bool {
@@ -337,6 +379,94 @@ mod tests {
         assert!(folded.fold().is_some() && others(&folded).is_empty());
         let walked = PreparedPattern::prepare("Int(32|64)#").unwrap();
         assert!(walked.automaton().is_some() && others(&walked).is_empty());
+    }
+
+    #[test]
+    fn plain_literal_is_a_pattern_of_one_literal() {
+        for (pattern, literal) in [
+            ("HscEnv", "HscEnv"),
+            ("StgClosure \\*", "StgClosure *"),
+            ("a\\.b", "a.b"),
+            ("caf\u{e9}", "caf\u{e9}"),
+            ("a b", "a b"),
+            ("/a\\.b/", "/a.b/"),
+        ] {
+            assert_eq!(
+                plain_literal(pattern).as_deref(),
+                Some(literal),
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_literal_leaves_every_other_pattern_to_the_regex_path() {
+        for pattern in [
+            "",
+            "a.b",
+            "a|b",
+            "a+",
+            "a*",
+            "a?",
+            "a{2}",
+            "[ab]",
+            "(a)",
+            "^a",
+            "a$",
+            "\\bword",
+            "\\w",
+            "\\d+",
+            "(?i)abc",
+            "(?-i)FOO",
+            "\\((?-i)f",
+            "(?:abc)",
+            "a\\nb",
+            "a\nb",
+            "(",
+            "[",
+            "a\\",
+            "(?-u)\\xff",
+        ] {
+            assert_eq!(plain_literal(pattern), None, "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn plain_literal_reads_back_what_escape_writes() {
+        // Every string without a newline, from a deterministic walk over the
+        // bytes a source file holds.
+        let alphabet: Vec<char> = "ab .*+?()[]{}|^$\\#&-~/_\t\u{e9}\u{4e2d}\0AZ09'\""
+            .chars()
+            .collect();
+        let mut rng = crate::tests::support::Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..4000 {
+            let len = 1 + rng.below(8);
+            let s: String = (0..len)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            assert_eq!(
+                plain_literal(&regex::escape(&s)).as_deref(),
+                Some(s.as_str()),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_literal_leaves_a_class_to_the_regex_path() {
+        // A class is no literal, even when it holds one character: `[a--A]`
+        // is `a` read as written, and empty under -i.
+        for pattern in [
+            "[a--A]",
+            "[aA--A]",
+            "[k--\\x{212A}]",
+            "[a--\\p{Lu}]",
+            "[^\\x00-\\x60\\x62-\\x{10FFFF}]",
+            "[a&&a]",
+            "[a]",
+        ] {
+            assert_eq!(plain_literal(pattern), None, "{pattern:?}");
+        }
     }
 
     #[test]

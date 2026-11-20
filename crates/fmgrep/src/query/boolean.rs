@@ -22,7 +22,7 @@ use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
 use crate::manifest::{FileTable, Manifest};
 use crate::matching::{self, DocSearch, QueryOutput};
-use crate::pattern::{PreparedPattern, count_overlapping};
+use crate::pattern::{PreparedPattern, count_overlapping, plain_literal};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::{DocfmIndex, Walk};
 use crate::sink::{DocMatches, MatchSink};
@@ -43,7 +43,9 @@ enum Probe {
 
 struct Leaf<'a> {
     name: String,
-    src: &'a str,
+    /// The literal a term or a plain-literal regex stands for, else the
+    /// regex source.
+    src: Cow<'a, str>,
     pattern: Option<Cow<'a, str>>,
     prep: Option<PreparedPattern>,
     /// `None` for the empty term.
@@ -56,22 +58,30 @@ struct Leaf<'a> {
 fn leaves<'a>(expr: &'a Expr, req: &QueryRequest<'_>) -> Result<Vec<Leaf<'a>>, String> {
     let mut out = Vec::new();
     for leaf in expr.leaves() {
-        let (src, pattern) = match leaf {
-            Expr::Term(t) if req.mode.ignore_case && !t.is_empty() => {
-                (t.as_str(), Some(Cow::Owned(regex::escape(t))))
-            }
-            Expr::Term(t) => (t.as_str(), None),
-            Expr::Regex(r) => (r.as_str(), Some(Cow::Borrowed(r.as_str()))),
+        // A regex that is nothing but a literal is planned as that term.
+        let (text, regex) = match leaf {
+            Expr::Term(t) => (Some(Cow::Borrowed(t.as_str())), None),
+            Expr::Regex(r) => (plain_literal(r).map(Cow::Owned), Some(r.as_str())),
             Expr::And(_) | Expr::Or(_) => unreachable!("leaves() yields leaves"),
         };
+        let literal = text.is_some();
+        let (src, pattern) = match (text, regex) {
+            (Some(t), _) if req.mode.ignore_case && !t.is_empty() => {
+                let pattern = Cow::Owned(regex::escape(&t));
+                (t, Some(pattern))
+            }
+            (Some(t), _) => (t, None),
+            (None, Some(r)) => (Cow::Borrowed(r), Some(Cow::Borrowed(r))),
+            (None, None) => unreachable!("a leaf is a term or a regex"),
+        };
         let prep = prepare(pattern.as_deref(), req.mode)?;
-        let matcher = matching::matcher(src, pattern.as_deref(), req.mode)?;
+        let matcher = matching::matcher(&src, pattern.as_deref(), req.mode)?;
         let probe = match prep.as_ref() {
             None if src.is_empty() => Probe::Never,
             None => Probe::Literal(src.as_bytes().to_vec()),
             Some(p) => match crate::pattern::literal(p) {
                 Some(l) => Probe::Literal(l.to_vec()),
-                None if matches!(leaf, Expr::Term(_)) && p.fold().is_some() => Probe::Fold,
+                None if literal && p.fold().is_some() => Probe::Fold,
                 None => Probe::Regex,
             },
         };
@@ -735,7 +745,7 @@ fn alternation_of(
         .filter(|l| !matches!(l.probe, Probe::Never))
         .map(|l| match &l.pattern {
             Some(p) => format!("(?:{p})"),
-            None => regex::escape(l.src),
+            None => regex::escape(&l.src),
         })
         .collect();
     if parts.is_empty() {

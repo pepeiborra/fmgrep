@@ -13,7 +13,7 @@ use crate::fetch::{Ask, DocStore, Paths, Skip, fetch_stream_parallel, fetch_thre
 use crate::filter::PathFilter;
 use crate::manifest::{Checked, FileTable, Manifest};
 use crate::matching::{self, DocSearch, Found, MatchMode, QueryOutput};
-use crate::pattern::{PreparedPattern, count_overlapping};
+use crate::pattern::{PreparedPattern, count_overlapping, plain_literal};
 use crate::probe::{Answer, Query, candidate_docs};
 use crate::sharded::{DocfmIndex, Walk};
 use crate::sink::{DocMatches, MatchSink};
@@ -296,15 +296,7 @@ pub fn answer(
     let mut report = match req.expr {
         Some(expr) => boolean::answer_expr(index, loaded, req, expr, sink, left_out)?,
         None => {
-            let terms: Vec<Term<'_>> = req
-                .terms
-                .iter()
-                .map(|t| Term {
-                    name: Cow::Borrowed(t),
-                    literal: t.as_bytes(),
-                    pattern: spelled(t, req.regex, req.mode.ignore_case),
-                })
-                .collect();
+            let terms: Vec<Term<'_>> = req.terms.iter().map(|t| Term::of(t, req)).collect();
             answer_terms(index, loaded, req, &terms, sink, left_out)?
         }
     };
@@ -335,31 +327,53 @@ pub fn none_searched(f: &PathFilter) -> String {
     format!("error: no files were searched: {why}")
 }
 
-/// One per-term query: the name it reports under, its literal bytes, and
-/// its pattern when it takes the pattern path.
+/// One per-term query: the name it reports under, the text it searches for,
+/// and its pattern when it takes the pattern path.
 struct Term<'a> {
     name: Cow<'a, str>,
-    literal: &'a [u8],
+    /// The literal, or for a pattern its source.
+    text: Cow<'a, str>,
     pattern: Option<Cow<'a, str>>,
+    /// A literal that `-i` turned into the escaped pattern of itself, so
+    /// that none stays a literal: the index walks its case variants.
+    folded: bool,
 }
 
-/// Under `--regex` every term is a pattern verbatim (slashes included);
-/// otherwise a `/x/` term is the pattern `x`, and under `-i` a bare term
-/// becomes the escaped pattern of itself, so none stays a literal. The empty
-/// bare term keeps the literal path's "matches nothing" under `-i` too,
-/// rather than the empty-pattern refusal.
-fn spelled(term: &str, regex: bool, ignore_case: bool) -> Option<Cow<'_, str>> {
-    match (regex, regex_pattern(term), ignore_case) {
-        (true, _, _) => Some(Cow::Borrowed(term)),
-        (false, Some(inner), _) => Some(Cow::Borrowed(inner)),
-        (false, None, true) if !term.is_empty() => Some(Cow::Owned(regex::escape(term))),
-        (false, None, _) => None,
+impl<'a> Term<'a> {
+    /// The term of `name`. Under `--regex` it is a pattern verbatim
+    /// (slashes included); else a `/x/` name is the pattern `x`, and
+    /// anything else is a literal. A pattern that is nothing but a literal
+    /// (`plain_literal`) is answered as that literal: from the index alone,
+    /// with no read of the files it names.
+    fn of(name: &'a str, req: &QueryRequest<'_>) -> Self {
+        let source = match (req.regex, regex_pattern(name)) {
+            (true, _) => Some(name),
+            (false, inner) => inner,
+        };
+        let bare = |text: Cow<'a, str>| {
+            let folded = req.mode.ignore_case && !text.is_empty();
+            Term {
+                name: Cow::Borrowed(name),
+                pattern: folded.then(|| Cow::Owned(regex::escape(&text))),
+                text,
+                folded,
+            }
+        };
+        match source.map(|p| (p, plain_literal(p))) {
+            None => bare(Cow::Borrowed(name)),
+            Some((_, Some(literal))) => bare(Cow::Owned(literal)),
+            Some((pattern, None)) => Term {
+                name: Cow::Borrowed(name),
+                text: Cow::Borrowed(name),
+                pattern: Some(Cow::Borrowed(pattern)),
+                folded: false,
+            },
+        }
     }
-}
 
-/// Whether `term` is a bare term `-i` turned into a pattern.
-fn folded(term: &Term<'_>, req: &QueryRequest<'_>) -> bool {
-    req.mode.ignore_case && !req.regex && regex_pattern(&term.name).is_none()
+    fn literal(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
 }
 
 /// An invalid pattern is fatal, never a silent 0.
@@ -461,7 +475,7 @@ fn answer_terms(
         // Outside counts mode only, so its newline refusal does not change
         // what the harness path accepts; built before any fetch.
         if emit {
-            let m = matching::matcher(&t.name, pattern, req.mode)?;
+            let m = matching::matcher(&t.text, pattern, req.mode)?;
             searches.push(m.map(|m| DocSearch::new(m, req.output, req.mode)));
         }
         prepared.push(prep);
@@ -476,7 +490,7 @@ fn answer_terms(
                 // read from the live docs.shard.
                 (Some(_), Some(lit)) if !emit && !manifest.store_docs => Query::Literal(lit),
                 (Some(p), _) => Query::Regex(p),
-                (None, _) => Query::Literal(t.literal),
+                (None, _) => Query::Literal(t.literal()),
             }
         })
         .collect();
@@ -487,7 +501,7 @@ fn answer_terms(
     // A filtered folded term is counted by its walk, which a locate reuses.
     let walks: Vec<Option<Walk<'_>>> = (probes.iter().zip(terms))
         .map(|(q, t)| match (*q, cover.as_deref()) {
-            (Query::Regex(p), Some(c)) if folded(t, req) && boolean::demotable(t.literal) => {
+            (Query::Regex(p), Some(c)) if t.folded && boolean::demotable(t.literal()) => {
                 index.walk(p, Some(c))
             }
             _ => None,
@@ -507,7 +521,7 @@ fn answer_terms(
                     }
                     (_, Some(walk)) => Some(read::Readable {
                         count: read::Count::Walked(walk),
-                        text: t.literal,
+                        text: t.literal(),
                         fetched: true,
                     }),
                     _ => None,
@@ -551,6 +565,10 @@ fn answer_terms(
             })
         })
         .collect();
+    let plans: Vec<String> = match crate::verbose::plans() {
+        true => probes.iter().map(plan_of).collect(),
+        false => Vec::new(),
+    };
     drop(probes);
     debug_assert_eq!(answers.len(), terms.len());
 
@@ -563,7 +581,7 @@ fn answer_terms(
     let each = terms.iter().zip(&prepared).zip(answers).zip(reading);
     for (i, (((t, pattern), answer), read)) in each.enumerate() {
         let search = searches.get(i).and_then(Option::as_ref);
-        let (term, literal) = (&*t.name, t.literal);
+        let (term, literal) = (&*t.name, t.literal());
         let fetch_start = Instant::now();
         let mut exact = answer.exact;
         let mut candidates = candidate_docs(answer.candidates, num_docs);
@@ -586,6 +604,14 @@ fn answer_terms(
             scan.sort_unstable();
         }
         paths.sort(&mut scan);
+        if let Some(plan) = plans.get(i) {
+            crate::held::text(&format!(
+                "plan: term {term:?}: {plan}; {} files located, {} candidates, {} files read\n",
+                exact.len(),
+                candidates.len(),
+                scan.len()
+            ));
+        }
         // Every path the term may print is checked before its first line.
         if emit {
             paths.check(exact.iter().map(|e| e.0).chain(scan.iter().copied()))?;
@@ -679,6 +705,22 @@ fn answer_terms(
         queries,
         none_searched: false,
     })
+}
+
+/// How the index answers a term, as `FMGREP_VERBOSE=2` says it.
+fn plan_of(query: &Query<'_>) -> String {
+    match query {
+        Query::Literal(_) | Query::Count(_) | Query::LiteralWithin { .. } => {
+            "literal, located".to_owned()
+        }
+        Query::Walked(_) => "folded literal, walked".to_owned(),
+        Query::Regex(p) if crate::pattern::fold_planned(p) => "folded literal, walked".to_owned(),
+        Query::Regex(p) => match crate::pattern::anchor(p) {
+            Some(a) => format!("regex, anchor {:?}", String::from_utf8_lossy(a)),
+            None if crate::pattern::narrows(p) => "regex, walked as an automaton".to_owned(),
+            None => "regex, no anchor".to_owned(),
+        },
+    }
 }
 
 /// A term's reported counts and the provenance that decides `counts_exact`.
