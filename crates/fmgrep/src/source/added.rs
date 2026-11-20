@@ -273,7 +273,7 @@ impl Known {
         let slot = doc.checked_sub(self.state.len())?;
         let rel = self.added().paths.get(slot)?.clone();
         let path = self.root.join(&rel);
-        match read_text(&path) {
+        match crate::binary::read_text(&path) {
             Ok(text) => Some(text.bytes),
             Err(why) => {
                 if let Some(why) = why {
@@ -286,20 +286,6 @@ impl Known {
             }
         }
     }
-}
-
-/// The text of the file at `path`, or why it is left out: `None` for a file
-/// that is gone or binary, which is no news.
-fn read_text(path: &Path) -> Result<crate::binary::Text, Option<String>> {
-    use crate::binary::{MAX_DOC_BYTES, Skip};
-    let unread = |e: std::io::Error| {
-        (e.kind() != std::io::ErrorKind::NotFound).then(|| format!("cannot read ({e})"))
-    };
-    if std::fs::metadata(path).map_err(unread)?.len() > MAX_DOC_BYTES {
-        return Err(Some(Skip::TooLarge.to_string()));
-    }
-    let raw = std::fs::read(path).map_err(unread)?;
-    crate::binary::text(raw).map_err(|why| (why == Skip::TooLarge).then(|| why.to_string()))
 }
 
 #[cfg(test)]

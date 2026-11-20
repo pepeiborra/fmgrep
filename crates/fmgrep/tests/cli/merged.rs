@@ -916,3 +916,96 @@ fn fmgrep_verbose_notes_where_local_changes_come_from() {
         assert!(note.contains(counts), "{note}");
     }
 }
+
+/// `-l printk` through the server from the client's top, with git's
+/// messages translated if it can: they must not hide what the client looks for.
+fn search_in_french(r: &Remote) -> std::process::Output {
+    r.tried(|| {
+        r.command(&r.addr, &r.client, &["-l", "printk"])
+            .env("LC_ALL", "fr_FR.UTF-8")
+            .env("LANGUAGE", "fr")
+            .output()
+            .expect("spawn fmgrep")
+    })
+}
+
+/// `path` with mode `mode`.
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A local change that cannot be read, or a directory of the checkout that
+/// cannot be listed, is left out of the answer and named on stderr, as rg
+/// names what it cannot open. The server leaves out what the checkout
+/// changed, so the file is in neither part.
+#[cfg(unix)]
+#[test]
+fn a_local_change_that_cannot_be_read_is_named() {
+    let r = Remote::new(&FILES);
+    let c = &r.client;
+    r.s.write(
+        c,
+        &[
+            ("a.c", "printk a edited\n"),
+            ("nd/x.c", "printk x\n"),
+            ("ut/a.c", "printk u\n"),
+            ("ut/sub/s.c", "printk s\n"),
+        ],
+    );
+    // Git lists `ut/` and may also say it cannot open `ut/sub`, as it reads
+    // `ut` only until a first file; the client lists `ut` and names
+    // `ut/sub` once; git says it cannot open `nd/`.
+    chmod(&c.join("a.c"), 0o000);
+    chmod(&c.join("nd"), 0o000);
+    chmod(&c.join("ut/sub"), 0o000);
+    let readable = std::fs::read(c.join("a.c")).is_ok();
+    let out = search_in_french(&r);
+    chmod(&c.join("a.c"), 0o644);
+    chmod(&c.join("nd"), 0o755);
+    chmod(&c.join("ut/sub"), 0o755);
+    if readable {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "dir/b.c\ndir/sub/c.h\ne.c\nut/a.c\n");
+    let warnings = format!(
+        "warning: git status: could not open directory 'nd/': Permission denied; untracked \
+         files under it are not searched\n\
+         warning: cannot list {ut}/sub: Permission denied (os error 13); files under it may be \
+         missing from the answer\n\
+         warning: skipping {a}: cannot read (Permission denied (os error 13))\n",
+        ut = c.join("ut").display(),
+        a = c.join("a.c").display()
+    );
+    assert_eq!(r.warnings(&out), warnings);
+}
+
+/// Git leaves out the tracked files of a directory it cannot open, as it
+/// does the untracked ones, and says only that it could not open it: the
+/// server's copy of those files answers, and the warning does not claim
+/// that they are not searched.
+#[cfg(unix)]
+#[test]
+fn a_tracked_directory_that_cannot_be_opened_is_answered_by_the_server() {
+    let r = Remote::new(&FILES);
+    let c = &r.client;
+    r.s.write(c, &[("e.c", "printk e edited\n")]);
+    chmod(&c.join("dir"), 0o000);
+    let readable = std::fs::read(c.join("dir/b.c")).is_ok();
+    let out = search_in_french(&r);
+    chmod(&c.join("dir"), 0o755);
+    if readable {
+        println!("skipped: the directory can be read (running as root)");
+        return;
+    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
+    assert_eq!(
+        r.warnings(&out),
+        "warning: git status: could not open directory 'dir/': Permission denied; untracked \
+         files under it are not searched\n"
+    );
+}

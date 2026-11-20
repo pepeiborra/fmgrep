@@ -8,11 +8,15 @@ use std::path::PathBuf;
 /// A case that the answer lacks something for, and the reason.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Diagnostic {
-    /// A file left out of the answer: it cannot be read, or is over 2 GiB.
+    /// A file left out of the answer: it cannot be read, is over 2 GiB, or
+    /// cannot be looked at.
     Skipped { path: PathBuf, why: String },
     /// A directory that could not be listed: what is new under it is
     /// missing. `dir` is empty when the error names none.
     Unlisted { dir: PathBuf, why: String },
+    /// An untracked directory that git status could not open, so that it
+    /// lists none of the files in it. `dir` is as git writes it: `nd/`.
+    Unopened { dir: String, why: String },
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -32,6 +36,11 @@ impl fmt::Display for Diagnostic {
                     "warning: cannot list {at}{why}; files under it may be missing from the answer"
                 )
             }
+            Self::Unopened { dir, why } => write!(
+                f,
+                "warning: git status: could not open directory '{dir}': {why}; untracked files \
+                 under it are not searched"
+            ),
         }
     }
 }
@@ -70,6 +79,19 @@ mod tests {
         assert_eq!(
             none.to_string(),
             "warning: cannot list loop detected; files under it may be missing from the answer"
+        );
+    }
+
+    #[test]
+    fn a_directory_git_cannot_open_says_what_is_not_searched() {
+        let d = Diagnostic::Unopened {
+            dir: "nd/".into(),
+            why: "Permission denied".into(),
+        };
+        assert_eq!(
+            d.to_string(),
+            "warning: git status: could not open directory 'nd/': Permission denied; \
+             untracked files under it are not searched"
         );
     }
 }

@@ -41,7 +41,13 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     }
     // A replace ref is the repository's own: a commit read through one
     // holds files that another clone's commit of that id does not.
-    cmd.env("GIT_OPTIONAL_LOCKS", "0")
+    // A line of git's stderr that a caller matches is in English, whatever
+    // the user's locale: `LC_ALL` outranks `LANG` and `LC_MESSAGES`, and a
+    // translated git also reads `LANGUAGE`. The `-z` output is not
+    // translated.
+    cmd.env("LC_ALL", "C")
+        .env_remove("LANGUAGE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -69,9 +75,18 @@ fn spawn_failed(e: std::io::Error) -> String {
 
 /// The stdout of `git -C dir <args>`, or why there is none.
 pub fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    Ok(noted(dir, args)?.0)
+}
+
+/// [`git`], and what git wrote on stderr although it succeeded: the
+/// warnings a caller may need to pass on.
+pub fn noted(dir: &Path, args: &[&str]) -> Result<(Vec<u8>, String), String> {
     let out = command(dir, args).output().map_err(spawn_failed)?;
     match out.status.success() {
-        true => Ok(out.stdout),
+        true => Ok((
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )),
         false => Err(failed(&out.stderr, out.status)),
     }
 }
@@ -246,4 +261,31 @@ fn read_blobs(
         each(i, bytes).map_err(Stop::Each)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use super::command;
+
+    /// A git built with gettext says its warnings in the user's language, and
+    /// a caller that matches a line of them would then see nothing: the
+    /// command fixes the locale, and drops `LANGUAGE`, which a translated
+    /// git reads before the locale.
+    #[test]
+    fn git_runs_in_the_c_locale_whatever_the_users() {
+        let cmd = command(Path::new("."), &["status"]);
+        let set = |key: &str| cmd.get_envs().find(|(k, _)| *k == OsStr::new(key));
+        assert_eq!(
+            set("LC_ALL"),
+            Some((OsStr::new("LC_ALL"), Some(OsStr::new("C"))))
+        );
+        assert_eq!(
+            set("LANGUAGE"),
+            Some((OsStr::new("LANGUAGE"), None)),
+            "removed"
+        );
+    }
 }

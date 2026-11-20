@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::Diagnostic;
 use crate::remote::Server;
 use crate::vcs;
 use crate::wire::{MAX_SKIP, ServeStatus};
@@ -124,8 +125,12 @@ pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
 /// `commit`: every path where the checkout differs from it, as git says
 /// (`d/` for an untracked directory), ascending. Else why the checkout
 /// cannot be compared: the reason of the warning.
-pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
-    let status = vcs::git(
+pub fn changes(
+    top: &Path,
+    commit: &str,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<Vec<String>, String> {
+    let (status, noted) = vcs::noted(
         top,
         &[
             "status",
@@ -184,7 +189,37 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
     }
+    // Git lists none of the untracked files in a directory it cannot open,
+    // and says so only here. A tracked file in it is not listed either, and
+    // git says nothing of it: the server's copy answers.
+    left_out.extend(unopened(&noted, &skip));
     Ok(skip)
+}
+
+/// The entries for git's stderr `noted` that the client passes on: each
+/// directory git could not open, unless it is below a directory of the
+/// skip list `skip`, whose walk names it itself.
+fn unopened(noted: &str, skip: &[String]) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for line in noted.lines() {
+        let Some(rest) = line.strip_prefix("warning: could not open directory ") else {
+            continue;
+        };
+        let Some((dir, why)) = rest.strip_prefix('\'').and_then(|r| r.rsplit_once("': ")) else {
+            continue;
+        };
+        if skip
+            .iter()
+            .any(|d| d == "/" || (d.ends_with('/') && dir.starts_with(d.as_str()) && dir != d))
+        {
+            continue;
+        }
+        out.push(Diagnostic::Unopened {
+            dir: dir.to_owned(),
+            why: why.to_owned(),
+        });
+    }
+    out
 }
 
 /// The paths where commit `head` differs from the served commit `commit`,
@@ -418,7 +453,12 @@ fn excluded(top: &Path) -> Result<Vec<String>, String> {
 /// with their count and their bytes less leading UTF-8 BOMs. Else, as
 /// soon as it lists more than [`MAX_SKIP`] files and before it reads any,
 /// why: the reason of the warning.
-pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, String> {
+pub fn resolve(
+    top: &Path,
+    skip: &[String],
+    commit: &str,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<Local, String> {
     let mut rules = crate::walk::rules(top);
     let mut listed = Vec::new();
     // The walk of `/` lists every file that another entry would: it goes
@@ -449,11 +489,29 @@ pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, Strin
             continue;
         }
         let room = MAX_SKIP - listed.len();
-        match lstat(top, rel) {
+        let found = match try_lstat(top, rel) {
+            Ok(found) => found,
+            // A path of the skip list that cannot be looked at: in neither part.
+            Err(e) => {
+                left_out.push(Diagnostic::Skipped {
+                    path: top.join(rel),
+                    why: format!("cannot stat ({e})"),
+                });
+                continue;
+            }
+        };
+        match found {
             Some(m) if m.is_dir() && tree => {
                 walked.push(rel);
                 let found = crate::walk::walk_paths_within(top, &top.join(rel), room);
-                listed.extend(found.ok_or_else(|| too_many(skip, &walked, commit))?.files);
+                let found = found.ok_or_else(|| too_many(skip, &walked, commit))?;
+                let unlisted = found.unlisted;
+                left_out.extend(
+                    unlisted
+                        .into_iter()
+                        .map(|(dir, why)| Diagnostic::Unlisted { dir, why }),
+                );
+                listed.extend(found.files);
             }
             Some(m) if m.is_file() && !tree && !rules.matched(rel, false).is_ignore() => {
                 if room == 0 {
@@ -468,11 +526,16 @@ pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, Strin
     listed.dedup();
     let mut local = Local::default();
     for rel in listed {
-        let Ok(raw) = std::fs::read(top.join(&rel)) else {
-            continue;
-        };
-        let Ok(text) = crate::binary::text(raw) else {
-            continue;
+        // A file that is gone or binary is no news, as at the index; one
+        // that cannot be read, or is too large, is left out and named.
+        let path = top.join(&rel);
+        let text = match crate::binary::read_text(&path) {
+            Ok(text) => text,
+            Err(None) => continue,
+            Err(Some(why)) => {
+                left_out.push(Diagnostic::Skipped { path, why });
+                continue;
+            }
         };
         let bom = text.bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
         let len = text.bytes.len() as u64 - if bom { 3 } else { 0 };
@@ -506,19 +569,33 @@ fn too_many(skip: &[String], walked: &[&str], commit: &str) -> String {
 /// or not a directory. A file seen through a symlinked directory is
 /// outside the tree that the index's walk lists.
 pub fn lstat(top: &Path, rel: &str) -> Option<std::fs::Metadata> {
+    try_lstat(top, rel).ok().flatten()
+}
+
+/// [`lstat`], with why it could not look at a path that may be there: a
+/// directory above it that this process cannot search, say. Absent is
+/// `Ok(None)`.
+pub fn try_lstat(top: &Path, rel: &str) -> std::io::Result<Option<std::fs::Metadata>> {
+    let absent = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => Ok(None),
+        _ => Err(e),
+    };
     let mut at = top.to_path_buf();
     let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
     while let Some(part) = parts.next() {
         at.push(part);
-        let m = std::fs::symlink_metadata(&at).ok()?;
+        let m = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) => return absent(e),
+        };
         if parts.peek().is_none() {
-            return Some(m);
+            return Ok(Some(m));
         }
         if !m.is_dir() {
-            return None;
+            return Ok(None);
         }
     }
-    std::fs::symlink_metadata(top).ok()
+    std::fs::symlink_metadata(top).map(Some).or_else(absent)
 }
 
 /// The files a client searches itself, and the shape of a full scan of
