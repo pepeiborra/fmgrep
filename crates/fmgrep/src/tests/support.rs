@@ -286,3 +286,51 @@ pub(crate) fn search(term: &str, output: QueryOutput, mode: MatchMode) -> DocSea
     let m = matcher("", Some(term), mode);
     DocSearch::new(m.unwrap().unwrap(), output, mode)
 }
+
+/// The system allocator, counting the bytes each thread holds, for tests
+/// that bound what a call allocates.
+struct Counted;
+
+thread_local! {
+    /// The bytes this thread holds, and the most it held since [`held_at_most`] began.
+    static HELD: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn held(delta: isize) {
+    let _ = HELD.try_with(|h| {
+        let (now, top) = h.get();
+        h.set((now + delta, top.max(now + delta)));
+    });
+}
+
+// SAFETY: every call is the system allocator's, with its own arguments.
+unsafe impl std::alloc::GlobalAlloc for Counted {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        held(layout.size() as isize);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        held(-(layout.size() as isize));
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        held(size as isize - layout.size() as isize);
+        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+    }
+}
+
+#[global_allocator]
+static COUNTED: Counted = Counted;
+
+/// `f`'s value, and the most bytes that this thread held at once during it,
+/// beyond what it held before.
+pub(crate) fn held_at_most<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let start = HELD.with(|h| {
+        let (now, _) = h.get();
+        h.set((now, now));
+        now
+    });
+    let value = f();
+    let top = HELD.with(|h| h.get().1);
+    (value, usize::try_from(top - start).unwrap_or(0))
+}

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rayon::prelude::*;
 
-use crate::binary::{MAX_DOC_BYTES, Skip, Text, text};
+use crate::binary::{MAX_DOC_BYTES, Skip, Text, text, whole_text};
 use crate::verbose::verbose;
 
 /// Documents one read batch holds: bounded by count AND by bytes, so a batch
@@ -366,6 +366,37 @@ fn unlisted_of(e: &ignore::Error) -> (PathBuf, String) {
 /// in [`Walked::unlisted`].
 pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Walked {
     walk_changed(root, vec![under.to_path_buf()], exclude, |_| false)
+}
+
+/// Whether rg, told to search the directory `dir`, would read a file in it:
+/// the walk lists one that is not binary, hidden or ignored. The directory
+/// itself is never filtered, as in rg, whatever its name or its rules. A
+/// file too large or unreadable counts: rg reads it and says why it cannot.
+/// Else the first directory the walk could not list, and why: rg names it
+/// and exits 2.
+pub fn rg_reads_in(dir: &Path) -> Result<bool, (PathBuf, String)> {
+    let mut unlisted = None;
+    for entry in builder(dir).build() {
+        match entry {
+            Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
+                if !matches!(whole_text(entry.path()), Ok(false)) {
+                    return Ok(true);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // The OS's words, as rg's: this walk wraps them in its own.
+                let (dir, mut why) = unlisted_of(&e);
+                let mut cause: Option<&dyn std::error::Error> = e.io_error().map(|io| io as _);
+                while let Some(c) = cause {
+                    why = c.to_string();
+                    cause = c.source();
+                }
+                unlisted.get_or_insert((dir, why));
+            }
+        }
+    }
+    unlisted.map_or(Ok(false), Err)
 }
 
 /// [`walk_paths`] under `under`, or none once it lists more than `limit`
@@ -1181,5 +1212,22 @@ mod tests {
             [(shut, "Permission denied (os error 13)".to_owned())]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check of a PATH holds a chunk of a file at a time, never all of
+    /// it: a binary file is known by its head, a late NUL by a scan.
+    #[test]
+    fn rg_reads_in_never_holds_a_whole_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let zeros = std::fs::File::create(dir.join("zeros.bin")).unwrap();
+        zeros.set_len(64 << 20).unwrap();
+        let mut late = vec![b'x'; 8 << 20];
+        *late.last_mut().unwrap() = 0;
+        std::fs::write(dir.join("late.bin"), &late).unwrap();
+        drop(late);
+        let (reads, held) = crate::tests::support::held_at_most(|| rg_reads_in(dir));
+        assert_eq!(reads, Ok(false));
+        assert!(held < 1 << 20, "held {held} bytes");
     }
 }

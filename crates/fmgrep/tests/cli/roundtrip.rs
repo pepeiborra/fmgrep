@@ -934,6 +934,168 @@ fn stdin_is_never_read_and_a_dash_is_a_plain_path() {
     assert_eq!(said(&out), (Some(0), "printk dash\n".into(), "".into()));
 }
 
+/// A PATH that exists, though the index skips it, is an error: rg searches
+/// it, an index cannot. The other PATHs are searched, and the exit is 2.
+#[cfg(unix)]
+#[test]
+fn a_path_the_index_skips_is_an_error() {
+    let (_tmp, docs) = stage_files(&[
+        ("a.c", b"printk a\n"),
+        (".hidden.c", b"printk hidden\n"),
+        ("bin.dat", b"printk\0binary\n"),
+    ]);
+    // Older than 2 s, so that the index records its stamp: a newer one is
+    // unknown, and every search warns.
+    let ignore = std::fs::File::create(docs.join(".ignore")).unwrap();
+    std::io::Write::write_all(&mut &ignore, b"build/\n").unwrap();
+    ignore
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(10))
+        .unwrap();
+    std::fs::create_dir(docs.join("build")).unwrap();
+    std::fs::write(docs.join("build/out.c"), "printk built\n").unwrap();
+    std::os::unix::fs::symlink("a.c", docs.join("link.c")).unwrap();
+    // Directories in which rg reads nothing either: it exits 1 there.
+    std::fs::create_dir_all(docs.join("emptydir")).unwrap();
+    std::fs::create_dir_all(docs.join("onlykeep")).unwrap();
+    std::fs::write(docs.join("onlykeep/.keep"), "").unwrap();
+    std::fs::create_dir_all(docs.join("onlybin")).unwrap();
+    std::fs::write(docs.join("onlybin/b.dat"), b"printk\0binary\n").unwrap();
+    std::fs::create_dir_all(docs.join("gone")).unwrap();
+    std::fs::write(docs.join("gone/g.c"), "printk gone\n").unwrap();
+    // The files layout knows its tree; the stored documents of an index
+    // outside the tree do not, and the tests of the library cover them.
+    {
+        let store_docs = false;
+        let index = do_index(&docs, store_docs).display().to_string();
+        let found = |args: &[&str]| {
+            let args = [&["--index", &index][..], args].concat();
+            let out = run_in(&docs, &args);
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr(&out),
+            )
+        };
+        let skipped = |path: &str| {
+            format!(
+                "error: {path}: not in the index (hidden, ignored, binary, a symlink, or new to \
+                 a --store-docs index); search it with rg\n"
+            )
+        };
+        // A binary file added since the index is no file of it either.
+        std::fs::write(docs.join("new.dat"), b"printk\0new\n").unwrap();
+        for path in [
+            ".hidden.c",
+            "build",
+            "build/out.c",
+            "bin.dat",
+            "link.c",
+            "new.dat",
+        ] {
+            let want = (Some(2), "".into(), skipped(path));
+            assert_eq!(found(&["printk", path]), want, "{store_docs} {path}");
+        }
+        assert_eq!(
+            found(&["printk", "a.c", ".hidden.c"]),
+            (Some(2), "a.c:printk a\n".into(), skipped(".hidden.c")),
+            "{store_docs}"
+        );
+        // rg finds nothing in these either, and exits 1 without a word.
+        for dir in ["emptydir", "onlykeep", "onlybin"] {
+            let want = (Some(1), "".into(), "".into());
+            assert_eq!(found(&["printk", dir]), want, "{store_docs} {dir}");
+        }
+        // The error is the search's, and the report is printed first.
+        let (code, out, said) = found(&["--json", "printk", "build"]);
+        assert_eq!((code, said), (Some(2), skipped("build")));
+        assert!(out.contains("\"unindexed\":[\"build\"]"), "{out}");
+        // A PATH the index holds, or the tree, is no error.
+        assert_eq!(found(&["-l", "printk", "a.c"]).0, Some(0), "{store_docs}");
+        assert_eq!(found(&["-l", "printk", "."]).0, Some(0), "{store_docs}");
+        // So is one whose indexed files are all deleted; the search only
+        // warns of the files it lacks, as every search does.
+        std::fs::remove_file(docs.join("gone/g.c")).unwrap();
+        for dir in ["gone", "gone/"] {
+            let (code, out, said) = found(&["printk", dir]);
+            assert_eq!((code, out.as_str()), (Some(1), ""), "{store_docs} {dir}");
+            assert!(!said.contains("error:"), "{said}");
+        }
+        // On a case-insensitive file system, a PATH in another case exists but
+        // names no file of the index, and the error says so.
+        if docs.join("A.C").exists() {
+            let (code, _, said) = found(&["printk", "A.C"]);
+            assert_eq!(code, Some(2));
+            assert!(
+                said.contains("spelled in another case than on disk (a.c)"),
+                "{said}"
+            );
+        }
+    }
+}
+
+/// A PATH under which the walk cannot list a directory is an error, as in
+/// rg: the directory is named, with the reason, and the exit is 2. A PATH
+/// with nothing to read still exits 1.
+#[cfg(unix)]
+#[test]
+fn a_path_that_cannot_be_listed_is_an_error_as_in_rg() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, docs) = stage_files(&[("a.txt", b"printk a\n")]);
+    let index = do_index(&docs, false).display().to_string();
+    // Made after the index, so that it holds no indexed file.
+    std::fs::create_dir_all(docs.join("shut")).unwrap();
+    std::fs::write(docs.join("shut/x.c"), "printk x\n").unwrap();
+    std::fs::create_dir_all(docs.join("outer/inner")).unwrap();
+    std::fs::write(docs.join("outer/inner/y.c"), "printk y\n").unwrap();
+    std::fs::create_dir_all(docs.join("empty")).unwrap();
+    let chmod = |dir: &str, mode: u32| {
+        std::fs::set_permissions(docs.join(dir), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    chmod("shut", 0o000);
+    chmod("outer/inner", 0o000);
+    let listable = std::fs::read_dir(docs.join("shut")).is_ok();
+    let found = |paths: &[&str]| {
+        let args = [&["--index", &index, "printk"][..], paths].concat();
+        let out = run_in(&docs, &args);
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr(&out),
+        )
+    };
+    let (shut, outer, with_file, empty) = (
+        found(&["shut"]),
+        found(&["outer"]),
+        found(&["shut", "a.txt"]),
+        found(&["empty"]),
+    );
+    chmod("shut", 0o755);
+    chmod("outer/inner", 0o755);
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    // The files layout lists both directories on every search.
+    let top = std::fs::canonicalize(&docs).unwrap();
+    let warned = format!(
+        "warning: cannot list {top}/outer/inner: Permission denied (os error 13); files \
+         under it may be missing from the answer\n\
+         warning: cannot list {top}/shut: Permission denied (os error 13); files under it \
+         may be missing from the answer\n",
+        top = top.display()
+    );
+    let denied = |dir: &str| format!("{warned}error: {dir}: Permission denied (os error 13)\n");
+    assert_eq!(shut, (Some(2), "".into(), denied("shut")));
+    assert_eq!(outer, (Some(2), "".into(), denied("outer/inner")));
+    // The other PATH is searched, and the error is still the search's.
+    assert_eq!(
+        with_file,
+        (Some(2), "a.txt:printk a\n".into(), denied("shut"))
+    );
+    // A directory with nothing in it is no error, as in rg.
+    assert_eq!(empty, (Some(1), "".into(), warned));
+}
+
 /// Each expectation is rg 15.2.0's from the same directory.
 #[test]
 fn no_path_searches_the_cwd_subtree_as_rg() {

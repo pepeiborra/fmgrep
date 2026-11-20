@@ -250,7 +250,7 @@ fn search(
     printing: bool,
 ) -> Result<Outcome, String> {
     let patterns = !s.fixed_strings && s.expr.is_none() && s.expr_json.is_none();
-    let (typed, mut errors) = named_paths(&s.paths());
+    let (typed, mut errors) = existing_paths(&s.paths());
     let found = find(
         s,
         env,
@@ -261,6 +261,11 @@ fn search(
         &typed,
         !errors.is_empty(),
     );
+    // A PATH that exists, with no file the index or the added files hold:
+    // rg would search it, an index cannot.
+    if let Ok(Outcome::Query(r)) = &found {
+        errors.extend(r.unindexed.iter().filter_map(|t| unindexed_error(t)));
+    }
     // A pattern /x/ matches its slashes too, as in rg; v0.1.0 read it as x.
     // Each such pattern that found nothing says so, in a search of several.
     if patterns && let Ok(Outcome::Query(r)) = &found {
@@ -294,18 +299,77 @@ fn search(
     }
 }
 
-/// The PATHs `told` that name a file or directory, and the errors, one
-/// for each that does not: rg's words, with `error:` before them.
-fn named_paths(told: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut named = Vec::new();
+/// The error for the PATH `t`, which exists and holds no file the index or the
+/// added files hold; none for a directory in which rg would read nothing
+/// either (empty, or holding only hidden, ignored or binary files), where the
+/// search simply found nothing.
+fn unindexed_error(t: &str) -> Option<String> {
+    let path = std::path::Path::new(t);
+    if path.is_dir() {
+        match crate::walk::rg_reads_in(path) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            // rg's words: the directory it cannot list, and why.
+            Err((dir, why)) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    path
+                } else {
+                    &dir
+                };
+                return Some(format!("error: {}: {why}", dir.display()));
+            }
+        }
+    }
+    Some(match respelled(t) {
+        Some(real) => format!(
+            "error: {t}: spelled in another case than on disk ({real}); the index holds names as \
+             they are"
+        ),
+        None => format!(
+            "error: {t}: not in the index (hidden, ignored, binary, a symlink, or new to a \
+             --store-docs index); search it with rg"
+        ),
+    })
+}
+
+/// Where the PATH `t` is on disk, when `t` differs from it only in case, as on
+/// a case-insensitive file system: its last components, as spelled there.
+fn respelled(t: &str) -> Option<String> {
+    use std::path::Component::Normal;
+    let typed = std::path::Path::new(t);
+    // A symlink is another name, not another case.
+    if std::fs::symlink_metadata(typed).ok()?.is_symlink() {
+        return None;
+    }
+    let real = std::fs::canonicalize(typed).ok()?;
+    let mut spelled = Vec::new();
+    let mut other = false;
+    for (a, b) in typed.components().rev().zip(real.components().rev()) {
+        let (Normal(a), Normal(b)) = (a, b) else {
+            break;
+        };
+        if !a.eq_ignore_ascii_case(b) {
+            return None;
+        }
+        other |= a != b;
+        spelled.push(b.to_string_lossy());
+    }
+    spelled.reverse();
+    other.then(|| spelled.join("/"))
+}
+
+/// The PATHs `told` that exist, and the errors, one for each that does
+/// not: rg's words, with `error:` before them.
+fn existing_paths(told: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut existing = Vec::new();
     let mut errors = Vec::new();
     for t in told {
         match std::fs::metadata(t) {
-            Ok(_) => named.push(t.clone()),
+            Ok(_) => existing.push(t.clone()),
             Err(e) => errors.push(format!("error: {t}: {e}")),
         }
     }
-    (named, errors)
+    (existing, errors)
 }
 
 /// Whether the pattern `t` found nothing: its own section if it has one,
