@@ -1,16 +1,17 @@
 //! A watchman daemon, started by its own client when none runs: a token is
 //! the daemon's socket plus a clock of a watch on the root or above it; a
-//! token question is a `since` query, synced by watchman's own cookies.
-//! Where no watch covers the root, `watch-project` adds one; watchman
-//! sends its answer once the crawl of the tree ends, so a short deadline
-//! gives up on the answer but not on the watch. A clock answered during a
-//! crawl, its tail included, is the crawl's tick, synced or not; files
-//! changed then get that tick too, so `since` it misses them. Each batch
-//! after a crawl ticks first, so a token is a second synced clock past the
-//! first; one equal to it, or a clock that does not sync in time, gives
-//! none. Connects and calls share one deadline, and each failure says why.
+//! token question is a `since` query, synced by watchman's own cookies
+//! unless a token of its watch was just taken. Where no watch covers the
+//! root, `watch-project` adds one; watchman sends its answer once the
+//! crawl of the tree ends, so a short deadline gives up on the answer but
+//! not on the watch. A clock answered during a crawl, its tail included, is
+//! the crawl's tick, synced or not; files changed then get that tick too, so
+//! `since` it misses them. Each batch after a crawl ticks first, so a token
+//! is a synced clock past a clock read just before it, not synced; one equal
+//! to it, or a clock that does not sync in time, gives none. Connects and
+//! calls share one deadline, and each failure says why.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead as _, BufReader, Read, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +32,8 @@ pub struct Watchman {
     late: Cell<bool>,
     /// A server's: each reason speaks of its queries, not of searches.
     served: bool,
+    /// The watch of the token taken last: a question to it need not sync.
+    synced: RefCell<Option<String>>,
 }
 
 /// Reads that fail once the deadline passes.
@@ -57,6 +60,7 @@ impl Watchman {
             budget,
             late: Cell::new(false),
             served: false,
+            synced: RefCell::new(None),
         }
     }
 
@@ -180,12 +184,13 @@ impl Watchman {
         u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
     }
 
-    /// A clock of `watch`, synced.
-    fn clock(&self, watch: &str, root: &Path) -> Result<String, String> {
-        let reply = self.call(
-            &json!(["clock", watch, {"sync_timeout": self.sync_ms()}]),
-            root,
-        )?;
+    /// A clock of `watch`: synced, or the tick it has now.
+    fn clock(&self, watch: &str, root: &Path, synced: bool) -> Result<String, String> {
+        let command = match synced {
+            true => json!(["clock", watch, {"sync_timeout": self.sync_ms()}]),
+            false => json!(["clock", watch]),
+        };
+        let reply = self.call(&command, root)?;
         let clock = reply.get("clock").and_then(Value::as_str);
         clock
             .map(str::to_owned)
@@ -193,8 +198,9 @@ impl Watchman {
     }
 
     /// A token for now, of the watch covering `root`. Refused when an
-    /// `ignore_dirs` entry would hide changes under it, or when the two
-    /// clocks do not sync in time or share a tick (a crawl's).
+    /// `ignore_dirs` entry would hide changes under it, or when the synced
+    /// clock does not come in time or shares the tick of the one before it
+    /// (a crawl's).
     pub fn mark(&self, root: &Path) -> Result<Token, String> {
         let (watch, relative) = self.watch(root)?;
         let config = self.call(&json!(["get-config", watch]), root)?;
@@ -206,12 +212,13 @@ impl Watchman {
                 root.display()
             ));
         }
-        let first = self.clock(&watch, root)?;
-        let clock = self.clock(&watch, root)?;
+        let first = self.clock(&watch, root, false)?;
+        let clock = self.clock(&watch, root, true)?;
         if !ticked(&first, &clock) {
             self.late.set(true);
             return Err(format!("watchman is still crawling {}", root.display()));
         }
+        *self.synced.borrow_mut() = Some(watch.clone());
         let sock = self
             .sock
             .to_str()
@@ -226,17 +233,20 @@ impl Watchman {
 
     /// The paths under `root` changed since `token`'s clock; refused on a
     /// fresh instance: a restart, the watch added again, or deleted files
-    /// pruned since. A recrawl is not one: it names what it statted.
+    /// pruned since. A recrawl is not one: it names what it statted. Not
+    /// synced after a token of the same watch: the list is made after that
+    /// token's synced clock was read, so it holds every change up to it.
     pub fn since(&self, token: &Token, root: &Path) -> Result<Vec<String>, String> {
         let watched = Path::new(&token.watch).join(&token.relative);
         if watched.components().ne(root.components()) {
             return Err("the token watches another root".to_owned());
         }
+        let synced = self.synced.borrow().as_deref() == Some(token.watch.as_str());
         let mut query = json!({
             "since": token.clock,
             "fields": ["name"],
             "empty_on_fresh_instance": true,
-            "sync_timeout": self.sync_ms(),
+            "sync_timeout": if synced { 0 } else { self.sync_ms() },
         });
         if !token.relative.is_empty() {
             query["relative_root"] = json!(token.relative);
