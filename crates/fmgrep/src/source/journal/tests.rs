@@ -342,7 +342,7 @@ mod watchman_tests {
     /// Replies that a real daemon gives only in states a test cannot make
     /// it hold: a query error text, two texts of a sync that timed out (the
     /// second came from a real daemon), the error of a sync during a crawl,
-    /// to a query or to a clock as well, and the clocks of a crawl's tail,
+    /// to a query or to a synced clock as well (a plain one answers), and the clocks of a crawl's tail,
     /// which share one tick.
     const ERROR: u8 = 0;
     const SYNC_FAILED: u8 = 1;
@@ -350,6 +350,8 @@ mod watchman_tests {
     const CRAWL: u8 = 3;
     const CRAWL_CLOCK: u8 = 4;
     const STUCK: u8 = 5;
+    /// Each ask, from its watch-list on, may sync once; a second sync fails.
+    const ONE_SYNC: u8 = 6;
 
     const CRAWL_TEXT: &str = "synchronization failed: syncToNow: timed out waiting for cookie \
                               file to be observed by watcher within 74 milliseconds: Timer \
@@ -361,16 +363,24 @@ mod watchman_tests {
         let sock = dir.join("sock");
         let listener = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
+            let mut syncs = 0;
             for (tick, conn) in listener.incoming().enumerate() {
                 let mut conn = conn.unwrap();
                 let mut line = String::new();
                 BufReader::new(&conn).read_line(&mut line).unwrap();
                 let cmd: serde_json::Value = serde_json::from_str(&line).unwrap();
                 let mode = mode.load(Ordering::Relaxed);
+                if cmd[0] == "watch-list" {
+                    syncs = 0;
+                }
+                let synced = cmd[2]["sync_timeout"].as_u64().is_some_and(|ms| ms > 0);
+                syncs += usize::from(synced);
                 let reply = match (cmd[0].as_str().unwrap(), mode) {
+                    (_, ONE_SYNC) if syncs > 1 => json!({"error": "synced twice"}),
+                    ("query", ONE_SYNC) => json!({"is_fresh_instance": false, "files": ["a.c"]}),
                     ("watch-list", _) => json!({"roots": ["/w"]}),
                     ("get-config", _) => json!({"config": {}}),
-                    ("clock", CRAWL_CLOCK) => json!({"error": CRAWL_TEXT}),
+                    ("clock", CRAWL_CLOCK) if synced => json!({"error": CRAWL_TEXT}),
                     ("clock", STUCK) => json!({"clock": "c:1:2"}),
                     ("clock", _) => json!({"clock": format!("c:1:{tick}")}),
                     ("query", ERROR) => json!({"error": "bad"}),
@@ -646,6 +656,66 @@ mod watchman_tests {
             Err("watchman is still crawling /w/sub".into())
         );
         assert!(w.late());
+    }
+
+    /// An ask syncs once: its token's clock does, and the question after it
+    /// to the same watch does not. A question to another watch syncs.
+    #[test]
+    fn an_ask_syncs_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = fake(tmp.path(), Arc::new(AtomicU8::new(ONE_SYNC)));
+        let root = Path::new("/w/sub");
+        let w = Watchman::at(sock.clone(), Duration::from_secs(5));
+        w.mark(root).expect("one synced clock");
+        assert_eq!(w.since(&faked(&sock), root), Ok(vec!["a.c".to_owned()]));
+        let above = Token {
+            watch: "/".into(),
+            relative: "w/sub".into(),
+            ..faked(&sock)
+        };
+        assert_eq!(w.since(&above, root), Err("watchman: synced twice".into()));
+    }
+
+    /// Against a real daemon: files written while searches go on are each
+    /// listed by some search. Each search takes its token, then asks since
+    /// the last one, so a change that races with a token falls in the
+    /// question of this search or in the next.
+    #[test]
+    fn no_change_falls_between_two_tokens() {
+        let Some(daemon) = live() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let (watch, root) = (canonical(tmp.path()), canonical(tmp.path()).join("sub"));
+        std::fs::create_dir(&root).unwrap();
+        daemon.watch(&watch);
+        let mut last = at(&daemon).mark(&root).unwrap();
+        let written = 60;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let mut listed = std::collections::BTreeSet::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..written {
+                    put(&root, &format!("f{i}.c"));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                done.store(true, Ordering::Release);
+            });
+            // Searches go on until two have started after the last write.
+            let mut after = 0;
+            while after < 2 {
+                after += usize::from(done.load(Ordering::Acquire));
+                let w = at(&daemon);
+                let next = w.mark(&root).unwrap();
+                listed.extend(w.since(&last, &root).unwrap());
+                last = next;
+            }
+        });
+        let missed: Vec<String> = (0..written)
+            .map(|i| format!("f{i}.c"))
+            .filter(|name| !listed.contains(name))
+            .collect();
+        assert!(missed.is_empty(), "no search listed {missed:?}");
     }
 
     #[test]

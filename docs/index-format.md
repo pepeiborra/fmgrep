@@ -342,12 +342,13 @@ says the search asked git or checked every file, a pin in `warning:
 <why>; asked the server at ADDR for its status`. The search then does
 what it does without one, and writes a new one.
 
-A **token** is the second of two watchman clocks synced within 100 ms,
-kept only when it is a later tick than the first. A clock answered during
-a crawl, its tail included, is the crawl's tick, which files changed then
-get too, so `since` it misses them; such clocks share the tick, and a
-watch still crawling gives no token. A watch whose `ignore_dirs` reach
-into the tree, or above it, gives no token.
+A **token** is a watchman clock synced within 100 ms, kept only when it
+is a later tick than a clock read just before it, which is not synced.
+The question after it, to the same watch, does not sync again. A clock
+answered during a crawl, its tail included, is the crawl's tick, which
+files changed then get too, so `since` it misses them; such clocks share
+the tick, and a watch still crawling gives no token. A watch whose
+`ignore_dirs` reach into the tree, or above it, gives no token.
 
 The token comes from the watch on the tree or on a directory above it.
 Where no watch covers the tree, the search asks watchman to watch it
@@ -421,17 +422,18 @@ server keeps its last token, or at its start the record's token, since
 the stat pass runs after it was taken. A daemon gone from its socket, a
 restart or a removed watch makes the server take a new token.
 
-On Linux the ask makes each served query 1.1 to 3.2 ms slower (p50,
-measured on trees of 161 to 1.25 M files): a query that took 0.4 ms takes
-2.1 ms. On linux, chromium and aosp the question to watchman takes 1.1 to
-1.2 ms, and the re-check of what it reports 0.4 to 1.5 ms. In a git
+On Linux the ask made each served query 1.1 to 3.2 ms slower (p50,
+measured on trees of 161 to 1.25 M files): a query that took 0.4 ms took
+2.1 ms. On linux, chromium and aosp the question to watchman took 1.1 to
+1.2 ms, and the re-check of what it reports 0.4 to 1.5 ms. Those figures
+were measured with three synced calls per ask and not measured again; the
+ask now makes fewer, and is expected to cost about 0.7 ms less. In a git
 checkout watchman reports `.git` at every query, because its sync cookie
 changes that directory's mtime, so every query re-checks it. On macOS
-each of its three synced calls (two clocks and the question) waits for
-FSEvents, and the ask takes about 38 ms (35 to 41 ms on a tree of 60,000
-files); a loaded Mac can pass the 100 ms limit, and that query checks
-every file. Serve a tree that does not change with `--no-watch`, which
-asks watchman nothing.
+a synced call waits for FSEvents. The ask makes one, the token's clock,
+and takes about 9 ms on a tree of 60,000 files; a loaded Mac can pass the
+100 ms limit, and that query checks every file. Serve a tree that does
+not change with `--no-watch`, which asks watchman nothing.
 
 When watchman cannot answer, the search checks every file and prints one
 line on stderr per process that says why and what to do; stdout does not
