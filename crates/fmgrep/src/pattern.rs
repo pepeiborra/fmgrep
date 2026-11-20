@@ -122,7 +122,8 @@ fn others_of(hir: &regex_syntax::hir::Hir, anchor: &[u8]) -> Vec<Vec<u8>> {
 /// `StgClosure \*` or `a\.b`: what `regex::escape` writes for them. Such a
 /// pattern is answered as the literal is, from the index alone. A pattern
 /// with any other part, a flag, a class, a repetition or an assertion, is
-/// not plain, nor is one that holds a newline or is not UTF-8: the regex
+/// not plain, nor is one that holds a newline, a NUL (which rg refuses) or is
+/// not UTF-8: the regex
 /// path gives each its own error or answer. An inline flag such as `(?-i)`
 /// is no part of the bytes yet changes how they match under -i or -S, so a
 /// pattern with a `(?` is left to the regex path too; no escaped literal
@@ -152,7 +153,7 @@ pub fn plain_literal(pattern: &str) -> Option<String> {
         return None;
     };
     let text = std::str::from_utf8(&lit.0).ok()?;
-    (!text.is_empty() && !text.contains('\n')).then(|| text.to_owned())
+    (!text.is_empty() && !text.contains(['\n', '\0'])).then(|| text.to_owned())
 }
 
 /// One regex compiled once, plus the literals the FM-index prunes it with.
@@ -418,6 +419,8 @@ mod tests {
             "\\d+",
             "(?i)abc",
             "(?-i)FOO",
+            "\0",
+            "a\0b",
             "\\((?-i)f",
             "(?:abc)",
             "a\\nb",
@@ -435,7 +438,7 @@ mod tests {
     fn plain_literal_reads_back_what_escape_writes() {
         // Every string without a newline, from a deterministic walk over the
         // bytes a source file holds.
-        let alphabet: Vec<char> = "ab .*+?()[]{}|^$\\#&-~/_\t\u{e9}\u{4e2d}\0AZ09'\""
+        let alphabet: Vec<char> = "ab .*+?()[]{}|^$\\#&-~/_\t\u{e9}\u{4e2d}AZ09'\""
             .chars()
             .collect();
         let mut rng = crate::tests::support::Rng(0x9e37_79b9_7f4a_7c15);

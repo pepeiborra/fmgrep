@@ -9,12 +9,14 @@ use clap::{Args, ColorChoice, Parser, Subcommand};
 
 use super::params::{Color, Context, Mode, QueryParams};
 use crate::expr::Expr;
-use crate::regex_pattern;
+use crate::pattern::plain_literal;
 
 const SEARCH_NOTE: &str = "\
-A search reads the .fmgrep of the nearest enclosing directory. Put -- first
-to search for a TERM named index, serve or status. Trailing TERMs naming
-files or directories are PATHs, as in rg; with --expr every argument is one.
+A search reads the .fmgrep of the nearest enclosing directory. A TERM is a
+regex, as in rg; -F makes it a literal. Put -- first to search for a TERM
+named index, serve or status. Trailing TERMs naming files or directories
+are PATHs, as in rg. With --expr every argument is a PATH, a word is a
+literal and /x/ is a regex.
 Without a PATH only the cwd's subtree is searched, as in rg; from outside the
 indexed tree, all of it.
 
@@ -128,11 +130,18 @@ pub struct StatusArgs {
 
 #[derive(Args)]
 pub struct Search {
-    /// A literal, or /REGEX/
+    /// A regex, as in rg
     #[arg(value_name = "TERM")]
     pub terms: Vec<String>,
-    /// Read every TERM as a regex
-    #[arg(long)]
+    /// Read every TERM as a literal
+    #[arg(
+        short = 'F',
+        long,
+        conflicts_with_all = ["regex", "expr", "expr_json"]
+    )]
+    pub fixed_strings: bool,
+    /// Accepted for v0.1.0: every TERM is a regex now
+    #[arg(long, hide = true)]
     pub regex: bool,
     /// Match case-insensitively
     #[arg(short, long)]
@@ -301,7 +310,7 @@ impl Search {
         let mut p = QueryParams {
             terms,
             expr: self.expr(input)?,
-            regex: self.regex,
+            regex: !self.fixed_strings && self.expr.is_none() && self.expr_json.is_none(),
             ignore_case: self.ignore_case,
             multiline: self.multiline,
             dotall: self.multiline_dotall,
@@ -318,10 +327,12 @@ impl Search {
             if p.terms.len() < 2 {
                 return Err(format!("error: {op} needs at least two terms"));
             }
-            let leaf = |t: String| match (p.regex, regex_pattern(&t)) {
-                (true, _) => Expr::Regex(t),
-                (false, Some(inner)) => Expr::Regex(inner.to_owned()),
-                (false, None) => Expr::Term(t),
+            // A pattern that is nothing but a literal is a term, as the
+            // server plans it: the report names it as typed.
+            let leaf = |t: String| match (self.fixed_strings, plain_literal(&t)) {
+                (true, _) => Expr::Term(t),
+                (false, Some(literal)) => Expr::Term(literal),
+                (false, None) => Expr::Regex(t),
             };
             let leaves = std::mem::take(&mut p.terms).into_iter().map(leaf).collect();
             p.expr = Some(if self.and {
@@ -355,9 +366,14 @@ impl Search {
         Ok(self.split()?.1)
     }
 
+    /// The TERMs, as typed; none under an expression.
+    pub fn typed_terms(&self) -> Vec<String> {
+        self.split().map(|(terms, _)| terms).unwrap_or_default()
+    }
+
     /// The positionals as TERMs and PATHs: under an expression all are
     /// PATHs, else the trailing ones after the first that name files or
-    /// directories and are not spelled /REGEX/.
+    /// directories.
     fn split(&self) -> Result<(Vec<String>, Vec<String>), String> {
         if self.expr.is_some() || self.expr_json.is_some() {
             if let Some(t) = self.terms.iter().find(|t| !Path::new(t).exists()) {
@@ -366,7 +382,7 @@ impl Search {
             return Ok((Vec::new(), self.terms.clone()));
         }
         let n = (self.terms.iter().skip(1).rev())
-            .take_while(|t| regex_pattern(t).is_none() && Path::new(t).exists())
+            .take_while(|t| Path::new(t).exists())
             .count();
         let (terms, paths) = self.terms.split_at(self.terms.len() - n);
         Ok((terms.to_vec(), paths.to_vec()))

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use fmgrep::regex_pattern;
+use crate::regex_pattern;
 
 use crate::verify::{Paths, rg as rg_cmd};
 use crate::{Query, Row, RowKind, Server, case_flag, leaves, with_warm_up};
@@ -92,6 +92,26 @@ pub fn and_pipe(
     cmd
 }
 
+/// What fmgrep is passed to run `term`: `-i` for a `-i ` query, `--and` for
+/// several leaves, and then the leaves. A pattern is a regex to fmgrep, so
+/// a `/re/` leaf is passed as `re`; a query of literals only is passed
+/// with `-F`, and a literal beside a regex is escaped, which fmgrep
+/// answers as the literal.
+pub fn fmgrep_args(term: &str) -> Vec<String> {
+    let leaves = leaves(term);
+    let fixed = leaves.iter().all(|l| regex_pattern(l).is_none());
+    let mut args: Vec<String> = case_flag(term).map(String::from).into_iter().collect();
+    args.extend(fixed.then(|| "-F".to_owned()));
+    args.extend((leaves.len() > 1).then(|| "--and".to_owned()));
+    args.push("--".to_owned());
+    args.extend(leaves.iter().map(|l| match (regex_pattern(l), fixed) {
+        (Some(re), _) => re.to_owned(),
+        (None, true) => (*l).to_owned(),
+        (None, false) => regex::escape(l),
+    }));
+    args
+}
+
 /// Printed by every row: `path:N:text`, one line per matching line.
 pub const LINES: [&str; 4] = ["-n", "--no-heading", "--color", "never"];
 
@@ -121,11 +141,8 @@ fn clients(
         .map_err(|e| format!("cannot resolve {}: {e}", bin.display()))?;
     for (term, warm_up) in with_warm_up(terms) {
         let mut cmd = Command::new(&bin);
-        let leaves = leaves(term);
         cmd.current_dir(root).args(["--server", addr]).args(LINES);
-        cmd.args(case_flag(term));
-        cmd.args((leaves.len() > 1).then_some("--and"));
-        cmd.arg("--").args(leaves);
+        cmd.args(fmgrep_args(term));
         let paused = sampler.as_deref_mut().filter(|_| warm_up);
         let (out, latency, _) = unsampled(paused, || timed(&mut cmd, None))?;
         let hits = paths.hits(&format!("fmgrep --server {term:?}"), &out)?;
@@ -293,11 +310,8 @@ fn direct(
     let mut largest = None;
     for term in terms {
         let mut cmd = Command::new(&bin);
-        let leaves = leaves(term);
         cmd.current_dir(root).arg("--index").arg(index).args(LINES);
-        cmd.args(case_flag(term));
-        cmd.args((leaves.len() > 1).then_some("--and"));
-        cmd.arg("--").args(leaves);
+        cmd.args(fmgrep_args(term));
         let (out, latency, peak) = timed(&mut cmd, Some(Duration::from_millis(1)))?;
         let hits = paths.hits(&format!("fmgrep --index {term:?}"), &out)?;
         row.queries.push(Query::new(term, latency, hits));
@@ -571,16 +585,32 @@ mod tests {
         let from = root.display();
         let query = |how, what| format!("{from} {how} -n --no-heading --color never {what}");
         let want = [
-            query("--server h:1", "-- a"),
-            query("--server h:1", "-- a"),
-            query("--server h:1", "--and -- b c"),
-            query("--server h:1", "-i --and -- d e"),
+            query("--server h:1", "-F -- a"),
+            query("--server h:1", "-F -- a"),
+            query("--server h:1", "-F --and -- b c"),
+            query("--server h:1", "-i -F --and -- d e"),
             format!("{from} status /i"),
-            query("--index /i", "-- a"),
-            query("--index /i", "--and -- b c"),
-            query("--index /i", "-i --and -- d e"),
+            query("--index /i", "-F -- a"),
+            query("--index /i", "-F --and -- b c"),
+            query("--index /i", "-i -F --and -- d e"),
         ];
         assert_eq!(runs, want);
+    }
+
+    #[test]
+    fn fmgrep_is_passed_patterns_and_fixed_strings() {
+        let args = |q: &str| fmgrep_args(q).join(" ");
+        assert_eq!(args("StgClosure *"), "-F -- StgClosure *");
+        assert_eq!(args("-i a.b"), "-i -F -- a.b");
+        assert_eq!(args("/a.b/"), "-- a.b");
+        assert_eq!(args("a AND b"), "-F --and -- a b");
+        // A literal beside a regex is a pattern of its own.
+        assert_eq!(
+            args("/-- \\|/ AND simplifyTop"),
+            "--and -- -- \\| simplifyTop"
+        );
+        assert_eq!(args("a.b AND /c+/"), "--and -- a\\.b c+");
+        assert_eq!(args("-i ALPHA AND /b+/"), "-i --and -- ALPHA b+");
     }
 
     #[test]

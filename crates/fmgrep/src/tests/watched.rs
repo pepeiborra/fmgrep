@@ -924,7 +924,7 @@ fn named_changes_answer_like_a_fresh_index() {
     put(&folder, "kb/k.dat", b"printk\0binary");
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
-    let terms = ["printk", "/pr[i1]ntk/", "aa", "deep", "now"];
+    let terms = ["printk", "pr[i1]ntk", "aa", "deep", "now"];
     answers_like(&stale, &fresh, &terms, &["printk", "aa", "deep"]);
 }
 
@@ -952,7 +952,7 @@ fn edits_before_the_first_search_and_between_searches_answer_like_a_fresh_index(
         index_it(&folder, &fresh, false);
         fresh
     };
-    let terms = ["printk", "/pr[i1]ntk/", "now", "deep"];
+    let terms = ["printk", "pr[i1]ntk", "now", "deep"];
     // Before the first search, which takes a token, then checks every file.
     put(&folder, "a.c", b"printk one\nprintk now\n");
     put(&folder, "b.c", b"printk added\n");
@@ -1051,7 +1051,7 @@ fn watchman_answers_like_the_stat_pass() {
     answers_like(
         &stale,
         &fresh,
-        &["printk", "/pr[i1]ntk/", "aa", "deep", "now"],
+        &["printk", "pr[i1]ntk", "aa", "deep", "now"],
         &terms,
     );
 }
