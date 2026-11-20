@@ -167,11 +167,21 @@ impl Served<'_> {
                 code: QUERY_FAILED,
                 message,
             })?;
-        self.docs.recheck(self.files);
+        let mut left_out = Vec::new();
+        let checked = self.docs.recheck(self.files, &mut left_out);
+        super::print_diagnostics(left_out);
+        if checked {
+            self.docs.note_added();
+        }
         // Until the next query sets its own.
         self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
-        let mut run = |sink: &mut dyn MatchSink| answer(index, loaded, &req, sink);
+        let mut run = |sink: &mut dyn MatchSink| {
+            let mut left_out = Vec::new();
+            let report = answer(index, loaded, &req, sink, &mut left_out);
+            super::print_diagnostics(left_out);
+            report
+        };
         let answered = match p.mode {
             Mode::Counts => run(&mut Discard).map(Answer::Report),
             // Output so far precedes an error, as in a local search.
@@ -445,13 +455,18 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         true => Ask::EachQuery,
         false => Ask::Never,
     };
-    let (index, mut docs) = load(
+    let mut left_out = Vec::new();
+    let loaded = load(
         req.index_dir,
         req.manifest,
         req.corpus_root,
         ask,
         Some(files),
-    )?;
+        &mut left_out,
+    );
+    super::print_diagnostics(left_out);
+    let (index, mut docs) = loaded?;
+    docs.note_stale(&req.manifest.files);
     if let Some(cause) = docs.refusal() {
         return Err(format!(
             "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \

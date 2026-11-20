@@ -8,6 +8,8 @@ use super::super::tests::Fix;
 use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
+use crate::diagnostic::Diagnostic;
+#[cfg(unix)]
 use crate::manifest::{Checked, FileTable};
 #[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
@@ -53,7 +55,7 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     }
     let mut files = open_files(&fix);
     files.exclude(&root.join("idx"));
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["b.c", "new/deep/n.c"]);
     assert_eq!(
         files.snapshot().added[0],
@@ -61,7 +63,9 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
         "added ids follow the manifest's"
     );
     assert_eq!(
-        files.read_added(fix.files.len() + 1).as_deref(),
+        files
+            .read_added(fix.files.len() + 1, &mut Vec::new())
+            .as_deref(),
         Some(&b"printk"[..])
     );
 }
@@ -73,16 +77,48 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     write(&fix.path, "x.c", b"printk");
     write(&fix.path, "y.c", b"printk");
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(files.snapshot().added, [1, 2]);
     let epoch = files.epoch();
     std::fs::write(fix.path.join("x.c"), b"printk\0").unwrap();
     std::fs::remove_file(fix.path.join("y.c")).unwrap();
-    assert_eq!(files.read_added(1), None);
-    assert_eq!(files.read_added(2), None);
-    assert_eq!(files.read_added(3), None, "no such slot");
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(files.read_added(2, &mut left_out), None);
+    assert_eq!(files.read_added(3, &mut left_out), None, "no such slot");
     assert!(files.snapshot().added.is_empty() && files.epoch() != epoch);
     assert_eq!(files.known.state[0].load(Ordering::Acquire) & WARNED, 0);
+    assert!(left_out.is_empty(), "no news");
+}
+
+/// A file found at load that cannot be read when a query reads it is named
+/// and dropped.
+#[cfg(unix)]
+#[test]
+fn read_of_an_added_file_that_became_unreadable_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    write(&fix.path, "x.c", b"printk");
+    let files = open_files(&fix);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
+    assert_eq!(files.snapshot().added, [1]);
+    let shut = fix.path.join("x.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(
+        left_out,
+        [Diagnostic::Skipped {
+            path: shut,
+            why: "cannot read (Permission denied (os error 13))".to_owned(),
+        }]
+    );
+    assert!(files.snapshot().added.is_empty());
 }
 
 #[test]
@@ -92,10 +128,10 @@ fn added_utf16_file_is_found_and_read_as_utf8() {
     write(&fix.path, "u.c", &crate::binary::utf16le("printk ü\r\n"));
     write(&fix.path, "z.c", &crate::binary::utf16le("printk\0"));
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["u.c"]);
     assert_eq!(
-        files.read_added(1).as_deref(),
+        files.read_added(1, &mut Vec::new()).as_deref(),
         Some("printk ü\r\n".as_bytes())
     );
 }
@@ -130,7 +166,7 @@ fn discovered(fix: &Fix, manifest: Checked<'_>, walk_all: bool) -> Files {
         let index = fix.path.parent().unwrap();
         files.record(super::super::Recorded::open(index).unwrap().unwrap());
     }
-    files.discover(manifest, &vec![0; manifest.len()]);
+    files.discover(manifest, &vec![0; manifest.len()], &mut Vec::new());
     files
 }
 
@@ -216,7 +252,7 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     assert_eq!(
         files
             .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens),
+            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new()),
         Ok(1)
     );
     assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");
@@ -289,4 +325,37 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(files.known.kind(1), IGNORED);
     assert!(files.snapshot().gone.is_empty());
+}
+
+/// A file that is gone or binary is no news; one that cannot be read, or is
+/// too large, says why.
+#[cfg(unix)]
+#[test]
+fn read_text_says_why_it_cannot_read_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "ok.c", b"printk");
+    write(dir, "bin.c", b"printk\0");
+    write(dir, "shut.c", b"printk");
+    std::fs::File::create(dir.join("huge.log"))
+        .unwrap()
+        .set_len(1 << 31)
+        .unwrap();
+    let shut = dir.join("shut.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let read = |name: &str| super::read_text(&dir.join(name)).map(|t| t.bytes);
+    assert_eq!(read("ok.c"), Ok(b"printk".to_vec()));
+    assert_eq!(read("missing.c"), Err(None));
+    assert_eq!(read("bin.c"), Err(None));
+    assert_eq!(
+        read("huge.log"),
+        Err(Some("over 2147483646 bytes".to_owned()))
+    );
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let why = read("shut.c").unwrap_err().unwrap();
+    assert!(why.starts_with("cannot read (Permission denied"), "{why}");
 }

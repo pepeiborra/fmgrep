@@ -15,12 +15,14 @@ mod serve;
 mod status;
 
 use crate::checkout;
+use crate::diagnostic::Diagnostic;
 use crate::events::JsonSink;
+use crate::fetch::Ask;
 use crate::filter::SearchPath;
 use crate::index::{INDEX_DIR, IndexRequest, run_index};
 use crate::manifest::{BLOBS_SHARD, MANIFEST_FORMAT, Manifest, read_manifest};
 use crate::output::{MatchWriter, WRITE_FAILED};
-use crate::query::run_query;
+use crate::query::{answer as answer_local, load};
 use crate::remote::{Conn, Server};
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport, ServeStatus};
@@ -320,11 +322,38 @@ fn local(
     rebase(&mut p, typed, tree.as_deref())?;
     p.scope(tree.as_deref());
     let req = p.request(&found.index_dir, &manifest, root_of(&found, &manifest))?;
-    let report = render(&p, json, out, |sink| run_query(&req, sink));
+    let report = render(&p, json, out, |sink| {
+        let mut left_out = Vec::new();
+        let loaded = load(
+            req.index_dir,
+            req.manifest,
+            req.corpus_root,
+            Ask::Load,
+            None,
+            &mut left_out,
+        );
+        print_diagnostics(std::mem::take(&mut left_out));
+        let (index, mut loaded) = loaded?;
+        loaded.note_stale(&req.manifest.files);
+        let report = answer_local(&index, &mut loaded, &req, sink, &mut left_out);
+        print_diagnostics(left_out);
+        tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
+        report
+    });
     drop(req);
     // Off the exit path: dropping a large tree's paths costs milliseconds.
     let _ = std::thread::Builder::new().spawn(move || drop(manifest));
     report.map(Outcome::Query)
+}
+
+/// What a load or a search left out, on stderr: the one place that prints
+/// entries, in the order they were found. In a search through a server that
+/// holds its lines they join the held ones, so that they print or drop with
+/// them, in the order of the lines they sit between.
+fn print_diagnostics(left_out: Vec<Diagnostic>) {
+    for d in left_out {
+        crate::held::line(&d.to_string());
+    }
 }
 
 /// `line` on stderr, as a warning.
@@ -556,7 +585,10 @@ fn merged(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<OutputReport, String> {
-    let part = merge::part(&p, top, local)?;
+    let mut left_out = Vec::new();
+    let part = merge::part(&p, top, local, &mut left_out);
+    print_diagnostics(left_out);
+    let part = part?;
     p.skip = skip;
     render(&p, json, out, |sink| {
         let mut both = merge::Merge::new(sink, &part);

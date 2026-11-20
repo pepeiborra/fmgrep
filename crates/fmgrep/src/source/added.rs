@@ -3,12 +3,13 @@
 //! docs.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 
 use super::{IGNORED, Known, Recorded, parallel};
 use crate::binary::sniff_text;
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{Checked, partition_ids};
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
@@ -75,16 +76,21 @@ impl super::Files {
     /// not list, and mark the indexed ones an ignore rule now skips; with a
     /// record, only changed and new directories are listed, and the dirs a
     /// changed ignore input affects.
-    pub fn discover(&self, files: Checked<'_>, lens: &[u64]) {
+    pub fn discover(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
         let known = &*self.known;
         let span = tracing::info_span!("discovery").entered();
         match &known.recorded {
-            Some(recorded) => known.discover_recorded(recorded, files, lens),
-            None => known.discover(&known.root, &known.root, files, lens),
+            Some(recorded) => known.discover_recorded(recorded, files, lens, left_out),
+            None => known.discover(&known.root, &known.root, files, lens, left_out),
         }
         drop(span);
         known.complete.store(true, Ordering::Release);
-        let n = known.added().live().count();
+    }
+
+    /// Under verbose, note how many added files every query scans in full.
+    /// After the caller prints what the check left out.
+    pub fn note_added(&self) {
+        let n = self.known.added().live().count();
         if n > 0 && crate::verbose::verbose() {
             eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
         }
@@ -159,18 +165,45 @@ impl Known {
     }
 
     /// The paths of `rels` whose first bytes allow text, in order.
-    pub(super) fn text_only(&self, root: &Path, rels: Vec<String>) -> Vec<String> {
-        let keep = parallel(&rels, |rel| sniff_text(&root.join(rel)));
+    ///
+    /// A file that cannot be read, or is too large, is left out with one
+    /// entry in `left_out`. A binary one is not named, as at the index.
+    pub(super) fn text_only(
+        &self,
+        root: &Path,
+        rels: Vec<String>,
+        left_out: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
+        let sniffed = parallel(&rels, |rel| sniff_text(&root.join(rel)));
+        // The entries come in path order, whichever thread ended first.
         rels.into_iter()
-            .zip(keep)
-            .filter_map(|(rel, k)| k.then_some(rel))
+            .zip(sniffed)
+            .filter_map(|(rel, text)| match text {
+                Ok(text) => text.then_some(rel),
+                Err(why) => {
+                    self.skipped(root.join(&rel), why, left_out);
+                    None
+                }
+            })
             .collect()
+    }
+
+    /// Report that `path`, a file new since the index, is left out for `why`.
+    fn skipped(&self, path: PathBuf, why: String, left_out: &mut Vec<Diagnostic>) {
+        self.left_out_once(Diagnostic::Skipped { path, why }, left_out);
     }
 
     /// Walk `under` (at or below `root`) and reconcile what it holds: an
     /// indexed doc the rule skips, or no longer a regular file, is ignored;
     /// one the walk missed or lists again is statted.
-    pub fn discover(&self, root: &Path, under: &Path, files: Checked<'_>, lens: &[u64]) {
+    pub fn discover(
+        &self,
+        root: &Path,
+        under: &Path,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
@@ -198,14 +231,20 @@ impl Known {
             }
         });
         parallel(&back, |&id| self.stat(id, files, lens, true));
-        let found = self.text_only(root, unlisted(walked, files));
+        let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile(rel, &found);
     }
 
     /// [`Self::discover`] of the root, listing only the recorded dirs whose
     /// stamp moved and the new ones below them, then walking the dirs a
     /// changed ignore input affects.
-    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: Checked<'_>, lens: &[u64]) {
+    fn discover_recorded(
+        &self,
+        recorded: &Arc<Recorded>,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
         let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));
@@ -214,9 +253,9 @@ impl Known {
             crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {
                 prune.is_dir(rel)
             });
-        let found = self.text_only(root, unlisted(walked, files));
+        let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile("", &found);
-        self.discover_scopes(scopes, files, lens);
+        self.discover_scopes(scopes, files, lens, left_out);
     }
 
     /// Whether `rel` is at or under the index dir.
@@ -227,18 +266,16 @@ impl Known {
             .is_some_and(|x| Path::new(rel).starts_with(x))
     }
 
-    pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {
+    pub fn read_added(&self, doc: usize, left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
         let slot = doc.checked_sub(self.state.len())?;
         let rel = self.added().paths.get(slot)?.clone();
         let path = self.root.join(&rel);
-        let text = std::fs::metadata(&path)
-            .is_ok_and(|m| m.len() <= crate::binary::MAX_DOC_BYTES)
-            .then(|| std::fs::read(&path).ok())
-            .flatten()
-            .and_then(|raw| crate::binary::text(raw).ok());
-        match text {
-            Some(text) => Some(text.bytes),
-            None => {
+        match read_text(&path) {
+            Ok(text) => Some(text.bytes),
+            Err(why) => {
+                if let Some(why) = why {
+                    self.skipped(path, why, left_out);
+                }
                 if self.added().set(&rel, false) {
                     self.epoch.fetch_add(1, Ordering::AcqRel);
                 }
@@ -246,6 +283,20 @@ impl Known {
             }
         }
     }
+}
+
+/// The text of the file at `path`, or why it is left out: `None` for a file
+/// that is gone or binary, which is no news.
+fn read_text(path: &Path) -> Result<crate::binary::Text, Option<String>> {
+    use crate::binary::{MAX_DOC_BYTES, Skip};
+    let unread = |e: std::io::Error| {
+        (e.kind() != std::io::ErrorKind::NotFound).then(|| format!("cannot read ({e})"))
+    };
+    if std::fs::metadata(path).map_err(unread)?.len() > MAX_DOC_BYTES {
+        return Err(Some(Skip::TooLarge.to_string()));
+    }
+    let raw = std::fs::read(path).map_err(unread)?;
+    crate::binary::text(raw).map_err(|why| (why == Skip::TooLarge).then(|| why.to_string()))
 }
 
 #[cfg(test)]

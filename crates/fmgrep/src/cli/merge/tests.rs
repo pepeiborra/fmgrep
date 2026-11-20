@@ -27,7 +27,7 @@ fn the_clients_part_counts_as_the_server_does() {
             stats,
             ..QueryParams::default()
         };
-        let part = part(&p, tmp.path(), &local).unwrap();
+        let part = part(&p, tmp.path(), &local, &mut Vec::new()).unwrap();
         let q = &part.report.queries[0];
         assert_eq!(
             (q.total_matches, q.docs_matched),
@@ -65,7 +65,7 @@ fn the_clients_stats_corpus_is_what_the_filter_keeps() {
             globs: globs.iter().map(|g| (*g).to_owned()).collect(),
             ..QueryParams::default()
         };
-        let part = part(&p, tmp.path(), &local).unwrap();
+        let part = part(&p, tmp.path(), &local, &mut Vec::new()).unwrap();
         assert_eq!(part.corpus, want, "{globs:?} {stats}");
     }
 }
