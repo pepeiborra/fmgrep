@@ -15,15 +15,24 @@ tree.
 `fmgrep index` takes the files `rg --files` lists, minus binary files
 ([Indexing](../README.md#indexing)). A search never reads a file the
 index skips. `rg` searches a hidden or ignored file that you name as a
-PATH or match with a `-g` glob. fmgrep finds nothing in it.
+PATH or match with a `-g` glob. fmgrep says that it cannot, and exits 2.
+It searches the other PATHs first.
 
 | search | rg | fmgrep |
 |---|---|---|
-| `HscEnv .hidden.txt` | finds the line | exit 1, no output |
-| `HscEnv build/out.txt` (gitignored) | finds the line | exit 1, no output |
+| `HscEnv .hidden.txt` | finds the line | `error: .hidden.txt: not in the index (...)`, exit 2 |
+| `HscEnv build/out.txt` (gitignored) | finds the line | the same error, exit 2 |
+| `-c HscEnv link.md` (a symlink) | counts the target's lines | the same error, exit 2 |
 | `-g '.hidden*' HscEnv` | finds the line | `error: no files were searched`, exit 2 |
-| `-c HscEnv link.md` (a symlink) | counts the target's lines | exit 1, no output |
 | `HscEnv /etc/hosts` (outside the tree) | searches it | `error: /etc/hosts is outside the indexed tree`, exit 2 |
+| `--hidden HscEnv` | searches hidden files | `error: --hidden cannot work on an index`, exit 2 |
+
+The error ends with `search it with rg`. It names a directory only when
+rg would read a file in it, such as an ignored `build/`. An empty one, or
+one with only hidden or binary files, is no error: the search finds
+nothing and exits 1, as rg does. With a `--store-docs` index, the error
+also names a file added since the index, which such a search never reads. `--no-ignore`, `-u`, `-L`, `-a`, `-z` and
+`--pre` get the same refusal, each with its reason.
 
 A search needs an index. With none above the cwd, it exits 2 with
 `error: no .fmgrep index in DIR or any parent`. `fmgrep index` refuses
@@ -37,9 +46,9 @@ outside the indexed tree, a search covers the whole tree, relative to
 its root. A PATH is relative to the cwd, and its files print as rg
 prints them. Files print in path order.
 
-### A TERM is a regex
+### A PATTERN is a regex
 
-A TERM is a regex, as in rg. The syntax is that of rg's default engine,
+The PATTERN is a regex, as in rg. The syntax is that of rg's default engine,
 the Rust regex crate. `-F` makes it the text it is, and `-i`, `-s`, `-S`
 and `-U` work as in rg.
 
@@ -59,25 +68,39 @@ with a `.`, a bracket or a `+` reads every file that may match, so use
 `-F` for code such as `foo(` or `a.b`. A search for `/a.b/` that finds
 nothing says that the slashes are part of the pattern.
 
-`--and` and `--or` read each TERM as a regex too, or as text under `-F`.
-Under `--expr`, a word is still a literal and `/re/` a regex, and `-F`
-is refused ([Expressions](../README.md#expressions)). `--regex` is
-accepted from v0.1.0 and does nothing.
+`--expr` and `--expr-json` keep their own syntax: a word is a literal and
+`/re/` a regex, and `-F` is refused
+([Expressions](../README.md#expressions)). `--regex` is accepted from v0.1.0
+and does nothing.
 
 rg wraps each pattern in a group, so it accepts a few patterns with an
 unbalanced `)`, such as `)(\d#?`. fmgrep refuses them with a parse error.
 
-`-P` and `--engine` do not exist: there is one engine. `-e`, `-f`, `-w`,
-`-x` and `-v` are refused.
+`-P` and `--engine` do not exist: there is one engine. `-f`, `-w`, `-x` and
+`-v` are refused.
 
-Several TERMs are searched one after the other, and each prints under a
-`== TERM ==` line. In rg, `-e A -e B` is one search. `--and`, `--or` and
-`--expr` pick files, then print the lines of every TERM in them.
+### The PATTERN and the PATHs
 
-Trailing arguments that name an existing file or directory are PATHs, as
-in rg, whatever they look like: `/tmp/` is a PATH. One that does not exist
-is a TERM. So `fmgrep HscEnv nope.txt` also searches for `nope.txt`, and
-exits 0. `rg` exits 2 with an error.
+The first argument is the PATTERN, and every other argument is a PATH, as
+in rg. A PATH that does not exist is an error, and the other PATHs are still
+searched.
+
+| search | rg | fmgrep |
+|---|---|---|
+| `alpha nosuch.txt` | `No such file or directory`, exit 2 | the same |
+| `alpha nosuch.txt a.txt` | the lines of `a.txt`, then the error, exit 2 | the same |
+| `-e alpha -e beta a.txt` | the lines with either | the same |
+| `-e alpha -- -file` | `-file` is a PATH | the same |
+| `-- -x a.txt` | the PATTERN is `-x` | the same |
+
+`-e` gives the patterns, and then every argument is a PATH. Several make
+one search: the lines that match any, with no heading for each. `-F`, `-i`
+and `-S` apply to every pattern.
+
+`--and` and `--or` take their patterns with `-e`, and need two or more.
+`--and A B` is a search for `A` in the PATH `B`, so it says to write
+`--and -e A -e B`. They pick files, then print the lines of every pattern in
+them, as `--expr` does. Under `--expr`, every argument is a PATH too.
 
 `index`, `serve` and `status` are commands when they are the first word.
 To search for one of these words, put `--` or any flag first:
@@ -85,31 +108,42 @@ To search for one of these words, put `--` or any flag first:
 
 ### Flags
 
-These work as in rg: `-F`, `-i`, `-s`, `-S`, `-U`,
+These work as in rg: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`,
 `--multiline-dotall`, `-g`, `--iglob`, `--glob-case-insensitive`, `-c`,
 `--count-matches`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
 `--no-heading`, `--color` and `--stats`. `fmgrep --help` lists them. Any
 other flag of rg is refused with `error: unexpected argument` and exit 2.
 These are some of them:
 
-- patterns: `-e`, `-f`, `-w`, `-x`, `-v`, `-P`, `--engine`
-- files: `--hidden`, `--no-ignore`, `-u`, `-t`, `-T`, `--type-add`,
-  `-L`, `-d`, `--max-filesize`, `--files`, `--files-without-match`,
-  `-a`, `-z`
+- patterns: `-f`, `-w`, `-x`, `-v`, `-P`, `--engine`
+- files: `-t`, `-T`, `--type-add`, `-d`, `--max-filesize`, `--files`,
+  `--files-without-match`
 - output: `-m`, `-r`, `-H`, `-I`, `-0`, `--column`, `--vimgrep`,
   `--pretty`, `--passthru`, `--trim`, `--sort`, `-q`, `--colors`,
   `--byte-offset`, `--max-columns`, `--context-separator`
-- process: `-j`, `-E`, `--debug`, `--no-config`
+- process: `-j`, `--debug`, `--no-config`
+
+An index cannot honour these, and each is refused with its reason, such as
+`error: --hidden cannot work on an index: hidden files are not indexed; use
+rg`: `--hidden`, `-.`, `--no-ignore` and its variants, `-u`, `-L`, `-a`,
+`--binary`, `-z`, `--pre`, `--pre-glob` and `-E`.
 
 fmgrep does not search stdin, and does not read a `RIPGREP_CONFIG_PATH`
 file. To filter a pipe, or to use a flag above, use rg.
+
+In rg the PATH `-` is stdin. In fmgrep it is a PATH like any other: with no
+file named `-` it is the error `error: -: No such file or directory`, exit 2,
+and with one that file is searched.
+
+Under `-e` or `--expr`, every positional is a PATH. Otherwise the first
+positional is always the PATTERN, so `fmgrep -- -` searches for a hyphen.
 
 ### Output
 
 - `--json` alone prints a counts report, not rg's events.
   `--json --matches` prints rg's JSON event stream
   ([protocol.md](protocol.md#cli---json)).
-- `--stats` prints rg's statistics after the matched lines of each TERM.
+- `--stats` prints rg's statistics after the matched lines.
   Files and bytes searched count the indexed files that the PATHs, globs
   and cwd keep. A narrowed search also counts their UTF-8 byte-order
   marks, which rg leaves out. The total time runs from the start of the

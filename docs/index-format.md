@@ -183,10 +183,10 @@ UTF-8 or if an end cuts it inside a character; either way the refusal
 says the manifest "holds a path that is not UTF-8". A search checks every
 path a term may print before it prints the first line of that term, and
 every path a PATH or glob filter reads, even one it would not print. A
-search of several terms prints the terms before the one that reads the
-damaged path, then stops. What reads every path checks all of the text
-once, first: a search or `fmgrep status` of the files layout, at load;
-`fmgrep serve`, at start; `fmgrep status --json`. That check says "holds
+request of several terms, which the CLI does not send, prints the terms
+before the one that reads the damaged path, then stops. What reads every
+path checks all of the text once, first: a search or `fmgrep status` of
+the files layout, at load; `fmgrep serve`, at start; `fmgrep status --json`. That check says "holds
 a path that is not UTF-8", or names the first path an end "cuts inside a
 character". So a damaged path is refused by the first command that reads
 it; `fmgrep status` of `--store-docs` without `--json`, and a search of
