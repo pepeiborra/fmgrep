@@ -131,8 +131,8 @@ fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
     let src = Path::new("/src/linux");
     let (a, b) = (Of::commit(&"a".repeat(40)), Of::commit(&"b".repeat(40)));
     let say = |of: &Of, why: &str| match unsaid(src, of, why) {
-        Some(keep) => {
-            keep();
+        Some(unsaid) => {
+            unsaid.keep();
             true
         }
         None => false,
@@ -167,7 +167,7 @@ fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
     std::fs::remove_file(&file).unwrap();
     std::fs::create_dir(&file).unwrap();
     assert!(unsaid(src, &a, "no daemon").is_some());
-    unsaid(src, &a, "no daemon").unwrap()();
+    unsaid(src, &a, "no daemon").unwrap().keep();
     assert!(unsaid(src, &a, "no daemon").is_some());
     crate::tests::CACHE.set(None);
     assert!(unsaid(src, &a, "no daemon").is_some(), "no cache directory");
@@ -183,7 +183,7 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
     let full = |id: &str| id.len() == 40;
     let id = "a".repeat(40);
     assert_eq!(pinned(src, addr, full), Pinned::Missing);
-    pin(src, addr, Some(&id));
+    pin(src, addr, Some(&id)).unwrap();
     assert_eq!(pinned(src, addr, full), Pinned::Commit(id.clone()));
     assert_eq!(pinned(src, "h:8", full), Pinned::Missing, "another server");
     assert_eq!(pinned(Path::new("/src/l2"), addr, full), Pinned::Missing);
@@ -202,9 +202,9 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
         1,
         "no temp left"
     );
-    pin(src, addr, None);
+    pin(src, addr, None).unwrap();
     assert_eq!(pinned(src, addr, full), Pinned::Missing, "removed");
-    pin(src, addr, None);
+    pin(src, addr, None).unwrap();
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     let shown = file.display();
     let other = json!({"v": 1, "root": "/src/l2", "server": addr, "commit": id});
@@ -244,6 +244,29 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
         Pinned::Damaged(got) => assert!(got.starts_with("cannot read the pin "), "{got}"),
         got => panic!("{got:?}"),
     }
+}
+
+/// A pin or a record that cannot be written is a value for the caller to say.
+#[test]
+fn a_pin_that_cannot_be_saved_returns_why() {
+    crate::tests::CACHE.set(None);
+    let got = pin(Path::new("/src/linux"), "h:7", None).expect_err("no cache directory");
+    assert_eq!(
+        got.to_string(),
+        "cannot save the pin (no cache directory: set XDG_CACHE_HOME or HOME); the next search \
+         checks again"
+    );
+    let record = remember(
+        Path::new("/src/linux"),
+        &Of::commit(&"a".repeat(40)),
+        token("c:1:2"),
+        vec![],
+        json!({}),
+    );
+    assert!(
+        matches!(record, Err(Check::CannotSave { .. })),
+        "{record:?}"
+    );
 }
 
 #[test]

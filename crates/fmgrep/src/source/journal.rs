@@ -14,7 +14,7 @@
 //! checks every file and says why, once per process.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -438,16 +438,15 @@ pub fn pinned(root: &Path, addr: &str, full_id: fn(&str) -> bool) -> Pinned {
 }
 
 /// Pin `commit` for the checkout at canonical `root` and the server at
-/// `addr`; with none, remove the pin. Says why it could not, once per
-/// process.
-pub fn pin(root: &Path, addr: &str, commit: Option<&str>) {
+/// `addr`; with none, remove the pin. Why it could not, if it could not.
+pub fn pin(root: &Path, addr: &str, commit: Option<&str>) -> Result<(), Check> {
     let Some(root_str) = root.to_str() else {
-        return say_once(&cannot_save(
+        return Err(cannot_save(
             "the pin (the checkout's path is not UTF-8)".to_owned(),
         ));
     };
     let Some(path) = pin_path(root, addr) else {
-        return say_once(&cannot_save(
+        return Err(cannot_save(
             "the pin (no cache directory: set XDG_CACHE_HOME or HOME)".to_owned(),
         ));
     };
@@ -465,9 +464,9 @@ pub fn pin(root: &Path, addr: &str, commit: Option<&str>) {
     };
     match wrote {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            say_once(&cannot_save(format!("the pin {}: {e}", path.display())));
+            Err(cannot_save(format!("the pin {}: {e}", path.display())))
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
@@ -801,10 +800,10 @@ fn said_path(root: &str) -> Option<PathBuf> {
 /// For a search of the checkout at canonical `root` against `of` that
 /// cannot ask watchman, for reason `why`: `None` when the last such
 /// search already said this, for this commit; else what to run once it
-/// has said it, which keeps the note. A note that cannot be read, is
+/// has said it, which keeps the note: [`Unsaid::keep`]. A note that cannot be read, is
 /// malformed or was written by another fmgrep version is not used; one
 /// that cannot be written is not kept, and the next search says it again.
-pub fn unsaid(root: &Path, of: &Of, why: &str) -> Option<Box<dyn FnOnce()>> {
+pub fn unsaid(root: &Path, of: &Of, why: &str) -> Option<Unsaid> {
     let said = root.to_str().map(|root| Said {
         v: SAID_VERSION,
         root: root.to_owned(),
@@ -813,17 +812,29 @@ pub fn unsaid(root: &Path, of: &Of, why: &str) -> Option<Box<dyn FnOnce()>> {
     });
     let path = said.as_ref().and_then(|s| said_path(&s.root));
     let (Some(said), Some(path)) = (said, path) else {
-        return Some(Box::new(|| {}));
+        return Some(Unsaid(None));
     };
     let last = std::fs::read(&path).ok();
     let last = last.and_then(|b| serde_json::from_slice::<Said>(&b).ok());
     if last.as_ref() == Some(&said) {
         return None;
     }
-    Some(Box::new(move || {
-        let bytes = serde_json::to_vec(&said).expect("a note serializes");
-        let _ = write_atomic(&path, &bytes);
-    }))
+    Some(Unsaid(Some((path, said))))
+}
+
+/// What a search that said a reason keeps once the reason is printed: the
+/// note that makes the next search quiet. A search whose lines are dropped
+/// drops it, and the next search says the reason again.
+pub struct Unsaid(Option<(PathBuf, Said)>);
+
+impl Unsaid {
+    /// Write the note; a note that cannot be written is not kept.
+    pub fn keep(self) {
+        if let Some((path, said)) = self.0 {
+            let bytes = serde_json::to_vec(&said).expect("a note serializes");
+            let _ = write_atomic(&path, &bytes);
+        }
+    }
 }
 
 /// Drop the note of the checkout at canonical `root`: watchman answered, so
@@ -848,16 +859,17 @@ pub fn record_path(root: &Path, of: &Of) -> Option<PathBuf> {
 }
 
 /// Save `token`, `baseline` (ascending) and `extra` as what differs from
-/// `of` in the checkout at canonical `root`.
+/// `of` in the checkout at canonical `root`. Why it could not, if it could
+/// not.
 pub fn remember(
     root: &Path,
     of: &Of,
     token: Token,
     baseline: Vec<String>,
     extra: serde_json::Value,
-) {
+) -> Result<(), Check> {
     let Some(root) = root.to_str() else {
-        return say_once(&cannot_save(
+        return Err(cannot_save(
             "the record (the checkout's path is not UTF-8)".to_owned(),
         ));
     };
@@ -869,20 +881,7 @@ pub fn remember(
         baseline: Some(baseline),
         extra: Some(extra),
     };
-    if let Err(check) = record.write(&of.key) {
-        say_once(&check);
-    }
-}
-
-/// `check` on stderr, once per process, held with the lines of a search that
-/// sent its query pinned: a record or pin that cannot be saved.
-fn say_once(check: &Check) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    #[cfg(test)]
-    crate::tests::note(&check.to_string());
-    if !SEEN.swap(true, Ordering::Relaxed) {
-        crate::held::once(Some(&SEEN), &format!("warning: {check}"));
-    }
+    record.write(&of.key).map(drop)
 }
 
 pub fn cannot(why: &str) -> Check {

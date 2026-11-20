@@ -172,14 +172,14 @@ impl Served<'_> {
         if checked {
             self.docs.note_added(&mut left_out);
         }
-        super::print_diagnostics(left_out);
+        super::print_diagnostics(&left_out);
         // Until the next query sets its own.
         self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
         let mut run = |sink: &mut dyn MatchSink| {
             let mut left_out = Vec::new();
             let report = answer(index, loaded, &req, sink, &mut left_out);
-            super::print_diagnostics(left_out);
+            super::print_diagnostics(&left_out);
             report
         };
         let answered = match p.mode {
@@ -468,7 +468,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
         docs.note_stale(&req.manifest.files, &mut left_out);
         (index, docs)
     });
-    super::print_diagnostics(std::mem::take(&mut left_out));
+    super::print_diagnostics(&std::mem::take(&mut left_out));
     let (index, mut docs) = loaded?;
     if let Some(cause) = docs.refusal() {
         return Err(format!(
@@ -482,7 +482,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     }
     docs.measure_band(req.manifest, &mut left_out);
     docs.measure_locate(&index, &mut left_out);
-    super::print_diagnostics(left_out);
+    super::print_diagnostics(&left_out);
     Ok(Served {
         index,
         docs,
@@ -585,13 +585,14 @@ pub fn status_on(conn: &mut Conn) -> Result<ServeStatus, String> {
 /// `p` (with `stream` and `rendered`) answered by the server: its output
 /// copied to `out` as it comes, as a local search prints it, then the
 /// report. The search fails as a local one does when it searched no file.
-/// The first frame, or the result, prints the held lines: the server took
-/// the query.
+/// The first frame, or the result, prints what `attempt` holds: the server
+/// took the query.
 pub fn rendered(
     conn: &mut Conn,
     p: &QueryParams,
     json: bool,
     out: &mut dyn Write,
+    attempt: &mut super::Try,
 ) -> Result<OutputReport, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
@@ -599,13 +600,13 @@ pub fn rendered(
     let printed = p.mode != Mode::Counts && (!json || p.mode == Mode::JsonMatches);
     let mut pipe = Pipe::new(&mut *out);
     let result = conn.call("query", sent, &mut |frame| {
-        crate::held::release();
+        attempt.print();
         match printed {
             true => pipe.raw(frame),
             false => Ok(()),
         }
     })?;
-    crate::held::release();
+    attempt.print();
     pipe.finish()?;
     let report = match p.mode {
         Mode::Counts => conn.decode(result)?,
@@ -619,20 +620,21 @@ pub fn rendered(
 }
 
 /// `p` (with `stream`) answered by the server: each event to `sink`, then
-/// the report. The first frame, or the result, prints the held lines: the
-/// server took the query.
+/// the report. The first frame, or the result, prints what `attempt` holds:
+/// the server took the query.
 pub fn remote(
     conn: &mut Conn,
     p: &QueryParams,
     sink: &mut dyn MatchSink,
+    attempt: &mut super::Try,
 ) -> Result<OutputReport, String> {
     let sent =
         serde_json::to_value(p).map_err(|e| format!("error: failed to encode request: {e}"))?;
     let result = conn.call("query", sent, &mut |frame| {
-        crate::held::release();
+        attempt.print();
         Frame::decode(frame)?.replay(sink)
     })?;
-    crate::held::release();
+    attempt.print();
     match p.mode {
         Mode::Counts => conn.decode(result),
         _ => Ok(conn.decode::<Rendered>(result)?.report),

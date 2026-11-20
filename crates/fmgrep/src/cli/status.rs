@@ -73,7 +73,7 @@ fn settle(found: Vec<Diagnostic>) -> Vec<String> {
             d => rest.push(d),
         }
     }
-    super::print_diagnostics(rest);
+    super::print_diagnostics(&rest);
     warned
 }
 
