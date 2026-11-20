@@ -125,6 +125,7 @@ impl Conn {
 }
 
 /// A server's address, and whether `FMGREP_SERVER` gave it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Server {
     pub addr: String,
     pub env: bool,

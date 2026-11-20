@@ -273,10 +273,7 @@ fn search(
             .filter(|t| t.len() > 1 && t.starts_with('/') && t.ends_with('/'))
             .filter(|t| found_nothing(r, t))
         {
-            eprintln!(
-                "note: the pattern {t} matches its slashes too; write {} for what they hold",
-                &t[1..t.len() - 1]
-            );
+            say(Diagnostic::Slashes { pattern: t.clone() });
         }
     }
     let found = found.map_err(|e| match e {
@@ -430,10 +427,10 @@ fn find(
         });
     }
     if let Some(note) = note {
-        warn(&format!(
-            "Using local index {}{note}",
-            found.index_dir.display()
-        ));
+        say(Diagnostic::LocalIndex {
+            dir: found.index_dir.clone(),
+            note,
+        });
     }
     // `local` finds the index again, inside its spans.
     local(s.index.as_deref(), p, typed, s.json, out)
@@ -507,17 +504,16 @@ fn print_diagnostics(left_out: Vec<Diagnostic>) {
     }
 }
 
-/// `line` on stderr, as a warning.
-fn warn(line: &str) {
-    crate::held::line(&format!("warning: {line}"));
+/// One entry, printed at once.
+fn say(d: Diagnostic) {
+    print_diagnostics(vec![d]);
 }
 
 /// The one warning of a search whose local changes are ignored.
 fn degraded(why: &str) {
-    warn(&format!(
-        "local changes are ignored ({why}); these results are the server's alone; use \
-         --ignore-local-changes to avoid this warning"
-    ));
+    say(Diagnostic::Degraded {
+        why: why.to_owned(),
+    });
 }
 
 /// A search through `server`, on `conn`. With `ignore`
@@ -557,12 +553,10 @@ fn client(
             if crate::verbose::verbose() {
                 let pin =
                     (top.as_deref()).and_then(|top| crate::source::pin_path(top, &server.addr));
-                let pin = pin.map_or_else(|| "none".to_owned(), |p| p.display().to_string());
-                crate::held::line(&format!(
-                    "note: sent the query pinned to the served commit {}, which the pin {pin} \
-                     keeps, with no status request",
-                    checkout::short(id)
-                ));
+                say(Diagnostic::SentPinned {
+                    commit: id.clone(),
+                    pin,
+                });
             }
             let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone());
             if !crate::held::holding() || tried.is_ok() {
@@ -594,9 +588,10 @@ fn client(
         }
         other => {
             match other {
-                Some(Pinned::Damaged(why)) => {
-                    warn(&format!("{why}; asked {server} for its status"))
-                }
+                Some(Pinned::Damaged(why)) => say(Diagnostic::PinDamaged {
+                    why: why.clone(),
+                    server: server.clone(),
+                }),
                 // Outside a checkout no pin applies: no note.
                 None => {}
                 Some(_) => asked(server, "no pin of an earlier search"),
@@ -624,7 +619,10 @@ fn client(
 /// and `why`.
 fn asked(server: &Server, why: &str) {
     if crate::verbose::verbose() {
-        crate::held::line(&format!("note: asked {server} for its status ({why})"));
+        say(Diagnostic::Asked {
+            server: server.clone(),
+            why: why.to_owned(),
+        });
     }
 }
 

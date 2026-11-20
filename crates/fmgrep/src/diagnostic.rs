@@ -6,6 +6,15 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::checkout::short;
+use crate::remote::Server;
+use crate::verbose::{Us, plural};
+
+/// `d` as the verbose output writes a time.
+fn us(d: &Duration) -> Us {
+    Us(d.as_secs_f64() * 1e6)
+}
+
 /// A warning about how a load checked what changed since the index: why it
 /// checked every file, or why it could not keep what it learned. A server
 /// compares the last one it said with the next, and `status` prints them
@@ -120,6 +129,48 @@ pub enum Diagnostic {
     Check(Check),
     /// A server's note once watchman answers again after a warning.
     AnswersAgain,
+    /// A search that found a local index, and `note` of why it passed over
+    /// a server; `note` is the suffix that `status` prints too.
+    LocalIndex { dir: PathBuf, note: String },
+    /// A search through a server that cannot compare the checkout with the
+    /// served commit: the server's answer alone.
+    Degraded { why: String },
+    /// A pin that cannot be used; the search asked `server` for its status.
+    PinDamaged { why: String, server: Server },
+    /// Git was asked what differs from the served commit. `saved` is
+    /// whether the record could be saved for watchman to answer later.
+    AskedGit {
+        commit: String,
+        why: String,
+        took: Duration,
+        saved: bool,
+    },
+    /// Watchman cannot say what changed, and git was asked.
+    NoWatchman {
+        why: String,
+        commit: String,
+        took: Duration,
+    },
+    /// Under `FMGREP_VERBOSE`: the query went pinned to the served
+    /// `commit`, which `pin` keeps, with no status request.
+    SentPinned {
+        commit: String,
+        pin: Option<PathBuf>,
+    },
+    /// Under `FMGREP_VERBOSE`: the search asked `server` for its status.
+    Asked { server: Server, why: String },
+    /// Under `FMGREP_VERBOSE`: where the skip list came from, and how much
+    /// the client searches by itself.
+    LocalChanges {
+        source: &'static str,
+        skip: usize,
+        files: usize,
+        bytes: u64,
+        commit: String,
+        record: Option<PathBuf>,
+    },
+    /// A pattern `/x/` that found nothing: it matches its slashes too.
+    Slashes { pattern: String },
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -146,6 +197,84 @@ impl fmt::Display for Diagnostic {
             ),
             Self::Plan { text } => f.write_str(text.strip_suffix('\n').unwrap_or(text)),
             Self::Check(check) => write!(f, "warning: {check}"),
+            Self::LocalIndex { dir, note } => {
+                write!(f, "warning: Using local index {}{note}", dir.display())
+            }
+            Self::Degraded { why } => write!(
+                f,
+                "warning: local changes are ignored ({why}); these results are the server's \
+                 alone; use --ignore-local-changes to avoid this warning"
+            ),
+            Self::PinDamaged { why, server } => {
+                write!(f, "warning: {why}; asked {server} for its status")
+            }
+            Self::AskedGit {
+                commit,
+                why,
+                took,
+                saved,
+            } => {
+                let next = match saved {
+                    true => "later searches ask watchman",
+                    false => {
+                        "git's config files changed while git ran; the next search asks \
+                              git again"
+                    }
+                };
+                write!(
+                    f,
+                    "warning: asked git what differs from the served commit {} ({why}; took {}); \
+                     {next}",
+                    short(commit),
+                    us(took)
+                )
+            }
+            Self::NoWatchman { why, commit, took } => write!(
+                f,
+                "warning: watchman cannot say what changed ({why}); asked git what differs from \
+                 the served commit {} (took {})",
+                short(commit),
+                us(took)
+            ),
+            Self::SentPinned { commit, pin } => {
+                let pin = pin
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+                write!(
+                    f,
+                    "note: sent the query pinned to the served commit {}, which the pin {pin} \
+                     keeps, with no status request",
+                    short(commit)
+                )
+            }
+            Self::Asked { server, why } => {
+                write!(f, "note: asked {server} for its status ({why})")
+            }
+            Self::LocalChanges {
+                source,
+                skip,
+                files,
+                bytes,
+                commit,
+                record,
+            } => {
+                let record = record
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+                write!(
+                    f,
+                    "note: local changes from {source}: {skip} path{} on the skip list, {files} \
+                     file{} ({bytes} bytes) searched here; served commit {}; record {record}",
+                    plural(*skip),
+                    plural(*files),
+                    short(commit)
+                )
+            }
+            Self::Slashes { pattern } => write!(
+                f,
+                "note: the pattern {pattern} matches its slashes too; write {} for what they hold",
+                &pattern[1..pattern.len() - 1]
+            ),
             Self::AnswersAgain => {
                 write!(
                     f,
@@ -315,6 +444,117 @@ mod tests {
                     apply: ms,
                 },
                 "note: watchman reported 3 path(s) changed, 2 kept (ask 1.5ms, apply 1.5ms)",
+            ),
+        ];
+        for (d, line) in cases {
+            assert_eq!(d.to_string(), line);
+        }
+    }
+
+    /// The lines of a search through a server read as they always did.
+    #[test]
+    fn the_lines_of_the_client_read_as_before() {
+        use std::time::Duration;
+        let server = || crate::remote::Server {
+            addr: "127.0.0.1:47700".into(),
+            env: true,
+        };
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let took = Duration::from_millis(150);
+        let cases = [
+            (
+                Diagnostic::LocalIndex {
+                    dir: "/src/.fmgrep".into(),
+                    note: ", not the server at x (FMGREP_SERVER)".into(),
+                },
+                "warning: Using local index /src/.fmgrep, not the server at x (FMGREP_SERVER)",
+            ),
+            (
+                Diagnostic::Degraded {
+                    why: "git failed".into(),
+                },
+                "warning: local changes are ignored (git failed); these results are the \
+                 server's alone; use --ignore-local-changes to avoid this warning",
+            ),
+            (
+                Diagnostic::PinDamaged {
+                    why: "the pin p is malformed".into(),
+                    server: server(),
+                },
+                "warning: the pin p is malformed; asked the server at 127.0.0.1:47700 \
+                 (FMGREP_SERVER) for its status",
+            ),
+            (
+                Diagnostic::AskedGit {
+                    commit: id.into(),
+                    why: "no record".into(),
+                    took,
+                    saved: true,
+                },
+                "warning: asked git what differs from the served commit 0123456 (no record; \
+                 took 150.0 ms); later searches ask watchman",
+            ),
+            (
+                Diagnostic::AskedGit {
+                    commit: id.into(),
+                    why: "no record".into(),
+                    took,
+                    saved: false,
+                },
+                "warning: asked git what differs from the served commit 0123456 (no record; \
+                 took 150.0 ms); git's config files changed while git ran; the next search \
+                 asks git again",
+            ),
+            (
+                Diagnostic::NoWatchman {
+                    why: "no daemon".into(),
+                    commit: id.into(),
+                    took,
+                },
+                "warning: watchman cannot say what changed (no daemon); asked git what differs \
+                 from the served commit 0123456 (took 150.0 ms)",
+            ),
+            (
+                Diagnostic::SentPinned {
+                    commit: id.into(),
+                    pin: Some("/cache/p.pin".into()),
+                },
+                "note: sent the query pinned to the served commit 0123456, which the pin \
+                 /cache/p.pin keeps, with no status request",
+            ),
+            (
+                Diagnostic::SentPinned {
+                    commit: id.into(),
+                    pin: None,
+                },
+                "note: sent the query pinned to the served commit 0123456, which the pin none \
+                 keeps, with no status request",
+            ),
+            (
+                Diagnostic::Asked {
+                    server: server(),
+                    why: "no pin of an earlier search".into(),
+                },
+                "note: asked the server at 127.0.0.1:47700 (FMGREP_SERVER) for its status \
+                 (no pin of an earlier search)",
+            ),
+            (
+                Diagnostic::LocalChanges {
+                    source: "git, a new baseline",
+                    skip: 1,
+                    files: 2,
+                    bytes: 30,
+                    commit: id.into(),
+                    record: None,
+                },
+                "note: local changes from git, a new baseline: 1 path on the skip list, 2 files \
+                 (30 bytes) searched here; served commit 0123456; record none",
+            ),
+            (
+                Diagnostic::Slashes {
+                    pattern: "/x+/".into(),
+                },
+                "note: the pattern /x+/ matches its slashes too; write x+ for what they hold",
             ),
         ];
         for (d, line) in cases {

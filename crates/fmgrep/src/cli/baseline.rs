@@ -16,7 +16,7 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use super::params::QueryParams;
-use crate::checkout::{Local, changes, resolve, short};
+use crate::checkout::{Local, changes, resolve};
 use crate::diagnostic::Diagnostic;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
@@ -67,15 +67,12 @@ pub fn skip_list(
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
-                crate::held::then(
-                    &format!(
-                        "warning: watchman cannot say what changed ({why}); asked git what \
-                         differs from the served commit {} (took {})",
-                        short(commit),
-                        crate::verbose::Us(took.as_secs_f64() * 1e6)
-                    ),
-                    said,
-                );
+                let d = Diagnostic::NoWatchman {
+                    why,
+                    commit: commit.to_owned(),
+                    took,
+                };
+                crate::held::then(&d.to_string(), said);
             }
             note(
                 top,
@@ -106,15 +103,12 @@ pub fn skip_list(
         remember(top, &of, token, skip.clone(), extra);
     }
     let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
-    let next = match same {
-        true => "later searches ask watchman",
-        false => "git's config files changed while git ran; the next search asks git again",
-    };
-    super::warn(&format!(
-        "asked git what differs from the served commit {} ({why}; took {}); {next}",
-        short(commit),
-        crate::verbose::Us(took.as_secs_f64() * 1e6)
-    ));
+    super::say(Diagnostic::AskedGit {
+        commit: commit.to_owned(),
+        why,
+        took,
+        saved: same,
+    });
     let source = "git, a new baseline";
     note(top, same.then_some(&of), commit, source, &skip, &local, p);
     Ok((skip, local))
@@ -139,7 +133,7 @@ fn note(
     top: &Path,
     of: Option<&Of>,
     commit: &str,
-    source: &str,
+    source: &'static str,
     skip: &[String],
     local: &Local,
     p: &QueryParams,
@@ -147,24 +141,21 @@ fn note(
     if !crate::verbose::verbose() {
         return;
     }
-    let record = of
-        .and_then(|of| crate::source::record_path(top, of))
-        .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
+    let record = of.and_then(|of| crate::source::record_path(top, of));
     let (n, bytes) = match p.filter() {
         Ok(Some(f)) => {
             (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i]))
         }
         _ => (local.files.len(), local.bytes),
     };
-    let s = skip.len();
-    crate::held::line(&format!(
-        "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
-         searched here; served commit {}; record {record}",
-        crate::verbose::plural(s),
-        crate::verbose::plural(n),
+    super::say(Diagnostic::LocalChanges {
+        source,
+        skip: skip.len(),
+        files: n,
         bytes,
-        short(commit)
-    ));
+        commit: commit.to_owned(),
+        record,
+    });
 }
 
 /// The baseline plus what watchman says `changed`, when the variables
