@@ -112,6 +112,50 @@ fn rg_flags_set_the_params() {
 }
 
 #[test]
+fn the_last_case_flag_wins_and_smart_case_reads_the_patterns() {
+    for (words, ignore) in [
+        (&["-i", "x"][..], true),
+        (&["-s", "x"], false),
+        (&["-i", "-s", "x"], false),
+        (&["-s", "-i", "x"], true),
+        (&["-i", "-S", "Foo"], false),
+        (&["-S", "-i", "Foo"], true),
+        (&["-S", "-s", "foo"], false),
+        // Smart case: some literal, and none of them uppercase.
+        (&["-S", "foo"], true),
+        (&["-S", "Foo"], false),
+        (&["-S", "fOo"], false),
+        (&["-S", "foo", "Bar"], false),
+        (&["-S", "foo", "bar"], true),
+        (&["-S", "foo.*\\w"], true),
+        (&["-S", "\\S+"], false),
+        (&["-S", "\\p{Lu}foo"], true),
+        (&["-S", "foo[A-Z]"], false),
+        (&["-S", "\\w+\\.rs"], true),
+        (&["-S", "a\\.B"], false),
+        (&["-S", "-F", "a.B"], false),
+        (&["-S", "-F", "a.b"], true),
+        (&["-S", "-F", "\\S"], false),
+        (&["-S", "-F", "\\s"], true),
+        (&["-S", ""], false),
+        (&["-S", "("], false),
+        (&["-S", "--and", "foo", "Bar"], false),
+        (&["-S", "--or", "foo", "bar"], true),
+        (&["-S", "--expr", "foo AND /ba+/"], true),
+        (&["-S", "--expr", "foo AND Bar"], false),
+        (
+            &["-S", "--expr-json", r#"{"or":[{"term":"a"},{"term":"B"}]}"#],
+            false,
+        ),
+    ] {
+        assert_eq!(params(words).ignore_case, ignore, "{words:?}");
+    }
+    // -s and -S need no wire field: a request carries what they decided.
+    assert_eq!(params(&["-s", "x"]), params(&["x"]));
+    assert_eq!(params(&["-S", "x"]), params(&["-i", "x"]));
+}
+
+#[test]
 fn last_mode_flag_wins() {
     for (words, want) in [
         (&["-c", "-l"][..], Mode::Files),
