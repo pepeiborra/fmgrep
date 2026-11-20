@@ -98,15 +98,15 @@ fn do_index(docs: &Path, store_docs: bool) -> PathBuf {
     index
 }
 
-/// `--index <index> --json [--regex] -- <terms>`.
-fn query_argv(index: &Path, regex: bool, terms: &[&str]) -> Vec<String> {
+/// `--index <index> --json [-F] -- <terms>`.
+fn query_argv(index: &Path, fixed: bool, terms: &[&str]) -> Vec<String> {
     let mut argv = vec![
         "--index".to_string(),
         index.display().to_string(),
         "--json".into(),
     ];
-    if regex {
-        argv.push("--regex".into());
+    if fixed {
+        argv.push("-F".into());
     }
     argv.push("--".into());
     argv.extend(terms.iter().map(|t| t.to_string()));

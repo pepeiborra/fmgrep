@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use fmgrep::regex_pattern;
+use crate::regex_pattern;
 use serde_json::Value;
 
 use crate::report::bytes;

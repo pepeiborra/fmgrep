@@ -1,10 +1,8 @@
 use super::*;
 
 #[test]
-fn regex_marker_runs_every_term_as_pattern_verbatim() {
-    // Under --regex even a `/.../`-wrapped term is a pattern verbatim: the
-    // marker wins over the slash convention. A pattern that is nothing but
-    // a literal counts as the literal does.
+fn a_term_is_a_pattern_and_a_slash_is_part_of_it() {
+    // A pattern that is nothing but a literal counts as the literal does.
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let folder = stage_corpus(
@@ -13,7 +11,7 @@ fn regex_marker_runs_every_term_as_pattern_verbatim() {
         );
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let out = query_it(&output, true, &["/printk/", "pr[i1]ntk", "(aa)", "aa"]);
+        let out = query_it(&output, false, &["/printk/", "pr[i1]ntk", "(aa)", "aa"]);
         assert_eq!(out.queries[0].term, "/printk/", "store_docs={store_docs}");
         assert_eq!(out.queries[0].total_matches, 0, "store_docs={store_docs}");
         assert_eq!(out.queries[1].total_matches, 2, "store_docs={store_docs}");
@@ -27,19 +25,24 @@ fn regex_marker_runs_every_term_as_pattern_verbatim() {
 }
 
 #[test]
-fn human_driven_slash_terms_take_the_regex_path() {
+fn fixed_strings_search_every_term_as_the_text_it_is() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
-        let folder = stage_corpus(tmp.path(), &[("a.c", b"printk hello printk")]);
+        let folder = stage_corpus(
+            tmp.path(),
+            &[("a.c", b"printk(x) a.b axb"), ("b.c", b"aaaa a+b")],
+        );
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let out = query_it(&output, false, &["/pr[i1]ntk/", "printk"]);
-        assert_eq!(
-            out.queries[0].term, "/pr[i1]ntk/",
-            "store_docs={store_docs}"
-        );
-        assert_eq!(out.queries[0].total_matches, 2, "store_docs={store_docs}");
-        assert_eq!(out.queries[1].total_matches, 2, "store_docs={store_docs}");
+        let terms = ["printk(", "a.b", "a+b", "(aa)", "a|b"];
+        let fixed = query_it(&output, true, &terms);
+        let totals: Vec<_> = fixed.queries.iter().map(|q| q.total_matches).collect();
+        assert_eq!(totals, [1, 1, 1, 0, 0], "store_docs={store_docs}");
+        // As patterns, the same terms are other searches, or errors.
+        assert!(query_it_err(&output, false, &["printk("]).contains("unclosed group"));
+        let regex = query_it(&output, false, &terms[1..]);
+        let totals: Vec<_> = regex.queries.iter().map(|q| q.total_matches).collect();
+        assert_eq!(totals, [3, 0, 2, 10], "store_docs={store_docs}");
     }
 }
 
@@ -50,14 +53,14 @@ fn invalid_patterns_fail_loudly_never_silent() {
         let folder = stage_corpus(tmp.path(), &[("a.c", b"printk hello")]);
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let err = query_it_err(&output, true, &["printk", "(["]);
+        let err = query_it_err(&output, false, &["printk", "(["]);
         assert!(
             err.starts_with("error: invalid regex pattern"),
             "got: {err}"
         );
         assert!(err.contains("(["), "must name the pattern: {err}");
         // `//` strips to the empty pattern: loud rejection.
-        let err = query_it_err(&output, false, &["//"]);
+        let err = query_it_err(&output, false, &[""]);
         assert!(err.contains("empty"), "must reject empty: {err}");
     }
 }
@@ -90,7 +93,7 @@ fn literal_query_needs_no_raw_bytes() {
         2
     );
     assert_eq!(
-        query_it(&output, false, &["a\0b"]).queries[0].total_matches,
+        query_it(&output, true, &["a\0b"]).queries[0].total_matches,
         0
     );
 }
@@ -106,7 +109,7 @@ fn regex_fetches_only_unpruned_candidates() {
     );
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    let out = query_it(&output, true, &["pr[i1]ntk", "pr[i1]ntk", "missing"]);
+    let out = query_it(&output, false, &["pr[i1]ntk", "pr[i1]ntk", "missing"]);
     assert_eq!(out.queries[0].total_matches, 2);
     assert_eq!(out.queries[0].docs_matched, 1);
     assert_eq!(out.queries[1].total_matches, 2);
@@ -115,10 +118,10 @@ fn regex_fetches_only_unpruned_candidates() {
     // A fully-pruned pattern is exact with no shard; a candidate-bearing one
     // is loud.
     assert_eq!(
-        query_it(&output, true, &["missing"]).queries[0].total_matches,
+        query_it(&output, false, &["missing"]).queries[0].total_matches,
         0
     );
-    let err = query_it_err(&output, true, &["pr[i1]ntk"]);
+    let err = query_it_err(&output, false, &["pr[i1]ntk"]);
     assert!(
         err.contains("cannot read") && err.contains(DOCS_SHARD),
         "got: {err}"
@@ -132,7 +135,7 @@ fn regex_fetches_only_unpruned_candidates() {
     assert_eq!(swapped.len(), shard.len());
     std::fs::write(output.join(DOCS_SHARD), &swapped).unwrap();
     assert_eq!(
-        query_it(&output, true, &["pr[i1]ntk"]).queries[0].total_matches,
+        query_it(&output, false, &["pr[i1]ntk"]).queries[0].total_matches,
         0,
         "regex must follow the swapped bytes"
     );
@@ -146,8 +149,7 @@ fn regex_fetches_only_unpruned_candidates() {
 
 #[test]
 fn a_plain_literal_pattern_reads_no_file() {
-    // Under `--regex` a pattern that is nothing but a literal is located
-    // as a bare term is: `-l` and the counts need no shard, where a pattern
+    // A pattern that is nothing but a literal is located as a bare term is: `-l` and the counts need no shard, where a pattern
     // with a class reads every candidate.
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(
@@ -162,7 +164,7 @@ fn a_plain_literal_pattern_reads_no_file() {
         ("a\\.b", "a.c\nb.c\n"),
         ("hello a\\.b", "a.c\n"),
     ] {
-        assert_eq!(printed(&output, &["-l", "--regex"], &[plain]), files);
+        assert_eq!(printed(&output, &["-l"], &[plain]), files);
     }
     // So is a regex leaf of an expression, whose answer is the same.
     assert_eq!(
@@ -171,11 +173,27 @@ fn a_plain_literal_pattern_reads_no_file() {
     );
     // A class, an alternation and a metacharacter read the candidates.
     for regex in ["pr[i1]ntk", "printk|nothing", "a.b"] {
-        let err = query(&output, &["-l", "--regex"], &[regex]).unwrap_err();
+        let err = query(&output, &["-l"], &[regex]).unwrap_err();
         assert!(err.contains("cannot read"), "{regex}: {err}");
     }
     let err = query(&output, &["-l", "--expr", "/printk/ AND /pr[i1]ntk/"], &[]).unwrap_err();
     assert!(err.contains("cannot read"), "{err}");
+}
+
+#[test]
+fn a_pattern_that_needs_a_nul_is_refused_as_in_rg() {
+    // rg's binary detection makes a NUL impossible to match, and says so.
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(tmp.path(), &[("a.c", b"abc\nfoo\n")]);
+    let output = tmp.path().join("idx");
+    index_it(&folder, &output, true);
+    for pattern in ["\\x00", "a\\x00b", "[\\x00]", "\\x00*", "\\x00a|b"] {
+        let err = query(&output, &["-c"], &[pattern]).unwrap_err();
+        assert!(err.contains("impossible to match"), "{pattern}: {err}");
+    }
+    // A class loses the NUL, an alternative that can match stays.
+    assert_eq!(printed(&output, &["-c"], &["a|\\x00"]), "a.c:1\n");
+    assert_eq!(printed(&output, &["-c"], &["[\\x00-\\x01]"]), "");
 }
 
 /// Files-layout and stored-docs indexes of `files`, then `a.c` made unopenable:
@@ -205,7 +223,7 @@ fn literal_pattern_counts_without_fetch() {
         .collect();
     let tmp = tempfile::tempdir().unwrap();
     let (output, shard) = unreadable_files_index(tmp.path(), &files);
-    let out = query_it(&output, false, &["/printk\\(/"]);
+    let out = query_it(&output, false, &["printk\\("]);
     let q = &out.queries[0];
     assert_eq!(q.total_matches, per_doc.iter().sum::<u64>());
     assert_eq!(q.docs_matched, per_doc.iter().filter(|&&c| c > 0).count());
@@ -214,7 +232,7 @@ fn literal_pattern_counts_without_fetch() {
     // A stored-docs index keeps reading its live docs.shard for a pattern
     // that is more than a literal.
     std::fs::rename(shard.join(DOCS_SHARD), shard.join("hidden")).unwrap();
-    assert!(query_it_err(&shard, false, &["/printk\\(+/"]).contains("cannot read"));
+    assert!(query_it_err(&shard, false, &["printk\\(+"]).contains("cannot read"));
 }
 
 #[test]
@@ -223,7 +241,7 @@ fn non_literal_patterns_still_fetch() {
     let tmp = tempfile::tempdir().unwrap();
     let (output, _) = unreadable_files_index(tmp.path(), &files);
     // The only doc matches every term: a zero proves the fetch.
-    for term in ["/(aa)/", "/(caf\u{e9})/", "/a\nb/"] {
+    for term in ["(aa)", "(caf\u{e9})", "a\nb"] {
         assert_eq!(
             query_it(&output, false, &[term]).queries[0].total_matches,
             0,
@@ -273,7 +291,7 @@ fn empty_docs_index_and_query_exactly() {
         assert_eq!(out.queries[0].docs_matched, 1, "store_docs={store_docs}");
         assert_eq!(out.queries[1].total_matches, 0, "store_docs={store_docs}");
         assert_eq!(out.num_files_indexed, 4, "store_docs={store_docs}");
-        let out = query_it(&output, true, &["pr[i1]ntk"]);
+        let out = query_it(&output, false, &["pr[i1]ntk"]);
         assert_eq!(out.queries[0].total_matches, 2, "store_docs={store_docs}");
     }
 }
@@ -351,7 +369,7 @@ fn counts_exact_marks_only_rg_exact_terms() {
     let want = [
         ("printk", true),
         ("aa", false),
-        ("/pr[i1]ntk/", false),
+        ("pr[i1]ntk", false),
         ("a\nb", false),
     ];
     let terms: Vec<&str> = want.iter().map(|&(t, _)| t).collect();
@@ -382,13 +400,13 @@ fn batch_drive_matches_per_term_answers() {
     ];
     let want = [
         ("printk", 3u64, 2usize),
-        ("/pr[i1]ntk/", 3, 2),
+        ("pr[i1]ntk", 3, 2),
         // Literals count overlapping, regexes do not; a pattern that is
         // nothing but a literal is one.
         ("aa", 3, 1),
-        ("/aa/", 3, 1),
-        ("/(aa)/", 2, 1),
-        ("/no|tail/", 1, 1),
+        ("aa", 3, 1),
+        ("(aa)", 2, 1),
+        ("no|tail", 1, 1),
         ("missing", 0, 0),
     ];
     let terms: Vec<&str> = want.iter().map(|&(t, _, _)| t).collect();
@@ -425,7 +443,7 @@ fn ignore_case_runs_every_term_as_a_pattern() {
         );
         let output = tmp.path().join("idx");
         index_it(&folder, &output, store_docs);
-        let out = query(&output, &["-i"], &["hscenv", "h.c"]).unwrap();
+        let out = query(&output, &["-i", "-F"], &["hscenv", "h.c"]).unwrap();
         assert_eq!(out.queries[0].total_matches, 3, "store_docs={store_docs}");
         assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
         // `.` stays literal, so `h.c` matches the text `h.c` only.
@@ -444,7 +462,7 @@ fn ignore_case_keeps_the_empty_term_matching_nothing() {
     let folder = stage_corpus(tmp.path(), &[("a.c", b"HscEnv\n")]);
     let output = tmp.path().join("idx");
     index_it(&folder, &output, true);
-    for flags in [&[][..], &["-i"]] {
+    for flags in [&["-F"][..], &["-i", "-F"]] {
         let out = query(&output, flags, &[""]).unwrap();
         assert_eq!(out.queries[0].total_matches, 0, "flags={flags:?}");
     }
@@ -473,18 +491,15 @@ fn stale_doc_counts_its_current_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let (folder, output) = files_index(tmp.path());
     std::fs::write(folder.join("a.c"), b"printk changed\nprintk printk\n").unwrap();
-    for (regex, term) in [(false, "printk"), (true, "pr[i1]ntk")] {
+    for (exact, term) in [(true, "printk"), (false, "pr[i1]ntk")] {
         assert_eq!(
-            totals(&query_it(&output, regex, &[term])),
-            [(3, 1, !regex)],
+            totals(&query_it(&output, false, &[term])),
+            [(3, 1, exact)],
             "{term}"
         );
     }
     assert_eq!(printed(&output, &["-c"], &["printk"]), "a.c:2\n");
-    assert_eq!(
-        printed(&output, &["-c", "--regex"], &["pr[i1]ntk"]),
-        "a.c:2\n"
-    );
+    assert_eq!(printed(&output, &["-c"], &["pr[i1]ntk"]), "a.c:2\n");
 }
 
 #[test]
@@ -497,7 +512,7 @@ fn stale_doc_outside_the_indexed_answer_is_found() {
         [(3, 2, true), (0, 0, true)]
     );
     assert_eq!(
-        totals(&query_it(&output, true, &["pr[i1]ntk"])),
+        totals(&query_it(&output, false, &["pr[i1]ntk"])),
         [(3, 2, false)]
     );
 }
@@ -507,9 +522,9 @@ fn missing_doc_is_excluded_from_every_term() {
     let tmp = tempfile::tempdir().unwrap();
     let (folder, output) = files_index(tmp.path());
     std::fs::remove_file(folder.join("a.c")).unwrap();
-    let out = query_it(&output, false, &["printk", "/pr[i1]ntk/", "here"]);
+    let out = query_it(&output, false, &["printk", "pr[i1]ntk", "here"]);
     assert_eq!(totals(&out), [(0, 0, true), (0, 0, false), (1, 1, true)]);
-    assert_eq!(printed(&output, &["-l"], &["/[a-z]+/"]), "b.c\n");
+    assert_eq!(printed(&output, &["-l"], &["[a-z]+"]), "b.c\n");
 }
 
 /// `stale` answers `terms`, and prints each of `printed_terms`, as `fresh`
@@ -564,8 +579,8 @@ fn stale_tree_answers_like_a_fresh_index() {
     std::fs::remove_file(folder.join("d.c")).unwrap();
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
-    let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/"];
-    answers_like(&stale, &fresh, &terms, &["printk", "/pr[i1]ntk/", "aa"]);
+    let terms = ["printk", "pr[i1]ntk", "aa", "a+"];
+    answers_like(&stale, &fresh, &terms, &["printk", "pr[i1]ntk", "aa"]);
 }
 
 #[test]
@@ -592,8 +607,8 @@ fn added_tree_answers_like_a_fresh_index() {
     std::fs::write(folder.join("d.c"), b"back printk printk\n").unwrap();
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
-    let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
-    answers_like(&stale, &fresh, &terms, &["printk", "/pr[i1]ntk/", "aa"]);
+    let terms = ["printk", "pr[i1]ntk", "aa", "a+", "deep"];
+    answers_like(&stale, &fresh, &terms, &["printk", "pr[i1]ntk", "aa"]);
     assert_eq!(
         printed(&stale, &["-l"], &["printk"]),
         "a.c\nb.c\nc.c\nd.c\ne.c\nnew/deep/n.c\n"
@@ -645,8 +660,8 @@ fn pruned_added_tree_answers_like_a_fresh_index() {
     std::fs::write(folder.join("kb/k.dat"), b"printk\0binary").unwrap();
     let fresh = tmp.path().join("fresh");
     index_it(&folder, &fresh, false);
-    let terms = ["printk", "/pr[i1]ntk/", "aa", "/a+/", "deep"];
-    let printed_terms = ["printk", "/pr[i1]ntk/", "aa", "deep", "now"];
+    let terms = ["printk", "pr[i1]ntk", "aa", "a+", "deep"];
+    let printed_terms = ["printk", "pr[i1]ntk", "aa", "deep", "now"];
     answers_like(&stale, &fresh, &terms, &printed_terms);
 }
 
@@ -715,7 +730,7 @@ fn files_index_answers_like_the_stored_docs_index() {
     let (folder, output) = files_index(tmp.path());
     let shard = tmp.path().join("idx-shard");
     index_it(&folder, &shard, true);
-    let terms = ["printk", "/pr[i1]ntk/", "/no|tail/", "missing"];
+    let terms = ["printk", "pr[i1]ntk", "no|tail", "missing"];
     let counts = |r: OutputReport| {
         r.queries
             .iter()
@@ -737,13 +752,13 @@ fn moved_tree_answers_through_its_dotdir() {
     index_it(&folder, &folder.join(INDEX_DIR), false);
     let moved = tmp.path().join("moved");
     std::fs::rename(&folder, &moved).unwrap();
-    let err = query_it_err(&output, true, &["pr[i1]ntk"]);
+    let err = query_it_err(&output, false, &["pr[i1]ntk"]);
     assert!(
         err.contains("is not a directory") && err.contains("fmgrep index"),
         "got: {err}"
     );
     for start in [moved.join(INDEX_DIR), moved.clone()] {
-        let out = query_it(&start, true, &["pr[i1]ntk"]);
+        let out = query_it(&start, false, &["pr[i1]ntk"]);
         assert_eq!(out.queries[0].total_matches, 2, "{}", start.display());
     }
 }

@@ -88,9 +88,9 @@ fn every_mode_sees_only_filtered_documents() {
         for flags in MODES {
             for terms in [
                 &["printk"][..],
-                &["/al[a-z]ha/"],
+                &["al[a-z]ha"],
                 &["printk", "alpha"],
-                &["/^/"],
+                &["^"],
             ] {
                 same(&all, &kept, &FILTER, flags, terms);
             }
@@ -118,10 +118,10 @@ fn a_regex_without_candidates_reads_only_kept_files() {
         .unwrap();
     shard.set_len(offsets[manifest.files.len() - 1]).unwrap();
     assert_eq!(
-        printed(&all, &[&FILTER[..], &["-c"]].concat(), &["/^/"]),
+        printed(&all, &[&FILTER[..], &["-c"]].concat(), &["^"]),
         "a.c:2\nsub/c.c:2\n"
     );
-    assert!(query(&all, &["-c"], &["/^/"]).is_err());
+    assert!(query(&all, &["-c"], &["^"]).is_err());
 }
 
 #[cfg(unix)]
@@ -134,7 +134,7 @@ fn stale_and_added_files_are_filtered() {
     std::fs::create_dir_all(all.join("new")).unwrap();
     std::fs::write(all.join("new/n.c"), "printk added\n").unwrap();
     std::fs::write(all.join("new/n.h"), "printk added\n").unwrap();
-    for flags in [&[][..], &["--regex"]] {
+    for flags in [&[][..], &["-F"]] {
         assert_eq!(
             printed(&all, &[&FILTER[..], flags, &["-l"]].concat(), &["printk"]),
             "a.c\nnew/n.c\nsub/c.c\n",
@@ -282,7 +282,7 @@ fn filtered_answers_match_on_a_multi_shard_index() {
         assert!(read_manifest(&all.join(INDEX_DIR)).unwrap().blobs.len() > 2);
         let sub = |tree: &Path| tree.join("sub").display().to_string();
         for flags in MODES {
-            for terms in [&["printk"][..], &["/al[a-z]ha/"], &["printk", "alpha"]] {
+            for terms in [&["printk"][..], &["al[a-z]ha"], &["printk", "alpha"]] {
                 same(&all, &kept, &["-g", "sub/**"], flags, terms);
                 same(&all, &kept, &["-g", "/sub/*"], flags, terms);
                 let pathed = |tree: &Path| {
@@ -313,7 +313,7 @@ fn reading_instead_of_locating_answers_alike() {
         for band in [(0.0, 0.0), (f64::INFINITY, f64::INFINITY)] {
             crate::tests::BAND.set(Some(band));
             for flags in MODES {
-                for terms in [&["printk"][..], &["printk", "/al[a-z]ha/"]] {
+                for terms in [&["printk"][..], &["printk", "al[a-z]ha"]] {
                     same(&all, &kept, &["-g", "sub/**"], flags, terms);
                 }
             }

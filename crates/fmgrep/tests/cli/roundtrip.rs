@@ -27,6 +27,69 @@ fn human_output_is_readable() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "a.bin:1\nb.bin:1\n");
 }
 
+/// A TERM is a regex, as in rg; `-F` makes it the text it is.
+#[test]
+fn a_term_is_a_regex_and_f_makes_it_a_literal() {
+    let (_tmp, docs) = stage_files(&[
+        ("a.txt", b"call foo(bar)\nx a.b y\naxb\n/a.b/\n"),
+        ("b.txt", b"nothing\n"),
+    ]);
+    let index_dir = do_index(&docs, false);
+    let index = index_dir.display().to_string();
+    let search =
+        |args: &[&str]| run(&[&["--index", &index, "--no-heading", "-N"][..], args].concat());
+    let text = |args: &[&str]| String::from_utf8_lossy(&search(args).stdout).into_owned();
+    // The dot matches any character, as in rg; -F matches a dot.
+    assert_eq!(text(&["a.b"]), "a.txt:x a.b y\na.txt:axb\na.txt:/a.b/\n");
+    assert_eq!(text(&["-F", "a.b"]), "a.txt:x a.b y\na.txt:/a.b/\n");
+    // The slashes of /a.b/ are text, not a delimiter.
+    assert_eq!(text(&["/a.b/"]), "a.txt:/a.b/\n");
+    let none = search(&["/a.c/"]);
+    assert_eq!(none.status.code(), Some(1));
+    assert!(
+        stderr(&none).contains("the pattern /a.c/ matches its slashes too"),
+        "{}",
+        stderr(&none)
+    );
+    // A search of several patterns says it of each one that found nothing.
+    let some = search(&["foo", "/a.c/", "/a.b/"]);
+    assert!(some.status.success());
+    assert_eq!(
+        stderr(&some).matches("matches its slashes too").count(),
+        1,
+        "{}",
+        stderr(&some)
+    );
+    assert!(stderr(&some).contains("/a.c/"), "{}", stderr(&some));
+    let leaf = search(&["-c", "--or", "foo", "/a.c/"]);
+    assert!(leaf.status.success());
+    assert!(stderr(&leaf).contains("/a.c/"), "{}", stderr(&leaf));
+    // A pattern that is not a regex is an error, with the way out.
+    let bad = search(&["foo("]);
+    assert_eq!(bad.status.code(), Some(2));
+    let said = stderr(&bad);
+    assert!(said.contains("unclosed group"), "{said}");
+    assert!(
+        said.ends_with("hint: to search for the text as it is, pass -F\n"),
+        "{said}"
+    );
+    assert_eq!(text(&["-F", "foo("]), "a.txt:call foo(bar)\n");
+    // A NUL is refused as rg refuses it, and -F is no way out of that.
+    let nul = search(&["a\\x00b"]);
+    assert_eq!(nul.status.code(), Some(2));
+    let said = stderr(&nul);
+    assert!(said.contains("impossible to match"), "{said}");
+    assert!(!said.contains("hint:"), "{said}");
+    // v0.1.0's flag still works, and means what the bare TERM means now.
+    assert_eq!(text(&["--regex", "a.b"]), text(&["a.b"]));
+    assert_eq!(search(&["-F", "--regex", "a"]).status.code(), Some(2));
+    assert_eq!(search(&["-F", "--expr", "a"]).status.code(), Some(2));
+    // -F reads --and and --or leaves as literals.
+    assert_eq!(text(&["-l", "--and", "a.b", "foo("]), "");
+    assert_eq!(text(&["-l", "--and", "-F", "a.b", "foo\\("]), "");
+    assert_eq!(text(&["-l", "--and", "a.b", "foo\\("]), "a.txt\n");
+}
+
 #[test]
 fn index_refuses_to_overwrite_and_reports_argv_errors() {
     let (_tmp, docs) = stage();
@@ -109,8 +172,8 @@ fn missing_file_is_warned_once_and_excluded() {
     let (_tmp, docs) = stage();
     let index_dir = do_index(&docs, false);
     std::fs::remove_file(docs.join("a.bin")).unwrap();
-    for (regex, terms) in [(false, ["printk", "hello"]), (true, ["pr[i1]ntk", "h.llo"])] {
-        let out = run(&query_argv(&index_dir, regex, &terms));
+    for terms in [["printk", "hello"], ["pr[i1]ntk", "h.llo"]] {
+        let out = run(&query_argv(&index_dir, false, &terms));
         let stderr = stderr(&out);
         assert!(out.status.success(), "{stderr}");
         assert_eq!(stderr.matches("warning:").count(), 1, "{stderr}");
@@ -630,11 +693,11 @@ fn a_long_anchor_reads_only_matching_docs() {
     ]);
     let index_dir = do_index(&docs, false);
     std::fs::set_permissions(docs.join("a.c"), std::fs::Permissions::from_mode(0o000)).unwrap();
-    let out = run(&query_argv(&index_dir, true, &["union[ \\t]+\\{"]));
+    let out = run(&query_argv(&index_dir, false, &["union[ \\t]+\\{"]));
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(counts(&out.stdout), [(1, 1)]);
     let index = index_dir.display().to_string();
-    let out = run(&["--index", &index, "-c", "/union[ \\t]+\\{/"]);
+    let out = run(&["--index", &index, "-c", "union[ \\t]+\\{"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "b.c:1\n");
     assert!(!stderr(&out).contains("excluding"));
 }

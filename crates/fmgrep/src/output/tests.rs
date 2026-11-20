@@ -384,11 +384,11 @@ fn a_leading_bom_is_absent_from_the_printed_line() {
         ("plain.c", b"module Bar where\n"),
     ];
     assert_eq!(
-        String::from_utf8(render(cfg(Format::Lines), MATCHES, &DOCS, &["/^module/"])).unwrap(),
+        String::from_utf8(render(cfg(Format::Lines), MATCHES, &DOCS, &["^module"])).unwrap(),
         "bom.c\n1:module Foo where\n\nplain.c\n1:module Bar where\n"
     );
     assert_eq!(
-        String::from_utf8(render(cfg(Format::Lines), only(MATCHES), &DOCS, &["/o+/"])).unwrap(),
+        String::from_utf8(render(cfg(Format::Lines), only(MATCHES), &DOCS, &["o+"])).unwrap(),
         "bom.c\n1:o\n1:oo\n2:o\n\nplain.c\n1:o\n"
     );
 }
