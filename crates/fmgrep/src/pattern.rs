@@ -18,6 +18,12 @@ pub fn count_overlapping(haystack: &[u8], finder: &memchr::memmem::Finder<'_>) -
     count
 }
 
+/// The lines of `raw`: a last line needs no terminator.
+fn line_count(raw: &[u8]) -> u64 {
+    let ends = memchr::memchr_iter(b'\n', raw).count() as u64;
+    ends + u64::from(raw.last().is_some_and(|&b| b != b'\n'))
+}
+
 /// Inputs longer than this never seed the quadratic
 /// [`longest_common_substring`].
 const ANCHOR_LEN_CAP: usize = 1024;
@@ -165,6 +171,8 @@ pub struct PreparedPattern {
     fold: Option<FoldPlan>,
     automaton: Option<RegexPlan>,
     deferred: Option<DeferredPlan>,
+    /// The empty pattern, which matches every line.
+    empty: bool,
 }
 
 /// The anchor of a parsed pattern: its required literal, unless that literal
@@ -193,16 +201,11 @@ impl PreparedPattern {
         Self::prepare_with(pattern, MatchMode::default())
     }
 
-    /// Compile `pattern` under `mode`; empty and invalid patterns are a
-    /// [`RegexError`] naming it. Every prune comes from one HIR parsed with
+    /// Compile `pattern` under `mode`; an invalid pattern is a
+    /// [`RegexError`] naming it. The empty pattern matches every line, as in
+    /// rg, and narrows nothing. Every prune comes from one HIR parsed with
     /// the matcher's flags; [`Self::count`]'s regex carries only `-i`.
     pub fn prepare_with(pattern: &str, mode: MatchMode) -> Result<Self, RegexError> {
-        if pattern.is_empty() {
-            return Err(RegexError::new(
-                pattern,
-                "empty regex pattern: rejected by the native-regex contract (not match-everywhere)",
-            ));
-        }
         let re = regex::bytes::RegexBuilder::new(pattern)
             .case_insensitive(mode.ignore_case)
             .build()
@@ -245,6 +248,7 @@ impl PreparedPattern {
             fold,
             automaton,
             deferred,
+            empty: pattern.is_empty(),
         })
     }
 
@@ -262,6 +266,10 @@ impl PreparedPattern {
     /// Exact non-overlapping count over `raw`: `find_iter` is the pinned
     /// `Matches` semantics (`/aa/` on `"aaaa"` is 2).
     pub fn count(&self, raw: &[u8]) -> u64 {
+        if self.empty {
+            // Every line holds one match; the bytes between positions do not.
+            return line_count(raw);
+        }
         self.re.find_iter(raw).count() as u64
     }
 
@@ -481,12 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_empty_and_invalid_loudly() {
-        for bad in ["", "(["] {
-            match PreparedPattern::prepare(bad) {
-                Err(e) => assert_eq!(e.pattern, bad, "must name the pattern"),
-                Ok(_) => panic!("pattern {bad:?} must be rejected"),
-            }
+    fn prepare_rejects_invalid_loudly_and_takes_the_empty_pattern() {
+        assert!(PreparedPattern::prepare("").is_ok());
+        match PreparedPattern::prepare("([") {
+            Err(e) => assert_eq!(e.pattern, "([", "must name the pattern"),
+            Ok(_) => panic!("an unclosed class must be rejected"),
         }
         // NUL-containing anchors never prune.
         assert_eq!(anchor(&PreparedPattern::prepare("a\\x00b").unwrap()), None);
@@ -531,13 +538,14 @@ mod tests {
         );
         // A case-sensitive compile never plans one.
         assert!(PreparedPattern::prepare("HscEnv").unwrap().fold().is_none());
-        // Empty and invalid stay loud on both paths.
-        for bad in ["", "(["] {
-            assert!(
-                PreparedPattern::prepare_with(bad, ci()).is_err(),
-                "pattern {bad:?}"
-            );
-        }
+        // The empty pattern has no case; invalid stays loud on both paths.
+        assert!(
+            PreparedPattern::prepare_with("", ci())
+                .unwrap()
+                .fold()
+                .is_none()
+        );
+        assert!(PreparedPattern::prepare_with("([", ci()).is_err());
     }
 
     #[test]

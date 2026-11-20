@@ -344,6 +344,16 @@ impl<'a> Term<'a> {
     /// literal (`plain_literal`) is answered as that literal: from the index
     /// alone, with no read of the files it names.
     fn of(name: &'a str, req: &QueryRequest<'_>) -> Self {
+        // The empty pattern matches every line, whatever the flags; the
+        // empty literal matches the same.
+        if name.is_empty() {
+            return Term {
+                name: Cow::Borrowed(name),
+                text: Cow::Borrowed(name),
+                pattern: Some(Cow::Borrowed(name)),
+                folded: false,
+            };
+        }
         let source = req.regex.then_some(name);
         let bare = |text: Cow<'a, str>| {
             let folded = req.mode.ignore_case && !text.is_empty();

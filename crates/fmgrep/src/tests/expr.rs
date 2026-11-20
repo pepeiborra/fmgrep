@@ -515,7 +515,7 @@ fn expr_refusals_are_loud_and_before_io() {
     let index = blind_index(tmp.path(), &[("a.c", b"alpha\nbeta")]);
     for (flags, expr, want) in [
         (&[][..], and(vec![t("alpha"), re("(")]), "regex parse error"),
-        (&["-l"], or(vec![re(""), t("alpha")]), "empty regex pattern"),
+        (&["-l"], or(vec![re("["), t("alpha")]), "regex parse error"),
         (
             &["-c"],
             and(vec![t("alpha\nbeta"), t("alpha")]),
