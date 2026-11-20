@@ -883,12 +883,18 @@ fn dispatch_in(
     crate::verbose::set_verbose(verbose).map_err(|e| format!("error: {e}"))?;
     match &cli.command {
         Some(Command::Index(a)) => {
-            let summary = run_index(&IndexRequest {
-                folder: &a.path,
-                output: a.output.as_deref(),
-                store_docs: a.store_docs,
-                require_commit: a.require_served_commit,
-            })?;
+            let mut left_out = Vec::new();
+            let summary = run_index(
+                &IndexRequest {
+                    folder: &a.path,
+                    output: a.output.as_deref(),
+                    store_docs: a.store_docs,
+                    require_commit: a.require_served_commit,
+                },
+                &mut left_out,
+            );
+            print_diagnostics(&left_out);
+            let summary = summary?;
             print::index_summary(out, a.json, &summary)?;
             Ok(Outcome::Index(summary))
         }

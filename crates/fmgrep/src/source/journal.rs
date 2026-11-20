@@ -68,25 +68,21 @@ pub fn not_due() -> String {
 /// only once its crawl ends; the watch stays, and watchman crawls the tree
 /// while the index reads it. Takes no token, and asks nothing where no
 /// search asks: on a network filesystem, or when the mount table cannot
-/// be read. Why not, or that the crawl goes on, only under `--verbose`.
-pub fn request_watch(root: &Path, files: usize) {
+/// be read. Why not, or that the crawl goes on, as a note, only under
+/// `--verbose`.
+pub fn request_watch(root: &Path, files: usize) -> Option<Diagnostic> {
     if !due(files) {
-        return;
+        return None;
     }
-    let Ok(root) = root.canonicalize() else {
-        return;
-    };
+    let root = root.canonicalize().ok()?;
     let asked = local(&root).and_then(|()| {
         #[cfg(unix)]
         return watchman::Watchman::find(ASK_WAIT).and_then(|w| w.watch(&root).map(drop));
         #[cfg(not(unix))]
         return Err("no change source on this platform".to_owned());
     });
-    if let Err(why) = asked
-        && crate::verbose::verbose()
-    {
-        eprintln!("note: {why}");
-    }
+    let why = asked.err().filter(|_| crate::verbose::verbose())?;
+    Some(Diagnostic::NoWatch { why })
 }
 
 /// Re-checking a path that watchman reported costs about 7 µs, the stat pass

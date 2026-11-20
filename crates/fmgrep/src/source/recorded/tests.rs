@@ -137,7 +137,8 @@ fn recorded_tree(tmp: &Path, files: &[&str]) -> (PathBuf, Recorded) {
         std::fs::write(root.join(rel), b"x\n").unwrap();
     }
     crate::tests::support::backdate(&tmp.join("outer"));
-    let walk = crate::for_each_index_doc(&root, None, |_, _, _, _| Ok(())).unwrap();
+    let walk =
+        crate::for_each_index_doc(&root, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
     write_walk(tmp, &walk, std::time::SystemTime::now()).unwrap();
     (root, Recorded::open(tmp).unwrap().unwrap())
 }

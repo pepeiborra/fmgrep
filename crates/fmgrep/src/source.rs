@@ -1212,7 +1212,8 @@ mod tests {
         }
         crate::tests::support::backdate(&path);
         write_stamps(dir, &vec![0; docs.len()], &[]).unwrap();
-        let walk = crate::for_each_index_doc(&path, None, |_, _, _, _| Ok(())).unwrap();
+        let walk =
+            crate::for_each_index_doc(&path, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
         write_walk(dir, &walk, std::time::SystemTime::now()).unwrap();
         Fix {
             path,
@@ -1358,7 +1359,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"a"]);
         std::fs::create_dir_all(fix.path.join("old")).unwrap();
-        let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
+        let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(()), &mut Vec::new())
+            .unwrap();
         write_walk(&fix.index, &walk, std::time::SystemTime::now()).unwrap();
         let recorded = Recorded::open(&fix.index).unwrap().unwrap();
         let r = Some(&recorded);

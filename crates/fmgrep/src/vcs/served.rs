@@ -5,6 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::{Entry, entries, git, records};
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{Commit, DOCS_SHARD};
 use crate::walk::WalkNotes;
 
@@ -356,10 +357,10 @@ fn left_out_too(folder: &Path, oids: &[&str], files: &[&String]) -> Result<(), S
     })
 }
 
-/// [`after`], said on stderr in one note.
-pub fn note(commit: &Result<Commit, String>) {
+/// [`after`], as one note.
+pub fn note(commit: &Result<Commit, String>) -> Diagnostic {
     match commit {
-        Ok(c) => eprintln!("note: the index holds commit {}", c.id),
-        Err(why) => eprintln!("note: the index records no served commit ({why})"),
+        Ok(c) => Diagnostic::Commit { id: c.id.clone() },
+        Err(why) => Diagnostic::NoCommit { why: why.clone() },
     }
 }

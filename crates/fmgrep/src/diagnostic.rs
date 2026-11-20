@@ -171,6 +171,20 @@ pub enum Diagnostic {
     },
     /// A pattern `/x/` that found nothing: it matches its slashes too.
     Slashes { pattern: String },
+    /// `index` skipped `n` binary files, said in one line without
+    /// `FMGREP_VERBOSE`.
+    Binaries { n: usize },
+    /// The walk of `index` met an error that it could go on past. It is
+    /// text because the walk's error holds the path itself and cannot be
+    /// kept as a value.
+    Walk { why: String },
+    /// `index` records the served commit `id`.
+    Commit { id: String },
+    /// `index` records no served commit.
+    NoCommit { why: String },
+    /// Under `FMGREP_VERBOSE`: `index` did not ask watchman to watch the
+    /// tree, or the crawl goes on.
+    NoWatch { why: String },
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -270,6 +284,17 @@ impl fmt::Display for Diagnostic {
                     short(commit)
                 )
             }
+            Self::Binaries { n } => write!(
+                f,
+                "skipped {n} non-text file(s) (binary or NUL); set FMGREP_VERBOSE=1 or pass \
+                 --verbose to list them"
+            ),
+            Self::Walk { why } => write!(f, "warning: {why}"),
+            Self::Commit { id } => write!(f, "note: the index holds commit {id}"),
+            Self::NoCommit { why } => {
+                write!(f, "note: the index records no served commit ({why})")
+            }
+            Self::NoWatch { why } => write!(f, "note: {why}"),
             Self::Slashes { pattern } => write!(
                 f,
                 "note: the pattern {pattern} matches its slashes too; write {} for what they hold",
@@ -555,6 +580,44 @@ mod tests {
                     pattern: "/x+/".into(),
                 },
                 "note: the pattern /x+/ matches its slashes too; write x+ for what they hold",
+            ),
+        ];
+        for (d, line) in cases {
+            assert_eq!(d.to_string(), line);
+        }
+    }
+
+    /// What `index` says reads as it always did; a binary file is skipped
+    /// in one line without a prefix.
+    #[test]
+    fn the_lines_of_an_index_read_as_before() {
+        let cases = [
+            (
+                Diagnostic::Binaries { n: 70 },
+                "skipped 70 non-text file(s) (binary or NUL); set FMGREP_VERBOSE=1 or pass \
+                 --verbose to list them",
+            ),
+            (
+                Diagnostic::Walk {
+                    why: "/src/x: Permission denied".into(),
+                },
+                "warning: /src/x: Permission denied",
+            ),
+            (
+                Diagnostic::Commit { id: "abc".into() },
+                "note: the index holds commit abc",
+            ),
+            (
+                Diagnostic::NoCommit {
+                    why: "git is not on PATH".into(),
+                },
+                "note: the index records no served commit (git is not on PATH)",
+            ),
+            (
+                Diagnostic::NoWatch {
+                    why: "no daemon".into(),
+                },
+                "note: no daemon",
             ),
         ];
         for (d, line) in cases {

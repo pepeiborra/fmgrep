@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::blobs::{create_sink, finish_sink};
+use crate::diagnostic::Diagnostic;
 use crate::docs;
 use crate::manifest::{MANIFEST_FORMAT, Manifest, create_output_dir, write_manifest};
 use crate::plan::shard_bytes;
@@ -24,7 +25,9 @@ pub struct IndexRequest<'a> {
     pub require_commit: bool,
 }
 
-/// Build, persist and summarize an index. Printing is the caller's job.
+/// Build, persist and summarize an index. Printing is the caller's job: the
+/// warnings and notes of the walk and of the served commit go to
+/// `left_out` in the order found, also when the index fails.
 ///
 /// `build_time_us` is the index wall — the document stream, construction,
 /// the blob flush and the check of the served commit, all of it, so the
@@ -40,7 +43,10 @@ pub struct IndexRequest<'a> {
 /// a failure, in the words of the note it would print: the checks that
 /// need no walk run before the output dir is made, so they fail before a
 /// file is read, and an index already at the output stays.
-pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
+pub fn run_index(
+    req: &IndexRequest<'_>,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<IndexSummary, String> {
     if req.require_commit && !req.store_docs {
         return Err(
             "error: --require-served-commit needs --store-docs: only a --store-docs index \
@@ -64,7 +70,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         false => None,
     };
     create_output_dir(&output)?;
-    let persist = |output: &Path| -> Result<Manifest, String> {
+    let mut persist = |output: &Path| -> Result<Manifest, String> {
         let before = req.store_docs.then(|| match &early {
             Some(head) => Ok(head.clone()),
             None => served::before(req.folder),
@@ -79,14 +85,20 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         let listed = |files: usize| {
             #[cfg(test)]
             hooks.apply();
-            if !req.store_docs {
-                request_watch(req.folder, files);
+            match req.store_docs {
+                true => None,
+                false => request_watch(req.folder, files),
             }
         };
-        let (docs, index_size_bytes) =
-            docs::stream_while(req.folder, output, cap, req.store_docs, listed, |cuts| {
-                DocfmIndex::build_into(cuts, cap, None, req.store_docs, &mut sink)
-            })?;
+        let (docs, index_size_bytes) = docs::stream_while(
+            req.folder,
+            output,
+            cap,
+            req.store_docs,
+            listed,
+            |cuts| DocfmIndex::build_into(cuts, cap, None, req.store_docs, &mut sink),
+            left_out,
+        )?;
         let (blobs, blob_lens) = finish_sink(sink)?;
         if !req.store_docs {
             write_stamps(output, &docs.mtimes, &docs.file_lens)?;
@@ -97,7 +109,7 @@ pub fn run_index(req: &IndexRequest<'_>) -> Result<IndexSummary, String> {
         let build_time_us = start.elapsed().as_micros() as u64;
         match &commit {
             Some(Err(why)) if req.require_commit => return Err(no_commit(why)),
-            Some(commit) => served::note(commit),
+            Some(commit) => left_out.push(served::note(commit)),
             None => {}
         }
         let since_epoch = started.duration_since(UNIX_EPOCH).unwrap_or_default();
