@@ -81,17 +81,13 @@ are the differences.
   name it as a PATH or match it with `-g`. A PATH outside the indexed
   tree is an error. A search also finds matches in a file edited or
   added since the index.
-* **A TERM is a literal, not a regex.** `'a.b'` is three bytes. Write
-  `/a.b/` for a regex, or pass `--regex` to make every TERM one. Several
-  TERMs print one `== TERM ==` section each. `--and`, `--or` and
-  `--expr` combine TERMs to choose the files, then print the lines of
-  every TERM ([Expressions](#expressions)).
 * **A word that names no file is a TERM, not a PATH.**
   `fmgrep HscEnv nope.txt` also searches for `nope.txt`. `rg` fails with
-  exit 2.
-* **Fewer flags.** These work: `-i`, `-U`, `-g`, `--iglob`, `-c`, `-l`,
-  `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`, `--color` and
-  `--stats`. Other flags of `rg`, such as `-F`, `-w`, `-v`, `-e`, `-t`,
+  exit 2. Several TERMs print one `== TERM ==` section each, where `rg`
+  takes `-e A -e B` as one search.
+* **Fewer flags.** These work: `-F`, `-i`, `-s`, `-S`, `-U`, `-g`, `--iglob`,
+  `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`, `--color`
+  and `--stats`. Other flags of `rg`, such as `-w`, `-x`, `-v`, `-e`, `-t`,
   `-m`, `--hidden`, `--no-ignore` and `--sort`, fail with exit 2.
   `fmgrep --help` lists the flags that work.
 * **It does not search stdin or read a `RIPGREP_CONFIG_PATH` file.**
@@ -125,16 +121,15 @@ checkout with a team, index it with `fmgrep index --store-docs`. See
 ## Expressions
 
 ```sh
-fmgrep HscEnv                     # a TERM is a literal: 'a.b' is three bytes
-fmgrep '/Dyn[A-Z]\w+/'            # /../ is a regex
-fmgrep --regex 'Dyn[A-Z]\w+'      # --regex makes every TERM a regex
-fmgrep --and HscEnv DynFlags      # files holding every TERM
-fmgrep --or HscEnv DynFlags       # files holding any TERM
+fmgrep --and HscEnv DynFlags       # files holding every TERM
+fmgrep --or HscEnv 'Dyn[A-Z]\w+'   # files holding any TERM
 fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)'
 ```
 
-`AND` and `OR` are capitals, `AND` binds tighter, and quoting is as in sh.
-They pick files; fmgrep then prints the lines of every TERM in those files.
+`--and` and `--or` read each TERM as a regex, as a search does. In `--expr`
+a word is a literal, and `/re/` is a regex. `AND` and `OR` are capitals,
+`AND` binds tighter, and quoting is as in sh. They pick files; fmgrep then
+prints the lines of every TERM in those files.
 
 ## Indexing
 
