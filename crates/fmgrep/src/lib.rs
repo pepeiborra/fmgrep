@@ -36,6 +36,7 @@
 
 mod automaton;
 mod base64;
+mod baseline;
 mod binary;
 mod blobs;
 mod checkout;
@@ -52,6 +53,7 @@ mod fold;
 mod index;
 mod manifest;
 mod matching;
+mod merge;
 mod output;
 mod pattern;
 mod plan;
