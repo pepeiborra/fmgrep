@@ -29,8 +29,8 @@ fn loads_ask_from_50_000_docs() {
 
 #[test]
 fn the_cap_is_where_the_stat_pass_gets_cheaper() {
-    assert_eq!(named_cap(1_250_000), 156_250);
-    assert_eq!(named_cap(10), 64, "a small tree's floor");
+    assert_eq!(reported_cap(1_250_000), 156_250);
+    assert_eq!(reported_cap(10), 64, "a small tree's floor");
 }
 
 #[test]
@@ -814,13 +814,13 @@ mod watchman_tests {
         let root = canonical(tmp.path());
         let token = at(&daemon).mark(&root).expect("a token of the tree");
         std::fs::write(root.join("new.c"), b"new").unwrap();
-        let named = |token: &Token| at(&daemon).since(token, &root).unwrap();
-        assert!(named(&token).iter().any(|p| p == "new.c"));
+        let reported = |token: &Token| at(&daemon).since(token, &root).unwrap();
+        assert!(reported(&token).iter().any(|p| p == "new.c"));
         for i in 0..10 {
             let token = at(&daemon).mark(&root).unwrap();
             let name = format!("r{i}.c");
             std::fs::write(root.join(&name), b"raced").unwrap();
-            assert!(named(&token).contains(&name), "rep {i}");
+            assert!(reported(&token).contains(&name), "rep {i}");
         }
     }
 }

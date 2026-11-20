@@ -298,13 +298,14 @@ impl Known {
     /// Take root-relative `paths` (any order) as all that may differ in
     /// ascending `files`, instead of the stat pass and discovery: the number
     /// kept, or Err when they cost more than the stat pass (nothing is
-    /// touched then: past [`journal::named_cap`]).
+    /// touched then: past [`journal::reported_cap`]).
     ///
     /// A dir the index did not record, or a path under one, counts once, as
     /// the topmost such dir, which discovery walks: its added files become
-    /// those the walk finds now. A hidden one is skipped. A named doc is
-    /// statted. A named recorded dir, and the parent of any other named path
-    /// that is not hidden, are listed again, one level: the docs in each are
+    /// those the walk finds now. A hidden one is skipped. A doc that watchman
+    /// reported is statted. A recorded dir that it reported, and the parent of
+    /// any other path it reported that is not hidden, are listed again, one
+    /// level: the docs in each are
     /// statted, a recorded subdir that moved is listed in turn, one that
     /// went has its docs statted, a new one is walked. Then the ignore
     /// inputs, as discovery does.
@@ -318,7 +319,7 @@ impl Known {
     ) -> Result<usize, ()> {
         let root = &self.root;
         let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
-        let (mut named_ignores, mut new_dirs) = (Vec::new(), std::collections::HashSet::new());
+        let (mut reported_ignores, mut new_dirs) = (Vec::new(), std::collections::HashSet::new());
         for rel in paths {
             let (parent, name) = rel.rsplit_once('/').unwrap_or(("", rel));
             if rel.is_empty() || self.excluded(root, rel) {
@@ -346,13 +347,13 @@ impl Known {
             if let Some(dir) = crate::walk::ignore_file_dir(rel) {
                 scopes.push(dir.to_owned());
                 if !recorded.is_ignore(rel) && root.join(rel).exists() {
-                    named_ignores.push(rel.clone());
+                    reported_ignores.push(rel.clone());
                 }
             }
         }
-        self.keep_ignores(named_ignores);
+        self.keep_ignores(reported_ignores);
         let kept = kept + new_dirs.len();
-        if kept > journal::named_cap(files.len()) {
+        if kept > journal::reported_cap(files.len()) {
             return Err(());
         }
         scopes.extend(new_dirs.into_iter().map(str::to_owned));
@@ -649,7 +650,7 @@ impl Files {
         let kept = match self.known.replay(recorded, &paths, files, lens, left_out) {
             Ok(kept) => kept,
             Err(()) => {
-                journal::over(journal::named_cap(files.len()));
+                journal::over(journal::reported_cap(files.len()));
                 return Learned::Checked;
             }
         };
@@ -732,7 +733,7 @@ impl Files {
         };
         let applied = std::time::Instant::now();
         let Ok(kept) = self.known.replay(recorded, &paths, files, lens, left_out) else {
-            return Some(journal::over_since(journal::named_cap(files.len())));
+            return Some(journal::over_since(journal::reported_cap(files.len())));
         };
         let n = paths.len();
         timed(
@@ -790,7 +791,7 @@ impl Files {
         );
         baseline.sort_unstable();
         baseline.dedup();
-        let cap = journal::named_cap(files.len());
+        let cap = journal::reported_cap(files.len());
         Ok(journal::save(&root, index, token, baseline, cap))
     }
 
@@ -1123,7 +1124,7 @@ mod tests {
     /// `docs` and a binary `kb/k.bin` under `<dir>/corpus`, backdated and
     /// recorded as `index` records them.
     #[cfg(unix)]
-    fn stage_named(dir: &Path, docs: &[&str]) -> Fix {
+    fn stage_reported(dir: &Path, docs: &[&str]) -> Fix {
         let path = dir.join("corpus");
         for rel in docs.iter().chain(&["kb/k.bin"]) {
             std::fs::create_dir_all(path.join(rel).parent().unwrap()).unwrap();
@@ -1146,25 +1147,29 @@ mod tests {
         }
     }
 
-    /// `fix`'s files with its record, after a replay of `named`.
+    /// `fix`'s files with its record, after a replay of `reported`.
     #[cfg(unix)]
-    fn replayed(fix: &Fix, named: &[&str]) -> (Files, Result<usize, ()>) {
+    fn replayed(fix: &Fix, reported: &[&str]) -> (Files, Result<usize, ()>) {
         let mut files = open_files(fix);
         let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
         files.record(Recorded::open(&fix.index).unwrap().unwrap());
-        let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
-        let kept = files
-            .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new());
+        let reported: Vec<String> = reported.iter().map(|n| n.to_string()).collect();
+        let kept = files.known.replay(
+            &recorded,
+            &reported,
+            fix.paths(),
+            &fix.lens,
+            &mut Vec::new(),
+        );
         (files, kept)
     }
 
     #[cfg(unix)]
     #[test]
-    fn replay_rechecks_what_is_named_and_lists_named_dirs_one_level() {
+    fn replay_rechecks_what_is_reported_and_lists_reported_dirs_one_level() {
         let tmp = tempfile::tempdir().unwrap();
         let docs = ["a.c", "d/in/i.c", "d/m.c", "d/x.c", "keep/k.c", "z.c"];
-        let fix = stage_named(tmp.path(), &docs);
+        let fix = stage_reported(tmp.path(), &docs);
         let at = |rel: &str| fix.path.join(rel);
         let added = |f: &Files| {
             let s = f.snapshot();
@@ -1182,15 +1187,15 @@ mod tests {
         std::fs::rename(at("d/in"), at("d/out")).unwrap();
         std::fs::write(at("kb/k.bin"), b"now text\n").unwrap();
         std::fs::remove_file(at("keep/k.c")).unwrap();
-        let named = ["a.c", "z.c", "d", "kb/k.bin", "gone/dir/x.c", ".hidden"];
-        let (files, kept) = replayed(&fix, &named);
+        let reported = ["a.c", "z.c", "d", "kb/k.bin", "gone/dir/x.c", ".hidden"];
+        let (files, kept) = replayed(&fix, &reported);
         assert_eq!(
             kept,
             Ok(6),
             "a path under an unrecorded dir counts as that dir"
         );
         let want = [STALE, GONE, FRESH, GONE, FRESH, FRESH];
-        assert_eq!(files.kinds(), want, "keep/k.c is not named, nor its dir");
+        assert_eq!(files.kinds(), want, "keep/k.c is not reported, nor its dir");
         assert_eq!(added(&files), ["d/out/i.c", "kb/k.bin"]);
         // A new file in the root: the root is listed, then each recorded
         // dir in it whose stamp moved.
@@ -1213,14 +1218,18 @@ mod tests {
     #[test]
     fn replay_walks_a_new_dir_and_drops_what_its_ignore_file_hides() {
         let tmp = tempfile::tempdir().unwrap();
-        let fix = stage_named(tmp.path(), &["a.c"]);
+        let fix = stage_reported(tmp.path(), &["a.c"]);
         let (files, _) = replayed(&fix, &[]);
         let recorded = Arc::new(Recorded::open(&fix.index).unwrap().unwrap());
-        let replay = |named: &[&str]| {
-            let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
-            files
-                .known
-                .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new())
+        let replay = |reported: &[&str]| {
+            let reported: Vec<String> = reported.iter().map(|n| n.to_string()).collect();
+            files.known.replay(
+                &recorded,
+                &reported,
+                fix.paths(),
+                &fix.lens,
+                &mut Vec::new(),
+            )
         };
         let put = |rel: &str| {
             std::fs::create_dir_all(fix.path.join(rel).parent().unwrap()).unwrap();
@@ -1249,7 +1258,7 @@ mod tests {
     #[test]
     fn checking_every_file_again_brings_back_a_doc_no_longer_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let fix = stage_named(tmp.path(), &["a.c", "sub/b.c"]);
+        let fix = stage_reported(tmp.path(), &["a.c", "sub/b.c"]);
         let (files, _) = replayed(&fix, &[]);
         files.check_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(files.kinds(), [FRESH, FRESH]);

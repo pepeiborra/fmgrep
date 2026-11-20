@@ -75,8 +75,8 @@ pub fn early(folder: &Path) -> Before {
         no_submodule(&entry?)?;
     }
     let mut outside = vec![(exclude_file(&folder)?, false)];
-    // Sorted as the walk lists them, so that the file named is the one
-    // that the check after the build would name.
+    // Sorted as the walk lists them, so that the file reported is the one
+    // that the check after the build would report.
     let mut outer = crate::walk::outer_ignores(&folder);
     outer.sort_by(|a, b| a.0.cmp(&b.0));
     let outer = outer.into_iter().filter(|(rel, _)| is_outside(rel));
@@ -315,8 +315,8 @@ fn names_below(p: &[u8], dir: &Path, root: &Path) -> bool {
             if !rel.contains(['*', '?', '[', '{', '\\'])
                 && rel.split('/').all(|c| !matches!(c, "" | "." | "..")) =>
         {
-            let named = dir.join(rel);
-            named != root && named.starts_with(root)
+            let joined = dir.join(rel);
+            joined != root && joined.starts_with(root)
         }
         _ => true,
     }
