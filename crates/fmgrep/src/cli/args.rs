@@ -25,6 +25,32 @@ Environment:
   FMGREP_SERVER=HOST:PORT  with no --server, --index or enclosing .fmgrep,
                            search through that server";
 
+/// Why an index cannot honour rg's `flag`, which asks for what it does not
+/// hold, as the error of that flag; None for any other flag.
+pub fn unindexable(flag: &str) -> Option<String> {
+    let name = flag.split('=').next().unwrap_or(flag);
+    let reason = match name {
+        "--hidden" | "-." => "hidden files are not indexed",
+        "-u" | "--unrestricted" => "hidden and ignored files are not indexed",
+        "--no-ignore"
+        | "--no-ignore-vcs"
+        | "--no-ignore-dot"
+        | "--no-ignore-parent"
+        | "--no-ignore-global"
+        | "--no-ignore-exclude"
+        | "--no-ignore-files" => "ignored files are not indexed",
+        "-L" | "--follow" => "symlinks are not indexed",
+        "-a" | "--text" | "--binary" => "binary files are not indexed",
+        "-z" | "--search-zip" => "files are indexed as they are on disk, not decompressed",
+        "--pre" | "--pre-glob" => "files are indexed as they are on disk, not preprocessed",
+        "-E" | "--encoding" => "files are indexed as bytes, and fmgrep decodes none",
+        _ => return None,
+    };
+    Some(format!(
+        "error: {name} cannot work on an index: {reason}; use rg"
+    ))
+}
+
 const ENV: &str = "\
 Environment:
   FMGREP_SHARD_BYTES    index shard size (default 100MiB)

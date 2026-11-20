@@ -674,3 +674,76 @@ fn e_gives_the_patterns_and_every_positional_is_a_path() {
         assert!(e.starts_with("error: "), "{words:?}: {e}");
     }
 }
+
+#[test]
+fn flags_that_ask_for_what_an_index_lacks_say_why() {
+    for (words, want) in [
+        (
+            &["--hidden", "x"][..],
+            "--hidden cannot work on an index: hidden files are not indexed",
+        ),
+        (
+            &["-.", "x"],
+            "-. cannot work on an index: hidden files are not indexed",
+        ),
+        (
+            &["-uu", "x"],
+            "-u cannot work on an index: hidden and ignored files are not indexed",
+        ),
+        (
+            &["x", "--unrestricted"],
+            "--unrestricted cannot work on an index: hidden and ignored files are not indexed",
+        ),
+        (
+            &["--no-ignore", "x"],
+            "--no-ignore cannot work on an index: ignored files are not indexed",
+        ),
+        (
+            &["--no-ignore-vcs", "x"],
+            "--no-ignore-vcs cannot work on an index: ignored files are not indexed",
+        ),
+        (
+            &["-iL", "x"],
+            "-L cannot work on an index: symlinks are not indexed",
+        ),
+        (
+            &["-a", "x"],
+            "-a cannot work on an index: binary files are not indexed",
+        ),
+        (
+            &["--binary", "x"],
+            "--binary cannot work on an index: binary files are not indexed",
+        ),
+        (
+            &["-z", "x"],
+            "-z cannot work on an index: files are indexed as they are on disk, not decompressed",
+        ),
+        (
+            &["--pre=cat", "x"],
+            "--pre cannot work on an index: files are indexed as they are on disk, not preprocessed",
+        ),
+        (
+            &["-E", "utf-16", "x"],
+            "-E cannot work on an index: files are indexed as bytes, and fmgrep decodes none",
+        ),
+    ] {
+        let e = dispatch_to(words, &mut &b""[..], &mut Vec::new(), false).err();
+        assert_eq!(e, Some(format!("error: {want}; use rg")), "{words:?}");
+    }
+    // An index is built from files rg never lists, so `index` has no such
+    // reason to give: the flag is only unknown to it.
+    let e = dispatch_to(
+        ["index", "--hidden", "."],
+        &mut &b""[..],
+        &mut Vec::new(),
+        false,
+    );
+    let e = e.err().unwrap();
+    assert!(e.starts_with("error: unexpected argument"), "{e}");
+    // Any other flag rg has that fmgrep lacks is only unknown.
+    for flag in ["-w", "-x", "-v", "-m", "--files", "-t"] {
+        let e = dispatch_to([flag, "x"], &mut &b""[..], &mut Vec::new(), false);
+        let e = e.err().unwrap();
+        assert!(e.starts_with("error: unexpected argument"), "{flag}: {e}");
+    }
+}
