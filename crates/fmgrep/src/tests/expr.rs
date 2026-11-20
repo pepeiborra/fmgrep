@@ -206,10 +206,7 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                     &["--no-heading", "-C", "1"],
                 ] {
                     let flags = [flag, mode_flags].concat();
-                    let want = only(
-                        &printed(&index, &[&flags[..], &["--regex"]].concat(), &[&alt]),
-                        &m,
-                    );
+                    let want = only(&printed(&index, &flags, &[&alt]), &m);
                     let got = printed_expr(&index, &flags, &expr).unwrap();
                     if mode_flags.contains(&"-C") {
                         // Context lines of non-members interleave; compare members' lines only.
@@ -220,11 +217,7 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 }
                 let c = report(&index, &[flag, &["--count-matches"]].concat(), &expr).unwrap();
                 let per_file: u64 = only(
-                    &printed(
-                        &index,
-                        &[flag, &["--count-matches", "--regex"]].concat(),
-                        &[&alt],
-                    ),
+                    &printed(&index, &[flag, &["--count-matches"]].concat(), &[&alt]),
                     &m,
                 )
                 .lines()
@@ -267,7 +260,7 @@ fn expr_single_leaf_equals_its_term() {
             // same counts, exactness and files.
             (re("printk"), "printk"),
             (re("alpha"), "alpha"),
-            (re("pr[i1]ntk"), "/pr[i1]ntk/"),
+            (re("pr[i1]ntk"), "pr[i1]ntk"),
             (t("alpha"), "alpha"),
         ] {
             for flags in [

@@ -64,7 +64,7 @@ fn a_leading_bom_is_stripped_from_the_whole_stream() {
         let summary = index_it(&folder, &index, store_docs);
         // The corpus keeps its BOM on disk; only the searcher drops it.
         assert_eq!(summary.num_bytes, 49, "store_docs={store_docs}");
-        let got = printed(&index, &["--json", "--matches", "--regex"], &["^module"]);
+        let got = printed(&index, &["--json", "--matches"], &["^module"]);
         let events = timeless_lines(&got);
         assert_eq!(
             events[1]["data"]["lines"]["text"], "module Foo where\n",

@@ -237,8 +237,61 @@ fn reach(server: &Server, start: Option<&Path>) -> Result<Reached, String> {
     Err(format!("error: cannot reach {server}: {e}"))
 }
 
-/// A search: what [`choose`] and [`reach`] pick from the cwd.
+/// A search: what [`choose`] and [`reach`] pick from the cwd. A TERM that
+/// is not a regex says how to search for it as it is.
 fn search(
+    s: &Search,
+    env: Env,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    tty: bool,
+    printing: bool,
+) -> Result<Outcome, String> {
+    let patterns = !s.fixed_strings && s.expr.is_none() && s.expr_json.is_none();
+    let found = find(s, env, input, out, tty, printing);
+    // A pattern /x/ matches its slashes too, as in rg; v0.1.0 read it as x.
+    // Each such pattern that found nothing says so, in a search of several.
+    if patterns && let Ok(Outcome::Query(r)) = &found {
+        for t in (s.typed_terms().iter())
+            .filter(|t| t.len() > 1 && t.starts_with('/') && t.ends_with('/'))
+            .filter(|t| found_nothing(r, t))
+        {
+            eprintln!(
+                "note: the pattern {t} matches its slashes too; write {} for what they hold",
+                &t[1..t.len() - 1]
+            );
+        }
+    }
+    found.map_err(|e| match e {
+        // A NUL is no matter of syntax: -F would not help.
+        e if patterns
+            && e.contains("invalid regex pattern")
+            && !e.contains("impossible to match") =>
+        {
+            format!("{e}\nhint: to search for the text as it is, pass -F")
+        }
+        e => e,
+    })
+}
+
+/// Whether the pattern `t` found nothing: its own section if it has one,
+/// else its own total in a counting search of an expression, else the whole
+/// search.
+fn found_nothing(r: &OutputReport, t: &str) -> bool {
+    if let Some(q) = r.queries.iter().find(|q| q.term == t) {
+        return q.total_matches == 0 && q.docs_matched == 0;
+    }
+    if let Some(leaf) = (r.queries.iter())
+        .flat_map(|q| &q.leaves)
+        .find(|l| l.term == crate::expr::Expr::Regex(t.to_owned()).to_string())
+    {
+        return leaf.total_matches == 0;
+    }
+    (r.queries.iter()).all(|q| q.total_matches == 0 && q.docs_matched == 0)
+}
+
+/// [`search`] without the hint.
+fn find(
     s: &Search,
     env: Env,
     input: &mut dyn BufRead,

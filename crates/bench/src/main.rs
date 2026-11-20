@@ -16,7 +16,6 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use corpus::{CORPORA, corpus_root, query_set};
-use fmgrep::regex_pattern;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator, IntoStaticStr};
 
 const USAGE: &str = "\
@@ -192,6 +191,13 @@ impl Kind {
             Kind::IgnoreCase => "-i",
         }
     }
+}
+
+/// The pattern inside a `/.../`-spelled leaf, or `None` for a literal: how
+/// the query sets tell the two apart, whatever each tool is passed.
+pub fn regex_pattern(leaf: &str) -> Option<&str> {
+    leaf.strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix('/'))
 }
 
 /// `-i` for a query spelled `-i ...`, which every row passes to its tool.

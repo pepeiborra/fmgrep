@@ -4,8 +4,6 @@ use std::time::{Duration, Instant};
 
 use grep_printer::Stats;
 
-use crate::regex_pattern;
-
 use crate::blobs::BlobSlots;
 use crate::diagnostic::Diagnostic;
 use crate::expr::Expr;
@@ -27,6 +25,7 @@ pub struct QueryRequest<'a> {
     pub manifest: &'a Manifest,
     /// Overrides a files-layout manifest's root.
     pub corpus_root: Option<&'a Path>,
+    /// Every term is a regex, not a literal.
     pub regex: bool,
     /// rg `-U` / `--multiline-dotall` / `-i`, as the CLI parsed them.
     pub mode: MatchMode,
@@ -340,16 +339,12 @@ struct Term<'a> {
 }
 
 impl<'a> Term<'a> {
-    /// The term of `name`. Under `--regex` it is a pattern verbatim
-    /// (slashes included); else a `/x/` name is the pattern `x`, and
-    /// anything else is a literal. A pattern that is nothing but a literal
-    /// (`plain_literal`) is answered as that literal: from the index alone,
-    /// with no read of the files it names.
+    /// The term of `name`: a pattern verbatim when the request reads its
+    /// terms as regexes, else a literal. A pattern that is nothing but a
+    /// literal (`plain_literal`) is answered as that literal: from the index
+    /// alone, with no read of the files it names.
     fn of(name: &'a str, req: &QueryRequest<'_>) -> Self {
-        let source = match (req.regex, regex_pattern(name)) {
-            (true, _) => Some(name),
-            (false, inner) => inner,
-        };
+        let source = req.regex.then_some(name);
         let bare = |text: Cow<'a, str>| {
             let folded = req.mode.ignore_case && !text.is_empty();
             Term {

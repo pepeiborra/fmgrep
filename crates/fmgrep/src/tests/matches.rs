@@ -160,7 +160,7 @@ fn counts_mode_report_has_only_the_counting_keys() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
-        let (out, _) = ok(&index, false, &["printk", "/a+/"], QueryOutput::Counts);
+        let (out, _) = ok(&index, true, &["printk", "a+"], QueryOutput::Counts);
         // A literal that cannot overlap itself counts as rg does; a pattern
         // never does.
         assert!(out.queries[0].counts_exact, "store_docs={store_docs}");

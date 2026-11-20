@@ -43,7 +43,7 @@ fn serve_stdio_matches_query() {
         let got = serve_stdio(
             &index,
             &[
-                r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["printk","aa","/pr[i1]ntk/",""]}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["printk","aa","pr[i1]ntk",""]}}"#,
                 r#"{"jsonrpc":"2.0","id":"two","method":"query","params":{"terms":["pr.ntk"],"regex":true}}"#,
                 r#"{"jsonrpc":"2.0","id":3,"method":"query","params":{"terms":["PRINTK"],"ignore_case":true}}"#,
                 "",
@@ -54,8 +54,8 @@ fn serve_stdio_matches_query() {
         );
         assert_eq!(got.len(), 5, "store_docs={store_docs}: {got:?}");
         let want = [
-            query(&index, &[], &["printk", "aa", "/pr[i1]ntk/", ""]).unwrap(),
-            query(&index, &["--regex"], &["pr.ntk"]).unwrap(),
+            query(&index, &["-F"], &["printk", "aa", "pr[i1]ntk", ""]).unwrap(),
+            query(&index, &[], &["pr.ntk"]).unwrap(),
             query(&index, &["-i"], &["PRINTK"]).unwrap(),
         ];
         for (response, want) in got.iter().zip(want) {
@@ -544,7 +544,10 @@ fn malformed_requests_are_refused_and_serving_continues() {
     }
     assert_eq!(
         got[10]["error"]["message"],
-        query_it_err(&index, true, &["("]).as_str()
+        query_it_err(&index, false, &["("])
+            .split("\nhint:")
+            .next()
+            .unwrap()
     );
     let old = got[9]["error"]["message"].as_str().unwrap();
     assert!(
@@ -618,7 +621,7 @@ fn serve_tcp_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
         let index = staged(tmp.path(), store_docs);
         let (addr, server) = spawn_server(&index, FIXED);
-        let terms = ["printk", "aa", "/pr[i1]ntk/"];
+        let terms = ["printk", "aa", "pr[i1]ntk"];
 
         let (_, json) = client(&addr, &[&["--json", "--"][..], &terms].concat()).unwrap();
         let report: OutputReport = serde_json::from_str(json.trim_end()).unwrap();
@@ -663,9 +666,9 @@ fn server_errors_surface_on_the_client() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), true);
     let (addr, server) = spawn_server(&index, FIXED);
-    let query = query_it_err(&index, true, &["("]);
+    let query = query_it_err(&index, false, &["("]);
     assert_eq!(
-        client(&addr, &["--regex", "--", "("]).err().unwrap(),
+        client(&addr, &["--", "("]).err().unwrap(),
         format!("error: server: {}", query.strip_prefix("error: ").unwrap())
     );
     // The server survives the error.
@@ -756,7 +759,7 @@ fn serve_refuses_a_tree_missing_most_files() {
 fn serve_reads_a_moved_tree_through_its_dotdir() {
     let tmp = tempfile::tempdir().unwrap();
     let index = staged(tmp.path(), false);
-    let want = timeless(query(&index, &["--regex"], &["pr[i1]ntk"]).unwrap());
+    let want = timeless(query(&index, &[], &["pr[i1]ntk"]).unwrap());
     let folder = tmp.path().join("corpus");
     index_it(&folder, &folder.join(INDEX_DIR), false);
     let moved = tmp.path().join("moved");
@@ -813,7 +816,7 @@ fn serve_rescans_stale_files_per_request() {
     let corpus = tmp.path().join("corpus");
     std::fs::write(corpus.join("a.c"), b"printk\n").unwrap();
     let (addr, server) = spawn_server(&index, FIXED);
-    assert_eq!(served_totals(&addr, &["printk", "/pr[i1]ntk/"]), [2, 2]);
+    assert_eq!(served_totals(&addr, &["printk", "pr[i1]ntk"]), [2, 2]);
     std::fs::write(corpus.join("a.c"), b"printk printk printk\n").unwrap();
     assert_eq!(
         served_totals(&addr, &["printk"]),
@@ -846,13 +849,13 @@ fn each_served_query_sees_the_changes_made_before_it() {
     let ask = |said: &mut Option<String>, terms: &[&str]| {
         on_time(&daemon, said, || served_totals(&addr, terms)).0
     };
-    assert_eq!(ask(said, &["printk", "/pr[i1]ntk/"]), [5, 5]);
+    assert_eq!(ask(said, &["printk", "pr[i1]ntk"]), [5, 5]);
     std::fs::write(corpus.join("b.c"), b"aaaa\n").unwrap();
     assert_eq!(ask(said, &["printk"]), [4], "an edit");
     std::fs::create_dir_all(corpus.join("new/deep")).unwrap();
     std::fs::write(corpus.join("new/deep/n.c"), b"printk after printk\n").unwrap();
     std::fs::write(corpus.join("bin.dat"), b"printk\0").unwrap();
-    assert_eq!(ask(said, &["printk", "/pr[i1]ntk/"]), [6, 6]);
+    assert_eq!(ask(said, &["printk", "pr[i1]ntk"]), [6, 6]);
     let list = || client(&addr, &["-l", "--", "printk"]).unwrap().1;
     assert_eq!(on_time(&daemon, said, list).0, "a.c\nab.c\nnew/deep/n.c\n");
     std::fs::remove_file(corpus.join("ab.c")).unwrap();
@@ -873,7 +876,7 @@ fn serve_no_watch_sees_a_change_only_when_read() {
     std::fs::write(tmp.path().join("corpus").join("b.c"), b"aaaa\n").unwrap();
     assert_eq!(served_totals(&addr, &["printk"]), [4], "the index's count");
     assert_eq!(
-        served_totals(&addr, &["/pr[i1]ntk/", "printk"]),
+        served_totals(&addr, &["pr[i1]ntk", "printk"]),
         [3, 3],
         "a read marks the file"
     );
@@ -1206,7 +1209,7 @@ fn served_searches_honour_the_filter() {
             (&["--iglob", "*.H", "-n"], &["printk"]),
             (
                 &["-g", "!sub", "--json", "--approx-counts"],
-                &["printk", "/al[a-z]ha/"],
+                &["printk", "al[a-z]ha"],
             ),
             (&["-c"], &["printk", &sub]),
             (&["-g", "!*.h", "-l"], &["printk", &b, &sub]),

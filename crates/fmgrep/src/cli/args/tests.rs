@@ -44,6 +44,7 @@ type Edit = fn(&mut QueryParams);
 
 fn lines(edit: Edit) -> QueryParams {
     let mut p = QueryParams {
+        regex: true,
         mode: Mode::Lines,
         line_numbers: false,
         heading: false,
@@ -60,13 +61,22 @@ fn clap_definition_is_valid() {
 
 #[test]
 fn rg_flags_set_the_params() {
-    let cases: [(&[&str], Edit); 17] = [
+    let cases: [(&[&str], Edit); 20] = [
         (&["-i"], |p| p.ignore_case = true),
         (&["-U"], |p| p.multiline = true),
         (&["--multiline-dotall"], |p| p.dotall = true),
-        (&["--regex", "a", "/b|c/"], |p| {
-            p.regex = true;
-            p.terms = vec!["a".into(), "/b|c/".into()];
+        (&["a", "b|c"], |p| p.terms = vec!["a".into(), "b|c".into()]),
+        // v0.1.0's flag: a no-op now, for every TERM is a regex.
+        (&["--regex", "a", "b|c"], |p| {
+            p.terms = vec!["a".into(), "b|c".into()];
+        }),
+        (&["-F", "a", "b|c"], |p| {
+            p.regex = false;
+            p.terms = vec!["a".into(), "b|c".into()];
+        }),
+        (&["--fixed-strings", "a"], |p| {
+            p.regex = false;
+            p.terms = vec!["a".into()];
         }),
         (&["--", "--regex", "-i"], |p| {
             p.terms = vec!["--regex".into(), "-i".into()]
@@ -165,6 +175,7 @@ fn params_pick_the_mode() {
         params_in(&words, "", true, true),
         QueryParams {
             terms: vec!["x".into()],
+            regex: true,
             ..QueryParams::default()
         },
         "a counts request carries no printer fields"
@@ -312,27 +323,29 @@ fn and_or_flags_equal_their_expr_json() {
     let same = |flags: &[&str], json: &str| {
         assert_eq!(params(flags), params(&["--expr-json", json]), "{flags:?}");
     };
-    same(&["--and", "a", "/b+/"], AND_JSON);
-    same(&["a", "/b+/", "--and"], AND_JSON);
-    same(&["--and", "--and", "a", "/b+/"], AND_JSON);
+    // A pattern that is nothing but a literal is a term; any other is a regex.
+    same(&["--and", "a", "b+"], AND_JSON);
+    same(&["a", "b+", "--and"], AND_JSON);
+    same(&["--and", "--and", "a", "b+"], AND_JSON);
+    same(&["--regex", "--and", "a", "b+"], AND_JSON);
     same(
-        &["--regex", "--and", "a", "b+"],
-        r#"{"and":[{"regex":"a"},{"regex":"b+"}]}"#,
+        &["-F", "--and", "a", "b+"],
+        r#"{"and":[{"term":"a"},{"term":"b+"}]}"#,
     );
     same(
-        &["--regex", "--or", "/a/", "b"],
-        r#"{"or":[{"regex":"/a/"},{"regex":"b"}]}"#,
+        &["--or", "/a/", "b\\.c"],
+        r#"{"or":[{"term":"/a/"},{"term":"b.c"}]}"#,
     );
     same(
-        &["--or", "a", "//", "c"],
+        &["--or", "a", "", "c"],
         r#"{"or":[{"term":"a"},{"regex":""},{"term":"c"}]}"#,
     );
     same(
         &["--or", "--", "-x", "--and", ""],
-        r#"{"or":[{"term":"-x"},{"term":"--and"},{"term":""}]}"#,
+        r#"{"or":[{"term":"-x"},{"term":"--and"},{"regex":""}]}"#,
     );
     assert_eq!(
-        params(&["-i", "-U", "-l", "--and", "a", "/b+/"]),
+        params(&["-i", "-U", "-l", "--and", "a", "b+"]),
         QueryParams {
             multiline: true,
             ..params(&["--expr-json", AND_JSON, "-i", "-l"])
@@ -477,8 +490,9 @@ fn the_first_positional_is_always_a_term() {
         split(&["src", "Cargo.toml"]),
         (vec!["src".into()], vec!["Cargo.toml".into()])
     );
-    let (terms, paths) = split(&["a", "/src/"]);
-    assert_eq!((terms.len(), paths.len()), (2, 0));
+    // A word with slashes is a PATH when it exists, whatever it looks like.
+    let (terms, paths) = split(&["a", "/tmp/"]);
+    assert_eq!((terms.len(), paths.len()), (1, 1));
 }
 
 #[test]
@@ -509,7 +523,7 @@ fn one_file_path_drops_the_file_name() {
 #[test]
 fn and_or_count_terms_without_their_paths() {
     assert_eq!(
-        params(&["--and", "a", "/b+/", "src"]),
+        params(&["--and", "a", "b+", "src"]),
         params(&["--expr-json", AND_JSON, "src"])
     );
     assert_eq!(
