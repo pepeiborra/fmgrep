@@ -228,7 +228,8 @@ or intersection that every row searches with `-i` (see
 [BENCHMARKS.md, Method](../BENCHMARKS.md#method)). To add a corpus, add
 a query file and name it in `crates/bench/src/corpus.rs`. The harness passes
 fmgrep a query of literals with `-F`, a `/re/` as `re`, and a literal that
-stands beside a regex escaped.
+stands beside a regex escaped. The leaves of an intersection go after
+`--and`, each with `-e`.
 
 ## Comparing index configurations
 

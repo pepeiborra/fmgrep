@@ -13,8 +13,9 @@ fmgrep index .                  # once: writes ./.fmgrep (add it to .gitignore)
 fmgrep HscEnv                   # lines as rg prints them; -n adds line numbers
 fmgrep -l HscEnv                # files only; -c counts lines per file
 fmgrep -i hscenv                # case-insensitive
-fmgrep 'Dyn[A-Z]\w+'            # a TERM is a regex, as in rg
+fmgrep 'Dyn[A-Z]\w+'            # the PATTERN is a regex, as in rg
 fmgrep -F 'foo('                # -F: a literal, as in rg
+fmgrep -e HscEnv -e DynFlags    # lines with either, one search, as in rg
 fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)' -l
 ```
 
@@ -29,9 +30,16 @@ fmgrep --server 127.0.0.1:7777 --shutdown
 
 ## Pitfalls
 
-- A TERM is a regex, as in rg. Pass `-F` for text such as `foo(` or `a.b`.
-  The patterns rg takes with `-e`, `-w`, `-x`, `-v`, `-f` and `-P` are not
-  supported: those flags fail with exit 2.
+- The first argument is the PATTERN, a regex as in rg, and the rest are
+  PATHs. Pass `-F` for text such as `foo(` or `a.b`. `-e` gives the
+  patterns instead, and several make one search of any of them, as in rg.
+  `-w`, `-x`, `-v`, `-f` and `-P` are not supported: those flags fail
+  with exit 2, as do `--hidden`, `--no-ignore` and `-u`, which no index can
+  honour.
+- As in rg, a PATH that does not exist is an error: the other PATHs are
+  searched, and the exit is 2. A PATH that exists but that the index lacks
+  (hidden, ignored, binary, a symlink) is an error too, exit 2: search
+  it with rg.
 - As in rg, without a PATH only the cwd's subtree is searched, with printed
   paths and `-g` globs relative to the cwd: from `compiler/`,
   `fmgrep -g 'GHC/*.hs' HscEnv` searches `compiler/GHC/*.hs` and prints
@@ -45,8 +53,9 @@ fmgrep --server 127.0.0.1:7777 --shutdown
   event stream.
 - `--and`, `--or` and `--expr` are **document-level**: `A AND B` picks files
   holding both, and then prints the lines of either. `AND` and `OR` must be
-  capitals.
-- Put `--` first to search for a term named `index`, `serve` or `status`.
+  capitals. `--and` and `--or` take their patterns with `-e`:
+  `fmgrep --and -e A -e B`.
+- Put `--` first to search for a pattern named `index`, `serve` or `status`.
   `fmgrep status` names the index or server a search here uses; `--json`
   prints the index's manifest, or the server's reply.
 
@@ -65,6 +74,8 @@ Details: [docs/index-format.md](docs/index-format.md#staleness).
 | `no .fmgrep index in DIR or any parent` | run `fmgrep index` at the root |
 | `unsupported manifest format` | index from another version: remove `.fmgrep`, re-index |
 | `manifest.bin is truncated`, or another error naming `manifest.bin` | the index is damaged: remove `.fmgrep`, re-index |
+| `error: PATH: No such file or directory (os error 2)` | the PATH does not exist; the other PATHs are searched, and the exit is 2 |
+| `error: PATH: not in the index (hidden, ignored, ...); search it with rg` | an index never holds that file or directory: search it with rg |
 | `warning: excluding PATH: is missing` | deleted since indexing; skipped |
 | `warning: skipping PATH: over 2147483646 bytes` | too large to index; search it with rg |
 | `warning: cannot list DIR: Permission denied (...); files under it may be missing from the answer` | a directory new since the index, or one that changed, that this process cannot list: the files new under it are not searched; fix its permissions, or search it with rg |

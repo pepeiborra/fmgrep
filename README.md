@@ -77,20 +77,18 @@ compiler/GHC/Driver/Main/Hsc.hs
 are the differences.
 
 * **It needs an index, and searches only what the index holds.** It
-  never finds a hidden, ignored, symlinked or binary file, even when you
-  name it as a PATH or match it with `-g`. A PATH outside the indexed
-  tree is an error. A search also finds matches in a file edited or
-  added since the index.
-* **A word that names no file is a TERM, not a PATH.**
-  `fmgrep HscEnv nope.txt` also searches for `nope.txt`. `rg` fails with
-  exit 2. Several TERMs print one `== TERM ==` section each, where `rg`
-  takes `-e A -e B` as one search.
-* **Fewer flags.** These work: `-F`, `-i`, `-s`, `-S`, `-U`, `-g`, `--iglob`,
-  `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`, `--color`
-  and `--stats`. Other flags of `rg`, such as `-w`, `-x`, `-v`, `-e`, `-t`,
-  `-m`, `--hidden`, `--no-ignore` and `--sort`, fail with exit 2.
-  `fmgrep --help` lists the flags that work.
-* **It does not search stdin or read a `RIPGREP_CONFIG_PATH` file.**
+  never finds a hidden, ignored, symlinked or binary file, not even
+  with a `-g` glob. A PATH that names one is an error, as is a PATH
+  outside the indexed tree; `rg` searches them. A search also finds
+  matches in a file edited or added since the index.
+* **Fewer flags.** These work: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`, `-g`,
+  `--iglob`, `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
+  `--color` and `--stats`. Other flags of `rg`, such as `-w`, `-x`, `-v`,
+  `-t`, `-m` and `--sort`, fail with exit 2. So do `--hidden` and
+  `--no-ignore`, which no index can honour. `fmgrep --help` lists the
+  flags that work.
+* **It does not search stdin or read a `RIPGREP_CONFIG_PATH` file.** `-` is a
+  PATH like any other, not stdin. To filter a pipe, use `rg`.
 * **`--json` prints a counts report.** `--json --matches` prints the
   events of `rg`.
 * **`index`, `serve` and `status` are commands** when they are the first
@@ -121,15 +119,15 @@ checkout with a team, index it with `fmgrep index --store-docs`. See
 ## Expressions
 
 ```sh
-fmgrep --and HscEnv DynFlags       # files holding every TERM
-fmgrep --or HscEnv 'Dyn[A-Z]\w+'   # files holding any TERM
+fmgrep --and -e HscEnv -e DynFlags       # files holding every PATTERN
+fmgrep --or -e HscEnv -e 'Dyn[A-Z]\w+'   # files holding any PATTERN
 fmgrep --expr 'HscEnv AND (DynFlags OR /Dyn[A-Z]\w+/)'
 ```
 
-`--and` and `--or` read each TERM as a regex, as a search does. In `--expr`
+`--and` and `--or` read each PATTERN as a regex, as a search does. In `--expr`
 a word is a literal, and `/re/` is a regex. `AND` and `OR` are capitals,
 `AND` binds tighter, and quoting is as in sh. They pick files; fmgrep then
-prints the lines of every TERM in those files.
+prints the lines of every PATTERN in those files.
 
 ## Indexing
 
