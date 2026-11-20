@@ -67,6 +67,11 @@ pub struct OutputReport {
     /// file. Absent when false.
     #[serde(default, skip_serializing_if = "is_no")]
     pub none_searched: bool,
+    /// The PATHs of the query, as typed, that name no file the index or the
+    /// added files hold (a hidden, ignored, binary or symlinked one, or a
+    /// directory with none such below it). Absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unindexed: Vec<String>,
 }
 
 fn is_no(v: &bool) -> bool {
@@ -141,6 +146,7 @@ mod tests {
                 leaves: Vec::new(),
             }],
             none_searched: false,
+            unindexed: Vec::new(),
         };
         let json = serde_json::to_string(&out).unwrap();
         // Counts mode stays byte-identical: no `files` key at all.
@@ -168,6 +174,13 @@ mod tests {
         }
         // Exact counts stay off the wire; only an inexact term carries the key.
         assert!(v["queries"][0].get("counts_exact").is_none(), "{json}");
+        // An empty list of unindexed PATHs stays off the wire.
+        assert!(v.get("unindexed").is_none(), "{json}");
+        let mut named = serde_json::from_str::<OutputReport>(&json).unwrap();
+        named.unindexed = vec!["build".into()];
+        let json = serde_json::to_string(&named).unwrap();
+        assert!(json.ends_with(r#""unindexed":["build"]}"#), "{json}");
+        assert_eq!(serde_json::from_str::<OutputReport>(&json).unwrap(), named);
         let mut inexact = out;
         inexact.queries[0].counts_exact = false;
         let json = serde_json::to_string(&inexact).unwrap();

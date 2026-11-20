@@ -85,6 +85,47 @@ pub fn read_text(path: &Path) -> Result<Text, Option<String>> {
     text(raw).map_err(|why| (why == Skip::TooLarge).then(|| why.to_string()))
 }
 
+/// Bytes read at a time where a NUL is searched for past a file's head.
+const CHUNK: usize = 64 * 1024;
+
+/// Whether the whole file at `path` is text, as [`text`] of all of it
+/// would say, with at most [`CHUNK`] bytes of it in memory:
+/// [`sniff_text`] of its head, then a NUL searched for in the rest. Errs
+/// as [`sniff_text`] does.
+pub fn whole_text(path: &Path) -> Result<bool, String> {
+    if !sniff_text(path)? {
+        return Ok(false);
+    }
+    match holds_nul(path) {
+        Ok(nul) => Ok(!nul),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read ({e})")),
+    }
+}
+
+/// Whether the text of the file at `path` holds a NUL: a zero byte, or a
+/// zero unit after a UTF-16 BOM. [`CHUNK`] is even: a unit never spans two.
+fn holds_nul(path: &Path) -> std::io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut chunk = Vec::with_capacity(CHUNK);
+    let mut wide = None;
+    loop {
+        chunk.clear();
+        (&mut file).take(CHUNK as u64).read_to_end(&mut chunk)?;
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+        let wide = *wide.get_or_insert_with(|| utf16(&chunk[..chunk.len().min(2)]).is_some());
+        let nul = match wide {
+            true => chunk.as_chunks::<2>().0.contains(&[0, 0]),
+            false => memchr::memchr(0, &chunk).is_some(),
+        };
+        if nul {
+            return Ok(true);
+        }
+    }
+}
+
 /// The leading bytes of the file at `path` that [`sniff_text`] inspects:
 /// enough UTF-16 to decode to the control-byte window. None when it is
 /// over [`MAX_DOC_BYTES`].
@@ -336,5 +377,63 @@ mod tests {
         file.set_len(MAX_DOC_BYTES + 1).unwrap();
         assert_eq!(sniff_text(&path), Err("over 2147483646 bytes".to_owned()));
         assert_eq!(Skip::TooLarge.to_string(), "over 2147483646 bytes");
+    }
+
+    /// [`whole_text`] says what [`text`] of the whole file says.
+    #[test]
+    fn whole_text_agrees_with_text_of_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let whole = |name: &str, bytes: &[u8]| {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+            let seen = whole_text(&dir.path().join(name)).unwrap();
+            assert_eq!(seen, is_text(bytes), "{name}");
+            seen
+        };
+        let plain = vec![b'x'; 3 * CHUNK + 10];
+        assert!(whole("plain.c", &plain));
+        // A NUL past the head and past a chunk, at a chunk's first byte and
+        // at the file's last.
+        for at in [2 * CHUNK + 5, CHUNK, plain.len() - 1] {
+            let mut late = plain.clone();
+            late[at] = 0;
+            assert!(!whole(&format!("late{at}.c"), &late), "{at}");
+        }
+        // UTF-16: its bytes are full of zeros, its text is none; a zero
+        // unit past a chunk is a NUL.
+        assert!(whole("le.c", &utf16le(&"x".repeat(2 * CHUNK))));
+        assert!(!whole(
+            "le-nul.c",
+            &utf16le(&format!("{}\0", "x".repeat(CHUNK)))
+        ));
+        let cut = utf16le(&format!("a{}", "🎉".repeat(SNIFF_BYTES)));
+        assert!(whole("cut.c", &cut));
+        let soup = utf16le(&format!(
+            "{}{}",
+            "x".repeat(SNIFF_BYTES - 1),
+            "\x01".repeat(1000)
+        ));
+        assert!(whole("soup.c", &soup));
+        assert!(!whole("gz.c", b"\x1f\x8btext") && whole("empty.c", b""));
+        assert_eq!(whole_text(&dir.path().join("missing.c")), Ok(false));
+    }
+
+    /// A file that cannot be read says why, as [`sniff_text`] does.
+    #[cfg(unix)]
+    #[test]
+    fn whole_text_says_why_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shut.c");
+        std::fs::write(&path, b"printk\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            println!("skipped: the file can be read (running as root)");
+            return;
+        }
+        let why = whole_text(&path).unwrap_err();
+        assert!(why.starts_with("cannot read (Permission denied"), "{why}");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(whole_text(&sub).unwrap_err().starts_with("cannot read ("));
     }
 }

@@ -180,7 +180,8 @@ fn sum(server: &QueryReport, local: &QueryReport) -> QueryReport {
 }
 
 /// The search's report over both parts: the server's index, both parts'
-/// counts. It searched no file only when neither part did.
+/// counts. It searched no file only when neither part did, and a PATH is
+/// unindexed only when neither part holds a file of it.
 pub fn report(server: OutputReport, local: &OutputReport) -> OutputReport {
     let queries = server
         .queries
@@ -200,6 +201,10 @@ pub fn report(server: OutputReport, local: &OutputReport) -> OutputReport {
     OutputReport {
         queries,
         none_searched: server.none_searched && local.none_searched,
+        unindexed: (server.unindexed.iter())
+            .filter(|p| local.unindexed.contains(p))
+            .cloned()
+            .collect(),
         ..server
     }
 }

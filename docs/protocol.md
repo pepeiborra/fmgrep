@@ -213,6 +213,7 @@ caps nesting at 60.
 | `num_files_indexed` | documents in the index |
 | `queries` | one `QueryReport` per term, in order, or one for the expression |
 | `none_searched` | present, as `true`, only when a query with `commit` found that its PATHs, cwd and globs keep it from every file it answers for; such a query does not fail, as its client searches other files too |
+| `unindexed` | present only when a PATH of the request, as typed, has no file at it or below it that the index or the added files hold: a hidden, ignored, binary or symlinked one. The query does not fail; the CLI prints an error for each and exits 2. A client that searches files of its own drops a PATH that holds one of them |
 
 `QueryReport`:
 
