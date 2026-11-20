@@ -59,9 +59,6 @@ fn invalid_patterns_fail_loudly_never_silent() {
             "got: {err}"
         );
         assert!(err.contains("(["), "must name the pattern: {err}");
-        // `//` strips to the empty pattern: loud rejection.
-        let err = query_it_err(&output, false, &[""]);
-        assert!(err.contains("empty"), "must reject empty: {err}");
     }
 }
 
@@ -454,17 +451,43 @@ fn ignore_case_runs_every_term_as_a_pattern() {
     }
 }
 
-/// `-i` must not change which argv is accepted: the empty bare term still
-/// matches nothing, as it does without `-i`.
+/// The empty pattern matches every line, as in rg, with or without `-F` or
+/// `-i`: every file is a candidate, and an empty file holds no line.
 #[test]
-fn ignore_case_keeps_the_empty_term_matching_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = stage_corpus(tmp.path(), &[("a.c", b"HscEnv\n")]);
-    let output = tmp.path().join("idx");
-    index_it(&folder, &output, true);
-    for flags in [&["-F"][..], &["-i", "-F"]] {
-        let out = query(&output, flags, &[""]).unwrap();
-        assert_eq!(out.queries[0].total_matches, 0, "flags={flags:?}");
+fn the_empty_pattern_matches_every_line() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = stage_corpus(
+            tmp.path(),
+            &[("a.c", b"HscEnv\nx\n\ny"), ("b.c", b"z\n"), ("c.c", b"")],
+        );
+        let output = tmp.path().join("idx");
+        index_it(&folder, &output, store_docs);
+        for flags in [&[][..], &["-F"], &["-i"], &["-i", "-F"]] {
+            let at = |extra: &[&str]| printed(&output, &[flags, extra].concat(), &[""]);
+            assert_eq!(at(&["-c"]), "a.c:4\nb.c:1\n", "{flags:?}");
+            assert_eq!(at(&["-l"]), "a.c\nb.c\n", "{flags:?}");
+            assert_eq!(
+                at(&["--no-heading", "-N"]),
+                "a.c:HscEnv\na.c:x\na.c:\na.c:y\nb.c:z\n",
+                "{flags:?}"
+            );
+            // In an expression it matches every file, too.
+            let both = [flags, &["-l", "--and"][..]].concat();
+            assert_eq!(printed(&output, &both, &["", "HscEnv"]), "a.c\n");
+            let either = [flags, &["-l", "--or"][..]].concat();
+            assert_eq!(printed(&output, &either, &["", "zzz"]), "a.c\nb.c\n");
+            let counted = query(&output, flags, &[""]).unwrap();
+            assert_eq!(
+                (
+                    counted.queries[0].total_matches,
+                    counted.queries[0].docs_matched
+                ),
+                (5, 2),
+                "{flags:?}"
+            );
+            assert!(!counted.queries[0].counts_exact, "{flags:?}");
+        }
     }
 }
 
