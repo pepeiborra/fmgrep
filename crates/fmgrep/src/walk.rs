@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rayon::prelude::*;
 
 use crate::binary::{MAX_DOC_BYTES, Skip, Text, read_text, text};
+use crate::diagnostic::Diagnostic;
 use crate::verbose::verbose;
 
 /// Documents one read batch holds: bounded by count AND by bytes, so a batch
@@ -190,27 +191,31 @@ pub fn for_each_index_doc(
     root: &Path,
     exclude: Option<&Path>,
     f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<WalkNotes, String> {
-    for_each_listed_doc(root, exclude, |_| {}, f)
+    for_each_listed_doc(root, exclude, |_| None, f, left_out)
 }
 
 /// [`for_each_index_doc`], calling `listed` with the number of files the
 /// walk listed, the ones it will skip included, once it has listed them
-/// all and before it reads the first.
+/// all and before it reads the first; the entry it returns goes to
+/// `left_out` there. The warnings of the walk and of each file it skips
+/// go to `left_out` in the order found, also when the walk fails.
 pub fn for_each_listed_doc(
     root: &Path,
     exclude: Option<&Path>,
-    listed: impl FnOnce(usize),
+    listed: impl FnOnce(usize) -> Option<Diagnostic>,
     mut f: impl FnMut(&str, Text, Stamp, u64) -> Result<(), String>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<WalkNotes, String> {
-    let (rels, mut notes) = list(root, exclude)?;
+    let (rels, mut notes) = list(root, exclude, left_out)?;
     if rels.is_empty() {
         return Err(format!(
             "error: no indexable files in {} (every file is ignored, hidden or a symlink)",
             root.display()
         ));
     }
-    listed(rels.len());
+    left_out.extend(listed(rels.len()));
     let pool = read_pool()?;
     let mut kept = 0usize;
     let mut skipped = 0usize;
@@ -232,7 +237,10 @@ pub fn for_each_listed_doc(
                     let binary = why == Skip::Binary;
                     skipped += usize::from(binary);
                     if !binary || verbose() {
-                        eprintln!("warning: skipping {rel}: {why}");
+                        left_out.push(Diagnostic::Skipped {
+                            path: PathBuf::from(rel),
+                            why: why.to_string(),
+                        });
                     }
                     notes.skipped.push(rel.clone());
                     continue;
@@ -250,7 +258,7 @@ pub fn for_each_listed_doc(
         ));
     }
     if skipped > 0 {
-        eprintln!("{}", skip_summary(skipped));
+        left_out.push(Diagnostic::Binaries { n: skipped });
     }
     Ok(notes)
 }
@@ -267,7 +275,11 @@ fn is_dir(entry: &ignore::DirEntry) -> bool {
 }
 
 /// The walk's files, sorted, each with its length, and what it saw besides.
-fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, WalkNotes), String> {
+fn list(
+    root: &Path,
+    exclude: Option<&Path>,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<(Vec<(String, u64)>, WalkNotes), String> {
     let exclude = exclude.and_then(|p| std::fs::canonicalize(p).ok());
     let mut ignores = outer_ignores(root);
     let notes = Arc::new(Mutex::new(WalkNotes {
@@ -296,6 +308,14 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
     });
     let files = Mutex::new(Vec::new());
     let failed = Mutex::new(None);
+    let warned = Mutex::new(Vec::new());
+    let warn = |e: &ignore::Error| {
+        let why = e.to_string();
+        warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Diagnostic::Walk { why });
+    };
     walk.build_parallel().run(|| {
         Box::new(|entry| {
             let entry = match entry {
@@ -308,7 +328,7 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
                 }
                 Err(e) => {
                     if verbose() {
-                        eprintln!("warning: {e}");
+                        warn(&e);
                     }
                     return ignore::WalkState::Continue;
                 }
@@ -316,7 +336,7 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
             if let Some(e) = entry.error()
                 && verbose()
             {
-                eprintln!("warning: {e}");
+                warn(e);
             }
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 let len = entry.metadata().map_or(0, |m| m.len());
@@ -328,6 +348,7 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
             ignore::WalkState::Continue
         })
     });
+    left_out.extend(warned.into_inner().unwrap_or_else(PoisonError::into_inner));
     if let Some(e) = failed.into_inner().unwrap_or_else(PoisonError::into_inner) {
         return Err(e);
     }
@@ -464,15 +485,6 @@ fn walk_within(
     Some(Walked { files, unlisted })
 }
 
-/// The walk's one default-verbosity line: what the per-file `warning:` lines
-/// collapse to.
-fn skip_summary(skipped: usize) -> String {
-    format!(
-        "skipped {skipped} non-text file(s) (binary or NUL); set FMGREP_VERBOSE=1 \
-         or pass --verbose to list them"
-    )
-}
-
 /// End of the batch starting at `at`: at least one document, then up to
 /// [`READ_BATCH_DOCS`] of them or [`READ_BATCH_BYTES`], whichever comes first.
 fn batch_end(rels: &[(String, u64)], at: usize) -> usize {
@@ -523,28 +535,40 @@ pub fn read_batch<T: Sync>(
 #[cfg(test)]
 pub fn discover_index_docs(root: &Path) -> Result<Vec<Document>, String> {
     let mut docs = Vec::new();
-    for_each_index_doc(root, None, |path, text, _, _| {
+    let each = |path: &str, text: Text, _: Stamp, _: u64| {
         docs.push(Document {
             id: docs.len(),
             path: path.to_owned(),
             bytes: text.bytes,
         });
         Ok(())
-    })?;
+    };
+    for_each_index_doc(root, None, each, &mut Vec::new())?;
     Ok(docs)
 }
 
 /// The indexable documents under `root` without their bytes: the
 /// [`for_each_index_doc`] walk, peak memory one file instead of the corpus.
+///
+/// The warnings of the walk are printed here, as the bench has no list to
+/// pass.
 pub fn discover_index_meta(root: &Path) -> Result<Vec<DocMeta>, String> {
     let mut metas = Vec::new();
-    for_each_index_doc(root, None, |path, text, _, _| {
-        metas.push(DocMeta {
-            path: path.to_owned(),
-            len: text.bytes.len() as u64,
-        });
-        Ok(())
-    })?;
+    let mut left_out = Vec::new();
+    let walked = for_each_index_doc(
+        root,
+        None,
+        |path, text, _, _| {
+            metas.push(DocMeta {
+                path: path.to_owned(),
+                len: text.bytes.len() as u64,
+            });
+            Ok(())
+        },
+        &mut left_out,
+    );
+    left_out.iter().for_each(|d| eprintln!("{d}"));
+    walked?;
     Ok(metas)
 }
 
@@ -587,7 +611,7 @@ mod tests {
 
     #[test]
     fn skip_summary_names_the_count_and_both_switches() {
-        let line = skip_summary(70);
+        let line = Diagnostic::Binaries { n: 70 }.to_string();
         assert!(line.starts_with("skipped 70 non-text file(s)"), "{line}");
         assert!(line.contains("FMGREP_VERBOSE=1"), "{line}");
         assert!(line.contains("--verbose"), "{line}");
@@ -802,7 +826,7 @@ mod tests {
             indexed(&dir),
             [".wl.c", "a.c", "keep.log", "p.c", "sub/m.c"]
         );
-        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(())).unwrap();
+        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
         let dirs: Vec<&str> = notes.dirs.iter().map(|(rel, _)| rel.as_str()).collect();
         assert_eq!(dirs, ["", "sub"], "ignored dirs are never listed");
         assert_eq!(walk_paths(&dir, &dir, None).files, indexed(&dir));
@@ -942,14 +966,14 @@ mod tests {
         std::fs::write(dir.join("a.c"), b"printk").unwrap();
         std::fs::write(dir.join("b.c"), b"").unwrap();
         let mut walked = Vec::new();
-        for_each_index_doc(&dir, None, |path, text, stamp, read| {
+        let each = |path: &str, text: Text, stamp: Stamp, read: u64| {
             let meta = std::fs::metadata(dir.join(path)).unwrap();
             assert_eq!(stamp, Stamp::of(&meta), "{path}");
             assert_eq!((stamp.len, read), (text.bytes.len() as u64, stamp.len));
             walked.push((path.to_owned(), text.bytes, stamp));
             Ok(())
-        })
-        .unwrap();
+        };
+        for_each_index_doc(&dir, None, each, &mut Vec::new()).unwrap();
         let rels: Vec<String> = walked.iter().map(|(p, _, _)| p.clone()).collect();
         let reread = read_batch(&read_pool().unwrap(), &dir, &rels, &String::as_str).unwrap();
         for ((_, bytes, stamp), got) in walked.iter().zip(&reread) {
@@ -999,11 +1023,11 @@ mod tests {
         }
         let exclude = dir.join("idx");
         let mut indexed = Vec::new();
-        for_each_index_doc(&dir, Some(&exclude), |path, _, _, _| {
+        let each = |path: &str, _: Text, _: Stamp, _: u64| {
             indexed.push(path.to_owned());
             Ok(())
-        })
-        .unwrap();
+        };
+        for_each_index_doc(&dir, Some(&exclude), each, &mut Vec::new()).unwrap();
         let walked = walk_paths(&dir, &dir, Some(&exclude)).files;
         let text: Vec<String> = walked
             .iter()
@@ -1048,11 +1072,12 @@ mod tests {
         symlink(dir.join("sub"), dir.join("links/linkdir")).unwrap();
         symlink(dir.join("nul.bin"), dir.join("bin-alias.o")).unwrap();
         let mut kept = Vec::new();
-        let notes = for_each_index_doc(&dir, Some(&dir.join("idx")), |rel, _, _, _| {
+        let each = |rel: &str, _: Text, _: Stamp, _: u64| {
             kept.push(rel.to_owned());
             Ok(())
-        })
-        .unwrap();
+        };
+        let notes =
+            for_each_index_doc(&dir, Some(&dir.join("idx")), each, &mut Vec::new()).unwrap();
         let stamp = |rel: &str| {
             Some(Stamp::of(
                 &std::fs::symlink_metadata(dir.join(rel)).unwrap(),
@@ -1083,7 +1108,7 @@ mod tests {
             ],
         );
         std::fs::write(dir.join(".ignore"), b"*.tmp\nskip/\n").unwrap();
-        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(())).unwrap();
+        let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
         let stamp = |rel: &str| Some(Stamp::of(&std::fs::metadata(dir.join(rel)).unwrap()));
         let rows: Vec<&(String, Option<Stamp>)> = notes
             .ignores

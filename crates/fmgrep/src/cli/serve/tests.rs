@@ -56,6 +56,7 @@ fn a_server_error_after_a_frame_per_file_keeps_the_output() {
             &mut conn,
             &p,
             &mut MatchWriter::new(&mut out, p.output_config()),
+            &mut crate::cli::Try::default(),
         );
         assert_eq!(
             got.err().unwrap(),

@@ -51,7 +51,9 @@ thread_local! {
     pub static MOUNTS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     /// The cache directory of searches on this thread; none when `None`.
     pub static CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    /// The warnings given by this thread's searches, every one.
+    /// The warnings of the check of what changed that this thread's
+    /// searches printed or tests noted, every one; shared with the threads
+    /// a test starts for a server.
     pub static NOTES: std::cell::RefCell<Arc<Mutex<Vec<String>>>> = std::cell::RefCell::default();
     /// The wall time, µs, this thread's fold walks report over the clock's.
     pub static WALK_US: Cell<Option<u64>> = const { Cell::new(None) };
@@ -86,5 +88,25 @@ impl Hooks {
         MOUNTS.set(self.mounts);
         CACHE.set(self.cache);
         NOTES.set(self.notes);
+    }
+}
+
+/// Note `body` as this thread's search printed it.
+pub fn note(body: &str) {
+    NOTES.with_borrow(|n| n.lock().unwrap().push(body.to_owned()));
+}
+
+/// Note the warnings of the check and the server's note that watchman
+/// answers again, among `entries`, as the command line prints them.
+pub fn note_entries(entries: &[crate::diagnostic::Diagnostic]) {
+    use crate::diagnostic::Diagnostic;
+    for d in entries {
+        match d {
+            Diagnostic::Check(check) => note(&check.to_string()),
+            Diagnostic::AnswersAgain => {
+                note(d.to_string().strip_prefix("note: ").unwrap_or_default())
+            }
+            _ => {}
+        }
     }
 }

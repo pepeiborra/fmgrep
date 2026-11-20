@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use rayon::prelude::*;
 
 use crate::Stamp;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Check, Diagnostic};
 use crate::manifest::{Checked, FileTable};
 
 mod added;
@@ -20,8 +20,8 @@ mod journal;
 mod recorded;
 
 pub use journal::{
-    Index, Of, Pinned, Remembered, keep, kept, not_due, pin, pin_path, pinned, record_path,
-    recorded, remember, remembered, request_watch, unsaid,
+    Index, Of, Pinned, Remembered, Unsaid, not_due, pin, pin_path, pinned, record_path, recorded,
+    remember, remembered, request_watch, unsaid,
 };
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
@@ -162,12 +162,15 @@ struct Known {
     moved_ignores: Mutex<std::collections::BTreeSet<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
+    /// Whether the warning that ignore files changed was said: once per
+    /// load, and a server's first query after its start says it too.
+    ignores_said: AtomicBool,
     /// Whether a server asks watchman again before each query: its
     /// warnings then speak of queries, not searches.
     each_query: bool,
     /// What this process already reported as left out: a server finds the
     /// same ones again at each query.
-    left_out: Mutex<std::collections::HashSet<Diagnostic>>,
+    left_out: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Known {
@@ -208,19 +211,22 @@ impl Known {
     }
 
     /// Mark `id` gone unless ignored; the first exclusion of a doc per
-    /// process warns.
-    fn exclude(&self, id: usize, path: &Path, why: &str) {
+    /// process adds an entry to `out`.
+    fn exclude(&self, id: usize, path: &Path, why: &str, out: &mut Vec<Diagnostic>) {
         let first = self.settle(id, GONE)
             && self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0;
         if first {
-            eprintln!("warning: excluding {}: {why}", path.display());
+            out.push(Diagnostic::Excluded {
+                path: path.to_owned(),
+                why: why.to_owned(),
+            });
         }
     }
 
     /// Add `what` to `out` unless this process already reported it.
     fn left_out_once(&self, what: Diagnostic, out: &mut Vec<Diagnostic>) {
         let mut said = self.left_out.lock().unwrap_or_else(PoisonError::into_inner);
-        if said.insert(what.clone()) {
+        if said.insert(what.to_string()) {
             out.push(what);
         }
     }
@@ -267,32 +273,39 @@ impl Known {
         *self.rules.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
-    /// Stat `ids` (ascending), ignored ones only if `force`, then warn about
-    /// the gone ones in order, or once when over half the docs are.
-    fn stat_ids(&self, ids: &[usize], files: Checked<'_>, lens: &[u64], force: bool) {
+    /// Stat `ids` (ascending), ignored ones only if `force`, then report the
+    /// gone ones in order, or once when over half the docs are.
+    fn stat_ids(
+        &self,
+        ids: &[usize],
+        files: Checked<'_>,
+        lens: &[u64],
+        force: bool,
+        out: &mut Vec<Diagnostic>,
+    ) {
         let gone = parallel(ids, |&id| self.stat(id, files, lens, force));
         let n = gone.iter().flatten().count();
         if n * 2 > self.state.len() {
-            eprintln!(
-                "warning: excluding {n} of {} indexed files, missing under {}",
-                self.state.len(),
-                self.root.display()
-            );
+            out.push(Diagnostic::MostlyGone {
+                gone: n,
+                files: self.state.len(),
+                root: self.root.clone(),
+            });
         }
         for (&id, why) in ids.iter().zip(gone) {
             match why {
                 Some(_) if n * 2 > self.state.len() => {
                     self.state[id].fetch_or(WARNED, Ordering::AcqRel);
                 }
-                Some(why) => self.exclude(id, &self.root.join(&files[id]), &why),
+                Some(why) => self.exclude(id, &self.root.join(&files[id]), &why, out),
                 None => {}
             }
         }
     }
 
-    fn stat_all(&self, files: Checked<'_>, lens: &[u64], force: bool) {
+    fn stat_all(&self, files: Checked<'_>, lens: &[u64], force: bool, out: &mut Vec<Diagnostic>) {
         let ids: Vec<usize> = (0..self.state.len()).collect();
-        self.stat_ids(&ids, files, lens, force);
+        self.stat_ids(&ids, files, lens, force, out);
     }
 
     /// Take root-relative `paths` (any order) as all that may differ in
@@ -379,14 +392,14 @@ impl Known {
         }
         ids.sort_unstable();
         ids.dedup();
-        self.stat_ids(&ids, files, lens, false);
+        self.stat_ids(&ids, files, lens, false, left_out);
         let prune = Arc::clone(recorded);
         let walked = crate::walk::walk_changed(root, listed.clone(), self.exclude.as_deref(), {
             move |rel| prune.is_dir(rel)
         });
         self.left_out_unlisted(walked.unlisted, left_out);
         self.add(&self.text_only(root, added::unlisted(walked.files, files), left_out));
-        scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed)));
+        scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed), left_out));
         self.discover_scopes(scopes, files, lens, left_out);
         self.complete.store(true, Ordering::Release);
         Ok(kept)
@@ -404,7 +417,11 @@ impl Known {
     /// The dirs of `changes` to walk again. Keeps its new ignore files for
     /// the baseline, and warns when any ignore file moved or is new
     /// since the index: every load walks the dirs they govern again.
-    fn apply_ignores(&self, changes: recorded::IgnoreScopes) -> Vec<String> {
+    fn apply_ignores(
+        &self,
+        changes: recorded::IgnoreScopes,
+        out: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
         self.keep_ignores(changes.found);
         let new = self
             .new_ignores
@@ -412,8 +429,11 @@ impl Known {
             .unwrap_or_else(PoisonError::into_inner)
             .len();
         let n = changes.moved.len() + new;
-        if n > 0 {
-            ignores_changed(n, self.each_query);
+        if n > 0 && !self.ignores_said.swap(true, Ordering::Relaxed) {
+            out.push(Diagnostic::Check(Check::IgnoresChanged {
+                n,
+                served: self.each_query,
+            }));
         }
         let mut moved = (self.moved_ignores.lock()).unwrap_or_else(PoisonError::into_inner);
         moved.extend(changes.moved);
@@ -435,25 +455,6 @@ impl Known {
     }
 }
 
-/// `n` ignore files moved or are new since the index, which every load
-/// applies by walking the dirs they govern again; worded for a server's
-/// queries if `served`.
-fn ignores_changed(n: usize, served: bool) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    let (files, dirs) = match n {
-        1 => ("file", "its directory"),
-        _ => ("files", "their directories"),
-    };
-    let each = if served { "query" } else { "search" };
-    journal::warn(
-        &SEEN,
-        &format!(
-            "{n} ignore {files} changed since the index; each {each} reads {dirs} again \
-             (re-run index to make searches fast again)"
-        ),
-    );
-}
-
 /// Added file `rel`, or its topmost ancestor the walk did not record: a
 /// replay walks that dir for any path under it.
 fn unrecorded<'a>(recorded: Option<&Recorded>, rel: &'a str) -> &'a str {
@@ -469,12 +470,24 @@ pub fn named(n: usize, kept: usize) -> String {
     format!("watchman and the baseline named {n} path(s), {kept} kept")
 }
 
-/// Under `--verbose`: what a re-check took from watchman, and its cost,
-/// the ask from `asked` to `applied` and the re-check since.
-fn timed(what: std::fmt::Arguments<'_>, asked: std::time::Instant, applied: std::time::Instant) {
+/// Under `--verbose`, adds to `out` what a re-check took from watchman,
+/// and its cost: the ask from `asked` to `applied` and the re-check since.
+fn timed(
+    reported: usize,
+    kept: usize,
+    served: bool,
+    asked: std::time::Instant,
+    applied: std::time::Instant,
+    out: &mut Vec<Diagnostic>,
+) {
     if crate::verbose::verbose() {
-        let (ask, apply) = (applied - asked, applied.elapsed());
-        eprintln!("note: {what} (ask {ask:.1?}, apply {apply:.1?})");
+        out.push(Diagnostic::Rechecked {
+            reported,
+            kept,
+            served,
+            ask: applied - asked,
+            apply: applied.elapsed(),
+        });
     }
 }
 
@@ -532,7 +545,7 @@ pub struct Files {
     /// Whether `files` ascend, checked once.
     sorted: OnceLock<bool>,
     /// The warning a server printed last, until watchman answers again.
-    said: Mutex<Option<String>>,
+    said: Mutex<Option<Check>>,
     /// Why a server cannot use watchman at all, found at its start.
     refusal: Mutex<Option<String>>,
 }
@@ -560,6 +573,7 @@ impl Files {
                 new_ignores: Mutex::default(),
                 moved_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
+                ignores_said: AtomicBool::new(false),
                 each_query: false,
                 left_out: Mutex::default(),
             }),
@@ -630,12 +644,12 @@ impl Files {
                 return Learned::Checked;
             }
             Err(why) => {
-                journal::cannot_answer(&why);
+                left_out.push(Diagnostic::Check(journal::cannot(&why)));
                 return Learned::Checked;
             }
         };
         let asked = std::time::Instant::now();
-        let answer = journal::ask(&root, index, files.len(), self.known.each_query);
+        let answer = journal::ask(&root, index, files.len(), self.known.each_query, left_out);
         if let Some(why) = answer.why {
             self.degraded(why);
         }
@@ -650,12 +664,14 @@ impl Files {
         let kept = match self.known.replay(recorded, &paths, files, lens, left_out) {
             Ok(kept) => kept,
             Err(()) => {
-                journal::over(journal::reported_cap(files.len()));
+                left_out.push(Diagnostic::Check(Check::Over {
+                    cap: journal::reported_cap(files.len()),
+                }));
                 return Learned::Checked;
             }
         };
         let n = paths.len();
-        timed(format_args!("{}", named(n, kept)), asked, applied);
+        timed(n, kept, false, asked, applied, left_out);
         Learned::Answered { named: n, kept }
     }
 
@@ -672,7 +688,7 @@ impl Files {
 
     /// A server's start that took no token says why: its first query
     /// prints a warning only when the reason differs.
-    fn degraded(&self, why: String) {
+    fn degraded(&self, why: Check) {
         if self.known.each_query {
             *self.said.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
         }
@@ -702,8 +718,10 @@ impl Files {
         }
         let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
         match (&why, said.is_some()) {
-            (Some(line), _) if said.as_ref() != Some(line) => journal::say(line),
-            (None, true) => journal::answers_again(),
+            (Some(check), _) if said.as_ref() != Some(check) => {
+                left_out.push(Diagnostic::Check(check.clone()));
+            }
+            (None, true) => left_out.push(Diagnostic::AnswersAgain),
             _ => {}
         }
         *said = why;
@@ -720,7 +738,7 @@ impl Files {
         files: Checked<'_>,
         lens: &[u64],
         left_out: &mut Vec<Diagnostic>,
-    ) -> Option<String> {
+    ) -> Option<Check> {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         let asked = std::time::Instant::now();
         let again = journal::again(root, last.as_ref());
@@ -733,21 +751,19 @@ impl Files {
         };
         let applied = std::time::Instant::now();
         let Ok(kept) = self.known.replay(recorded, &paths, files, lens, left_out) else {
-            return Some(journal::over_since(journal::reported_cap(files.len())));
+            return Some(Check::OverSince {
+                cap: journal::reported_cap(files.len()),
+            });
         };
         let n = paths.len();
-        timed(
-            format_args!("watchman reported {n} path(s) changed, {kept} kept"),
-            asked,
-            applied,
-        );
+        timed(n, kept, true, asked, applied, left_out);
         again.why
     }
 
     /// What a new load finds: every doc statted, ignored ones too, then
     /// discovery, which marks again what the rules skip.
     fn check_all(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
-        self.known.stat_all(files, lens, true);
+        self.known.stat_all(files, lens, true, left_out);
         self.discover(files, lens, left_out);
     }
 
@@ -755,7 +771,11 @@ impl Files {
     /// (the baseline) in the user's cache: once per process, so a server
     /// saves after its first query that has a token. The record's path,
     /// when this call wrote it.
-    pub fn checkpoint(&self, files: &FileTable) -> Result<Option<PathBuf>, String> {
+    pub fn checkpoint(
+        &self,
+        files: &FileTable,
+        left_out: &mut Vec<Diagnostic>,
+    ) -> Result<Option<PathBuf>, String> {
         let Some(index) = &self.index else {
             return Ok(None);
         };
@@ -792,7 +812,13 @@ impl Files {
         baseline.sort_unstable();
         baseline.dedup();
         let cap = journal::reported_cap(files.len());
-        Ok(journal::save(&root, index, token, baseline, cap))
+        Ok(match journal::save(&root, index, token, baseline, cap) {
+            Ok(path) => Some(path),
+            Err(check) => {
+                left_out.push(Diagnostic::Check(check));
+                None
+            }
+        })
     }
 
     /// Never take `index_dir` for an added file. Before any watch or
@@ -809,10 +835,10 @@ impl Files {
         known.recorded = Some(Arc::new(recorded));
     }
 
-    /// Stat every doc; each newly gone one warns, in doc order.
-    pub fn stat_all(&self, files: Checked<'_>, lens: &[u64]) {
+    /// Stat every doc; each newly gone one adds an entry, in doc order.
+    pub fn stat_all(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
         let _span = tracing::info_span!("stat").entered();
-        self.known.stat_all(files, lens, false);
+        self.known.stat_all(files, lens, false, left_out);
     }
 
     /// The ignore files seen moved or new since the index, ascending;
@@ -868,42 +894,53 @@ impl Files {
     /// [`crate::binary::text`] of the whole file, and the doc turns stale
     /// unless it is the indexed UTF-16 text. A file that is ignored, cannot
     /// be read or is no longer text is excluded: `None`.
-    pub fn read(&self, doc: usize, rel: &str, mut buf: Vec<u8>) -> Option<Vec<u8>> {
+    pub fn read(
+        &self,
+        doc: usize,
+        rel: &str,
+        mut buf: Vec<u8>,
+        left_out: &mut Vec<Diagnostic>,
+    ) -> Option<Vec<u8>> {
         use std::io::Read as _;
         let known = &*self.known;
         if known.kind(doc) == IGNORED {
             return None;
         }
         let path = known.root.join(rel);
-        let failed = |e: std::io::Error| {
-            known.exclude(doc, &path, &format!("cannot read ({e})"));
+        let failed = |e: std::io::Error, out: &mut Vec<Diagnostic>| {
+            known.exclude(doc, &path, &format!("cannot read ({e})"), out);
             None
         };
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(e) => return failed(e),
+            Err(e) => return failed(e, left_out),
         };
         let meta = match file.metadata() {
             Ok(m) => m,
-            Err(e) => return failed(e),
+            Err(e) => return failed(e, left_out),
         };
         let holds = known.stamps.holds(doc, &meta, buf.len() as u64);
         if holds && known.stamps.utf16(doc).is_none() {
             return match file.read_exact(&mut buf) {
                 Ok(()) => Some(buf),
-                Err(e) => failed(e),
+                Err(e) => failed(e, left_out),
             };
         }
         if !holds && !known.settle(doc, STALE) {
             return None;
         }
         if meta.len() > crate::binary::MAX_DOC_BYTES {
-            known.exclude(doc, &path, &crate::binary::Skip::TooLarge.to_string());
+            known.exclude(
+                doc,
+                &path,
+                &crate::binary::Skip::TooLarge.to_string(),
+                left_out,
+            );
             return None;
         }
         let mut whole = Vec::with_capacity(meta.len().try_into().unwrap_or(0));
         if let Err(e) = file.read_to_end(&mut whole) {
-            return failed(e);
+            return failed(e, left_out);
         }
         match crate::binary::text(whole) {
             Ok(text) => {
@@ -913,7 +950,7 @@ impl Files {
                 Some(text.bytes)
             }
             Err(why) => {
-                known.exclude(doc, &path, &why.to_string());
+                known.exclude(doc, &path, &why.to_string(), left_out);
                 None
             }
         }
@@ -1049,10 +1086,38 @@ mod tests {
         std::fs::remove_file(fix.path.join(&fix.paths()[2])).unwrap();
         let files = open_files(&fix);
         assert!(!files.changed(), "nothing is statted at open");
-        files.stat_all(fix.paths(), &fix.lens);
+        let mut said = Vec::new();
+        files.stat_all(fix.paths(), &fix.lens, &mut said);
         assert_eq!(files.kinds(), [FRESH, STALE, GONE]);
         assert_eq!(stale_gone(&files), (vec![1], vec![2]));
         assert!(files.changed() && files.warned(2) && !files.warned(1));
+        let gone = fix.path.join(&fix.paths()[2]);
+        let want = Diagnostic::Excluded {
+            path: gone,
+            why: "is missing".into(),
+        };
+        assert_eq!(said, [want], "one entry, for the file that is gone");
+        files.stat_all(fix.paths(), &fix.lens, &mut said);
+        assert_eq!(said.len(), 1, "said once");
+    }
+
+    #[test]
+    fn over_half_gone_is_one_entry_and_none_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fix = stage_files(tmp.path(), &[b"a", b"b", b"c"]);
+        for id in 0..2 {
+            std::fs::remove_file(fix.path.join(&fix.paths()[id])).unwrap();
+        }
+        let files = open_files(&fix);
+        let mut said = Vec::new();
+        files.stat_all(fix.paths(), &fix.lens, &mut said);
+        let want = Diagnostic::MostlyGone {
+            gone: 2,
+            files: 3,
+            root: fix.path.clone(),
+        };
+        assert_eq!(said, [want]);
+        assert!(files.warned(0) && files.warned(1), "no line per file later");
     }
 
     #[test]
@@ -1063,11 +1128,11 @@ mod tests {
         let fix = stage_files(tmp.path(), &docs);
         let files = open_files(&fix);
         let path = |id: usize| fix.path.join(&fix.paths()[id]);
-        files.stat_all(fix.paths(), &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert!(!files.changed());
         std::fs::write(path(150), b"changed!!").unwrap();
         std::fs::remove_file(path(7)).unwrap();
-        files.stat_all(fix.paths(), &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(stale_gone(&files), (vec![150], vec![7]));
         // A reappearing file is stale; one matching its stamp again is fresh.
         std::fs::write(path(7), b"back").unwrap();
@@ -1082,7 +1147,7 @@ mod tests {
                 + std::time::Duration::from_nanos(files.known.stamps.get(150) as u64),
         )
         .unwrap();
-        files.stat_all(fix.paths(), &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(stale_gone(&files), (vec![7], vec![]));
         assert_eq!(files.known.changed.load(Ordering::Acquire), 1);
     }
@@ -1092,10 +1157,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"printk", b"zz", b"aa"]);
         let files = open_files(&fix);
-        files.stat_all(fix.paths(), &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens, &mut Vec::new());
         std::fs::write(fix.path.join(&fix.paths()[1]), b"zz grew").unwrap();
         std::fs::write(fix.path.join(&fix.paths()[2]), b"a\0binary").unwrap();
-        let read = |id: usize| files.read(id, &fix.paths()[id], vec![0; fix.lens[id] as usize]);
+        let read = |id: usize| {
+            files.read(
+                id,
+                &fix.paths()[id],
+                vec![0; fix.lens[id] as usize],
+                &mut Vec::new(),
+            )
+        };
         assert_eq!(read(0).as_deref(), Some(&b"printk"[..]));
         assert_eq!(read(1).as_deref(), Some(&b"zz grew"[..]));
         assert_eq!(read(2), None);
@@ -1114,10 +1186,13 @@ mod tests {
         files.known.set(2, IGNORED);
         std::fs::write(fix.path.join(&fix.paths()[1]), b"zz changed").unwrap();
         std::fs::remove_file(fix.path.join(&fix.paths()[2])).unwrap();
-        files.stat_all(fix.paths(), &fix.lens);
+        files.stat_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(files.kinds(), [FRESH, IGNORED, IGNORED]);
         assert_eq!(stale_gone(&files), (vec![], vec![1, 2]));
-        assert_eq!(files.read(1, &fix.paths()[1], vec![0; 2]), None);
+        assert_eq!(
+            files.read(1, &fix.paths()[1], vec![0; 2], &mut Vec::new()),
+            None
+        );
         assert!(!files.warned(1) && !files.warned(2));
     }
 
@@ -1137,7 +1212,8 @@ mod tests {
         }
         crate::tests::support::backdate(&path);
         write_stamps(dir, &vec![0; docs.len()], &[]).unwrap();
-        let walk = crate::for_each_index_doc(&path, None, |_, _, _, _| Ok(())).unwrap();
+        let walk =
+            crate::for_each_index_doc(&path, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
         write_walk(dir, &walk, std::time::SystemTime::now()).unwrap();
         Fix {
             path,
@@ -1283,7 +1359,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_files(tmp.path(), &[b"a"]);
         std::fs::create_dir_all(fix.path.join("old")).unwrap();
-        let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
+        let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(()), &mut Vec::new())
+            .unwrap();
         write_walk(&fix.index, &walk, std::time::SystemTime::now()).unwrap();
         let recorded = Recorded::open(&fix.index).unwrap().unwrap();
         let r = Some(&recorded);

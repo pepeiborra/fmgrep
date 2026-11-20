@@ -10,6 +10,7 @@ mod read;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{DOCS_SHARD, SHARD_WRITE_BUFFER};
 use crate::plan::Cutter;
 use crate::walk::{WalkNotes, for_each_listed_doc};
@@ -49,8 +50,9 @@ pub fn stream_while<R>(
     output: &Path,
     cap: u64,
     store_docs: bool,
-    listed: impl FnOnce(usize) + Send,
+    listed: impl FnOnce(usize) -> Option<Diagnostic> + Send,
     build: impl FnOnce(&Cuts) -> Result<R, String>,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<(Docs, R), String> {
     let source = if store_docs {
         CutSource::Shard(output.join(DOCS_SHARD))
@@ -60,7 +62,8 @@ pub fn stream_while<R>(
     let (cuts, writer) = feed::feed(source.clone());
     // A plain thread: the stream blocks for the whole build and must never run a shard build.
     let (streamed, built) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| stream_into(folder, output, &source, cap, listed, writer));
+        let worker =
+            scope.spawn(|| stream_into(folder, output, &source, cap, listed, writer, left_out));
         let built = {
             // Scoped, so a build that gives up stops the stream before the
             // join below waits for it.
@@ -124,8 +127,9 @@ fn stream_into(
     output: &Path,
     source: &CutSource,
     cap: u64,
-    listed: impl FnOnce(usize),
+    listed: impl FnOnce(usize) -> Option<Diagnostic>,
     mut writer: feed::Writer,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<Docs, String> {
     let mut out = match source {
         CutSource::Files(_) => None,
@@ -146,37 +150,43 @@ fn stream_into(
     let mut bom_bytes = 0u64;
     let mut file_lens = Vec::new();
     let mut id = 0u64;
-    let walked = for_each_listed_doc(folder, Some(output), listed, |path, text, stamp, read| {
-        if writer.aborted() {
-            return Err(ABORTED.to_string());
-        }
-        if matches!(source, CutSource::Files(_)) && read != stamp.len {
-            return Err(read::changed_while_indexing(&folder.join(path)));
-        }
-        if text.utf16 {
-            file_lens.push((id, stamp.len));
-        }
-        id += 1;
-        let bytes = text.bytes;
-        let stamp = crate::Stamp {
-            len: bytes.len() as u64,
-            ..stamp
-        };
-        bom_bytes += (bytes.len() - crate::matching::strip_bom(&bytes).len()) as u64;
-        let cut = cutter.push(bytes.len() as u64);
-        let handed = match out.as_mut() {
-            Some((w, shard)) => {
-                w.write_all(&bytes).map_err(|e| failed(shard, e))?;
-                if cut.is_some() {
-                    w.flush().map_err(|e| failed(shard, e))?;
-                }
-                None
+    let walked = for_each_listed_doc(
+        folder,
+        Some(output),
+        listed,
+        |path, text, stamp, read| {
+            if writer.aborted() {
+                return Err(ABORTED.to_string());
             }
-            None => Some(bytes),
-        };
-        writer.pushed(path.to_owned(), stamp, handed, cut);
-        Ok(())
-    });
+            if matches!(source, CutSource::Files(_)) && read != stamp.len {
+                return Err(read::changed_while_indexing(&folder.join(path)));
+            }
+            if text.utf16 {
+                file_lens.push((id, stamp.len));
+            }
+            id += 1;
+            let bytes = text.bytes;
+            let stamp = crate::Stamp {
+                len: bytes.len() as u64,
+                ..stamp
+            };
+            bom_bytes += (bytes.len() - crate::matching::strip_bom(&bytes).len()) as u64;
+            let cut = cutter.push(bytes.len() as u64);
+            let handed = match out.as_mut() {
+                Some((w, shard)) => {
+                    w.write_all(&bytes).map_err(|e| failed(shard, e))?;
+                    if cut.is_some() {
+                        w.flush().map_err(|e| failed(shard, e))?;
+                    }
+                    None
+                }
+                None => Some(bytes),
+            };
+            writer.pushed(path.to_owned(), stamp, handed, cut);
+            Ok(())
+        },
+        left_out,
+    );
     let flushed = match out.as_mut() {
         Some((w, shard)) => w.flush().map_err(|e| failed(shard, e)),
         None => Ok(()),

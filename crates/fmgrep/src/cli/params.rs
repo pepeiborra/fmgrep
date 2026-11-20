@@ -218,6 +218,7 @@ impl QueryParams {
             output: self.output(),
             filter: self.filter()?,
             report_none: self.commit.is_some(),
+            plans: crate::verbose::plans(),
         })
     }
 

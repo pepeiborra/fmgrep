@@ -43,13 +43,12 @@ fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
     let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
     let files = manifest.files.checked().unwrap();
-    if !matches!(
-        docs.replay(files, &mut Vec::new()),
-        Learned::Answered { .. }
-    ) {
-        docs.discover(files, &mut Vec::new());
-        docs.stat_all(files);
+    let mut found = Vec::new();
+    if !matches!(docs.replay(files, &mut found), Learned::Answered { .. }) {
+        docs.discover(files, &mut found);
+        docs.stat_all(files, &mut found);
     }
+    crate::tests::note_entries(&found);
     // A start that took no token says why; a query says it again only
     // when the reason changes.
     let cannot = "watchman cannot say what changed (";
@@ -133,8 +132,8 @@ impl Served {
     }
 
     fn recheck(&mut self) -> (Vec<String>, Vec<String>) {
-        self.docs
-            .recheck(self.files.checked().unwrap(), &mut Vec::new());
+        let mut found = Vec::new();
+        self.docs.recheck(self.files.checked().unwrap(), &mut found);
         self.docs.begin();
         let paths = self.docs.paths(&self.files);
         let name = |&id: &usize| paths.path(id).unwrap().unwrap().to_owned();
@@ -145,7 +144,8 @@ impl Served {
             .iter()
             .filter(|&&id| self.docs.is_gone(id));
         let gone = gone.map(name).collect();
-        self.docs.checkpoint(&self.files).unwrap();
+        self.docs.checkpoint(&self.files, &mut found).unwrap();
+        crate::tests::note_entries(&found);
         (read, gone)
     }
 
@@ -201,6 +201,29 @@ fn each_query_sees_what_changed_before_it_and_the_record_is_saved_once() {
     assert!(notes().is_empty());
     assert_eq!(records(tmp.path()).len(), 1);
     assert_eq!(clock(tmp.path()), first, "saved after the first query only");
+}
+
+/// A server that cannot ask watchman checks every file, and says why after
+/// what the check left out, once while the reason holds.
+#[test]
+fn a_recheck_says_why_after_what_it_left_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), false);
+    std::fs::remove_file(index.join("dirs.stamps")).unwrap();
+    std::fs::remove_file(tmp.path().join("corpus/b.c")).unwrap();
+    let manifest = read_manifest(&index).unwrap();
+    let docs = DocStore::open(&index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
+    let files = manifest.files.checked().unwrap();
+    let mut found = Vec::new();
+    assert!(docs.recheck(files, &mut found));
+    let why = "the index has no dirs.stamps; re-run index";
+    let lines: Vec<String> = found.iter().map(ToString::to_string).collect();
+    assert!(lines[0].ends_with("b.c: is missing"), "{lines:?}");
+    let cannot = format!("warning: watchman cannot say what changed ({why}); checked every file");
+    assert_eq!(lines[1..], [cannot], "{lines:?}");
+    found.clear();
+    assert!(docs.recheck(files, &mut found));
+    assert!(found.is_empty(), "the same reason: said once, {found:?}");
 }
 
 /// A server's warning about an edited ignore file speaks of its queries.

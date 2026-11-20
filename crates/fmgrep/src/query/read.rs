@@ -6,7 +6,7 @@ use std::ops::{Range, RangeInclusive};
 
 use crate::probe::{Answer, Query};
 use crate::sharded::{DocfmIndex, Walk};
-use crate::verbose::{Us, plans, plural};
+use crate::verbose::{Us, plural};
 
 /// Unmeasured µs per located occurrence.
 const LOCATE_US: f64 = 0.7;
@@ -67,10 +67,11 @@ pub fn read_instead(
     kept: impl Iterator<Item = usize>,
     doc_lens: &[u64],
     costs: Costs,
-) -> Vec<Option<Answer>> {
+    plans: bool,
+) -> (Vec<Option<Answer>>, Option<String>) {
     let none = || terms.iter().map(|_| None).collect();
     if terms.iter().all(Option::is_none) {
-        return none();
+        return (none(), None);
     }
     let literals: Vec<Query<'_>> = (terms.iter().flatten())
         .filter_map(|t| match t.count {
@@ -126,24 +127,22 @@ pub fn read_instead(
         ids.push(id);
         bytes += doc_lens[id];
         if !reads(bound, ids.len(), bytes, costs) {
-            if plans() {
+            let plan = plans.then(|| {
                 let (read, locate) = estimates(bound, ids.len(), bytes, costs);
-                crate::held::text(&format!(
+                format!(
                     "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}\n",
                     ids.len(),
                     plural(ids.len()),
                     Us(read),
                     Us(locate)
-                ));
-            }
-            return none();
+                )
+            });
+            return (none(), plan);
         }
     }
-    if plans() {
-        crate::held::text(&note(terms, &spreads, ids.len(), bytes, costs));
-    }
+    let plan = plans.then(|| note(terms, &spreads, ids.len(), bytes, costs));
     let mut counted = counted.into_iter().zip(spreads);
-    terms
+    let answers = terms
         .iter()
         .map(|t| {
             t.as_ref()?;
@@ -156,7 +155,8 @@ pub fn read_instead(
                 counts: Vec::new(),
             })
         })
-        .collect()
+        .collect();
+    (answers, plan)
 }
 
 /// Whether reading `files` of `bytes` costs less than locating `spread` plus,
@@ -295,7 +295,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(loaded.locate_us, locate_us(None));
-            loaded.measure_locate(&fm);
+            loaded.measure_locate(&fm, &mut Vec::new());
             (fm, loaded.locate_us)
         };
         let tmp = tempfile::tempdir().unwrap();

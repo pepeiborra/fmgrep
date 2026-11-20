@@ -153,7 +153,8 @@ fn stage_recorded(
     let first = std::fs::metadata(fix.path.join(&fix.paths()[0])).unwrap();
     let t0 = crate::Stamp::of(&first).mtime_ns;
     super::super::write_stamps(dir, &vec![t0; docs.len()], &[]).unwrap();
-    let walk = crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(())).unwrap();
+    let walk =
+        crate::for_each_index_doc(&fix.path, None, |_, _, _, _| Ok(()), &mut Vec::new()).unwrap();
     super::super::write_walk(dir, &walk, started).unwrap();
     fix
 }

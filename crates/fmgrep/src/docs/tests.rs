@@ -36,7 +36,15 @@ fn stream_while<R>(
     store_docs: bool,
     build: impl FnOnce(&Cuts) -> Result<R, String>,
 ) -> Result<(Docs, R), String> {
-    super::stream_while(folder, output, cap, store_docs, |_| (), build)
+    super::stream_while(
+        folder,
+        output,
+        cap,
+        store_docs,
+        |_| None,
+        build,
+        &mut Vec::new(),
+    )
 }
 
 /// Stream with a build that consumes nothing: the write pass alone.
@@ -63,9 +71,21 @@ fn the_stream_gives_the_file_count_before_it_reads_a_file() {
     let rewrite = |files: usize| {
         listed = Some(files);
         std::fs::write(a, b"printk, rewritten").unwrap();
+        None
     };
-    let (docs, ()) =
-        super::stream_while(&folder, &output, u64::MAX, true, rewrite, |_| Ok(())).unwrap();
+    let mut left_out = Vec::new();
+    let (docs, ()) = super::stream_while(
+        &folder,
+        &output,
+        u64::MAX,
+        true,
+        rewrite,
+        |_| Ok(()),
+        &mut left_out,
+    )
+    .unwrap();
+    let binary = Diagnostic::Binaries { n: 1 };
+    assert_eq!(left_out, [binary], "nul.bin is the one non-text file");
     assert_eq!(listed, Some(5), "a.c b.c e.c nul.bin sub/c.c");
     assert_eq!(docs.num_docs(), 4, "nul.bin is skipped");
     let at = docs.paths.iter().position(|p| p == "a.c").unwrap();

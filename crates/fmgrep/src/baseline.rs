@@ -15,10 +15,10 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::params::QueryParams;
-use crate::checkout::{Local, changes, resolve, short};
+use crate::checkout::{Local, changes, resolve};
 use crate::diagnostic::Diagnostic;
-use crate::source::{Of, Remembered, remember, remembered, unsaid};
+use crate::filter::PathFilter;
+use crate::source::{Of, Remembered, Unsaid, remember, remembered, unsaid};
 use crate::vcs;
 use crate::wire::MAX_SKIP;
 
@@ -28,12 +28,16 @@ use crate::wire::MAX_SKIP;
 /// once the client can search the files it lists. Where watchman cannot
 /// say what changed, git is asked on every search, and the warning says so
 /// once for each reason and served commit, until watchman answers (always
-/// under `FMGREP_VERBOSE`). `p` is the search, for the note.
+/// under `FMGREP_VERBOSE`): the note that keeps it quiet is returned, to
+/// keep once the warning is printed. What the search leaves out, and its
+/// warnings and notes, go to `left_out`, in the order found, also when it
+/// fails. `filter` is the search's, for the note.
 pub fn skip_list(
     top: &Path,
     commit: &str,
-    p: &QueryParams,
-) -> Result<(Vec<String>, Local), String> {
+    filter: Option<&PathFilter>,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<(Vec<String>, Local, Option<Unsaid>), String> {
     let of = Of::commit(commit);
     let (token, why) = match remembered(top, &of) {
         Remembered::Since {
@@ -43,8 +47,10 @@ pub fn skip_list(
             changed,
         } => match since(top, baseline, &extra, changed) {
             Ok(skip) => {
-                remember(top, &of, token, skip.clone(), extra);
-                let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
+                if let Err(check) = remember(top, &of, token, skip.clone(), extra) {
+                    left_out.push(Diagnostic::Check(check));
+                }
+                let local = resolve(top, &skip, commit, left_out)?;
                 note(
                     top,
                     Some(&of),
@@ -52,30 +58,27 @@ pub fn skip_list(
                     "watchman since the baseline",
                     &skip,
                     &local,
-                    p,
+                    filter,
+                    left_out,
                 );
-                return Ok((skip, local));
+                return Ok((skip, local, None));
             }
             Err(why) => (token, why),
         },
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = printed(|left_out| changes(top, commit, left_out))?;
+            let skip = changes(top, commit, left_out)?;
             let took = asked.elapsed();
-            let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
+            let local = resolve(top, &skip, commit, left_out)?;
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
-                crate::held::then(
-                    &format!(
-                        "warning: watchman cannot say what changed ({why}); asked git what \
-                         differs from the served commit {} (took {})",
-                        short(commit),
-                        crate::verbose::Us(took.as_secs_f64() * 1e6)
-                    ),
-                    said,
-                );
+                left_out.push(Diagnostic::NoWatchman {
+                    why,
+                    commit: commit.to_owned(),
+                    took,
+                });
             }
             note(
                 top,
@@ -84,9 +87,10 @@ pub fn skip_list(
                 "git, as watchman cannot say",
                 &skip,
                 &local,
-                p,
+                filter,
+                left_out,
             );
-            return Ok((skip, local));
+            return Ok((skip, local, said));
         }
     };
     // The inputs before git reads them: one that moves while git runs
@@ -98,73 +102,68 @@ pub fn skip_list(
     let listed = settings(top);
     let git = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
-    let skip = printed(|left_out| changes(top, commit, left_out))?;
+    let skip = changes(top, commit, left_out)?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env()});
-        remember(top, &of, token, skip.clone(), extra);
+        if let Err(check) = remember(top, &of, token, skip.clone(), extra) {
+            left_out.push(Diagnostic::Check(check));
+        }
     }
-    let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
-    let next = match same {
-        true => "later searches ask watchman",
-        false => "git's config files changed while git ran; the next search asks git again",
-    };
-    super::warn(&format!(
-        "asked git what differs from the served commit {} ({why}; took {}); {next}",
-        short(commit),
-        crate::verbose::Us(took.as_secs_f64() * 1e6)
-    ));
+    let local = resolve(top, &skip, commit, left_out)?;
+    left_out.push(Diagnostic::AskedGit {
+        commit: commit.to_owned(),
+        why,
+        took,
+        saved: same,
+    });
     let source = "git, a new baseline";
-    note(top, same.then_some(&of), commit, source, &skip, &local, p);
-    Ok((skip, local))
-}
-
-/// What `find` leaves out of the checkout's files, printed as soon as it
-/// returns, before the lines of the search that follow: in a search that
-/// holds its lines these join them, in this order.
-fn printed<T>(find: impl FnOnce(&mut Vec<Diagnostic>) -> T) -> T {
-    let mut left_out = Vec::new();
-    let found = find(&mut left_out);
-    super::print_diagnostics(left_out);
-    found
+    note(
+        top,
+        same.then_some(&of),
+        commit,
+        source,
+        &skip,
+        &local,
+        filter,
+        left_out,
+    );
+    Ok((skip, local, None))
 }
 
 /// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
 /// checkout at `top` came from (`source`), its size, the files of
-/// `local` that the client searches for `p` (those that its PATHs, globs
+/// `local` that the client searches for `filter` (those that its PATHs, globs
 /// and cwd keep, as `--stats` counts them), the served commit `commit`,
 /// and the record of `of`, when one is saved.
+#[allow(clippy::too_many_arguments)]
 fn note(
     top: &Path,
     of: Option<&Of>,
     commit: &str,
-    source: &str,
+    source: &'static str,
     skip: &[String],
     local: &Local,
-    p: &QueryParams,
+    filter: Option<&PathFilter>,
+    left_out: &mut Vec<Diagnostic>,
 ) {
     if !crate::verbose::verbose() {
         return;
     }
-    let record = of
-        .and_then(|of| crate::source::record_path(top, of))
-        .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
-    let (n, bytes) = match p.filter() {
-        Ok(Some(f)) => {
-            (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i]))
-        }
-        _ => (local.files.len(), local.bytes),
+    let record = of.and_then(|of| crate::source::record_path(top, of));
+    let (n, bytes) = match filter {
+        Some(f) => (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i])),
+        None => (local.files.len(), local.bytes),
     };
-    let s = skip.len();
-    crate::held::line(&format!(
-        "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
-         searched here; served commit {}; record {record}",
-        crate::verbose::plural(s),
-        crate::verbose::plural(n),
+    left_out.push(Diagnostic::LocalChanges {
+        source,
+        skip: skip.len(),
+        files: n,
         bytes,
-        short(commit)
-    ));
+        commit: commit.to_owned(),
+        record,
+    });
 }
 
 /// The baseline plus what watchman says `changed`, when the variables

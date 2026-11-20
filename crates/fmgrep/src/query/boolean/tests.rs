@@ -1168,7 +1168,7 @@ fn answers(
     )
     .unwrap();
     if measure {
-        loaded.measure_band(&manifest);
+        loaded.measure_band(&manifest, &mut Vec::new());
     }
     crate::tests::BAND.set(pin);
     let outs = [
@@ -1267,4 +1267,33 @@ fn serve_measures_the_band_through_the_store() {
     assert!(read.iter().all(unread), "{read:?}");
     assert!(located[..2].iter().all(Result::is_ok), "{located:?}");
     assert!(unread(&located[2]), "{located:?}");
+}
+
+#[test]
+fn a_sampled_file_that_cannot_be_read_is_reported_by_the_measure() {
+    use crate::tests::support::{index_it, stage_corpus};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = stage_corpus(tmp.path(), &[("a.c", b"alpha one\n"), ("c.c", b"printk\n")]);
+    let index = tmp.path().join("idx");
+    index_it(&corpus, &index, false);
+    let manifest = crate::manifest::read_manifest(&index).unwrap();
+    let (_, mut loaded) = super::super::load(
+        &index,
+        &manifest,
+        None,
+        crate::fetch::Ask::Load,
+        None,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let shut = corpus.join("c.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut left_out = Vec::new();
+    loaded.measure_band(&manifest, &mut left_out);
+    let [Diagnostic::Excluded { path, why }] = left_out.as_slice() else {
+        panic!("one entry, for the file that cannot be read: {left_out:?}");
+    };
+    assert_eq!(path.file_name(), shut.file_name());
+    assert!(why.starts_with("cannot read (Permission denied"), "{why}");
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::cli::{Outcome, dispatch, dispatch_to};
+use crate::diagnostic::Diagnostic;
 use crate::expr::Expr;
 use crate::manifest::{BLOBS_SHARD, DOCS_SHARD, Manifest, read_manifest, shard_offsets};
 use crate::matching::{DocSearch, MatchMode, QueryOutput, matcher};
@@ -167,7 +168,37 @@ pub(crate) fn request<'a>(
         output,
         filter: None,
         report_none: false,
+        plans: false,
     }
+}
+
+/// `req` answered with a discarding sink: the report, and what the load and
+/// the answer left out, in the order a search prints it.
+pub(crate) fn run_entries(
+    req: &QueryRequest<'_>,
+) -> (Result<OutputReport, String>, Vec<Diagnostic>) {
+    let mut left_out = Vec::new();
+    let loaded = crate::query::load(
+        req.index_dir,
+        req.manifest,
+        req.corpus_root,
+        crate::fetch::Ask::Load,
+        None,
+        &mut left_out,
+    );
+    let (index, mut loaded) = match loaded {
+        Ok(l) => l,
+        Err(e) => return (Err(e), left_out),
+    };
+    loaded.note_stale(&req.manifest.files, &mut left_out);
+    let report = crate::query::answer(
+        &index,
+        &mut loaded,
+        req,
+        &mut crate::sink::Discard,
+        &mut left_out,
+    );
+    (report, left_out)
 }
 
 pub(crate) fn slice(bytes: &[u8], lens: &[u64]) -> Vec<Vec<u8>> {

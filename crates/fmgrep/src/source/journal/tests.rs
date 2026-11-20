@@ -67,7 +67,8 @@ fn a_record_is_used_only_by_its_index_build() {
         token("c:1:2"),
         baseline.clone(),
         64,
-    );
+    )
+    .unwrap();
     let of = idx.of().unwrap();
     let record = Record::read("/src/linux", &of).unwrap();
     let want = Record {
@@ -114,7 +115,7 @@ fn a_record_is_used_only_by_its_index_build() {
         "{err}"
     );
     let many: Vec<String> = (0..65).map(|i| format!("n{i}.c")).collect();
-    save(Path::new("/src/linux"), &idx, token("c:1:3"), many, 64);
+    save(Path::new("/src/linux"), &idx, token("c:1:3"), many, 64).unwrap();
     let over = Record::read("/src/linux", &idx.of().unwrap()).unwrap();
     assert_eq!(over.baseline, None, "past the cap");
 }
@@ -130,8 +131,8 @@ fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
     let src = Path::new("/src/linux");
     let (a, b) = (Of::commit(&"a".repeat(40)), Of::commit(&"b".repeat(40)));
     let say = |of: &Of, why: &str| match unsaid(src, of, why) {
-        Some(keep) => {
-            keep();
+        Some(unsaid) => {
+            unsaid.keep();
             true
         }
         None => false,
@@ -166,7 +167,7 @@ fn a_reason_is_said_once_for_a_checkout_and_a_commit() {
     std::fs::remove_file(&file).unwrap();
     std::fs::create_dir(&file).unwrap();
     assert!(unsaid(src, &a, "no daemon").is_some());
-    unsaid(src, &a, "no daemon").unwrap()();
+    unsaid(src, &a, "no daemon").unwrap().keep();
     assert!(unsaid(src, &a, "no daemon").is_some());
     crate::tests::CACHE.set(None);
     assert!(unsaid(src, &a, "no daemon").is_some(), "no cache directory");
@@ -182,7 +183,7 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
     let full = |id: &str| id.len() == 40;
     let id = "a".repeat(40);
     assert_eq!(pinned(src, addr, full), Pinned::Missing);
-    pin(src, addr, Some(&id));
+    pin(src, addr, Some(&id)).unwrap();
     assert_eq!(pinned(src, addr, full), Pinned::Commit(id.clone()));
     assert_eq!(pinned(src, "h:8", full), Pinned::Missing, "another server");
     assert_eq!(pinned(Path::new("/src/l2"), addr, full), Pinned::Missing);
@@ -201,9 +202,9 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
         1,
         "no temp left"
     );
-    pin(src, addr, None);
+    pin(src, addr, None).unwrap();
     assert_eq!(pinned(src, addr, full), Pinned::Missing, "removed");
-    pin(src, addr, None);
+    pin(src, addr, None).unwrap();
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     let shown = file.display();
     let other = json!({"v": 1, "root": "/src/l2", "server": addr, "commit": id});
@@ -245,37 +246,52 @@ fn a_pin_keeps_the_served_commit_of_a_checkout_and_a_server() {
     }
 }
 
+/// A pin or a record that cannot be written is a value for the caller to say.
+#[test]
+fn a_pin_that_cannot_be_saved_returns_why() {
+    crate::tests::CACHE.set(None);
+    let got = pin(Path::new("/src/linux"), "h:7", None).expect_err("no cache directory");
+    assert_eq!(
+        got.to_string(),
+        "cannot save the pin (no cache directory: set XDG_CACHE_HOME or HOME); the next search \
+         checks again"
+    );
+    let record = remember(
+        Path::new("/src/linux"),
+        &Of::commit(&"a".repeat(40)),
+        token("c:1:2"),
+        vec![],
+        json!({}),
+    );
+    assert!(
+        matches!(record, Err(Check::CannotSave { .. })),
+        "{record:?}"
+    );
+}
+
 #[test]
 fn a_record_that_cannot_be_saved_says_so() {
     let tmp = tempfile::tempdir().unwrap();
-    let notes = || crate::tests::NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()));
     crate::tests::CACHE.set(None);
-    notes();
-    save(
-        Path::new("/src"),
-        &index("/i", 1),
-        token("c:1:2"),
-        vec![],
-        64,
-    );
+    let saved = || {
+        let saved = save(
+            Path::new("/src"),
+            &index("/i", 1),
+            token("c:1:2"),
+            vec![],
+            64,
+        );
+        saved.expect_err("the record is not saved").to_string()
+    };
     let none = "cannot save the watchman token (no cache directory: set XDG_CACHE_HOME or \
                 HOME); the next search checks again";
-    assert_eq!(notes(), [none]);
+    assert_eq!(saved(), none);
     let file = tmp.path().join("file");
     std::fs::write(&file, b"").unwrap();
     crate::tests::CACHE.set(Some(file.join("fmgrep")));
-    save(
-        Path::new("/src"),
-        &index("/i", 1),
-        token("c:1:2"),
-        vec![],
-        64,
-    );
-    let got = notes();
+    let got = saved();
     assert!(
-        got.len() == 1
-            && got[0].starts_with("cannot save ")
-            && got[0].contains("/file/fmgrep/src-"),
+        got.starts_with("cannot save ") && got.contains("/file/fmgrep/src-"),
         "{got:?}"
     );
 }
@@ -633,15 +649,17 @@ mod watchman_tests {
         crate::tests::CACHE.set(Some(tmp.path().join("cache")));
         let sock = fake(tmp.path(), Arc::new(AtomicU8::new(SYNC_FAILED)));
         let (root, idx) = (Path::new("/w/sub"), index("/i", 1));
-        save(root, &idx, faked(&sock), vec!["b.c".into()], 64);
-        let asked = ask(root, &idx, 1000, false);
+        save(root, &idx, faked(&sock), vec!["b.c".into()], 64).unwrap();
+        let mut found = Vec::new();
+        let asked = ask(root, &idx, 1000, false, &mut found);
         let token = asked.token.expect("the new token");
         assert_ne!(token.clock, faked(&sock).clock);
         assert!(asked.paths.is_none(), "every file is checked");
-        let notes = crate::tests::NOTES.with_borrow(|n| std::mem::take(&mut *n.lock().unwrap()));
-        let late = "watchman cannot say what changed (watchman did not answer within 100 ms); \
-                    checked every file";
-        assert_eq!(notes, [late]);
+        let late = Check::Cannot {
+            why: "watchman did not answer within 100 ms".into(),
+        };
+        assert_eq!(found, [Diagnostic::Check(late.clone())]);
+        assert_eq!(asked.why, Some(late), "a server compares it with the next");
     }
 
     /// A crawl's tail answers syncs at once, all with the crawl's tick, which

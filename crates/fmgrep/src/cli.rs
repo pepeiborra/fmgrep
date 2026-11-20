@@ -5,17 +5,14 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
-mod baseline;
 mod frames;
 mod locate;
-mod merge;
-mod params;
+pub(crate) mod params;
 mod print;
 mod serve;
 mod status;
 
-use crate::checkout;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Check, Diagnostic};
 use crate::events::JsonSink;
 use crate::fetch::Ask;
 use crate::filter::SearchPath;
@@ -25,7 +22,9 @@ use crate::output::{MatchWriter, WRITE_FAILED};
 use crate::query::{answer as answer_local, load};
 use crate::remote::{Conn, Server};
 use crate::sink::{Discard, MatchSink};
+use crate::source::Unsaid;
 use crate::wire::{IndexSummary, OutputReport, ServeStatus};
+use crate::{baseline, checkout, merge};
 use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
@@ -273,10 +272,7 @@ fn search(
             .filter(|t| t.len() > 1 && t.starts_with('/') && t.ends_with('/'))
             .filter(|t| found_nothing(r, t))
         {
-            eprintln!(
-                "note: the pattern {t} matches its slashes too; write {} for what they hold",
-                &t[1..t.len() - 1]
-            );
+            say(Diagnostic::Slashes { pattern: t.clone() });
         }
     }
     let found = found.map_err(|e| match e {
@@ -430,10 +426,10 @@ fn find(
         });
     }
     if let Some(note) = note {
-        warn(&format!(
-            "Using local index {}{note}",
-            found.index_dir.display()
-        ));
+        say(Diagnostic::LocalIndex {
+            dir: found.index_dir.clone(),
+            note,
+        });
     }
     // `local` finds the index again, inside its spans.
     local(s.index.as_deref(), p, typed, s.json, out)
@@ -478,11 +474,14 @@ fn local(
             None,
             &mut left_out,
         );
-        print_diagnostics(std::mem::take(&mut left_out));
+        let loaded = loaded.map(|(index, mut loaded)| {
+            loaded.note_stale(&req.manifest.files, &mut left_out);
+            (index, loaded)
+        });
+        print_diagnostics(&std::mem::take(&mut left_out));
         let (index, mut loaded) = loaded?;
-        loaded.note_stale(&req.manifest.files);
         let report = answer_local(&index, &mut loaded, &req, sink, &mut left_out);
-        print_diagnostics(left_out);
+        print_diagnostics(&left_out);
         tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
         report
     });
@@ -493,26 +492,54 @@ fn local(
 }
 
 /// What a load or a search left out, on stderr: the one place that prints
-/// entries, in the order they were found. In a search through a server that
-/// holds its lines they join the held ones, so that they print or drop with
-/// them, in the order of the lines they sit between.
-fn print_diagnostics(left_out: Vec<Diagnostic>) {
+/// entries, in the order they were found. A search through a server keeps its
+/// entries in a `Try` until the server accepts the pin, and drops them with it
+/// if the server refuses.
+fn print_diagnostics(left_out: &[Diagnostic]) {
+    #[cfg(test)]
+    crate::tests::note_entries(left_out);
     for d in left_out {
-        crate::held::line(&d.to_string());
+        eprintln!("{d}");
     }
 }
 
-/// `line` on stderr, as a warning.
-fn warn(line: &str) {
-    crate::held::line(&format!("warning: {line}"));
+/// One entry, printed at once.
+fn say(d: Diagnostic) {
+    print_diagnostics(&[d]);
 }
 
-/// The one warning of a search whose local changes are ignored.
-fn degraded(why: &str) {
-    warn(&format!(
-        "local changes are ignored ({why}); these results are the server's alone; use \
-         --ignore-local-changes to avoid this warning"
-    ));
+/// What a search through a server has to say, kept as values until the
+/// server has taken its query: the first frame, or the result, prints them.
+/// A query that the server refuses spoke of a commit it no longer serves, so
+/// its `Try` is dropped, and with it what it holds.
+#[derive(Default)]
+struct Try {
+    entries: Vec<Diagnostic>,
+    /// How many of `entries` are printed.
+    shown: usize,
+    /// The note that keeps a warning quiet next time, kept once it is printed.
+    said: Option<Unsaid>,
+    /// Whether the server took the query.
+    printed: bool,
+}
+
+impl Try {
+    /// Print what is not printed yet, then keep the note of what was said.
+    fn print(&mut self) {
+        print_diagnostics(&self.entries[self.shown..]);
+        self.shown = self.entries.len();
+        self.printed = true;
+        if let Some(said) = self.said.take() {
+            said.keep();
+        }
+    }
+
+    /// Whether a record or a pin that could not be saved is among the
+    /// entries, printed or not: it is said once.
+    fn cannot_save(&self) -> bool {
+        let is = |d: &Diagnostic| matches!(d, Diagnostic::Check(Check::CannotSave { .. }));
+        self.entries.iter().any(is)
+    }
 }
 
 /// A search through `server`, on `conn`. With `ignore`
@@ -524,11 +551,11 @@ fn degraded(why: &str) {
 /// status. It searches as with a status of that commit: a search from a
 /// checkout reads only the format and the commit of a status, and a
 /// server of another commit or format refuses its pinned query before it
-/// searches. Its lines on stderr are held until the server answers. When
-/// the server refuses, or the search fails before an answer, the client
-/// asks for the status. If the status has the pinned commit, the lines
-/// print and the search ends as it would have; else they are dropped, and
-/// the search runs again as one without a pin.
+/// searches. Its lines on stderr are kept in a [`Try`] until the server
+/// answers. When the server refuses, or the search fails before an
+/// answer, the client asks for the status. If the status has the pinned
+/// commit, the lines print and the search ends as it would have; else the
+/// `Try` is dropped, and the search runs again as one without a pin.
 fn client(
     server: &Server,
     mut conn: Conn,
@@ -543,65 +570,73 @@ fn client(
     let top = checkout::top(&cwd);
     let had =
         (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
-    let mut search = |conn: &mut Conn, status: &ServeStatus, p: QueryParams| {
-        answer(server, conn, status, &cwd, ignore, p, typed, json, out)
+    let mut search = |conn: &mut Conn, status: &ServeStatus, p: QueryParams, attempt: &mut Try| {
+        answer(
+            server, conn, status, &cwd, ignore, p, typed, json, out, attempt,
+        )
     };
+    let mut attempt = Try::default();
     let status = match &had {
         Some(Pinned::Commit(id)) => {
-            crate::held::hold();
             if crate::verbose::verbose() {
                 let pin =
                     (top.as_deref()).and_then(|top| crate::source::pin_path(top, &server.addr));
-                let pin = pin.map_or_else(|| "none".to_owned(), |p| p.display().to_string());
-                crate::held::line(&format!(
-                    "note: sent the query pinned to the served commit {}, which the pin {pin} \
-                     keeps, with no status request",
-                    checkout::short(id)
-                ));
+                attempt.entries.push(Diagnostic::SentPinned {
+                    commit: id.clone(),
+                    pin,
+                });
             }
-            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone());
-            if !crate::held::holding() || tried.is_ok() {
-                crate::held::release();
+            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone(), &mut attempt);
+            if attempt.printed || tried.is_ok() {
+                attempt.print();
                 return tried;
             }
             let status = serve::status_on(&mut conn)
                 .and_then(|status| same_format(server, status.format).map(|()| status));
             match status {
                 Ok(status) if checkout::pin_of(&status) == Some(id) => {
-                    asked(server, "the search failed before a result came");
-                    crate::held::release();
+                    attempt
+                        .entries
+                        .extend(asked(server, "the search failed before a result came"));
+                    attempt.print();
                     return tried;
                 }
                 Ok(status) => {
-                    crate::held::discard();
+                    // The refusal: what the try held spoke of a commit the
+                    // server no longer serves.
+                    drop(attempt);
+                    attempt = Try::default();
                     let short = checkout::short(id);
-                    asked(
-                        server,
-                        &format!("it no longer serves {short}, the commit that the pin keeps"),
-                    );
+                    let why = format!("it no longer serves {short}, the commit that the pin keeps");
+                    if let Some(d) = asked(server, &why) {
+                        say(d);
+                    }
                     status
                 }
-                Err(e) => {
-                    crate::held::discard();
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
         other => {
             match other {
-                Some(Pinned::Damaged(why)) => {
-                    warn(&format!("{why}; asked {server} for its status"))
-                }
+                Some(Pinned::Damaged(why)) => say(Diagnostic::PinDamaged {
+                    why: why.clone(),
+                    server: server.clone(),
+                }),
                 // Outside a checkout no pin applies: no note.
                 None => {}
-                Some(_) => asked(server, "no pin of an earlier search"),
+                Some(_) => {
+                    if let Some(d) = asked(server, "no pin of an earlier search") {
+                        say(d);
+                    }
+                }
             }
             let status = serve::status_on(&mut conn)?;
             same_format(server, status.format)?;
             status
         }
     };
-    let answered = search(&mut conn, &status, p);
+    let answered = search(&mut conn, &status, p, &mut attempt);
+    attempt.print();
     // After the search, so that a record that cannot be saved says so first.
     let now = checkout::pin_of(&status);
     let kept = match &had {
@@ -609,23 +644,28 @@ fn client(
         Some(Pinned::Missing) => now.is_none(),
         _ => false,
     };
-    if let Some(top) = top.filter(|_| !kept) {
-        crate::source::pin(&top, &server.addr, now);
+    if let Some(top) = top.filter(|_| !kept)
+        && let Err(check) = crate::source::pin(&top, &server.addr, now)
+        && !attempt.cannot_save()
+    {
+        say(Diagnostic::Check(check));
     }
     answered
 }
 
 /// Under `FMGREP_VERBOSE`, that a search asked `server` for its status,
 /// and `why`.
-fn asked(server: &Server, why: &str) {
-    if crate::verbose::verbose() {
-        crate::held::line(&format!("note: asked {server} for its status ({why})"));
-    }
+fn asked(server: &Server, why: &str) -> Option<Diagnostic> {
+    crate::verbose::verbose().then(|| Diagnostic::Asked {
+        server: server.clone(),
+        why: why.to_owned(),
+    })
 }
 
 /// A search through `server` of `status`, on `conn`, from the canonical
 /// `cwd`; PATHs resolve against the served tree, unless the cwd is in a
-/// checkout and the server serves a commit.
+/// checkout and the server serves a commit. What it has to say goes to
+/// `attempt`.
 #[allow(clippy::too_many_arguments)]
 fn answer(
     server: &Server,
@@ -637,28 +677,36 @@ fn answer(
     typed: &[String],
     json: bool,
     out: &mut dyn Write,
+    attempt: &mut Try,
 ) -> Result<Outcome, String> {
     let mut ours = None;
     let plan = match ignore {
         true => checkout::Plan::Ignored,
         false => checkout::plan(server, status, cwd),
     };
+    let degraded = |why: String| Diagnostic::Degraded { why };
     match plan {
         // The checkout holds the served commit: PATHs and the cwd are
         // resolved here, against its top, and its changes searched here.
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
-            match baseline::skip_list(&top, &commit, &p) {
-                Ok(changes) => ours = Some((top, changes)),
-                Err(why) => degraded(&why),
+            // Only the verbose note counts the files that a filter keeps.
+            let filter = crate::verbose::verbose().then(|| p.filter().ok().flatten());
+            let filter = filter.flatten();
+            match baseline::skip_list(&top, &commit, filter.as_ref(), &mut attempt.entries) {
+                Ok((skip, local, unsaid)) => {
+                    attempt.said = unsaid;
+                    ours = Some((top, (skip, local)));
+                }
+                Err(why) => attempt.entries.push(degraded(why)),
             }
             p.commit = Some(commit);
         }
         plan => {
             let pinned = match plan {
                 checkout::Plan::Degraded(why) => {
-                    degraded(&why);
+                    attempt.entries.push(degraded(why));
                     checkout::top(cwd).zip(status.commit.as_ref())
                 }
                 checkout::Plan::Ignored => checkout::top(cwd).zip(status.commit.as_ref()),
@@ -689,7 +737,7 @@ fn answer(
         // The client's own files go between the server's: it needs each
         // file of the server's in a frame of its own.
         Some((top, (skip, local))) if !local.files.is_empty() => {
-            merged(conn, p, &top, skip, &local, json, out)
+            merged(conn, p, &top, skip, &local, json, out, attempt)
         }
         // The server's files only, those on the skip list (deleted
         // files) left out: its output is the search's.
@@ -699,7 +747,7 @@ fn answer(
             if let Some((_, (skip, _))) = ours {
                 p.skip = skip;
             }
-            serve::rendered(conn, &p, json, out)
+            serve::rendered(conn, &p, json, out, attempt)
         }
     };
     answered
@@ -721,7 +769,9 @@ fn searched(report: OutputReport, p: &QueryParams) -> Result<OutputReport, Strin
 
 /// `p` answered by the client for its files `local` under `top`, and by
 /// the server for every other file, the skip list `skip` left out; the
-/// files printed in path order.
+/// files printed in path order. What the client's part leaves out goes to
+/// `attempt`.
+#[allow(clippy::too_many_arguments)]
 fn merged(
     conn: &mut Conn,
     mut p: QueryParams,
@@ -730,15 +780,15 @@ fn merged(
     local: &checkout::Local,
     json: bool,
     out: &mut dyn Write,
+    attempt: &mut Try,
 ) -> Result<OutputReport, String> {
-    let mut left_out = Vec::new();
-    let part = merge::part(&p, top, local, &mut left_out);
-    print_diagnostics(left_out);
-    let part = part?;
+    let manifest = Manifest::empty(top);
+    let req = p.request(Path::new(""), &manifest, Some(top))?;
+    let part = merge::part(&req, p.stats, top, local, &mut attempt.entries)?;
     p.skip = skip;
     render(&p, json, out, |sink| {
         let mut both = merge::Merge::new(sink, &part);
-        let server = serve::remote(conn, &p, &mut both)?;
+        let server = serve::remote(conn, &p, &mut both, attempt)?;
         searched(merge::report(server, &part.report), &p)
     })
 }
@@ -836,12 +886,18 @@ fn dispatch_in(
     crate::verbose::set_verbose(verbose).map_err(|e| format!("error: {e}"))?;
     match &cli.command {
         Some(Command::Index(a)) => {
-            let summary = run_index(&IndexRequest {
-                folder: &a.path,
-                output: a.output.as_deref(),
-                store_docs: a.store_docs,
-                require_commit: a.require_served_commit,
-            })?;
+            let mut left_out = Vec::new();
+            let summary = run_index(
+                &IndexRequest {
+                    folder: &a.path,
+                    output: a.output.as_deref(),
+                    store_docs: a.store_docs,
+                    require_commit: a.require_served_commit,
+                },
+                &mut left_out,
+            );
+            print_diagnostics(&left_out);
+            let summary = summary?;
             print::index_summary(out, a.json, &summary)?;
             Ok(Outcome::Index(summary))
         }
@@ -941,5 +997,50 @@ pub fn run() {
             eprintln!("{m}");
             std::process::exit(if m.starts_with(WRITE_FAILED) { 1 } else { 2 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{Of, unsaid};
+
+    /// A try keeps its note of what it said only once it prints, and prints
+    /// each entry once; a try that is dropped keeps nothing, so the next
+    /// search says the reason again.
+    #[test]
+    fn a_try_keeps_what_it_said_only_when_it_prints() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::tests::CACHE.set(Some(tmp.path().join("cache")));
+        let top = Path::new("/src/linux");
+        let of = Of::commit(&"a".repeat(40));
+        let attempt = || Try {
+            entries: vec![Diagnostic::AnswersAgain],
+            said: unsaid(top, &of, "no daemon"),
+            ..Try::default()
+        };
+        drop(attempt());
+        assert!(unsaid(top, &of, "no daemon").is_some(), "dropped: not said");
+        let mut printed = attempt();
+        assert!(!printed.printed && printed.shown == 0);
+        printed.print();
+        assert!(printed.printed && printed.shown == 1 && printed.said.is_none());
+        assert!(unsaid(top, &of, "no daemon").is_none(), "printed: said");
+        printed.entries.push(Diagnostic::AnswersAgain);
+        printed.print();
+        assert_eq!(printed.shown, 2, "each entry once");
+    }
+
+    /// A record or pin that cannot be saved is said once: by the try that
+    /// holds it, not again by the pin.
+    #[test]
+    fn a_try_knows_it_holds_a_failed_save() {
+        let mut attempt = Try::default();
+        assert!(!attempt.cannot_save());
+        attempt.entries.push(Diagnostic::Check(Check::CannotSave {
+            what: "the record".into(),
+        }));
+        attempt.print();
+        assert!(attempt.cannot_save(), "also once printed");
     }
 }

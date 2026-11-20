@@ -124,6 +124,56 @@ fn ok(index: &Path, regex: bool, terms: &[&str], output: QueryOutput) -> (Output
     query_out(index, regex, terms, output).unwrap()
 }
 
+/// Each producer of a plan adds an entry to what the search leaves out, and
+/// only when the request asks for plans.
+#[test]
+fn a_plan_is_an_entry_of_the_search() {
+    use crate::diagnostic::Diagnostic;
+    use crate::filter::PathFilter;
+    let tmp = tempfile::tempdir().unwrap();
+    let index = staged(tmp.path(), false);
+    let manifest = read_manifest(&index).unwrap();
+    let terms = vec!["printk".to_string()];
+    let expr = and(vec![t("printk"), t("tail")]);
+    let plans_of = |req: &QueryRequest<'_>| -> Vec<String> {
+        let (report, entries) = run_entries(req);
+        report.unwrap();
+        (entries.into_iter())
+            .filter_map(|d| match d {
+                Diagnostic::Plan { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    for plans in [false, true] {
+        let paths = [crate::filter::SearchPath {
+            path: "a.c".to_owned(),
+            name: "a.c".to_owned(),
+        }];
+        let by_term = QueryRequest {
+            plans,
+            filter: PathFilter::new(&[], &[], false, &paths, "").unwrap(),
+            ..request(&index, &manifest, &terms, QueryOutput::Counts)
+        };
+        let by_expr = QueryRequest {
+            plans,
+            expr: Some(&expr),
+            ..request(&index, &manifest, &[], QueryOutput::Counts)
+        };
+        let (term, and) = (plans_of(&by_term), plans_of(&by_expr));
+        if !plans {
+            assert!(term.is_empty() && and.is_empty(), "{term:?} {and:?}");
+            continue;
+        }
+        assert!(and.len() == 1 && and[0].starts_with("plan: "), "{and:?}");
+        // The read's plan, then the term's own.
+        assert!(term[0].starts_with("plan:\nterm"), "{term:?}");
+        assert!(term[1].starts_with("plan: term "), "{term:?}");
+        assert_eq!(term.len(), 2, "{term:?}");
+        assert!(term.iter().chain(&and).all(|p| p.ends_with('\n')));
+    }
+}
+
 #[test]
 fn matches_mode_fetches_probe_exact_docs_too() {
     // The index answers `printk` exactly from the probe, so counts mode

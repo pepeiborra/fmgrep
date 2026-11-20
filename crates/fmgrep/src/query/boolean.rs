@@ -349,7 +349,7 @@ pub fn answer_expr(
     }
     let start = Instant::now();
     let mut probe_us = plan.probe_us + sample_us;
-    let verbose = crate::verbose::plans();
+    let verbose = req.plans;
     let mut leaf_us = Vec::new();
     let mut hits: Vec<Hits> = Vec::with_capacity(leaves.len());
     for a in answers {
@@ -489,7 +489,9 @@ pub fn answer_expr(
             output: req.output,
             reads: fetch.len(),
         };
-        crate::held::text(&explain.to_string());
+        left_out.push(Diagnostic::Plan {
+            text: explain.to_string(),
+        });
     }
     match (req.output, alternation.as_ref()) {
         (QueryOutput::Counts, _) => {
@@ -680,8 +682,13 @@ fn read_wall_us(
 }
 
 /// The band around the least of 3 warm per-document reads of spread fresh
-/// non-empty documents; the default when none exists or a read fails.
-pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
+/// non-empty documents; the default when none exists or a read fails. A
+/// sampled file that cannot be read adds its `Excluded` entry to `left_out`.
+pub fn warm_band(
+    docs: &mut DocStore,
+    manifest: &Manifest,
+    left_out: &mut Vec<Diagnostic>,
+) -> ReadBand {
     docs.begin();
     let fresh: Vec<usize> = (0..manifest.files.len())
         .filter(|&d| manifest.doc_lens[d] > 0 && docs.changed().binary_search(&d).is_err())
@@ -694,8 +701,7 @@ pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
     let mut warm = u64::MAX;
     for pass in 0..4 {
         docs.begin();
-        // It reads indexed docs only: nothing is left out.
-        let Ok((us, _)) = read_wall_us(docs, &manifest.files, &ids, &map, &mut Vec::new()) else {
+        let Ok((us, _)) = read_wall_us(docs, &manifest.files, &ids, &map, left_out) else {
             return ReadBand::DEFAULT;
         };
         if pass > 0 {
