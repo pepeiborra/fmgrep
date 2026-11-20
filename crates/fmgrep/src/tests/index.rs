@@ -33,7 +33,7 @@ fn index_of_a_missing_folder_creates_nothing() {
 
 #[test]
 fn load_index_ignores_stray_root_files() {
-    // Both shards are single named files: a stray root file is junk, never
+    // Both shards are single files: a stray root file is junk, never
     // a phantom doc or blob.
     let tmp = tempfile::tempdir().unwrap();
     let folder = stage_corpus(tmp.path(), &[("a.c", b"hello")]);
