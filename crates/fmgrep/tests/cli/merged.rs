@@ -444,8 +444,8 @@ fn an_interleaved_change_set_answers_as_a_local_index_in_every_mode() {
         ("", &["-C2", "printk"]),
         ("", &["-o", "pr.ntk"]),
         ("", &["-i", "printk"]),
-        ("", &["/oth[a-z]r/"]),
-        ("", &["-U", "/printk.*\\n.*other/"]),
+        ("", &["oth[a-z]r"]),
+        ("", &["-U", "printk.*\\n.*other"]),
         ("", &["-l", "printk"]),
         ("", &["-c", "printk"]),
         ("", &["--count-matches", "printk"]),
@@ -472,7 +472,7 @@ fn an_interleaved_change_set_answers_as_a_local_index_in_every_mode() {
         ("dir", &["--stats", "printk"]),
         ("", &["nothing-matches"]),
         ("", &["-g", "*.none", "printk"]),
-        ("", &["/(/"]),
+        ("", &["("]),
     ] {
         r.same(rel, args);
     }

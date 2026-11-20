@@ -417,7 +417,7 @@ fn a_later_search_prints_its_plan_in_place() {
     let r = Remote::new(&FILES);
     r.s.write(&r.client, &[("a.c", "printk edited\n")]);
     let proxy = Proxy::new(&r.addr);
-    let args = ["--and", "printk", "/ed+/"];
+    let args = ["--and", "printk", "ed+"];
     planned(&r, &proxy, &args);
     let (got, asked) = planned(&r, &proxy, &args);
     assert_eq!(asked, ["query"]);
@@ -591,7 +591,7 @@ fn fmgrep_verbose_says_whether_the_status_was_asked() {
     assert_eq!(note(&away), "");
     // A search that fails before a result, through a server that still
     // serves the pinned commit.
-    let mut cmd = r.command(&proxy.addr, &r.client, &["--regex", "(", "-l"]);
+    let mut cmd = r.command(&proxy.addr, &r.client, &["(", "-l"]);
     let out = cmd.env("FMGREP_VERBOSE", "1").output().unwrap();
     let text = stderr(&out);
     let failed = asked("the search failed before a result came");

@@ -18,6 +18,12 @@ pub fn count_overlapping(haystack: &[u8], finder: &memchr::memmem::Finder<'_>) -
     count
 }
 
+/// The lines of `raw`: a last line needs no terminator.
+fn line_count(raw: &[u8]) -> u64 {
+    let ends = memchr::memchr_iter(b'\n', raw).count() as u64;
+    ends + u64::from(raw.last().is_some_and(|&b| b != b'\n'))
+}
+
 /// Inputs longer than this never seed the quadratic
 /// [`longest_common_substring`].
 const ANCHOR_LEN_CAP: usize = 1024;
@@ -118,6 +124,91 @@ fn others_of(hir: &regex_syntax::hir::Hir, anchor: &[u8]) -> Vec<Vec<u8>> {
     kept
 }
 
+/// The bytes `pattern` matches when it is nothing but a literal, `HscEnv`,
+/// `StgClosure \*` or `a\.b`: what `regex::escape` writes for them. Such a
+/// pattern is answered as the literal is, from the index alone. A pattern
+/// with any other part, a flag, a class, a repetition or an assertion, is
+/// not plain, nor is one that holds a newline, a NUL (which rg refuses) or is
+/// not UTF-8: the regex
+/// path gives each its own error or answer. An inline flag such as `(?-i)`
+/// is no part of the bytes yet changes how they match under -i or -S, so a
+/// pattern with a `(?` is left to the regex path too; no escaped literal
+/// holds that text.
+pub fn plain_literal(pattern: &str) -> Option<String> {
+    use regex_syntax::hir::HirKind;
+    if pattern.contains("(?") {
+        return None;
+    }
+    let hir = regex_syntax::ParserBuilder::new()
+        .multi_line(true)
+        .build()
+        .parse(pattern)
+        .ok()?;
+    let HirKind::Literal(lit) = hir.kind() else {
+        return None;
+    };
+    let text = std::str::from_utf8(&lit.0).ok()?;
+    (!text.is_empty() && !text.contains(['\n', '\0'])).then(|| text.to_owned())
+}
+
+/// Whether rg's smart case reads `patterns` case-insensitively: some literal
+/// holds a letter in them, and no uppercase one does. A class such as `\S`,
+/// `\p{Lu}` or `\W` is no literal; the pattern `\.` is. A pattern that does
+/// not parse says nothing here: the search reports it.
+pub fn smart_case_folds<'a>(patterns: impl IntoIterator<Item = &'a str>) -> bool {
+    use regex_syntax::ast::{Ast, ClassSet, ClassSetItem, Literal};
+    #[derive(Default)]
+    struct Seen {
+        any_literal: bool,
+        any_uppercase: bool,
+    }
+    impl Seen {
+        fn literal(&mut self, lit: &Literal) {
+            self.any_literal = true;
+            self.any_uppercase |= lit.c.is_uppercase();
+        }
+        fn set(&mut self, set: &ClassSet) {
+            match set {
+                ClassSet::Item(item) => self.item(item),
+                ClassSet::BinaryOp(op) => {
+                    self.set(&op.lhs);
+                    self.set(&op.rhs);
+                }
+            }
+        }
+        fn item(&mut self, item: &ClassSetItem) {
+            match item {
+                ClassSetItem::Literal(lit) => self.literal(lit),
+                ClassSetItem::Range(range) => {
+                    self.literal(&range.start);
+                    self.literal(&range.end);
+                }
+                ClassSetItem::Bracketed(class) => self.set(&class.kind),
+                ClassSetItem::Union(union) => union.items.iter().for_each(|i| self.item(i)),
+                _ => {}
+            }
+        }
+        fn ast(&mut self, ast: &Ast) {
+            match ast {
+                Ast::Literal(lit) => self.literal(lit),
+                Ast::ClassBracketed(class) => self.set(&class.kind),
+                Ast::Repetition(rep) => self.ast(&rep.ast),
+                Ast::Group(group) => self.ast(&group.ast),
+                Ast::Alternation(alt) => alt.asts.iter().for_each(|a| self.ast(a)),
+                Ast::Concat(concat) => concat.asts.iter().for_each(|a| self.ast(a)),
+                _ => {}
+            }
+        }
+    }
+    let mut seen = Seen::default();
+    for pattern in patterns {
+        if let Ok(ast) = regex_syntax::ast::parse::Parser::new().parse(pattern) {
+            seen.ast(&ast);
+        }
+    }
+    seen.any_literal && !seen.any_uppercase
+}
+
 /// One regex compiled once, plus the literals the FM-index prunes it with.
 pub struct PreparedPattern {
     re: regex::bytes::Regex,
@@ -127,6 +218,8 @@ pub struct PreparedPattern {
     fold: Option<FoldPlan>,
     automaton: Option<RegexPlan>,
     deferred: Option<DeferredPlan>,
+    /// The empty pattern, which matches every line.
+    empty: bool,
 }
 
 /// The anchor of a parsed pattern: its required literal, unless that literal
@@ -155,16 +248,11 @@ impl PreparedPattern {
         Self::prepare_with(pattern, MatchMode::default())
     }
 
-    /// Compile `pattern` under `mode`; empty and invalid patterns are a
-    /// [`RegexError`] naming it. Every prune comes from one HIR parsed with
+    /// Compile `pattern` under `mode`; an invalid pattern is a
+    /// [`RegexError`] naming it. The empty pattern matches every line, as in
+    /// rg, and narrows nothing. Every prune comes from one HIR parsed with
     /// the matcher's flags; [`Self::count`]'s regex carries only `-i`.
     pub fn prepare_with(pattern: &str, mode: MatchMode) -> Result<Self, RegexError> {
-        if pattern.is_empty() {
-            return Err(RegexError::new(
-                pattern,
-                "empty regex pattern: rejected by the native-regex contract (not match-everywhere)",
-            ));
-        }
         let re = regex::bytes::RegexBuilder::new(pattern)
             .case_insensitive(mode.ignore_case)
             .build()
@@ -207,6 +295,7 @@ impl PreparedPattern {
             fold,
             automaton,
             deferred,
+            empty: pattern.is_empty(),
         })
     }
 
@@ -224,6 +313,10 @@ impl PreparedPattern {
     /// Exact non-overlapping count over `raw`: `find_iter` is the pinned
     /// `Matches` semantics (`/aa/` on `"aaaa"` is 2).
     pub fn count(&self, raw: &[u8]) -> u64 {
+        if self.empty {
+            // Every line holds one match; the bytes between positions do not.
+            return line_count(raw);
+        }
         self.re.find_iter(raw).count() as u64
     }
 
@@ -236,6 +329,11 @@ impl PreparedPattern {
 /// [`PreparedPattern::count`] on the BOM-stripped document.
 pub fn literal(p: &PreparedPattern) -> Option<&[u8]> {
     p.literal.as_deref()
+}
+
+/// Whether `p` is a literal under `-i`, walked through its case variants.
+pub fn fold_planned(p: &PreparedPattern) -> bool {
+    p.fold.is_some()
 }
 
 /// Whether the FM-index can narrow `p` at all; with `false` every document
@@ -340,6 +438,79 @@ mod tests {
     }
 
     #[test]
+    fn plain_literal_is_a_pattern_of_one_literal() {
+        for (pattern, literal) in [
+            ("HscEnv", "HscEnv"),
+            ("StgClosure \\*", "StgClosure *"),
+            ("a\\.b", "a.b"),
+            ("caf\u{e9}", "caf\u{e9}"),
+            ("a b", "a b"),
+            ("/a\\.b/", "/a.b/"),
+        ] {
+            assert_eq!(
+                plain_literal(pattern).as_deref(),
+                Some(literal),
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_literal_leaves_every_other_pattern_to_the_regex_path() {
+        for pattern in [
+            "",
+            "a.b",
+            "a|b",
+            "a+",
+            "a*",
+            "a?",
+            "a{2}",
+            "[ab]",
+            "(a)",
+            "^a",
+            "a$",
+            "\\bword",
+            "\\w",
+            "\\d+",
+            "(?i)abc",
+            "(?-i)FOO",
+            "\0",
+            "a\0b",
+            "\\((?-i)f",
+            "(?:abc)",
+            "a\\nb",
+            "a\nb",
+            "(",
+            "[",
+            "a\\",
+            "(?-u)\\xff",
+        ] {
+            assert_eq!(plain_literal(pattern), None, "{pattern:?}");
+        }
+    }
+
+    #[test]
+    fn plain_literal_reads_back_what_escape_writes() {
+        // Every string without a newline, from a deterministic walk over the
+        // bytes a source file holds.
+        let alphabet: Vec<char> = "ab .*+?()[]{}|^$\\#&-~/_\t\u{e9}\u{4e2d}AZ09'\""
+            .chars()
+            .collect();
+        let mut rng = crate::tests::support::Rng(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..4000 {
+            let len = 1 + rng.below(8);
+            let s: String = (0..len)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            assert_eq!(
+                plain_literal(&regex::escape(&s)).as_deref(),
+                Some(s.as_str()),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
     fn longest_common_substring_caps_long_inputs() {
         assert_eq!(longest_common_substring(b"printk", b"printf"), b"print");
         assert_eq!(longest_common_substring(b"foo", b"bar"), b"");
@@ -348,12 +519,11 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_empty_and_invalid_loudly() {
-        for bad in ["", "(["] {
-            match PreparedPattern::prepare(bad) {
-                Err(e) => assert_eq!(e.pattern, bad, "must name the pattern"),
-                Ok(_) => panic!("pattern {bad:?} must be rejected"),
-            }
+    fn prepare_rejects_invalid_loudly_and_takes_the_empty_pattern() {
+        assert!(PreparedPattern::prepare("").is_ok());
+        match PreparedPattern::prepare("([") {
+            Err(e) => assert_eq!(e.pattern, "([", "must name the pattern"),
+            Ok(_) => panic!("an unclosed class must be rejected"),
         }
         // NUL-containing anchors never prune.
         assert_eq!(anchor(&PreparedPattern::prepare("a\\x00b").unwrap()), None);
@@ -398,13 +568,14 @@ mod tests {
         );
         // A case-sensitive compile never plans one.
         assert!(PreparedPattern::prepare("HscEnv").unwrap().fold().is_none());
-        // Empty and invalid stay loud on both paths.
-        for bad in ["", "(["] {
-            assert!(
-                PreparedPattern::prepare_with(bad, ci()).is_err(),
-                "pattern {bad:?}"
-            );
-        }
+        // The empty pattern has no case; invalid stays loud on both paths.
+        assert!(
+            PreparedPattern::prepare_with("", ci())
+                .unwrap()
+                .fold()
+                .is_none()
+        );
+        assert!(PreparedPattern::prepare_with("([", ci()).is_err());
     }
 
     #[test]

@@ -77,8 +77,8 @@ pub fn revision(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regex_pattern;
     use crate::{Kind, leaves};
-    use fmgrep::regex_pattern;
     use std::process::Command;
 
     fn regexes(set: &QuerySet) -> impl Iterator<Item = &str> {
@@ -151,6 +151,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// fmgrep reads every pattern as a regex, so each query reaches it as the
+    /// search the other rows run: a literal with `-F`, or beside a regex as
+    /// the plain literal of its escape, and a `/re/` as `re`.
+    #[test]
+    fn fmgrep_is_passed_every_query_as_the_search_it_stands_for() {
+        let mut metacharacters = 0;
+        for id in CORPORA {
+            for q in query_set(id).queries {
+                let args = crate::rows::fmgrep_args(&q);
+                let patterns = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
+                let fixed = args.iter().any(|a| a == "-F");
+                let leaves = leaves(&q);
+                assert_eq!(patterns.len(), leaves.len(), "{id} {q:?}");
+                for (leaf, pattern) in leaves.iter().zip(patterns) {
+                    match regex_pattern(leaf) {
+                        Some(re) => assert!(!fixed && re == pattern, "{id} {q:?}"),
+                        None if fixed => assert_eq!(pattern, leaf, "{id} {q:?}"),
+                        None => assert_eq!(
+                            fmgrep::plain_literal(pattern).as_deref(),
+                            Some(*leaf),
+                            "{id} {q:?}"
+                        ),
+                    }
+                    if fixed && regex::escape(leaf) != *leaf {
+                        metacharacters += 1;
+                    }
+                }
+            }
+        }
+        // Literals that would be regexes or errors without -F.
+        assert!(metacharacters > 0);
     }
 
     /// fmgrep and rg fold case alike; ASCII terms mean the same to tgrep and eg.

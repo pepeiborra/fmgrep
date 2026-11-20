@@ -62,16 +62,16 @@ pub(crate) fn query(index: &Path, flags: &[&str], terms: &[&str]) -> Result<Outp
     }
 }
 
-fn regex_flag(regex: bool) -> &'static [&'static str] {
-    if regex { &["--regex"] } else { &[] }
+fn fixed_flag(fixed: bool) -> &'static [&'static str] {
+    if fixed { &["-F"] } else { &[] }
 }
 
-pub(crate) fn query_it(index: &Path, regex: bool, terms: &[&str]) -> OutputReport {
-    query(index, regex_flag(regex), terms).unwrap()
+pub(crate) fn query_it(index: &Path, fixed: bool, terms: &[&str]) -> OutputReport {
+    query(index, fixed_flag(fixed), terms).unwrap()
 }
 
-pub(crate) fn query_it_err(index: &Path, regex: bool, terms: &[&str]) -> String {
-    match query(index, regex_flag(regex), terms) {
+pub(crate) fn query_it_err(index: &Path, fixed: bool, terms: &[&str]) -> String {
+    match query(index, fixed_flag(fixed), terms) {
         Err(e) => e,
         Ok(_) => panic!("query must fail for {terms:?}"),
     }
@@ -237,11 +237,8 @@ pub(crate) fn backdate(path: &Path) {
     }
 }
 
-/// `term`'s search; a `/.../`-wrapped term is a pattern, as on the CLI.
+/// `term`'s search: a pattern, as on the CLI.
 pub(crate) fn search(term: &str, output: QueryOutput, mode: MatchMode) -> DocSearch {
-    let m = match crate::regex_pattern(term) {
-        Some(p) => matcher("", Some(p), mode),
-        None => matcher(term, None, mode),
-    };
+    let m = matcher("", Some(term), mode);
     DocSearch::new(m.unwrap().unwrap(), output, mode)
 }

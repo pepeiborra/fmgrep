@@ -206,10 +206,7 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                     &["--no-heading", "-C", "1"],
                 ] {
                     let flags = [flag, mode_flags].concat();
-                    let want = only(
-                        &printed(&index, &[&flags[..], &["--regex"]].concat(), &[&alt]),
-                        &m,
-                    );
+                    let want = only(&printed(&index, &flags, &[&alt]), &m);
                     let got = printed_expr(&index, &flags, &expr).unwrap();
                     if mode_flags.contains(&"-C") {
                         // Context lines of non-members interleave; compare members' lines only.
@@ -220,11 +217,7 @@ fn expr_matches_naive_oracle_on_both_layouts() {
                 }
                 let c = report(&index, &[flag, &["--count-matches"]].concat(), &expr).unwrap();
                 let per_file: u64 = only(
-                    &printed(
-                        &index,
-                        &[flag, &["--count-matches", "--regex"]].concat(),
-                        &[&alt],
-                    ),
+                    &printed(&index, &[flag, &["--count-matches"]].concat(), &[&alt]),
                     &m,
                 )
                 .lines()
@@ -263,7 +256,11 @@ fn expr_single_leaf_equals_its_term() {
         let index = stage(tmp.path(), store_docs);
         for (leaf, term) in [
             (t("printk"), "printk"),
-            (re("pr[i1]ntk"), "/pr[i1]ntk/"),
+            // A regex that is a literal is answered as the term is: the
+            // same counts, exactness and files.
+            (re("printk"), "printk"),
+            (re("alpha"), "alpha"),
+            (re("pr[i1]ntk"), "pr[i1]ntk"),
             (t("alpha"), "alpha"),
         ] {
             for flags in [
@@ -518,7 +515,7 @@ fn expr_refusals_are_loud_and_before_io() {
     let index = blind_index(tmp.path(), &[("a.c", b"alpha\nbeta")]);
     for (flags, expr, want) in [
         (&[][..], and(vec![t("alpha"), re("(")]), "regex parse error"),
-        (&["-l"], or(vec![re(""), t("alpha")]), "empty regex pattern"),
+        (&["-l"], or(vec![re("["), t("alpha")]), "regex parse error"),
         (
             &["-c"],
             and(vec![t("alpha\nbeta"), t("alpha")]),

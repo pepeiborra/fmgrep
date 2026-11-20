@@ -47,9 +47,9 @@ response line each, after any [frames](#streamed-output).
 
 | field | type | default | meaning |
 |---|---|---|---|
-| `terms` | [string] | required unless `expr` is given | each a literal, or `/re/` for a regex |
+| `terms` | [string] | required unless `expr` is given | each a literal, or a regex when `regex` is true |
 | `expr` | Expr | absent | one expression instead of `terms` |
-| `regex` | bool | false | every term is a regex (`--regex`) |
+| `regex` | bool | false | every term is a regex; the CLI sends true, and false for `-F` |
 | `ignore_case` | bool | false | `-i` |
 | `multiline` | bool | false | `-U` |
 | `dotall` | bool | false | `--multiline-dotall` |
@@ -73,6 +73,16 @@ response line each, after any [frames](#streamed-output).
 
 `expr` with non-empty `terms`, or with `regex: true`, is refused.
 
+A term is read as the request says, whoever sent it. With `regex` false, it
+is a literal verbatim, a `/re/` term included. With `regex` true, it is a
+regex, the empty one too, which matches every line. A regex term that is
+nothing but a literal, such as `HscEnv` or `a\.b`, is answered as that
+literal is, from the index alone, and so is a `{"regex"}` leaf of an
+expression. A server answers what its own build reads, and client and
+server are one build: a client of v0.1.0 sends `/re/` with `regex` false,
+which this server reads as a literal. The fields of the request, `expr`
+and `--expr-json` are those of v0.1.0.
+
 `mode` is `counts` (`--json --approx-counts`), `lines` (a plain search),
 `files` (`-l`), `count` (`-c`), `count_matches`, `only` (`-o`) or
 `json_matches` (`--json --matches`). `counts` answers the bare
@@ -83,8 +93,8 @@ output is not UTF-8, `bytes` (standard base64) replaces `text`.
 `json_matches` gives the matches as structured events.
 
 ```text
-> {"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["greet","/hel+o/"]}}
-< {"jsonrpc":"2.0","id":1,"result":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":37,"total_matches":6,"docs_matched":3},{"term":"/hel+o/","latency_us":90,"total_matches":2,"docs_matched":2,"counts_exact":false}]}}
+> {"jsonrpc":"2.0","id":1,"method":"query","params":{"terms":["greet","hel+o"],"regex":true}}
+< {"jsonrpc":"2.0","id":1,"result":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"greet","latency_us":37,"total_matches":6,"docs_matched":3},{"term":"hel+o","latency_us":90,"total_matches":2,"docs_matched":2,"counts_exact":false}]}}
 > {"jsonrpc":"2.0","id":3,"method":"query","params":{"terms":["hello"],"mode":"lines"}}
 < {"jsonrpc":"2.0","id":3,"result":{"text":"README.md\n3:Say hello with greet.\n\nsrc/Lib.hs\n4:greet name = \"hello \" ++ name\n","report":{"index_time_us":4305,"index_size_bytes":34456,"num_files_indexed":3,"queries":[{"term":"hello","latency_us":47,"total_matches":2,"docs_matched":2}]}}}
 > {"jsonrpc":"2.0","id":4,"method":"query","params":{"terms":["greet"],"mode":"files"}}
@@ -220,7 +230,8 @@ Counting semantics:
 - **`--approx-counts`** (serve's `counts` mode) gives the index's own
   numbers: document-wide, with overlapping literal matches, and a pattern
   may match across lines. `counts_exact` is false for every pattern, and
-  for a literal that is empty, overlaps itself or holds `\n`.
+  for a literal that overlaps itself or holds `\n`. The empty pattern
+  counts one match per line.
 - **`--count-matches` and `-l`** with `--json` print the report with
   rg's counts, line-anchored and non-overlapping. `-l` proves
   membership only, so its `counts_exact` is false.

@@ -92,6 +92,9 @@ pub fn matcher(
 ) -> Result<Option<RegexMatcher>, String> {
     let mut b = RegexMatcherBuilder::new();
     b.multi_line(true).case_insensitive(mode.ignore_case);
+    // rg's binary detection makes a NUL impossible to match; a pattern that
+    // needs one is refused, as rg does, and a class loses it.
+    b.ban_byte(Some(0));
     if mode.multiline {
         b.dot_matches_new_line(mode.dotall);
     } else {

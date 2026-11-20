@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::*;
 
-const TERMS: [&str; 5] = ["printk", "aa", "missing", "/pr[i1]ntk/", "/a+/"];
+const TERMS: [&str; 5] = ["printk", "aa", "missing", "pr[i1]ntk", "a+"];
 
 /// Runs to exit 0, or 1 for a search with no match.
 fn ok(args: &[&str]) -> Output {

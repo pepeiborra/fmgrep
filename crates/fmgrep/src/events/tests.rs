@@ -106,7 +106,7 @@ fn a_leading_bom_leaves_the_stream_unshifted() {
     const BOM: (&str, &[u8]) = ("bom.c", b"\xef\xbb\xbfmodule Foo where\nsecond line\n");
     const PLAIN: (&str, &[u8]) = ("plain.c", b"module Bar where\n");
     assert_eq!(
-        render(&[BOM, PLAIN], &["/^module/"]),
+        render(&[BOM, PLAIN], &["^module"]),
         stream(&[
             r#"{"type":"begin","data":{"path":{"text":"bom.c"}}}"#,
             r#"{"type":"match","data":{"path":{"text":"bom.c"},"lines":{"text":"module Foo where\n"},"line_number":1,"absolute_offset":0,"submatches":[{"match":{"text":"module"},"start":0,"end":6}]}}"#,
