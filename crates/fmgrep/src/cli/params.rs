@@ -83,9 +83,6 @@ pub struct QueryParams {
     pub skip: Vec<String>,
 }
 
-/// The longest skip list a query may carry.
-pub const MAX_SKIP: usize = 10_000;
-
 /// What a request produces: the report (`counts`) or the
 /// local stdout of lines, `-l`, `-c`, `--count-matches`, `-o` and
 /// `--json --matches`.

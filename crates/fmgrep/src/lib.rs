@@ -38,6 +38,7 @@ mod automaton;
 mod base64;
 mod binary;
 mod blobs;
+mod checkout;
 mod cli;
 mod cursor;
 mod docs;

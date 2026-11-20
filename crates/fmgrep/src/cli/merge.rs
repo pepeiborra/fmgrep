@@ -6,8 +6,8 @@ use std::path::Path;
 
 use grep_printer::Stats;
 
-use super::checkout::Local;
 use super::params::QueryParams;
+use crate::checkout::Local;
 use crate::manifest::Manifest;
 use crate::query::{answer, listed};
 use crate::sink::{DocMatches, MatchSink};

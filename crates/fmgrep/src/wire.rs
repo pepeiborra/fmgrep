@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::Commit;
+
 /// `index --json` stdout summary.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexSummary {
@@ -69,6 +71,55 @@ pub struct OutputReport {
 
 fn is_no(v: &bool) -> bool {
     !*v
+}
+
+/// The longest skip list a query may carry.
+pub const MAX_SKIP: usize = 10_000;
+
+/// `status` result.
+#[derive(Serialize, Deserialize)]
+pub struct ServeStatus {
+    /// The manifest format of the served index; absent from a server older
+    /// than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    pub store_docs: bool,
+    pub files: usize,
+    pub num_bytes: u64,
+    pub index_size_bytes: u64,
+    pub load_us: u64,
+    /// The documents' directory: the tree, or the index directory holding `docs.shard`.
+    pub root: String,
+    /// The served commit: the commit whose files a `store_docs` index holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commit>,
+    /// Why a `store_docs` index records no served commit: the reason that
+    /// its build gave. Absent when there is a commit, for a files layout,
+    /// and from a server older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_no_commit: Option<String>,
+}
+
+impl ServeStatus {
+    /// The status that a pin of the served git commit `id` stands for. A
+    /// search from a checkout through a server that serves a commit reads
+    /// only its format and its commit; the root here is empty.
+    pub fn pinned(id: &str) -> Self {
+        Self {
+            format: Some(crate::manifest::MANIFEST_FORMAT),
+            store_docs: true,
+            files: 0,
+            num_bytes: 0,
+            index_size_bytes: 0,
+            load_us: 0,
+            root: String::new(),
+            commit: Some(Commit {
+                vcs: "git".to_owned(),
+                id: id.to_owned(),
+            }),
+            why_no_commit: None,
+        }
+    }
 }
 
 #[cfg(test)]
