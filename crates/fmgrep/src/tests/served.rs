@@ -43,8 +43,11 @@ fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
     let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
     let files = manifest.files.checked().unwrap();
-    if !matches!(docs.replay(files), Learned::Answered { .. }) {
-        docs.discover(files);
+    if !matches!(
+        docs.replay(files, &mut Vec::new()),
+        Learned::Answered { .. }
+    ) {
+        docs.discover(files, &mut Vec::new());
         docs.stat_all(files);
     }
     // A start that took no token says why; a query says it again only
@@ -130,7 +133,8 @@ impl Served {
     }
 
     fn recheck(&mut self) -> (Vec<String>, Vec<String>) {
-        self.docs.recheck(self.files.checked().unwrap());
+        self.docs
+            .recheck(self.files.checked().unwrap(), &mut Vec::new());
         self.docs.begin();
         let paths = self.docs.paths(&self.files);
         let name = |&id: &usize| paths.path(id).unwrap().unwrap().to_owned();

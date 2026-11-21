@@ -9,6 +9,7 @@ use std::sync::{Arc, MutexGuard, PoisonError};
 
 use super::{IGNORED, Known, Recorded, parallel};
 use crate::binary::sniff_text;
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{Checked, partition_ids};
 
 /// Append-only: slot `i` is doc `num_docs + i` for the life of the process.
@@ -75,12 +76,12 @@ impl super::Files {
     /// not list, and mark the indexed ones an ignore rule now skips; with a
     /// record, only changed and new directories are listed, and the dirs a
     /// changed ignore input affects.
-    pub fn discover(&self, files: Checked<'_>, lens: &[u64]) {
+    pub fn discover(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
         let known = &*self.known;
         let span = tracing::info_span!("discovery").entered();
         match &known.recorded {
-            Some(recorded) => known.discover_recorded(recorded, files, lens),
-            None => known.discover(&known.root, &known.root, files, lens),
+            Some(recorded) => known.discover_recorded(recorded, files, lens, left_out),
+            None => known.discover(&known.root, &known.root, files, lens, left_out),
         }
         drop(span);
         known.complete.store(true, Ordering::Release);
@@ -159,7 +160,12 @@ impl Known {
     }
 
     /// The paths of `rels` whose first bytes allow text, in order.
-    pub(super) fn text_only(&self, root: &Path, rels: Vec<String>) -> Vec<String> {
+    pub(super) fn text_only(
+        &self,
+        root: &Path,
+        rels: Vec<String>,
+        _left_out: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
         let keep = parallel(&rels, |rel| sniff_text(&root.join(rel)));
         rels.into_iter()
             .zip(keep)
@@ -170,7 +176,14 @@ impl Known {
     /// Walk `under` (at or below `root`) and reconcile what it holds: an
     /// indexed doc the rule skips, or no longer a regular file, is ignored;
     /// one the walk missed or lists again is statted.
-    pub fn discover(&self, root: &Path, under: &Path, files: Checked<'_>, lens: &[u64]) {
+    pub fn discover(
+        &self,
+        root: &Path,
+        under: &Path,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
@@ -198,14 +211,20 @@ impl Known {
             }
         });
         parallel(&back, |&id| self.stat(id, files, lens, true));
-        let found = self.text_only(root, unlisted(walked, files));
+        let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile(rel, &found);
     }
 
     /// [`Self::discover`] of the root, listing only the recorded dirs whose
     /// stamp moved and the new ones below them, then walking the dirs a
     /// changed ignore input affects.
-    fn discover_recorded(&self, recorded: &Arc<Recorded>, files: Checked<'_>, lens: &[u64]) {
+    fn discover_recorded(
+        &self,
+        recorded: &Arc<Recorded>,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
         let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));
@@ -214,9 +233,9 @@ impl Known {
             crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {
                 prune.is_dir(rel)
             });
-        let found = self.text_only(root, unlisted(walked, files));
+        let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile("", &found);
-        self.discover_scopes(scopes, files, lens);
+        self.discover_scopes(scopes, files, lens, left_out);
     }
 
     /// Whether `rel` is at or under the index dir.
@@ -227,7 +246,7 @@ impl Known {
             .is_some_and(|x| Path::new(rel).starts_with(x))
     }
 
-    pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {
+    pub fn read_added(&self, doc: usize, _left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
         let slot = doc.checked_sub(self.state.len())?;
         let rel = self.added().paths.get(slot)?.clone();
         let path = self.root.join(&rel);

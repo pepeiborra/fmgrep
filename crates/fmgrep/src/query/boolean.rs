@@ -16,6 +16,7 @@ use grep_regex::RegexMatcher;
 
 use super::{Loaded, QueryRequest, corpus, in_index, path_of, prepare, printed, searched};
 use crate::UNIFIED_SEPARATOR;
+use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
 use crate::fetch::{DocStore, Paths, fetch_stream_parallel, fetch_threads};
 use crate::filter::PathFilter;
@@ -238,6 +239,7 @@ pub fn answer_expr(
     req: &QueryRequest<'_>,
     expr: &Expr,
     sink: &mut dyn MatchSink,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<OutputReport, String> {
     refuse(req, expr)?;
     let leaves = leaves(expr, req)?;
@@ -307,7 +309,7 @@ pub fn answer_expr(
             finders.iter().all(|f| f.find(raw).is_some()) && folds.iter().all(|p| p.is_match(raw))
         };
         let mut read_us = |ids: &[usize]| -> Result<demote::Sample, String> {
-            let (us, held) = read_wall_us(docs, &manifest.files, ids, &map)?;
+            let (us, held) = read_wall_us(docs, &manifest.files, ids, &map, left_out)?;
             sample_us += us;
             let n = ids.len().max(1) as f64;
             Ok(demote::Sample {
@@ -501,6 +503,7 @@ pub fn answer_expr(
                     }
                     Ok(())
                 },
+                left_out,
             )?;
             // Decided members left unfetched: every regex leaf counts 0 there.
             let rest = difference(&root.yes, &fetch);
@@ -550,6 +553,7 @@ pub fn answer_expr(
                     }
                     Ok(())
                 },
+                left_out,
             )?;
             emit_yes(sink, None, &mut next_yes)?;
             docs_matched += members;
@@ -610,6 +614,7 @@ pub fn answer_expr(
                         stats: &f.stats,
                     })
                 },
+                left_out,
             )?;
         }
     }
@@ -651,13 +656,15 @@ fn read_wall_us(
     files: &FileTable,
     ids: &[usize],
     map: &(dyn Fn(usize, &[u8]) -> bool + Sync),
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<(u64, usize), String> {
     let start = Instant::now();
     let mut held = 0;
-    fetch_stream_parallel(docs, files, ids, fetch_threads(), map, &mut |_, _, h| {
+    let emit = &mut |_: usize, _: &[u8], h: bool| {
         held += usize::from(h);
         Ok(())
-    })?;
+    };
+    fetch_stream_parallel(docs, files, ids, fetch_threads(), map, emit, left_out)?;
     Ok((start.elapsed().as_micros() as u64, held))
 }
 
@@ -676,7 +683,8 @@ pub fn warm_band(docs: &mut DocStore, manifest: &Manifest) -> ReadBand {
     let mut warm = u64::MAX;
     for pass in 0..4 {
         docs.begin();
-        let Ok((us, _)) = read_wall_us(docs, &manifest.files, &ids, &map) else {
+        // It reads indexed docs only: nothing is left out.
+        let Ok((us, _)) = read_wall_us(docs, &manifest.files, &ids, &map, &mut Vec::new()) else {
             return ReadBand::DEFAULT;
         };
         if pass > 0 {

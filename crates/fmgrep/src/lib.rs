@@ -41,6 +41,7 @@ mod blobs;
 mod checkout;
 mod cli;
 mod cursor;
+mod diagnostic;
 mod docs;
 mod env;
 mod events;

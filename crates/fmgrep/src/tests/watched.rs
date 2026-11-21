@@ -13,7 +13,7 @@ fn replays(index: &Path) -> bool {
     let manifest = read_manifest(index).unwrap();
     let docs =
         crate::fetch::DocStore::open(index, &manifest, None, crate::fetch::Ask::Load).unwrap();
-    let learned = docs.replay(manifest.files.checked().unwrap());
+    let learned = docs.replay(manifest.files.checked().unwrap(), &mut Vec::new());
     matches!(learned, Learned::Answered { .. })
 }
 
@@ -1077,7 +1077,7 @@ fn watchman_skips_the_stat_pass() {
     let ((mut docs, learned), lates) = tried(&daemon, || {
         let ask = crate::fetch::Ask::Load;
         let docs = crate::fetch::DocStore::open(&output, &manifest, None, ask).unwrap();
-        let learned = docs.replay(manifest.files.checked().unwrap());
+        let learned = docs.replay(manifest.files.checked().unwrap(), &mut Vec::new());
         (docs, learned)
     });
     assert!(
