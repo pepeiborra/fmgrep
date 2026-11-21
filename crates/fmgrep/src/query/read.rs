@@ -6,7 +6,7 @@ use std::ops::{Range, RangeInclusive};
 
 use crate::probe::{Answer, Query};
 use crate::sharded::{DocfmIndex, Walk};
-use crate::verbose::{Us, plans, plural};
+use crate::verbose::{Us, plural};
 
 /// Unmeasured µs per located occurrence.
 const LOCATE_US: f64 = 0.7;
@@ -67,6 +67,7 @@ pub fn read_instead(
     kept: impl Iterator<Item = usize>,
     doc_lens: &[u64],
     costs: Costs,
+    plans: bool,
 ) -> Vec<Option<Answer>> {
     let none = || terms.iter().map(|_| None).collect();
     if terms.iter().all(Option::is_none) {
@@ -126,7 +127,7 @@ pub fn read_instead(
         ids.push(id);
         bytes += doc_lens[id];
         if !reads(bound, ids.len(), bytes, costs) {
-            if plans() {
+            if plans {
                 let (read, locate) = estimates(bound, ids.len(), bytes, costs);
                 crate::held::text(&format!(
                     "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}\n",
@@ -139,7 +140,7 @@ pub fn read_instead(
             return none();
         }
     }
-    if plans() {
+    if plans {
         crate::held::text(&note(terms, &spreads, ids.len(), bytes, costs));
     }
     let mut counted = counted.into_iter().zip(spreads);

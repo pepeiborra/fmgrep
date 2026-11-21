@@ -41,6 +41,8 @@ pub struct QueryRequest<'a> {
     /// [`OutputReport::none_searched`] instead of failing: its client
     /// searches other files too.
     pub report_none: bool,
+    /// Whether the search says how it plans each term (`FMGREP_VERBOSE=2`).
+    pub plans: bool,
 }
 
 mod boolean;
@@ -548,7 +550,15 @@ fn answer_terms(
                 file_us,
                 locate_us: loaded.locate_us,
             };
-            let reads = read::read_instead(index, &readable, c, kept, &manifest.doc_lens, costs);
+            let reads = read::read_instead(
+                index,
+                &readable,
+                c,
+                kept,
+                &manifest.doc_lens,
+                costs,
+                req.plans,
+            );
             failed.map_or(Ok(reads), Err)?
         }
         _ => probes.iter().map(|_| None).collect(),
@@ -573,7 +583,7 @@ fn answer_terms(
             })
         })
         .collect();
-    let plans: Vec<String> = match crate::verbose::plans() {
+    let plans: Vec<String> = match req.plans {
         true => probes.iter().map(plan_of).collect(),
         false => Vec::new(),
     };
