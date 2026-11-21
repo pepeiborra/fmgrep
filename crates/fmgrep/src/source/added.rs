@@ -223,18 +223,22 @@ impl Known {
                 _ => {}
             }
         }
-        parallel(&skipped, |&id| {
-            let path = root.join(&files[id]);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if !m.is_file() || self.ignored(&files[id], false) => self.set(id, IGNORED),
-                Ok(_) => {
-                    if let Some(why) = self.stat(id, files, lens, true) {
-                        self.exclude(id, &path, &why);
-                    }
+        let whys = parallel(&skipped, |&id| {
+            match std::fs::symlink_metadata(root.join(&files[id])) {
+                Ok(m) if !m.is_file() || self.ignored(&files[id], false) => {
+                    self.set(id, IGNORED);
+                    None
                 }
-                Err(_) => {}
+                Ok(_) => self.stat(id, files, lens, true),
+                Err(_) => None,
             }
         });
+        // In doc order, whichever thread ended first.
+        for (&id, why) in skipped.iter().zip(whys) {
+            if let Some(why) = why {
+                self.exclude(id, &root.join(&files[id]), &why, left_out);
+            }
+        }
         parallel(&back, |&id| self.stat(id, files, lens, true));
         let found = self.text_only(root, unlisted(walked, files), left_out);
         self.reconcile(rel, &found);

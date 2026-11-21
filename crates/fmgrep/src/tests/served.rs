@@ -48,7 +48,7 @@ fn serving(index: &Path) -> Served {
         Learned::Answered { .. }
     ) {
         docs.discover(files, &mut Vec::new());
-        docs.stat_all(files);
+        docs.stat_all(files, &mut Vec::new());
     }
     // A start that took no token says why; a query says it again only
     // when the reason changes.

@@ -477,7 +477,9 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     if let Some(why) = docs.mostly_gone(req.manifest.files.len()) {
         return Err(format!("error: {why} under {}", root.display()));
     }
-    docs.measure_band(req.manifest);
+    let mut sampled = Vec::new();
+    docs.measure_band(req.manifest, &mut sampled);
+    super::print_diagnostics(sampled);
     docs.measure_locate(&index);
     Ok(Served {
         index,

@@ -58,8 +58,8 @@ pub struct Loaded {
 
 impl Loaded {
     /// Plan ANDs from this machine's warm read cost, measured now.
-    pub fn measure_band(&mut self, manifest: &Manifest) {
-        self.band = boolean::warm_band(&mut self.docs, manifest);
+    pub fn measure_band(&mut self, manifest: &Manifest, left_out: &mut Vec<Diagnostic>) {
+        self.band = boolean::warm_band(&mut self.docs, manifest, left_out);
     }
 
     /// Price a locate from this machine's warm locates, measured now; under
@@ -216,7 +216,7 @@ pub fn check_changes<'scope, 'env>(
         span.in_scope(|| docs.discover(files, &mut found));
         found
     });
-    docs.stat_all(files);
+    docs.stat_all(files, left_out);
     left_out.extend(
         discovery
             .join()
