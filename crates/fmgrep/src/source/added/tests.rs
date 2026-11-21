@@ -187,12 +187,23 @@ fn stage_recorded(
 /// The fixture's files, with its record unless `walk_all`, after discovery.
 #[cfg(unix)]
 fn discovered(fix: &Fix, manifest: Checked<'_>, walk_all: bool) -> Files {
+    discovered_with(fix, manifest, walk_all, &mut Vec::new())
+}
+
+/// [`discovered`], with what discovery left out in `left_out`.
+#[cfg(unix)]
+fn discovered_with(
+    fix: &Fix,
+    manifest: Checked<'_>,
+    walk_all: bool,
+    left_out: &mut Vec<Diagnostic>,
+) -> Files {
     let mut files = open_files(fix);
     if !walk_all {
         let index = fix.path.parent().unwrap();
         files.record(super::super::Recorded::open(index).unwrap().unwrap());
     }
-    files.discover(manifest, &vec![0; manifest.len()], &mut Vec::new());
+    files.discover(manifest, &vec![0; manifest.len()], left_out);
     files
 }
 
@@ -384,4 +395,48 @@ fn read_text_says_why_it_cannot_read_a_file() {
     }
     let why = read("shut.c").unwrap_err().unwrap();
     assert!(why.starts_with("cannot read (Permission denied"), "{why}");
+}
+
+/// A directory that cannot be listed is named by each kind of load that
+/// walks it: the full walk, the walk of the changed directories from a
+/// record, and the walk of what watchman reports.
+#[cfg(unix)]
+#[test]
+fn a_new_dir_that_cannot_be_listed_is_named_by_each_kind_of_load() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now();
+    let fix = stage_recorded(tmp.path(), &[b"printk"], &[("sub/s.bin", b"\0")], now);
+    write(&fix.path, "nd/e.c", b"printk");
+    write(&fix.path, "top.c", b"printk");
+    let shut = fix.path.join("nd");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&shut).is_ok();
+    let (mut full, mut recorded, mut replay) = (Vec::new(), Vec::new(), Vec::new());
+    discovered_with(&fix, fix.paths(), true, &mut full);
+    discovered_with(&fix, fix.paths(), false, &mut recorded);
+    let mut replayed = open_files(&fix);
+    replayed.record(
+        super::super::Recorded::open(fix.path.parent().unwrap())
+            .unwrap()
+            .unwrap(),
+    );
+    let record = replayed.known.recorded.clone().unwrap();
+    let reported = ["top.c".to_owned()];
+    let kept = replayed
+        .known
+        .replay(&record, &reported, fix.paths(), &fix.lens, &mut replay);
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    let want = [Diagnostic::Unlisted {
+        dir: shut,
+        why: "Permission denied (os error 13)".to_owned(),
+    }];
+    assert_eq!(full, want, "full walk");
+    assert_eq!(recorded, want, "from a record");
+    assert_eq!(kept, Ok(1));
+    assert_eq!(replay, want, "replay");
 }

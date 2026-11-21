@@ -208,6 +208,8 @@ impl Known {
         left_out: &mut Vec<Diagnostic>,
     ) {
         let walked = crate::walk::walk_paths(root, under, self.exclude.as_deref());
+        self.left_out_unlisted(walked.unlisted, left_out);
+        let walked = walked.files;
         let Some(rel) = under.strip_prefix(root).ok().and_then(Path::to_str) else {
             return;
         };
@@ -256,7 +258,8 @@ impl Known {
             crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {
                 prune.is_dir(rel)
             });
-        let found = self.text_only(root, unlisted(walked, files), left_out);
+        self.left_out_unlisted(walked.unlisted, left_out);
+        let found = self.text_only(root, unlisted(walked.files, files), left_out);
         self.reconcile("", &found);
         self.discover_scopes(scopes, files, lens, left_out);
     }
