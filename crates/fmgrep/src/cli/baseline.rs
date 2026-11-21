@@ -61,7 +61,7 @@ pub fn skip_list(
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = changes(top, commit)?;
+            let skip = printed(|left_out| changes(top, commit, left_out))?;
             let took = asked.elapsed();
             let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
             // Said once while the reason holds; git is asked every time.
@@ -98,7 +98,7 @@ pub fn skip_list(
     let listed = settings(top);
     let git = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
-    let skip = changes(top, commit)?;
+    let skip = printed(|left_out| changes(top, commit, left_out))?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
