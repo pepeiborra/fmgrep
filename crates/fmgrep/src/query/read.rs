@@ -4,6 +4,7 @@
 use std::fmt::Write;
 use std::ops::{Range, RangeInclusive};
 
+use crate::diagnostic::Diagnostic;
 use crate::probe::{Answer, Query};
 use crate::sharded::{DocfmIndex, Walk};
 use crate::verbose::{Us, plural};
@@ -60,6 +61,7 @@ pub enum Count<'a> {
 
 /// Per term, the answer that reads the ids `kept` yields, when that costs
 /// less than locating it in the shards overlapping `cover`; None to locate.
+#[allow(clippy::too_many_arguments)]
 pub fn read_instead(
     index: &DocfmIndex,
     terms: &[Option<Readable<'_>>],
@@ -68,6 +70,7 @@ pub fn read_instead(
     doc_lens: &[u64],
     costs: Costs,
     plans: bool,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Vec<Option<Answer>> {
     let none = || terms.iter().map(|_| None).collect();
     if terms.iter().all(Option::is_none) {
@@ -129,19 +132,20 @@ pub fn read_instead(
         if !reads(bound, ids.len(), bytes, costs) {
             if plans {
                 let (read, locate) = estimates(bound, ids.len(), bytes, costs);
-                crate::held::text(&format!(
+                left_out.push(Diagnostic::Plan(format!(
                     "plan:\nterms located: reading the first {} kept file{} already costs {} >= the dearest locate {}\n",
                     ids.len(),
                     plural(ids.len()),
                     Us(read),
                     Us(locate)
-                ));
+                )));
             }
             return none();
         }
     }
     if plans {
-        crate::held::text(&note(terms, &spreads, ids.len(), bytes, costs));
+        let text = note(terms, &spreads, ids.len(), bytes, costs);
+        left_out.push(Diagnostic::Plan(text));
     }
     let mut counted = counted.into_iter().zip(spreads);
     terms

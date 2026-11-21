@@ -558,6 +558,7 @@ fn answer_terms(
                 &manifest.doc_lens,
                 costs,
                 req.plans,
+                left_out,
             );
             failed.map_or(Ok(reads), Err)?
         }
@@ -623,12 +624,13 @@ fn answer_terms(
         }
         paths.sort(&mut scan);
         if let Some(plan) = plans.get(i) {
-            crate::held::text(&format!(
+            let text = format!(
                 "plan: term {term:?}: {plan}; {} files located, {} candidates, {} files read\n",
                 exact.len(),
                 candidates.len(),
                 scan.len()
-            ));
+            );
+            left_out.push(Diagnostic::Plan(text));
         }
         // Every path the term may print is checked before its first line.
         if emit {

@@ -489,7 +489,7 @@ pub fn answer_expr(
             output: req.output,
             reads: fetch.len(),
         };
-        crate::held::text(&explain.to_string());
+        left_out.push(Diagnostic::Plan(explain.to_string()));
     }
     match (req.output, alternation.as_ref()) {
         (QueryOutput::Counts, _) => {
