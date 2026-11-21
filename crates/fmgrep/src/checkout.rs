@@ -125,8 +125,12 @@ pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
 /// `commit`: every path where the checkout differs from it, as git says
 /// (`d/` for an untracked directory), ascending. Else why the checkout
 /// cannot be compared: the reason of the warning.
-pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
-    let status = vcs::git(
+pub fn changes(
+    top: &Path,
+    commit: &str,
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<Vec<String>, String> {
+    let (status, noted) = vcs::noted(
         top,
         &[
             "status",
@@ -185,7 +189,51 @@ pub fn changes(top: &Path, commit: &str) -> Result<Vec<String>, String> {
     if skip.len() > MAX_SKIP {
         return Err(over(skip.len(), commit));
     }
+    // Git lists none of the untracked files in a directory it cannot open,
+    // and says so only here. A tracked file in it is not listed either, and
+    // git says nothing of it: the server's copy answers.
+    left_out.extend(unopened(&noted, &skip));
     Ok(skip)
+}
+
+/// The entries for git's stderr `noted` that the client passes on: each
+/// directory git could not open, unless it is below a directory of the
+/// skip list `skip`, whose walk names it itself.
+fn unopened(noted: &str, skip: &[String]) -> Vec<Diagnostic> {
+    const PREFIX: &str = "warning: could not open directory ";
+    let mut out = Vec::new();
+    let mut lines = noted.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line.strip_prefix(PREFIX) else {
+            continue;
+        };
+        // Git writes the name as it is, a newline included: the warning
+        // goes on to the line that holds the reason.
+        let mut record = rest.to_owned();
+        while !record.contains("': ")
+            && let Some(more) = lines.next_if(|l| !l.starts_with(PREFIX))
+        {
+            record.push('\n');
+            record.push_str(more);
+        }
+        let Some((dir, why)) = record.strip_prefix('\'').and_then(|r| r.rsplit_once("': ")) else {
+            out.push(Diagnostic::Git(format!(
+                "could not open directory {record}"
+            )));
+            continue;
+        };
+        if skip
+            .iter()
+            .any(|d| d == "/" || (d.ends_with('/') && dir.starts_with(d.as_str()) && dir != d))
+        {
+            continue;
+        }
+        out.push(Diagnostic::Unopened {
+            dir: dir.to_owned(),
+            why: why.to_owned(),
+        });
+    }
+    out
 }
 
 /// The paths where commit `head` differs from the served commit `commit`,

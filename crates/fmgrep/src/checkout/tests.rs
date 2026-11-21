@@ -1,4 +1,4 @@
-use super::{Plan, plan, short};
+use super::{Plan, plan, short, unopened};
 use crate::diagnostic::Diagnostic;
 use crate::remote::Server;
 use crate::wire::ServeStatus;
@@ -211,5 +211,65 @@ fn a_directory_of_the_skip_list_that_cannot_be_listed_is_named() {
             dir: top.join("ut/sub"),
             why: "Permission denied (os error 13)".to_owned(),
         }]
+    );
+}
+
+fn skips(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn a_directory_git_cannot_open_is_named_once() {
+    let nd = "warning: could not open directory 'nd/': Permission denied\n";
+    let ut = "warning: could not open directory 'ut/sub/': Permission denied\n";
+    let once = vec![Diagnostic::Unopened {
+        dir: "nd/".to_owned(),
+        why: "Permission denied".to_owned(),
+    }];
+    let skip = skips(&["a.c", "ut/"]);
+    // The shape of a filesystem that lists `u.c` first, and of one that
+    // lists `sub` first.
+    assert_eq!(unopened(nd, &skip), once);
+    assert_eq!(unopened(&format!("{nd}{ut}"), &skip), once);
+    // A name that only starts like a walked directory is not below it.
+    let near = "warning: could not open directory 'utx/': Permission denied\n\
+                warning: could not open directory 'ut-b/': Permission denied\n";
+    assert_eq!(unopened(near, &skips(&["ut/"])).len(), 2);
+    // A walked root names everything below it.
+    assert!(unopened(&format!("{nd}{ut}"), &skips(&["/"])).is_empty());
+    // Other lines of git's stderr are not warnings of this kind.
+    assert!(unopened("d/f.c: Permission denied\n", &skip).is_empty());
+}
+
+/// Git writes a directory's name as it is, a newline included, so its
+/// warning can take two lines. A warning that cannot be read goes on as
+/// git wrote it: a search that left a directory out is never silent.
+#[test]
+fn a_directory_name_with_a_newline_is_read_whole() {
+    let both = "warning: could not open directory 'two\nlines/': Permission denied\n\
+                warning: could not open directory 'nd/': Permission denied\n";
+    let denied = |dir: &str| Diagnostic::Unopened {
+        dir: dir.to_owned(),
+        why: "Permission denied".to_owned(),
+    };
+    assert_eq!(
+        unopened(both, &skips(&["a.c"])),
+        [denied("two\nlines/"), denied("nd/")]
+    );
+    // A record that stops before its reason is kept as git wrote it, and
+    // the warning after it is read on its own.
+    let cut = "warning: could not open directory 'two\n";
+    assert_eq!(
+        unopened(cut, &[]),
+        [Diagnostic::Git("could not open directory 'two".to_owned())]
+    );
+    let cut_then_whole =
+        format!("{cut}warning: could not open directory 'nd/': Permission denied\n");
+    assert_eq!(
+        unopened(&cut_then_whole, &[]),
+        [
+            Diagnostic::Git("could not open directory 'two".to_owned()),
+            denied("nd/")
+        ]
     );
 }
