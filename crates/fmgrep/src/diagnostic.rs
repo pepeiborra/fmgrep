@@ -34,6 +34,9 @@ pub enum Diagnostic {
     },
     /// A note of `FMGREP_VERBOSE`, without its `note: ` prefix.
     Note(String),
+    /// A warning of the check of what changed since the index, without its
+    /// `warning: ` prefix: `status` prints it as one of its own lines.
+    Check(String),
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -69,6 +72,7 @@ impl fmt::Display for Diagnostic {
                 root.display()
             ),
             Self::Note(text) => write!(f, "note: {text}"),
+            Self::Check(line) => write!(f, "warning: {line}"),
         }
     }
 }

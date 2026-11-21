@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::print;
+use crate::diagnostic::Diagnostic;
 use crate::fetch::Ask;
 use crate::manifest::Manifest;
 use crate::query::{self, check_changes, note_stale};
-use crate::source::{Learned, keep, kept, named, not_due};
+use crate::source::{Learned, named, not_due};
 
 /// What the check did and found, as `--json` prints it too.
 #[derive(Serialize)]
@@ -35,25 +36,40 @@ pub struct Facts {
 /// lines it warns are kept, not printed; its notes print on stderr.
 pub fn check(index_dir: &Path, manifest: &Manifest, root: Option<&Path>) -> Result<Facts, String> {
     let (mut docs, _blobs) = query::open(index_dir, manifest, root, Ask::Load)?;
-    keep();
     let files = &manifest.files;
     let none = tracing::Span::none();
     let mut left_out = Vec::new();
     let learned =
         std::thread::scope(|s| check_changes(s, &none, &docs, files, None, &mut left_out));
-    super::print_diagnostics(left_out);
+    let mut warned = settle(left_out);
     let learned = learned?;
     let stale = note_stale(&mut docs, files);
-    let record = docs.checkpoint(files)?;
+    let mut saved = Vec::new();
+    let record = docs.checkpoint(files, &mut saved);
+    warned.extend(settle(saved));
+    let record = record?;
     Ok(Facts {
         learned,
-        warned: kept(),
+        warned,
         stale,
         added: docs.stale().len() - stale,
         gone: docs.gone(),
         ignores: docs.ignores(),
         record,
     })
+}
+
+/// The warnings of the check in `found`, as the lines of `status`; the
+/// rest printed on stderr.
+fn settle(found: Vec<Diagnostic>) -> Vec<String> {
+    let (warned, rest): (Vec<_>, Vec<_>) =
+        (found.into_iter()).partition(|d| matches!(d, Diagnostic::Check(_)));
+    super::print_diagnostics(rest);
+    let line = |d| match d {
+        Diagnostic::Check(line) => line,
+        _ => unreachable!("partitioned"),
+    };
+    warned.into_iter().map(line).collect()
 }
 
 /// One line per fact: how the check learned what changed, then what it

@@ -43,13 +43,12 @@ fn serving(index: &Path) -> Served {
     let manifest = read_manifest(index).unwrap();
     let docs = DocStore::open(index, &manifest, None, crate::fetch::Ask::EachQuery).unwrap();
     let files = manifest.files.checked().unwrap();
-    if !matches!(
-        docs.replay(files, &mut Vec::new()),
-        Learned::Answered { .. }
-    ) {
-        docs.discover(files, &mut Vec::new());
-        docs.stat_all(files, &mut Vec::new());
+    let mut found = Vec::new();
+    if !matches!(docs.replay(files, &mut found), Learned::Answered { .. }) {
+        docs.discover(files, &mut found);
+        docs.stat_all(files, &mut found);
     }
+    crate::tests::note_entries(&found);
     // A start that took no token says why; a query says it again only
     // when the reason changes.
     let cannot = "watchman cannot say what changed (";
@@ -133,8 +132,8 @@ impl Served {
     }
 
     fn recheck(&mut self) -> (Vec<String>, Vec<String>) {
-        self.docs
-            .recheck(self.files.checked().unwrap(), &mut Vec::new());
+        let mut found = Vec::new();
+        self.docs.recheck(self.files.checked().unwrap(), &mut found);
         self.docs.begin();
         let paths = self.docs.paths(&self.files);
         let name = |&id: &usize| paths.path(id).unwrap().unwrap().to_owned();
@@ -145,7 +144,8 @@ impl Served {
             .iter()
             .filter(|&&id| self.docs.is_gone(id));
         let gone = gone.map(name).collect();
-        self.docs.checkpoint(&self.files).unwrap();
+        self.docs.checkpoint(&self.files, &mut found).unwrap();
+        crate::tests::note_entries(&found);
         (read, gone)
     }
 

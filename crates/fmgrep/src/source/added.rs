@@ -256,7 +256,7 @@ impl Known {
     ) {
         let root = &self.root;
         let changed = recorded.changes(root, &|rel| self.excluded(root, rel));
-        let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed));
+        let scopes = self.apply_ignores(recorded.ignore_scopes(root, &changed), left_out);
         let prune = Arc::clone(recorded);
         let walked =
             crate::walk::walk_changed(root, changed, self.exclude.as_deref(), move |rel| {

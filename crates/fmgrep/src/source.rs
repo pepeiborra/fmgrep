@@ -20,8 +20,8 @@ mod journal;
 mod recorded;
 
 pub use journal::{
-    Index, Of, Pinned, Remembered, keep, kept, not_due, pin, pin_path, pinned, record_path,
-    recorded, remember, remembered, request_watch, unsaid,
+    Index, Of, Pinned, Remembered, not_due, pin, pin_path, pinned, record_path, recorded, remember,
+    remembered, request_watch, unsaid,
 };
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
@@ -162,6 +162,8 @@ struct Known {
     moved_ignores: Mutex<std::collections::BTreeSet<String>>,
     /// Whether every doc was statted and every added file found.
     complete: AtomicBool,
+    /// Whether the warning that ignore files changed was said: once.
+    ignores_said: AtomicBool,
     /// Whether a server asks watchman again before each query: its
     /// warnings then speak of queries, not searches.
     each_query: bool,
@@ -396,7 +398,7 @@ impl Known {
         });
         self.left_out_unlisted(walked.unlisted, left_out);
         self.add(&self.text_only(root, added::unlisted(walked.files, files), left_out));
-        scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed)));
+        scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed), left_out));
         self.discover_scopes(scopes, files, lens, left_out);
         self.complete.store(true, Ordering::Release);
         Ok(kept)
@@ -414,7 +416,11 @@ impl Known {
     /// The dirs of `changes` to walk again. Keeps its new ignore files for
     /// the baseline, and warns when any ignore file moved or is new
     /// since the index: every load walks the dirs they govern again.
-    fn apply_ignores(&self, changes: recorded::IgnoreScopes) -> Vec<String> {
+    fn apply_ignores(
+        &self,
+        changes: recorded::IgnoreScopes,
+        out: &mut Vec<Diagnostic>,
+    ) -> Vec<String> {
         self.keep_ignores(changes.found);
         let new = self
             .new_ignores
@@ -422,8 +428,8 @@ impl Known {
             .unwrap_or_else(PoisonError::into_inner)
             .len();
         let n = changes.moved.len() + new;
-        if n > 0 {
-            ignores_changed(n, self.each_query);
+        if n > 0 && !self.ignores_said.swap(true, Ordering::Relaxed) {
+            out.push(Diagnostic::Check(ignores_changed(n, self.each_query)));
         }
         let mut moved = (self.moved_ignores.lock()).unwrap_or_else(PoisonError::into_inner);
         moved.extend(changes.moved);
@@ -447,21 +453,17 @@ impl Known {
 
 /// `n` ignore files moved or are new since the index, which every load
 /// applies by walking the dirs they govern again; worded for a server's
-/// queries if `served`.
-fn ignores_changed(n: usize, served: bool) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
+/// queries if `served`: the line.
+fn ignores_changed(n: usize, served: bool) -> String {
     let (files, dirs) = match n {
         1 => ("file", "its directory"),
         _ => ("files", "their directories"),
     };
     let each = if served { "query" } else { "search" };
-    journal::warn(
-        &SEEN,
-        &format!(
-            "{n} ignore {files} changed since the index; each {each} reads {dirs} again \
-             (re-run index to make searches fast again)"
-        ),
-    );
+    format!(
+        "{n} ignore {files} changed since the index; each {each} reads {dirs} again \
+         (re-run index to make searches fast again)"
+    )
 }
 
 /// Added file `rel`, or its topmost ancestor the walk did not record: a
@@ -577,6 +579,7 @@ impl Files {
                 new_ignores: Mutex::default(),
                 moved_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
+                ignores_said: AtomicBool::new(false),
                 each_query: false,
                 left_out: Mutex::default(),
             }),
@@ -647,12 +650,12 @@ impl Files {
                 return Learned::Checked;
             }
             Err(why) => {
-                journal::cannot_answer(&why);
+                left_out.push(Diagnostic::Check(journal::cannot(&why)));
                 return Learned::Checked;
             }
         };
         let asked = std::time::Instant::now();
-        let answer = journal::ask(&root, index, files.len(), self.known.each_query);
+        let answer = journal::ask(&root, index, files.len(), self.known.each_query, left_out);
         if let Some(why) = answer.why {
             self.degraded(why);
         }
@@ -667,7 +670,8 @@ impl Files {
         let kept = match self.known.replay(recorded, &paths, files, lens, left_out) {
             Ok(kept) => kept,
             Err(()) => {
-                journal::over(journal::reported_cap(files.len()));
+                let over = journal::over(journal::reported_cap(files.len()));
+                left_out.push(Diagnostic::Check(over));
                 return Learned::Checked;
             }
         };
@@ -719,8 +723,10 @@ impl Files {
         }
         let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
         match (&why, said.is_some()) {
-            (Some(line), _) if said.as_ref() != Some(line) => journal::say(line),
-            (None, true) => journal::answers_again(),
+            (Some(line), _) if said.as_ref() != Some(line) => {
+                left_out.push(Diagnostic::Check(line.clone()));
+            }
+            (None, true) => left_out.push(Diagnostic::Note(journal::ANSWERS_AGAIN.to_owned())),
             _ => {}
         }
         *said = why;
@@ -773,7 +779,11 @@ impl Files {
     /// (the baseline) in the user's cache: once per process, so a server
     /// saves after its first query that has a token. The record's path,
     /// when this call wrote it.
-    pub fn checkpoint(&self, files: &FileTable) -> Result<Option<PathBuf>, String> {
+    pub fn checkpoint(
+        &self,
+        files: &FileTable,
+        left_out: &mut Vec<Diagnostic>,
+    ) -> Result<Option<PathBuf>, String> {
         let Some(index) = &self.index else {
             return Ok(None);
         };
@@ -810,7 +820,13 @@ impl Files {
         baseline.sort_unstable();
         baseline.dedup();
         let cap = journal::reported_cap(files.len());
-        Ok(journal::save(&root, index, token, baseline, cap))
+        match journal::save(&root, index, token, baseline, cap) {
+            Ok(path) => Ok(Some(path)),
+            Err(line) => {
+                left_out.push(Diagnostic::Check(line));
+                Ok(None)
+            }
+        }
     }
 
     /// Never take `index_dir` for an added file. Before any watch or
