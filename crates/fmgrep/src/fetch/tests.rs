@@ -87,6 +87,7 @@ fn fetch_map_parallel<T: Send, F: Fn(usize, &[u8]) -> T + Sync>(
             out.push((doc, v));
             Ok(())
         },
+        &mut Vec::new(),
     )?;
     Ok(out)
 }
@@ -200,10 +201,18 @@ fn hits_of(needle: &[u8], raw: &[u8]) -> u64 {
 /// Each fetched doc's bytes, in emission order.
 fn bytes_of(shard: &mut DocStore, fix: &Fix, ids: &[usize]) -> Result<Vec<Vec<u8>>, String> {
     let mut out = Vec::new();
-    fetch_stream_parallel(shard, &fix.files, ids, 8, &|_, _| (), &mut |_, raw, ()| {
-        out.push(raw.to_vec());
-        Ok(())
-    })?;
+    fetch_stream_parallel(
+        shard,
+        &fix.files,
+        ids,
+        8,
+        &|_, _| (),
+        &mut |_, raw, ()| {
+            out.push(raw.to_vec());
+            Ok(())
+        },
+        &mut Vec::new(),
+    )?;
     Ok(out)
 }
 
@@ -456,13 +465,21 @@ fn emission_is_ascending_and_starts_before_the_last_fetch() {
     let mut seen: Vec<usize> = Vec::new();
     let mut at_first = usize::MAX;
     let mut shard = reader(&fix);
-    fetch_stream_parallel(&mut shard, &fix.files, &ids, 8, &map, &mut |doc, _, _| {
-        if seen.is_empty() {
-            at_first = mapped.load(Ordering::SeqCst);
-        }
-        seen.push(doc);
-        Ok(())
-    })
+    fetch_stream_parallel(
+        &mut shard,
+        &fix.files,
+        &ids,
+        8,
+        &map,
+        &mut |doc, _, _| {
+            if seen.is_empty() {
+                at_first = mapped.load(Ordering::SeqCst);
+            }
+            seen.push(doc);
+            Ok(())
+        },
+        &mut Vec::new(),
+    )
     .unwrap();
     assert_eq!(seen, ids);
     assert!(
@@ -494,11 +511,19 @@ fn peak_live_mapped_values_is_one_batch() {
     };
     let mut peak = 0isize;
     let mut shard = reader(&fix);
-    fetch_stream_parallel(&mut shard, &fix.files, &ids, 8, &map, &mut |_, _, v| {
-        peak = peak.max(live.load(Ordering::SeqCst));
-        drop(v);
-        Ok(())
-    })
+    fetch_stream_parallel(
+        &mut shard,
+        &fix.files,
+        &ids,
+        8,
+        &map,
+        &mut |_, _, v| {
+            peak = peak.max(live.load(Ordering::SeqCst));
+            drop(v);
+            Ok(())
+        },
+        &mut Vec::new(),
+    )
     .unwrap();
     assert_eq!(
         live.load(Ordering::SeqCst),
@@ -533,6 +558,7 @@ fn emit_error_aborts_the_query_loudly() {
                 Ok(())
             }
         },
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert_eq!(err, "error: sink said no");
@@ -758,7 +784,7 @@ fn discovered(fix: &Fix, added: &[(&str, &[u8])]) -> DocStore {
     }
     let mut store = reader(fix);
     store.stat_all(fix.paths());
-    store.discover(fix.paths());
+    store.discover(fix.paths(), &mut Vec::new());
     store.begin();
     store
 }

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use rayon::prelude::*;
 
 use crate::Stamp;
+use crate::diagnostic::Diagnostic;
 use crate::manifest::{Checked, FileTable};
 
 mod added;
@@ -295,6 +296,7 @@ impl Known {
         paths: &[String],
         files: Checked<'_>,
         lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
     ) -> Result<usize, ()> {
         let root = &self.root;
         let (mut ids, mut dirs, mut scopes, mut kept) = (Vec::new(), Vec::new(), Vec::new(), 0);
@@ -363,9 +365,9 @@ impl Known {
         let walked = crate::walk::walk_changed(root, listed.clone(), self.exclude.as_deref(), {
             move |rel| prune.is_dir(rel)
         });
-        self.add(&self.text_only(root, added::unlisted(walked, files)));
+        self.add(&self.text_only(root, added::unlisted(walked, files), left_out));
         scopes.extend(self.apply_ignores(recorded.ignore_scopes(root, &listed)));
-        self.discover_scopes(scopes, files, lens);
+        self.discover_scopes(scopes, files, lens, left_out);
         self.complete.store(true, Ordering::Release);
         Ok(kept)
     }
@@ -399,10 +401,16 @@ impl Known {
     }
 
     /// [`Self::discover`] of the outermost of root-relative `scopes`.
-    fn discover_scopes(&self, scopes: Vec<String>, files: Checked<'_>, lens: &[u64]) {
+    fn discover_scopes(
+        &self,
+        scopes: Vec<String>,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) {
         let root = &self.root;
         for scope in outermost(scopes) {
-            self.discover(root, &root.join(scope), files, lens);
+            self.discover(root, &root.join(scope), files, lens, left_out);
         }
     }
 }
@@ -581,7 +589,12 @@ impl Files {
     /// baseline) instead of [`Self::stat_all`] and discovery, unless no
     /// ask is due (a server's always is), or, saying why on stderr, when
     /// watchman cannot say.
-    pub fn replay(&self, files: Checked<'_>, lens: &[u64]) -> Learned {
+    pub fn replay(
+        &self,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) -> Learned {
         let Some(index) = &self.index else {
             return Learned::NotDue;
         };
@@ -613,7 +626,7 @@ impl Files {
             return Learned::Checked;
         };
         let applied = std::time::Instant::now();
-        let kept = match self.known.replay(recorded, &paths, files, lens) {
+        let kept = match self.known.replay(recorded, &paths, files, lens, left_out) {
             Ok(kept) => kept,
             Err(()) => {
                 journal::over(journal::named_cap(files.len()));
@@ -657,17 +670,17 @@ impl Files {
     /// every file as a new load would. On stderr, why every file was
     /// checked, each time the reason changes, and a note once watchman
     /// answers again.
-    pub fn recheck(&self, files: Checked<'_>, lens: &[u64]) {
+    pub fn recheck(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
         if self.index.is_none() || !self.known.each_query {
             return;
         }
         self.known.reload_rules();
         let why = match self.askable(files) {
-            Ok((root, recorded)) => self.ask_again(&root, recorded, files, lens),
+            Ok((root, recorded)) => self.ask_again(&root, recorded, files, lens, left_out),
             Err(why) => Some(journal::cannot(&why)),
         };
         if why.is_some() {
-            self.check_all(files, lens);
+            self.check_all(files, lens, left_out);
         }
         let mut said = self.said.lock().unwrap_or_else(PoisonError::into_inner);
         match (&why, said.is_some()) {
@@ -687,6 +700,7 @@ impl Files {
         recorded: &Arc<Recorded>,
         files: Checked<'_>,
         lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
     ) -> Option<String> {
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         let asked = std::time::Instant::now();
@@ -699,7 +713,7 @@ impl Files {
             return again.why;
         };
         let applied = std::time::Instant::now();
-        let Ok(kept) = self.known.replay(recorded, &paths, files, lens) else {
+        let Ok(kept) = self.known.replay(recorded, &paths, files, lens, left_out) else {
             return Some(journal::over_since(journal::named_cap(files.len())));
         };
         let n = paths.len();
@@ -713,9 +727,9 @@ impl Files {
 
     /// What a new load finds: every doc statted, ignored ones too, then
     /// discovery, which marks again what the rules skip.
-    fn check_all(&self, files: Checked<'_>, lens: &[u64]) {
+    fn check_all(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
         self.known.stat_all(files, lens, true);
-        self.discover(files, lens);
+        self.discover(files, lens, left_out);
     }
 
     /// Once every doc is known, save the last token and what differs now
@@ -825,8 +839,8 @@ impl Files {
 
     /// Added doc `doc`'s whole bytes; one now missing, unreadable or binary
     /// is dropped silently: `None`.
-    pub fn read_added(&self, doc: usize) -> Option<Vec<u8>> {
-        self.known.read_added(doc)
+    pub fn read_added(&self, doc: usize, left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
+        self.known.read_added(doc, left_out)
     }
 
     /// Doc `doc`'s current text: `buf` (its recorded length) filled while
@@ -1122,7 +1136,7 @@ mod tests {
         let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
         let kept = files
             .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens);
+            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new());
         (files, kept)
     }
 
@@ -1187,7 +1201,7 @@ mod tests {
             let named: Vec<String> = named.iter().map(|n| n.to_string()).collect();
             files
                 .known
-                .replay(&recorded, &named, fix.paths(), &fix.lens)
+                .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new())
         };
         let put = |rel: &str| {
             std::fs::create_dir_all(fix.path.join(rel).parent().unwrap()).unwrap();
@@ -1218,13 +1232,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fix = stage_named(tmp.path(), &["a.c", "sub/b.c"]);
         let (files, _) = replayed(&fix, &[]);
-        files.check_all(fix.paths(), &fix.lens);
+        files.check_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(files.kinds(), [FRESH, FRESH]);
         std::fs::write(fix.path.join("sub/.ignore"), b"b.c\n").unwrap();
-        files.check_all(fix.paths(), &fix.lens);
+        files.check_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(files.kinds(), [FRESH, IGNORED]);
         std::fs::remove_file(fix.path.join("sub/.ignore")).unwrap();
-        files.check_all(fix.paths(), &fix.lens);
+        files.check_all(fix.paths(), &fix.lens, &mut Vec::new());
         assert_eq!(files.kinds(), [FRESH, FRESH], "as a new load finds it");
         assert!(!files.warned(1));
     }

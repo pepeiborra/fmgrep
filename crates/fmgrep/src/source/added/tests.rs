@@ -53,7 +53,7 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     }
     let mut files = open_files(&fix);
     files.exclude(&root.join("idx"));
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["b.c", "new/deep/n.c"]);
     assert_eq!(
         files.snapshot().added[0],
@@ -61,7 +61,9 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
         "added ids follow the manifest's"
     );
     assert_eq!(
-        files.read_added(fix.files.len() + 1).as_deref(),
+        files
+            .read_added(fix.files.len() + 1, &mut Vec::new())
+            .as_deref(),
         Some(&b"printk"[..])
     );
 }
@@ -73,14 +75,15 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     write(&fix.path, "x.c", b"printk");
     write(&fix.path, "y.c", b"printk");
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(files.snapshot().added, [1, 2]);
     let epoch = files.epoch();
     std::fs::write(fix.path.join("x.c"), b"printk\0").unwrap();
     std::fs::remove_file(fix.path.join("y.c")).unwrap();
-    assert_eq!(files.read_added(1), None);
-    assert_eq!(files.read_added(2), None);
-    assert_eq!(files.read_added(3), None, "no such slot");
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(files.read_added(2, &mut left_out), None);
+    assert_eq!(files.read_added(3, &mut left_out), None, "no such slot");
     assert!(files.snapshot().added.is_empty() && files.epoch() != epoch);
     assert_eq!(files.known.state[0].load(Ordering::Acquire) & WARNED, 0);
 }
@@ -92,10 +95,10 @@ fn added_utf16_file_is_found_and_read_as_utf8() {
     write(&fix.path, "u.c", &crate::binary::utf16le("printk ü\r\n"));
     write(&fix.path, "z.c", &crate::binary::utf16le("printk\0"));
     let files = open_files(&fix);
-    files.discover(fix.paths(), &fix.lens);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
     assert_eq!(live(&files), ["u.c"]);
     assert_eq!(
-        files.read_added(1).as_deref(),
+        files.read_added(1, &mut Vec::new()).as_deref(),
         Some("printk ü\r\n".as_bytes())
     );
 }
@@ -130,7 +133,7 @@ fn discovered(fix: &Fix, manifest: Checked<'_>, walk_all: bool) -> Files {
         let index = fix.path.parent().unwrap();
         files.record(super::super::Recorded::open(index).unwrap().unwrap());
     }
-    files.discover(manifest, &vec![0; manifest.len()]);
+    files.discover(manifest, &vec![0; manifest.len()], &mut Vec::new());
     files
 }
 
@@ -216,7 +219,7 @@ fn skipped_file_turned_text_is_found_once_named_or_listed() {
     assert_eq!(
         files
             .known
-            .replay(&recorded, &named, fix.paths(), &fix.lens),
+            .replay(&recorded, &named, fix.paths(), &fix.lens, &mut Vec::new()),
         Ok(1)
     );
     assert_eq!(live(&files), ["kb/k.bin"], "reported by watchman");

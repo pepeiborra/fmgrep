@@ -626,8 +626,15 @@ fn a_folded_leaf_is_counted_and_the_plan_names_it() {
     let index = tmp.path().join("idx");
     index_it(&stage_corpus(tmp.path(), &files), &index, false);
     let manifest = crate::manifest::read_manifest(&index).unwrap();
-    let (fm, _) =
-        super::super::load(&index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
+    let (fm, _) = super::super::load(
+        &index,
+        &manifest,
+        None,
+        crate::fetch::Ask::Load,
+        None,
+        &mut Vec::new(),
+    )
+    .unwrap();
     let expr = Expr::And(vec![t("PrintK"), t("123"), re("pr.ntk")]);
     let req = QueryRequest {
         mode: crate::matching::MatchMode {
@@ -1151,8 +1158,15 @@ fn answers(
     pin: Option<(f64, f64)>,
 ) -> (ReadBand, Answers) {
     let manifest = crate::manifest::read_manifest(index).unwrap();
-    let (fm, mut loaded) =
-        super::super::load(index, &manifest, None, crate::fetch::Ask::Load, None).unwrap();
+    let (fm, mut loaded) = super::super::load(
+        index,
+        &manifest,
+        None,
+        crate::fetch::Ask::Load,
+        None,
+        &mut Vec::new(),
+    )
+    .unwrap();
     if measure {
         loaded.measure_band(&manifest);
     }
@@ -1167,8 +1181,15 @@ fn answers(
             expr: Some(expr),
             ..crate::tests::support::request(index, &manifest, &[], output)
         };
-        answer_expr(&fm, &mut loaded, &req, expr, &mut crate::sink::Discard)
-            .map(crate::tests::support::timeless)
+        answer_expr(
+            &fm,
+            &mut loaded,
+            &req,
+            expr,
+            &mut crate::sink::Discard,
+            &mut Vec::new(),
+        )
+        .map(crate::tests::support::timeless)
     });
     crate::tests::BAND.set(None);
     (loaded.band, outs)
