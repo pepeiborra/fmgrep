@@ -71,6 +71,20 @@ pub fn sniff_text(path: &Path) -> Result<bool, String> {
     Ok(!is_binary(&utf16(&head).unwrap_or(head)))
 }
 
+/// The text of the file at `path`, or why it is left out: `Err(None)` for a
+/// file that is gone or binary, which is no news. The rest say why: it
+/// cannot be read, or is over [`MAX_DOC_BYTES`].
+pub fn read_text(path: &Path) -> Result<Text, Option<String>> {
+    let unread = |e: std::io::Error| {
+        (e.kind() != std::io::ErrorKind::NotFound).then(|| format!("cannot read ({e})"))
+    };
+    if std::fs::metadata(path).map_err(unread)?.len() > MAX_DOC_BYTES {
+        return Err(Some(Skip::TooLarge.to_string()));
+    }
+    let raw = std::fs::read(path).map_err(unread)?;
+    text(raw).map_err(|why| (why == Skip::TooLarge).then(|| why.to_string()))
+}
+
 /// The leading bytes of the file at `path` that [`sniff_text`] inspects:
 /// enough UTF-16 to decode to the control-byte window. None when it is
 /// over [`MAX_DOC_BYTES`].
@@ -240,6 +254,55 @@ mod tests {
         ));
         assert!(sniff("soup.c", &soup) && is_text(&soup), "past the window");
         assert_eq!(sniff_text(&dir.path().join("missing.c")), Ok(false), "gone");
+    }
+
+    /// A file that is gone or binary is no news; one that cannot be read, or is
+    /// too large, says why.
+    #[cfg(unix)]
+    #[test]
+    fn read_text_says_why_it_cannot_read_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for (name, bytes) in [
+            ("ok.c", &b"printk"[..]),
+            ("bin.c", b"printk\0"),
+            ("shut.c", b"printk"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        std::fs::File::create(dir.join("huge.log"))
+            .unwrap()
+            .set_len(1 << 31)
+            .unwrap();
+        let shut = dir.join("shut.c");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The size is checked before the read: a file too large is said to be
+        // so, though it could not be read either, and is never read whole.
+        let huge_shut = dir.join("huge-shut.log");
+        std::fs::File::create(&huge_shut)
+            .unwrap()
+            .set_len(1 << 31)
+            .unwrap();
+        std::fs::set_permissions(&huge_shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read = |name: &str| read_text(&dir.join(name)).map(|t| t.bytes);
+        assert_eq!(
+            read("huge-shut.log"),
+            Err(Some("over 2147483646 bytes".to_owned()))
+        );
+        assert_eq!(read("ok.c"), Ok(b"printk".to_vec()));
+        assert_eq!(read("missing.c"), Err(None));
+        assert_eq!(read("bin.c"), Err(None));
+        assert_eq!(
+            read("huge.log"),
+            Err(Some("over 2147483646 bytes".to_owned()))
+        );
+        if std::fs::read(&shut).is_ok() {
+            println!("skipped: the file can be read (running as root)");
+            return;
+        }
+        let why = read("shut.c").unwrap_err().unwrap();
+        assert!(why.starts_with("cannot read (Permission denied"), "{why}");
     }
 
     #[cfg(unix)]

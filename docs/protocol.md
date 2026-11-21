@@ -295,6 +295,18 @@ prints its files between the
 server's in path order. Counts, rg's JSON summary and the `--stats`
 block cover its files and the server's.
 
+What the client cannot search of that list it names on stderr, and the
+answer lacks it: a file it cannot read, or one over 2 GiB, as `warning:
+skipping PATH: why`, in every search that lists it; a path it cannot
+look at, because a directory above it is closed to it, as `warning:
+skipping PATH: cannot stat (why)`; and a directory of the list it cannot
+list, as `warning: cannot list DIR: why; files under it may be missing
+from the answer`. A binary file is left out quietly, as
+the index does.
+
+The warnings cover the whole list, whatever the PATH or `-g` of the
+search, where rg names only what it searches.
+
 It asks git once and saves what git found with a watchman token in a
 record ([index-format.md](index-format.md#watchman)); later searches ask
 watchman what changed since, and run no git. A search that asks git for
