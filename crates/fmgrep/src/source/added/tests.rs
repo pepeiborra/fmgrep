@@ -8,6 +8,8 @@ use super::super::tests::Fix;
 use super::super::tests::{open_files, stage_files};
 use super::super::{Files, IGNORED, WARNED};
 #[cfg(unix)]
+use crate::diagnostic::Diagnostic;
+#[cfg(unix)]
 use crate::manifest::{Checked, FileTable};
 #[cfg(unix)]
 use crate::tests::support::{T0, backdate, set_mtime};
@@ -68,6 +70,32 @@ fn discovery_registers_text_files_missing_from_the_manifest() {
     );
 }
 
+/// Without verbose, the note of added files looks at none of them: each
+/// query of a server would scan every slot it ever made.
+#[test]
+fn the_note_of_added_files_reads_nothing_without_verbose() {
+    if crate::verbose::verbose() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    write(&fix.path, "new.c", b"printk");
+    let files = open_files(&fix);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
+    // The list is held: a note that reads it waits.
+    let held = files.known.added();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            files.note_added();
+            let _ = tx.send(());
+        });
+        let waited = rx.recv_timeout(std::time::Duration::from_secs(2)).is_err();
+        drop(held);
+        assert!(!waited, "the note read the list of added files");
+    });
+}
+
 #[test]
 fn read_of_an_added_file_turned_binary_drops_it_silently() {
     let tmp = tempfile::tempdir().unwrap();
@@ -86,6 +114,37 @@ fn read_of_an_added_file_turned_binary_drops_it_silently() {
     assert_eq!(files.read_added(3, &mut left_out), None, "no such slot");
     assert!(files.snapshot().added.is_empty() && files.epoch() != epoch);
     assert_eq!(files.known.state[0].load(Ordering::Acquire) & WARNED, 0);
+    assert!(left_out.is_empty(), "no news");
+}
+
+/// A file found at load that cannot be read when a query reads it is named
+/// and dropped.
+#[cfg(unix)]
+#[test]
+fn read_of_an_added_file_that_became_unreadable_names_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fix = stage_files(tmp.path(), &[b"printk"]);
+    write(&fix.path, "x.c", b"printk");
+    let files = open_files(&fix);
+    files.discover(fix.paths(), &fix.lens, &mut Vec::new());
+    assert_eq!(files.snapshot().added, [1]);
+    let shut = fix.path.join("x.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let mut left_out = Vec::new();
+    assert_eq!(files.read_added(1, &mut left_out), None);
+    assert_eq!(
+        left_out,
+        [Diagnostic::Skipped {
+            path: shut,
+            why: "cannot read (Permission denied (os error 13))".to_owned(),
+        }]
+    );
+    assert!(files.snapshot().added.is_empty());
 }
 
 #[test]
@@ -292,4 +351,37 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_ne!(files.known.kind(1), IGNORED);
     assert!(files.snapshot().gone.is_empty());
+}
+
+/// A file that is gone or binary is no news; one that cannot be read, or is
+/// too large, says why.
+#[cfg(unix)]
+#[test]
+fn read_text_says_why_it_cannot_read_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write(dir, "ok.c", b"printk");
+    write(dir, "bin.c", b"printk\0");
+    write(dir, "shut.c", b"printk");
+    std::fs::File::create(dir.join("huge.log"))
+        .unwrap()
+        .set_len(1 << 31)
+        .unwrap();
+    let shut = dir.join("shut.c");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let read = |name: &str| super::read_text(&dir.join(name)).map(|t| t.bytes);
+    assert_eq!(read("ok.c"), Ok(b"printk".to_vec()));
+    assert_eq!(read("missing.c"), Err(None));
+    assert_eq!(read("bin.c"), Err(None));
+    assert_eq!(
+        read("huge.log"),
+        Err(Some("over 2147483646 bytes".to_owned()))
+    );
+    if std::fs::read(&shut).is_ok() {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    let why = read("shut.c").unwrap_err().unwrap();
+    assert!(why.starts_with("cannot read (Permission denied"), "{why}");
 }

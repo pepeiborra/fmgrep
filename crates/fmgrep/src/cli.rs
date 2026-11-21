@@ -334,6 +334,7 @@ fn local(
         );
         print_diagnostics(std::mem::take(&mut left_out));
         let (index, mut loaded) = loaded?;
+        loaded.note_stale(&req.manifest.files);
         let report = answer_local(&index, &mut loaded, &req, sink, &mut left_out);
         print_diagnostics(left_out);
         tracing::info_span!("drop").in_scope(|| drop((index, loaded)));

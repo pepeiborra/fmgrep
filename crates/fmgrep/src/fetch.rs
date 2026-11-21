@@ -317,9 +317,11 @@ impl DocStore {
 
     /// Before a served query, re-check what watchman reports as changed
     /// since the last query; nothing for stored docs, or unless asked to.
-    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) {
-        if let Source::Files(f) = &self.source {
-            f.recheck(files, &self.lens, left_out);
+    /// Whether it re-checked.
+    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) -> bool {
+        match &self.source {
+            Source::Files(f) => f.recheck(files, &self.lens, left_out),
+            Source::Shard { .. } => false,
         }
     }
 
@@ -352,6 +354,14 @@ impl DocStore {
     pub fn discover(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) {
         if let Source::Files(f) = &self.source {
             f.discover(files, &self.lens, left_out);
+        }
+    }
+
+    /// Under verbose, note the added files: after the caller prints what a
+    /// check or a discovery left out; nothing for stored docs.
+    pub fn note_added(&self) {
+        if let Source::Files(f) = &self.source {
+            f.note_added();
         }
     }
 
