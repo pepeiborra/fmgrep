@@ -509,6 +509,8 @@ fn local(
 /// holds its lines they join the held ones, so that they print or drop with
 /// them, in the order of the lines they sit between.
 fn print_diagnostics(left_out: Vec<Diagnostic>) {
+    #[cfg(test)]
+    crate::tests::note_entries(&left_out);
     for d in left_out {
         crate::held::line(&d.to_string());
     }
@@ -517,6 +519,16 @@ fn print_diagnostics(left_out: Vec<Diagnostic>) {
 /// `line` on stderr, as a warning.
 fn warn(line: &str) {
     crate::held::line(&format!("warning: {line}"));
+}
+
+/// `line`, a record or a pin that cannot be saved, as a warning, once per
+/// process; held with the lines of a search that sent its query pinned.
+fn say_once(line: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if !SEEN.swap(true, Ordering::Relaxed) {
+        crate::held::once(Some(&SEEN), &format!("warning: {line}"));
+    }
 }
 
 /// The one warning of a search whose local changes are ignored.
@@ -621,8 +633,10 @@ fn client(
         Some(Pinned::Missing) => now.is_none(),
         _ => false,
     };
-    if let Some(top) = top.filter(|_| !kept) {
-        crate::source::pin(&top, &server.addr, now);
+    if let Some(top) = top.filter(|_| !kept)
+        && let Err(line) = crate::source::pin(&top, &server.addr, now)
+    {
+        say_once(&line);
     }
     answered
 }

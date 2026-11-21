@@ -88,3 +88,18 @@ impl Hooks {
         NOTES.set(self.notes);
     }
 }
+
+/// Note the warnings of the check among `entries`, and the notes (a server's
+/// that watchman answers again: tests are not verbose), as this thread's
+/// searches give them.
+pub fn note_entries(entries: &[crate::diagnostic::Diagnostic]) {
+    use crate::diagnostic::Diagnostic;
+    for d in entries {
+        match d {
+            Diagnostic::Check(line) | Diagnostic::Note(line) => {
+                NOTES.with_borrow(|n| n.lock().unwrap().push(line.clone()))
+            }
+            _ => {}
+        }
+    }
+}

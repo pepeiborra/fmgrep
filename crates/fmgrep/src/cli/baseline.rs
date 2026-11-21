@@ -43,7 +43,9 @@ pub fn skip_list(
             changed,
         } => match since(top, baseline, &extra, changed) {
             Ok(skip) => {
-                remember(top, &of, token, skip.clone(), extra);
+                if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
+                    super::say_once(&line);
+                }
                 let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
                 note(
                     top,
@@ -103,7 +105,9 @@ pub fn skip_list(
     let took = asked.elapsed();
     if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env()});
-        remember(top, &of, token, skip.clone(), extra);
+        if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
+            super::say_once(&line);
+        }
     }
     let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
     let next = match same {

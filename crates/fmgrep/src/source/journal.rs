@@ -14,11 +14,12 @@
 //! checks every file and says why, once per process.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::diagnostic::Diagnostic;
 
 #[cfg(unix)]
 mod watchman;
@@ -329,21 +330,18 @@ impl Record {
     }
 
     /// Atomic: a crash leaves the old file or the new one, and two writers
-    /// leave one of theirs. Says why it could not, once per process; else
-    /// where it wrote.
-    fn write(&self, key: &str) -> Option<PathBuf> {
+    /// leave one of theirs. Where it wrote, or the warning of why not.
+    fn write(&self, key: &str) -> Result<PathBuf, String> {
         let Some(path) = path(&self.root, key) else {
-            cannot_save(format_args!(
+            return Err(cannot_save(format_args!(
                 "the watchman token (no cache directory: set XDG_CACHE_HOME or HOME)"
-            ));
-            return None;
+            )));
         };
         let bytes = serde_json::to_vec(self).expect("a record serializes");
-        if let Err(e) = write_atomic(&path, &bytes) {
-            cannot_save(format_args!("{} ({e})", path.display()));
-            return None;
+        match write_atomic(&path, &bytes) {
+            Ok(()) => Ok(path),
+            Err(e) => Err(cannot_save(format_args!("{} ({e})", path.display()))),
         }
-        Some(path)
     }
 }
 
@@ -440,16 +438,17 @@ pub fn pinned(root: &Path, addr: &str, full_id: fn(&str) -> bool) -> Pinned {
 }
 
 /// Pin `commit` for the checkout at canonical `root` and the server at
-/// `addr`; with none, remove the pin. Says why it could not, once per
-/// process, as a record does.
-pub fn pin(root: &Path, addr: &str, commit: Option<&str>) {
+/// `addr`; with none, remove the pin. The warning of why it could not.
+pub fn pin(root: &Path, addr: &str, commit: Option<&str>) -> Result<(), String> {
     let Some(root_str) = root.to_str() else {
-        return cannot_save(format_args!("the pin (the checkout's path is not UTF-8)"));
+        return Err(cannot_save(format_args!(
+            "the pin (the checkout's path is not UTF-8)"
+        )));
     };
     let Some(path) = pin_path(root, addr) else {
-        return cannot_save(format_args!(
+        return Err(cannot_save(format_args!(
             "the pin (no cache directory: set XDG_CACHE_HOME or HOME)"
-        ));
+        )));
     };
     let wrote = match commit {
         Some(commit) => {
@@ -465,31 +464,37 @@ pub fn pin(root: &Path, addr: &str, commit: Option<&str>) {
     };
     match wrote {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            cannot_save(format_args!("the pin {}: {e}", path.display()));
+            Err(cannot_save(format_args!("the pin {}: {e}", path.display())))
         }
-        _ => {}
+        _ => Ok(()),
     }
 }
 
 /// What may differ under canonical `root` from `index`, of `docs` docs, and
-/// a token for the record; why watchman cannot say goes to stderr, worded
+/// a token for the record; why watchman cannot say goes to `left_out`, worded
 /// for a server's queries if `served`, unless `served` and the cause
 /// lasts: then it is returned, for the server to refuse. On a network
 /// filesystem, or when the mount table cannot be read, there is no token,
 /// so no record either.
-pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
-    let fail = |why: String, lasting: bool| match lasting && served {
+pub fn ask(
+    root: &Path,
+    index: &Index,
+    docs: usize,
+    served: bool,
+    left_out: &mut Vec<Diagnostic>,
+) -> Asked {
+    let fail = |why: String, lasting: bool, out: &mut Vec<Diagnostic>| match lasting && served {
         true => Asked {
             lasting: Some(why),
             ..Asked::default()
         },
         false => Asked {
-            why: Some(cannot_answer(&why)),
+            why: Some(cannot_answer(&why, out)),
             ..Asked::default()
         },
     };
     let root_str = match unaskable(root) {
-        Err(why) => return fail(why, true),
+        Err(why) => return fail(why, true, left_out),
         Ok(root_str) => root_str,
     };
     #[cfg(unix)]
@@ -499,13 +504,13 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
             Ok(record) => {
                 let sock = record.token.sock.clone().into();
                 let w = watchman::Watchman::at(sock, ASK_WAIT).served(served);
-                match later(&w, &record, root, docs) {
+                match later(&w, &record, root, docs, left_out) {
                     Ok(asked) => return asked,
                     Err((why, token)) if w.late() => {
                         let kept = served.then(|| record.token.clone());
                         return Asked {
                             token: token.or(kept),
-                            why: Some(cannot_answer(&why)),
+                            why: Some(cannot_answer(&why, left_out)),
                             ..Asked::default()
                         };
                     }
@@ -516,13 +521,13 @@ pub fn ask(root: &Path, index: &Index, docs: usize, served: bool) -> Asked {
         };
         match first(root, taken, served) {
             Ok(token) => {
-                checked_once(&why, served);
+                left_out.push(Diagnostic::Check(once(&why, served)));
                 Asked {
                     token: Some(token),
                     ..Asked::default()
                 }
             }
-            Err((why, late)) => fail(why, !late),
+            Err((why, late)) => fail(why, !late, left_out),
         }
     }
     #[cfg(not(unix))]
@@ -626,10 +631,11 @@ fn later(
     record: &Record,
     root: &Path,
     docs: usize,
+    left_out: &mut Vec<Diagnostic>,
 ) -> Result<Asked, (String, Option<Token>)> {
     let token = w.mark(root).map_err(|why| (why, None))?;
     let Some(baseline) = &record.baseline else {
-        over(reported_cap(docs));
+        left_out.push(Diagnostic::Check(over(reported_cap(docs))));
         return Ok(Asked {
             token: Some(token),
             ..Asked::default()
@@ -670,17 +676,18 @@ fn first(root: &Path, taken: Option<Token>, served: bool) -> Result<Token, (Stri
 
 /// Save `token` and `baseline` (ascending, deduped) as what differs from
 /// `index` under canonical `root` at it, after the search answered: the
-/// record's path, once written.
+/// record's path, once written, or the warning of why not.
 pub fn save(
     root: &Path,
     index: &Index,
     token: Token,
     baseline: Vec<String>,
     cap: usize,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, String> {
     let (Some(root), Ok(of)) = (root.to_str(), index.of()) else {
-        cannot_save(format_args!("the record (the index path is not UTF-8)"));
-        return None;
+        return Err(cannot_save(format_args!(
+            "the record (the index path is not UTF-8)"
+        )));
     };
     let record = Record {
         v: VERSION,
@@ -838,18 +845,18 @@ pub fn record_path(root: &Path, of: &Of) -> Option<PathBuf> {
 }
 
 /// Save `token`, `baseline` (ascending) and `extra` as what differs from
-/// `of` in the checkout at canonical `root`.
+/// `of` in the checkout at canonical `root`; the warning of why it could not.
 pub fn remember(
     root: &Path,
     of: &Of,
     token: Token,
     baseline: Vec<String>,
     extra: serde_json::Value,
-) {
+) -> Result<(), String> {
     let Some(root) = root.to_str() else {
-        return cannot_save(format_args!(
+        return Err(cannot_save(format_args!(
             "the record (the checkout's path is not UTF-8)"
-        ));
+        )));
     };
     let record = Record {
         v: VERSION,
@@ -859,61 +866,11 @@ pub fn remember(
         baseline: Some(baseline),
         extra: Some(extra),
     };
-    record.write(&of.key);
-}
-
-/// Whether [`warn`] keeps its lines for [`kept`] instead of printing them.
-static KEEP: AtomicBool = AtomicBool::new(false);
-static KEPT: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// `line` on stderr, once per process for each `seen`; kept instead once
-/// [`keep`] was called.
-pub(super) fn warn(seen: &'static AtomicBool, line: &str) {
-    #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
-    if seen.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    match KEEP.load(Ordering::Relaxed) {
-        true => KEPT
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(line.to_owned()),
-        false => crate::held::once(Some(seen), &format!("warning: {line}")),
-    }
-}
-
-/// From now on, keep the lines [`warn`] would print: `status` prints them
-/// itself, once.
-pub fn keep() {
-    KEEP.store(true, Ordering::Relaxed);
-}
-
-/// The lines kept since [`keep`], in order; under test, this thread's
-/// warnings, left for the test to read as a search's.
-pub fn kept() -> Vec<String> {
-    #[cfg(test)]
-    return crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().clone());
-    #[cfg(not(test))]
-    std::mem::take(&mut *KEPT.lock().unwrap_or_else(PoisonError::into_inner))
-}
-
-/// `line` on stderr, as a warning, every time: a server's.
-pub fn say(line: &str) {
-    #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(line.to_owned()));
-    eprintln!("warning: {line}");
+    record.write(&of.key).map(drop)
 }
 
 /// What a server prints once watchman answers after a warning.
 pub const ANSWERS_AGAIN: &str = "each query re-checks only what watchman reports again";
-
-/// [`ANSWERS_AGAIN`] on stderr, as a note.
-pub fn answers_again() {
-    #[cfg(test)]
-    crate::tests::NOTES.with_borrow(|n| n.lock().unwrap().push(ANSWERS_AGAIN.to_owned()));
-    eprintln!("note: {ANSWERS_AGAIN}");
-}
 
 pub fn cannot(why: &str) -> String {
     format!("watchman cannot say what changed ({why}); checked every file")
@@ -929,39 +886,22 @@ fn once(why: &str, served: bool) -> String {
     format!("checked every file once ({why}); {next}")
 }
 
-/// No usable answer from watchman on a tree worth asking about: the line.
-pub fn cannot_answer(why: &str) -> String {
-    static SEEN: AtomicBool = AtomicBool::new(false);
+/// No usable answer from watchman on a tree worth asking about: the line,
+/// added to `out` and returned for a server to compare.
+fn cannot_answer(why: &str, out: &mut Vec<Diagnostic>) -> String {
     let line = cannot(why);
-    warn(&SEEN, &line);
+    out.push(Diagnostic::Check(line.clone()));
     line
 }
 
-/// This search, or server start if `served`, took a token, but checked
-/// every file for its baseline.
-fn checked_once(why: &str, served: bool) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(&SEEN, &once(why, served));
+/// The record could not be written: the line.
+fn cannot_save(what: std::fmt::Arguments<'_>) -> String {
+    format!("cannot save {what}; the next search checks again")
 }
 
-/// The record could not be written.
-fn cannot_save(what: std::fmt::Arguments<'_>) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        &format!("cannot save {what}; the next search checks again"),
-    );
-}
-
-/// More paths may differ than re-checking them beats the stat pass.
-pub fn over(cap: usize) {
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    warn(
-        &SEEN,
-        &format!(
-            "more than {cap} paths may differ from the index; checked every file (re-run index)"
-        ),
-    );
+/// More paths may differ than re-checking them beats the stat pass: the line.
+pub fn over(cap: usize) -> String {
+    format!("more than {cap} paths may differ from the index; checked every file (re-run index)")
 }
 
 /// A server's query after more than `cap` paths changed: the line.
