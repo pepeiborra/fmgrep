@@ -8,7 +8,8 @@ use std::path::PathBuf;
 /// A case that the answer lacks something for, and the reason.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Diagnostic {
-    /// A file left out of the answer: it cannot be read, or is over 2 GiB.
+    /// A file left out of the answer: it cannot be read, is over 2 GiB, or
+    /// cannot be looked at.
     Skipped { path: PathBuf, why: String },
     /// A directory that could not be listed: what is new under it is
     /// missing. `dir` is empty when the error names none.

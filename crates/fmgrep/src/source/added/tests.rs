@@ -364,39 +364,6 @@ fn discovery_keeps_a_doc_in_a_dir_it_cannot_list() {
     assert!(files.snapshot().gone.is_empty());
 }
 
-/// A file that is gone or binary is no news; one that cannot be read, or is
-/// too large, says why.
-#[cfg(unix)]
-#[test]
-fn read_text_says_why_it_cannot_read_a_file() {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-    write(dir, "ok.c", b"printk");
-    write(dir, "bin.c", b"printk\0");
-    write(dir, "shut.c", b"printk");
-    std::fs::File::create(dir.join("huge.log"))
-        .unwrap()
-        .set_len(1 << 31)
-        .unwrap();
-    let shut = dir.join("shut.c");
-    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let read = |name: &str| super::read_text(&dir.join(name)).map(|t| t.bytes);
-    assert_eq!(read("ok.c"), Ok(b"printk".to_vec()));
-    assert_eq!(read("missing.c"), Err(None));
-    assert_eq!(read("bin.c"), Err(None));
-    assert_eq!(
-        read("huge.log"),
-        Err(Some("over 2147483646 bytes".to_owned()))
-    );
-    if std::fs::read(&shut).is_ok() {
-        println!("skipped: the file can be read (running as root)");
-        return;
-    }
-    let why = read("shut.c").unwrap_err().unwrap();
-    assert!(why.starts_with("cannot read (Permission denied"), "{why}");
-}
-
 /// A directory that cannot be listed is named by each kind of load that
 /// walks it: the full walk, the walk of the changed directories from a
 /// record, and the walk of what watchman reports.

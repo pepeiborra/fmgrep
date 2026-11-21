@@ -1,4 +1,5 @@
 use super::{Plan, plan, short};
+use crate::diagnostic::Diagnostic;
 use crate::remote::Server;
 use crate::wire::ServeStatus;
 
@@ -144,4 +145,71 @@ fn a_server_without_a_served_commit_warns_unless_it_reads_the_tree() {
         assert!(warns(&other, &text), "store_docs {store_docs}");
         assert!(!warns(&away, &text), "store_docs {store_docs}");
     }
+}
+
+/// Mode `mode` on `path`.
+#[cfg(unix)]
+fn chmod(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A path of the skip list under a directory this process cannot search
+/// is left out with a warning, as one that cannot be read is, not dropped
+/// without a word.
+#[cfg(unix)]
+#[test]
+fn a_path_of_the_skip_list_below_a_closed_directory_gets_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let top = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir(top.join("shut")).unwrap();
+    std::fs::write(top.join("shut/x.c"), b"printk").unwrap();
+    std::fs::write(top.join("y.c"), b"printk").unwrap();
+    chmod(&top.join("shut"), 0o000);
+    let closed = std::fs::symlink_metadata(top.join("shut/x.c")).is_err();
+    let skip = ["gone.c", "shut/x.c", "y.c"].map(str::to_owned);
+    let mut said = Vec::new();
+    let local = super::resolve(&top, &skip, ID, &mut said);
+    chmod(&top.join("shut"), 0o755);
+    if !closed {
+        println!("skipped: the directory can be searched (running as root)");
+        return;
+    }
+    assert_eq!(local.unwrap().files, ["y.c"], "gone.c is no news");
+    assert_eq!(
+        said,
+        [Diagnostic::Skipped {
+            path: top.join("shut/x.c"),
+            why: "cannot stat (Permission denied (os error 13))".to_owned(),
+        }]
+    );
+}
+
+/// A directory of the skip list that this process cannot list is named, and
+/// the files around it are still searched.
+#[cfg(unix)]
+#[test]
+fn a_directory_of_the_skip_list_that_cannot_be_listed_is_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let top = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(top.join("ut/sub")).unwrap();
+    std::fs::write(top.join("ut/u.c"), b"printk").unwrap();
+    std::fs::write(top.join("ut/sub/s.c"), b"printk").unwrap();
+    chmod(&top.join("ut/sub"), 0o000);
+    let listable = std::fs::read_dir(top.join("ut/sub")).is_ok();
+    let mut said = Vec::new();
+    let local = super::resolve(&top, &["ut/".to_owned()], ID, &mut said);
+    chmod(&top.join("ut/sub"), 0o755);
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    assert_eq!(local.unwrap().files, ["ut/u.c"]);
+    assert_eq!(
+        said,
+        [Diagnostic::Unlisted {
+            dir: top.join("ut/sub"),
+            why: "Permission denied (os error 13)".to_owned(),
+        }]
+    );
 }

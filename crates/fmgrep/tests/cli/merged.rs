@@ -916,3 +916,54 @@ fn fmgrep_verbose_notes_where_local_changes_come_from() {
         assert!(note.contains(counts), "{note}");
     }
 }
+
+/// `path` with mode `mode`.
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A local change that cannot be read, or a directory of the checkout that
+/// cannot be listed, is left out of the answer and named on stderr, as rg
+/// names what it cannot open. The server leaves out what the checkout
+/// changed, so the file is in neither part.
+#[cfg(unix)]
+#[test]
+fn a_local_change_that_cannot_be_read_is_named() {
+    let r = Remote::new(&FILES);
+    let c = &r.client;
+    r.s.write(
+        c,
+        &[
+            ("a.c", "printk a edited\n"),
+            ("ut/a.c", "printk u\n"),
+            ("ut/sub/s.c", "printk s\n"),
+        ],
+    );
+    // Git lists `ut/`; the client lists `ut` and names `ut/sub`.
+    chmod(&c.join("a.c"), 0o000);
+    chmod(&c.join("ut/sub"), 0o000);
+    let readable = std::fs::read(c.join("a.c")).is_ok();
+    let out = r.tried(|| {
+        r.command(&r.addr, c, &["-l", "printk"])
+            .output()
+            .expect("spawn fmgrep")
+    });
+    chmod(&c.join("a.c"), 0o644);
+    chmod(&c.join("ut/sub"), 0o755);
+    if readable {
+        println!("skipped: the file can be read (running as root)");
+        return;
+    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "dir/b.c\ndir/sub/c.h\ne.c\nut/a.c\n");
+    let warnings = format!(
+        "warning: cannot list {ut}/sub: Permission denied (os error 13); files under it may be \
+         missing from the answer\n\
+         warning: skipping {a}: cannot read (Permission denied (os error 13))\n",
+        ut = c.join("ut").display(),
+        a = c.join("a.c").display()
+    );
+    assert_eq!(r.warnings(&out), warnings);
+}
