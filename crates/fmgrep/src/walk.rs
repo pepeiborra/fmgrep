@@ -341,15 +341,36 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
     Ok((rels, notes))
 }
 
+/// What a walk of some directories found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Walked {
+    /// Paths relative to the root, sorted.
+    pub files: Vec<String>,
+    /// The directories that could not be listed, each with why, sorted as
+    /// `PATH: why` reads: what is under one is not in `files`. A directory
+    /// that is gone is not one. The path is empty when the error has none.
+    pub unlisted: Vec<(PathBuf, String)>,
+}
+
+/// The directory and the reason of the listing error `e`.
+fn unlisted_of(e: &ignore::Error) -> (PathBuf, String) {
+    match e {
+        ignore::Error::WithDepth { err, .. } => unlisted_of(err),
+        ignore::Error::WithPath { path, err } => (path.clone(), err.to_string()),
+        e => (PathBuf::new(), e.to_string()),
+    }
+}
+
 /// Paths relative to `root`, sorted, of every file under `under` the index
-/// walk lists before its text check. An unreadable directory is skipped.
-pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Vec<String> {
+/// walk lists before its text check; a directory it cannot list is named
+/// in [`Walked::unlisted`].
+pub fn walk_paths(root: &Path, under: &Path, exclude: Option<&Path>) -> Walked {
     walk_changed(root, vec![under.to_path_buf()], exclude, |_| false)
 }
 
 /// [`walk_paths`] under `under`, or none once it lists more than `limit`
 /// files: the walk stops there.
-pub fn walk_paths_within(root: &Path, under: &Path, limit: usize) -> Option<Vec<String>> {
+pub fn walk_paths_within(root: &Path, under: &Path, limit: usize) -> Option<Walked> {
     walk_within(root, vec![under.to_path_buf()], None, |_| false, limit)
 }
 
@@ -360,7 +381,7 @@ pub fn walk_changed(
     dirs: Vec<PathBuf>,
     exclude: Option<&Path>,
     prune: impl Fn(&str) -> bool + Send + Sync + 'static,
-) -> Vec<String> {
+) -> Walked {
     walk_within(root, dirs, exclude, prune, usize::MAX).unwrap_or_default()
 }
 
@@ -371,7 +392,7 @@ fn walk_within(
     exclude: Option<&Path>,
     prune: impl Fn(&str) -> bool + Send + Sync + 'static,
     limit: usize,
-) -> Option<Vec<String>> {
+) -> Option<Walked> {
     // The walker never filters its roots.
     let mut matcher = rules(root);
     let mut seeds = dirs.into_iter().filter(|dir| {
@@ -379,7 +400,7 @@ fn walk_within(
         rel.is_empty() || !matcher.matched(&rel, true).is_ignore()
     });
     let Some(first) = seeds.next() else {
-        return Some(Vec::new());
+        return Some(Walked::default());
     };
     let mut walk = builder(&first);
     for seed in seeds {
@@ -393,26 +414,43 @@ fn walk_within(
                 && !prune(&relative_path(&base, entry.path()))
     });
     let found = Mutex::new(Vec::new());
+    let unlisted = Mutex::new(Vec::new());
     walk.build_parallel().run(|| {
         Box::new(|entry| {
-            if let Ok(entry) = entry
-                && entry.file_type().is_some_and(|t| t.is_file())
-            {
-                let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
-                found.push(relative_path(root, entry.path()));
-                if found.len() > limit {
-                    return ignore::WalkState::Quit;
+            match entry {
+                Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
+                    let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
+                    found.push(relative_path(root, entry.path()));
+                    if found.len() > limit {
+                        return ignore::WalkState::Quit;
+                    }
                 }
+                // Only a listing error has a depth; an ignore file's is skipped,
+                // as in `list`. A directory that is gone was never there.
+                Err(e)
+                    if e.depth().is_some()
+                        && e.io_error()
+                            .is_none_or(|io| io.kind() != std::io::ErrorKind::NotFound) =>
+                {
+                    let mut unlisted = unlisted.lock().unwrap_or_else(PoisonError::into_inner);
+                    unlisted.push(unlisted_of(&e));
+                }
+                _ => {}
             }
             ignore::WalkState::Continue
         })
     });
-    let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
-    if found.len() > limit {
+    let mut files = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    if files.len() > limit {
         return None;
     }
-    found.sort_unstable();
-    Some(found)
+    files.sort_unstable();
+    let mut unlisted = unlisted
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    unlisted.sort_by_cached_key(|(dir, why)| format!("{}: {why}", dir.display()));
+    unlisted.dedup();
+    Some(Walked { files, unlisted })
 }
 
 /// The walk's one default-verbosity line: what the per-file `warning:` lines
@@ -756,7 +794,7 @@ mod tests {
         let notes = for_each_index_doc(&dir, None, |_, _, _, _| Ok(())).unwrap();
         let dirs: Vec<&str> = notes.dirs.iter().map(|(rel, _)| rel.as_str()).collect();
         assert_eq!(dirs, ["", "sub"], "ignored dirs are never listed");
-        assert_eq!(walk_paths(&dir, &dir, None), indexed(&dir));
+        assert_eq!(walk_paths(&dir, &dir, None).files, indexed(&dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -955,7 +993,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let walked = walk_paths(&dir, &dir, Some(&exclude));
+        let walked = walk_paths(&dir, &dir, Some(&exclude)).files;
         let text: Vec<String> = walked
             .iter()
             .filter(|p| !p.ends_with(".bin"))
@@ -964,10 +1002,14 @@ mod tests {
         assert_eq!(text, indexed);
         assert!(walked.contains(&"nul.bin".to_string()));
         assert_eq!(
-            walk_paths(&dir, &dir.join("sub"), None),
+            walk_paths(&dir, &dir.join("sub"), None).files,
             ["sub/b.c", "sub/nested/d.c"]
         );
-        assert!(walk_paths(&dir, &dir.join("missing"), None).is_empty());
+        // A seed deleted since is no listing error.
+        assert_eq!(
+            walk_paths(&dir, &dir.join("missing"), None),
+            Walked::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1075,7 +1117,7 @@ mod tests {
             dir.join(".hdir"),
             dir.join("ok"),
         ];
-        assert_eq!(walk_changed(&dir, seeds, None, |_| false), ["ok/c.c"]);
+        assert_eq!(walk_changed(&dir, seeds, None, |_| false).files, ["ok/c.c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1095,18 +1137,49 @@ mod tests {
         }
         let old = |rel: &str| rel == "sub/old";
         let exclude = dir.join("sub/idx");
-        let got = walk_changed(&dir, vec![dir.join("sub")], Some(&exclude), old);
+        let got = walk_changed(&dir, vec![dir.join("sub")], Some(&exclude), old).files;
         assert_eq!(got, ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c"]);
         let seeds = vec![dir.join("sub/old"), dir.join("sub")];
-        let got = walk_changed(&dir, seeds, Some(&exclude), old);
+        let got = walk_changed(&dir, seeds, Some(&exclude), old).files;
         assert_eq!(
             got,
             ["sub/a.c", "sub/new/deep/d.c", "sub/new/n.c", "sub/old/o.c"]
         );
         let all = walk_changed(&dir, vec![dir.clone()], None, |_| false);
         assert_eq!(all, walk_paths(&dir, &dir, None));
-        assert_eq!(all.len(), 6);
-        assert!(walk_changed(&dir, Vec::new(), None, |_| false).is_empty());
+        assert_eq!(all.files.len(), 6);
+        assert_eq!(
+            walk_changed(&dir, Vec::new(), None, |_| false),
+            Walked::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory the walk cannot list is named, with why, and what is
+    /// around it is still listed; one that is gone is not named.
+    #[cfg(unix)]
+    #[test]
+    fn walk_changed_names_the_dirs_it_cannot_list() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("unlisted");
+        put(
+            &dir,
+            &[("a.c", "text"), ("shut/b.c", "text"), ("ok/c.c", "text")],
+        );
+        let shut = dir.join("shut");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let walked = walk_changed(&dir, vec![dir.clone(), dir.join("gone")], None, |_| false);
+        let readable = std::fs::read_dir(&shut).is_ok();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            println!("skipped: the directory can be listed (running as root)");
+            return;
+        }
+        assert_eq!(walked.files, ["a.c", "ok/c.c"]);
+        assert_eq!(
+            walked.unlisted,
+            [(shut, "Permission denied (os error 13)".to_owned())]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

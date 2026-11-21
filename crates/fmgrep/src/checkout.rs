@@ -453,7 +453,7 @@ pub fn resolve(top: &Path, skip: &[String], commit: &str) -> Result<Local, Strin
             Some(m) if m.is_dir() && tree => {
                 walked.push(rel);
                 let found = crate::walk::walk_paths_within(top, &top.join(rel), room);
-                listed.extend(found.ok_or_else(|| too_many(skip, &walked, commit))?);
+                listed.extend(found.ok_or_else(|| too_many(skip, &walked, commit))?.files);
             }
             Some(m) if m.is_file() && !tree && !rules.matched(rel, false).is_ignore() => {
                 if room == 0 {

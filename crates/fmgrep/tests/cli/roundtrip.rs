@@ -1157,3 +1157,36 @@ fn a_new_file_that_two_walks_find_is_named_once() {
         stderr(&out)
     );
 }
+
+/// A directory new since the index that cannot be listed is named on
+/// stderr, and the answer is the one without what is under it.
+#[cfg(unix)]
+#[test]
+fn a_new_directory_that_cannot_be_listed_is_named_with_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, docs) = stage_files(&[("a.c", b"printk\n")]);
+    let index_dir = do_index(&docs, false);
+    let shut = docs.join("newdir");
+    std::fs::create_dir(&shut).unwrap();
+    std::fs::write(shut.join("e.c"), b"printk\n").unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&shut).is_ok();
+    let index = index_dir.display().to_string();
+    let out = run(&["--index", &index, "printk"]);
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        println!("skipped: the directory can be listed (running as root)");
+        return;
+    }
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.c:printk\n");
+    let shut = shut.canonicalize().unwrap();
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "warning: cannot list {}: Permission denied (os error 13); files under it may be \
+             missing from the answer\n",
+            shut.display()
+        )
+    );
+}
