@@ -250,13 +250,8 @@ fn a_new_ignore_file_is_applied_and_warned_once() {
     let out = search(&index_dir);
     assert_eq!(stderr(&out), "");
     assert_eq!(leaf_totals(&out.stdout), [4, 1]);
-    // Older than 2 s, so that the fresh index below records their stamps:
-    // it records a newer one as unknown, which every load takes as changed.
-    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10);
     for (rel, text) in [(".ignore", b"b.bin\n"), ("sub/.ignore", b"d.bin\n")] {
-        let file = std::fs::File::create(docs.join(rel)).unwrap();
-        std::io::Write::write_all(&mut &file, text).unwrap();
-        file.set_modified(old).unwrap();
+        std::fs::write(docs.join(rel), text).unwrap();
     }
     let warning = "warning: 2 ignore files changed since the index; each search reads their \
                    directories again (re-run index to make searches fast again)\n";
@@ -1570,4 +1565,25 @@ fn a_new_directory_that_cannot_be_listed_is_named_with_a_warning() {
             shut.display()
         )
     );
+}
+
+/// Files source, no watchman: an ignore file written just before the
+/// index is not reported changed, and an edit after it is still applied.
+#[test]
+fn an_ignore_file_written_just_before_index_is_not_called_changed() {
+    let (_tmp, docs) = stage();
+    std::fs::write(docs.join(".ignore"), b"b.bin\n").unwrap();
+    let index_dir = do_index(&docs, false);
+    let search = || run(&query_argv(&index_dir, false, &["printk", "hello"]));
+    let out = search();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    assert_eq!(leaf_totals(&out.stdout), [2, 1], "b.bin ignored");
+    std::fs::write(docs.join(".ignore"), b"nothing.bin\n").unwrap();
+    let out = search();
+    assert!(out.status.success(), "{}", stderr(&out));
+    // A stamp the index could not vouch for is walked again at every load,
+    // and its edit is applied without a warning.
+    assert_eq!(stderr(&out), "");
+    assert_eq!(leaf_totals(&out.stdout), [3, 1], "b.bin searched again");
 }
