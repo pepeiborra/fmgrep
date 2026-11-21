@@ -167,6 +167,7 @@ pub(crate) fn request<'a>(
         output,
         filter: None,
         report_none: false,
+        plans: false,
     }
 }
 
