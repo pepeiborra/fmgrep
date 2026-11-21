@@ -272,7 +272,10 @@ impl Recorded {
             let now = crate::walk::stamp(&resolve(root, rel)).unwrap_or(ABSENT);
             now != self.ignores.rows[i].1
         });
-        let names = rows.iter().filter(|&&i| moved[i]);
+        // A racy row never matches, so its dir is walked again; it is not
+        // known to have changed, so it is not named.
+        let vouched = |i: usize| self.ignores.rows[i].1 != UNKNOWN;
+        let names = rows.iter().filter(|&&i| moved[i] && vouched(i));
         let names = names.map(|&i| self.ignores.path(i).to_owned()).collect();
         let mut scopes: Vec<String> = rows
             .into_iter()
@@ -318,7 +321,8 @@ pub struct IgnoreScopes {
     pub scopes: Vec<String>,
     /// The ignore files in the changed dirs that the index did not record.
     pub found: Vec<String>,
-    /// The recorded ignore inputs that moved, as recorded.
+    /// The recorded ignore inputs that moved, as recorded; not a racy one,
+    /// which is walked again without being named.
     pub moved: Vec<String>,
 }
 
