@@ -634,7 +634,7 @@ fn files_fetch_reads_original_bytes() {
 /// A files-layout store after the load stat, and a query begun.
 fn loaded(fix: &Fix) -> DocStore {
     let mut store = reader(fix);
-    store.stat_all(fix.paths());
+    store.stat_all(fix.paths(), &mut Vec::new());
     store.begin();
     store
 }
@@ -783,7 +783,7 @@ fn discovered(fix: &Fix, added: &[(&str, &[u8])]) -> DocStore {
         std::fs::write(fix.path.join(rel), bytes).unwrap();
     }
     let mut store = reader(fix);
-    store.stat_all(fix.paths());
+    store.stat_all(fix.paths(), &mut Vec::new());
     store.discover(fix.paths(), &mut Vec::new());
     store.begin();
     store

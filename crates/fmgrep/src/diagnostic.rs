@@ -23,6 +23,17 @@ pub enum Diagnostic {
     /// The planner's account of a search under `FMGREP_VERBOSE=2`: whole
     /// lines, each ending in a newline.
     Plan(String),
+    /// An indexed file left out of the answer: it is missing, cannot be
+    /// read or statted, or is no longer text.
+    Excluded { path: PathBuf, why: String },
+    /// Over half of the `files` indexed files are missing under `root`.
+    MostlyGone {
+        gone: usize,
+        files: usize,
+        root: PathBuf,
+    },
+    /// A note of `FMGREP_VERBOSE`, without its `note: ` prefix.
+    Note(String),
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -49,6 +60,15 @@ impl fmt::Display for Diagnostic {
                  under it are not searched"
             ),
             Self::Plan(text) => f.write_str(text.strip_suffix('\n').unwrap_or(text)),
+            Self::Excluded { path, why } => {
+                write!(f, "warning: excluding {}: {why}", path.display())
+            }
+            Self::MostlyGone { gone, files, root } => write!(
+                f,
+                "warning: excluding {gone} of {files} indexed files, missing under {}",
+                root.display()
+            ),
+            Self::Note(text) => write!(f, "note: {text}"),
         }
     }
 }
