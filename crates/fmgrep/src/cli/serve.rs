@@ -168,8 +168,11 @@ impl Served<'_> {
                 message,
             })?;
         let mut left_out = Vec::new();
-        self.docs.recheck(self.files, &mut left_out);
+        let checked = self.docs.recheck(self.files, &mut left_out);
         super::print_diagnostics(left_out);
+        if checked {
+            self.docs.note_added();
+        }
         // Until the next query sets its own.
         self.docs.skip(skip);
         let (index, loaded) = (&self.index, &mut self.docs);
@@ -463,6 +466,7 @@ fn hold<'m>(req: &ServeRequest<'m>) -> Result<Served<'m>, String> {
     );
     super::print_diagnostics(left_out);
     let (index, mut docs) = loaded?;
+    docs.note_stale(&req.manifest.files);
     if let Some(cause) = docs.refusal() {
         return Err(format!(
             "error: cannot use watchman for {} ({cause}); `fmgrep serve` asks it before each \

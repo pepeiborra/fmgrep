@@ -82,8 +82,22 @@ impl Loaded {
     }
 
     /// Before a served query, re-check what changed since the last one.
-    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) {
-        self.docs.recheck(files, left_out);
+    /// Whether it re-checked.
+    pub fn recheck(&self, files: Checked<'_>, left_out: &mut Vec<Diagnostic>) -> bool {
+        self.docs.recheck(files, left_out)
+    }
+
+    /// Under verbose, note the added docs, after what a recheck left out is
+    /// printed.
+    pub fn note_added(&self) {
+        self.docs.note_added();
+    }
+
+    /// Note the added docs, begin the first query and note the stale docs:
+    /// how many of the indexed `files` are stale. After the load, once its
+    /// warnings are printed.
+    pub fn note_stale(&mut self, files: &FileTable) -> usize {
+        note_stale(&mut self.docs, files)
     }
 
     /// Leave out `skip`'s files until the next call.
@@ -118,7 +132,8 @@ fn covers(index: usize, manifest: &Manifest) -> Result<(), String> {
 /// stats every doc and discovers added files; `ask` says when watchman is
 /// asked, at load and in [`Loaded::recheck`]. `checked` is the manifest's
 /// paths when the caller has checked them already, as a server has. What the
-/// check leaves out goes to `left_out`, also when the load fails.
+/// check leaves out goes to `left_out`, also when the load fails. The caller
+/// then calls [`note_stale`], after it prints those.
 pub fn load(
     index_dir: &Path,
     manifest: &Manifest,
@@ -157,13 +172,12 @@ pub fn load(
     left_out.extend(found);
     fresh?;
     let index = index.map_err(|e| format!("error: {e}"))?;
-    let mut loaded = Loaded {
+    let loaded = Loaded {
         docs,
         load_wall: load_start.elapsed(),
         band: boolean::ReadBand::DEFAULT,
         locate_us: read::locate_us(None),
     };
-    note_stale(&mut loaded.docs, &manifest.files);
     covers(index.num_files_indexed(), manifest)?;
     Ok((index, loaded))
 }
@@ -224,10 +238,11 @@ pub fn open<'m>(
     Ok((docs, blobs))
 }
 
-/// After the check of what changed, as [`load`] ends: begin the first
-/// query of `docs` and note its stale docs. How many of the indexed
-/// `files` are stale.
+/// After the check of what changed, as [`load`] ends: note the added docs,
+/// begin the first query of `docs` and note its stale docs. How many of the
+/// indexed `files` are stale.
 pub fn note_stale(docs: &mut DocStore, files: &FileTable) -> usize {
+    docs.note_added();
     docs.begin();
     let stale = docs.stale().partition_point(|&id| id < files.len());
     if stale > 0 {
@@ -250,7 +265,7 @@ pub fn listed(root: &Path, files: &[String]) -> Result<(DocfmIndex, Loaded), Str
     Ok((DocfmIndex::empty(), loaded))
 }
 
-/// [`load`] then [`answer`]; what they leave out is dropped.
+/// [`load`], [`note_stale`], then [`answer`]; what they leave out is dropped.
 #[cfg(test)]
 pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<OutputReport, String> {
     let mut left_out = Vec::new();
@@ -262,6 +277,7 @@ pub fn run_query(req: &QueryRequest<'_>, sink: &mut dyn MatchSink) -> Result<Out
         None,
         &mut left_out,
     )?;
+    loaded.note_stale(&req.manifest.files);
     let report = answer(&index, &mut loaded, req, sink, &mut left_out);
     tracing::info_span!("drop").in_scope(|| drop((index, loaded)));
     report

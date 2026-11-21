@@ -57,25 +57,32 @@ pub fn text(raw: Vec<u8>) -> Result<Text, Skip> {
     Ok(text)
 }
 
-/// Whether the file's first bytes allow it to be text: false implies
-/// [`text`] of the whole file is `Err`. An unreadable file is not text.
-pub fn sniff_text(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
+/// Whether the file's first bytes allow it to be text: `Ok(false)` implies
+/// [`text`] of the whole file is `Err`. A file that is gone is not text,
+/// as rg would not see it; one that cannot be read, or is over
+/// [`MAX_DOC_BYTES`], is an `Err` that says why, for the caller to name.
+pub fn sniff_text(path: &Path) -> Result<bool, String> {
+    let head = match head(path) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Err(Skip::TooLarge.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("cannot read ({e})")),
     };
-    if !file.metadata().is_ok_and(|m| m.len() <= MAX_DOC_BYTES) {
-        return false;
+    Ok(!is_binary(&utf16(&head).unwrap_or(head)))
+}
+
+/// The leading bytes of the file at `path` that [`sniff_text`] inspects:
+/// enough UTF-16 to decode to the control-byte window. None when it is
+/// over [`MAX_DOC_BYTES`].
+fn head(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_DOC_BYTES {
+        return Ok(None);
     }
-    // Enough UTF-16 to decode to the control-byte window.
     let mut head = Vec::with_capacity(2 * SNIFF_BYTES + 2);
-    if file
-        .take(2 * SNIFF_BYTES as u64 + 2)
-        .read_to_end(&mut head)
-        .is_err()
-    {
-        return false;
-    }
-    !is_binary(&utf16(&head).unwrap_or(head))
+    file.take(2 * SNIFF_BYTES as u64 + 2)
+        .read_to_end(&mut head)?;
+    Ok(Some(head))
 }
 
 /// The UTF-8 of UTF-16 text after its BOM; `None` without a BOM. Invalid
@@ -213,7 +220,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sniff = |name: &str, bytes: &[u8]| {
             std::fs::write(dir.path().join(name), bytes).unwrap();
-            sniff_text(&dir.path().join(name))
+            sniff_text(&dir.path().join(name)).unwrap()
         };
         let mut late = vec![b'x'; 2 * SNIFF_BYTES + 10];
         late[2 * SNIFF_BYTES + 3] = 0;
@@ -232,7 +239,27 @@ mod tests {
             "\x01".repeat(1000)
         ));
         assert!(sniff("soup.c", &soup) && is_text(&soup), "past the window");
-        assert!(!sniff_text(&dir.path().join("missing.c")));
+        assert_eq!(sniff_text(&dir.path().join("missing.c")), Ok(false), "gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sniff_text_says_why_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shut.c");
+        std::fs::write(&path, b"printk\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            println!("skipped: the file can be read (running as root)");
+            return;
+        }
+        let why = sniff_text(&path).unwrap_err();
+        assert!(why.starts_with("cannot read (Permission denied"), "{why}");
+        // A directory opens and then fails to read.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(sniff_text(&sub).unwrap_err().starts_with("cannot read ("));
     }
 
     #[test]
@@ -242,9 +269,9 @@ mod tests {
         std::fs::write(&path, vec![b'x'; 2 * SNIFF_BYTES + 2]).unwrap();
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_len(MAX_DOC_BYTES).unwrap();
-        assert!(sniff_text(&path));
+        assert_eq!(sniff_text(&path), Ok(true));
         file.set_len(MAX_DOC_BYTES + 1).unwrap();
-        assert!(!sniff_text(&path));
+        assert_eq!(sniff_text(&path), Err("over 2147483646 bytes".to_owned()));
         assert_eq!(Skip::TooLarge.to_string(), "over 2147483646 bytes");
     }
 }

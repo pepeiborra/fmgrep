@@ -3,7 +3,7 @@
 //! docs.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 
@@ -85,8 +85,16 @@ impl super::Files {
         }
         drop(span);
         known.complete.store(true, Ordering::Release);
-        let n = known.added().live().count();
-        if n > 0 && crate::verbose::verbose() {
+    }
+
+    /// Under verbose, note how many added files every query scans in full.
+    /// After the caller prints what the check left out.
+    pub fn note_added(&self) {
+        if !crate::verbose::verbose() {
+            return;
+        }
+        let n = self.known.added().live().count();
+        if n > 0 {
             eprintln!("note: {n} file(s) added since indexing are scanned in full by every query");
         }
     }
@@ -160,17 +168,32 @@ impl Known {
     }
 
     /// The paths of `rels` whose first bytes allow text, in order.
+    ///
+    /// A file that cannot be read, or is too large, is left out with one
+    /// entry in `left_out`. A binary one is not named, as at the index.
     pub(super) fn text_only(
         &self,
         root: &Path,
         rels: Vec<String>,
-        _left_out: &mut Vec<Diagnostic>,
+        left_out: &mut Vec<Diagnostic>,
     ) -> Vec<String> {
-        let keep = parallel(&rels, |rel| sniff_text(&root.join(rel)));
+        let sniffed = parallel(&rels, |rel| sniff_text(&root.join(rel)));
+        // The entries come in path order, whichever thread ended first.
         rels.into_iter()
-            .zip(keep)
-            .filter_map(|(rel, k)| k.then_some(rel))
+            .zip(sniffed)
+            .filter_map(|(rel, text)| match text {
+                Ok(text) => text.then_some(rel),
+                Err(why) => {
+                    self.skipped(root.join(&rel), why, left_out);
+                    None
+                }
+            })
             .collect()
+    }
+
+    /// Report that `path`, a file new since the index, is left out for `why`.
+    fn skipped(&self, path: PathBuf, why: String, left_out: &mut Vec<Diagnostic>) {
+        self.left_out_once(Diagnostic::Skipped { path, why }, left_out);
     }
 
     /// Walk `under` (at or below `root`) and reconcile what it holds: an
@@ -246,18 +269,16 @@ impl Known {
             .is_some_and(|x| Path::new(rel).starts_with(x))
     }
 
-    pub fn read_added(&self, doc: usize, _left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
+    pub fn read_added(&self, doc: usize, left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
         let slot = doc.checked_sub(self.state.len())?;
         let rel = self.added().paths.get(slot)?.clone();
         let path = self.root.join(&rel);
-        let text = std::fs::metadata(&path)
-            .is_ok_and(|m| m.len() <= crate::binary::MAX_DOC_BYTES)
-            .then(|| std::fs::read(&path).ok())
-            .flatten()
-            .and_then(|raw| crate::binary::text(raw).ok());
-        match text {
-            Some(text) => Some(text.bytes),
-            None => {
+        match read_text(&path) {
+            Ok(text) => Some(text.bytes),
+            Err(why) => {
+                if let Some(why) = why {
+                    self.skipped(path, why, left_out);
+                }
                 if self.added().set(&rel, false) {
                     self.epoch.fetch_add(1, Ordering::AcqRel);
                 }
@@ -265,6 +286,20 @@ impl Known {
             }
         }
     }
+}
+
+/// The text of the file at `path`, or why it is left out: `None` for a file
+/// that is gone or binary, which is no news.
+fn read_text(path: &Path) -> Result<crate::binary::Text, Option<String>> {
+    use crate::binary::{MAX_DOC_BYTES, Skip};
+    let unread = |e: std::io::Error| {
+        (e.kind() != std::io::ErrorKind::NotFound).then(|| format!("cannot read ({e})"))
+    };
+    if std::fs::metadata(path).map_err(unread)?.len() > MAX_DOC_BYTES {
+        return Err(Some(Skip::TooLarge.to_string()));
+    }
+    let raw = std::fs::read(path).map_err(unread)?;
+    crate::binary::text(raw).map_err(|why| (why == Skip::TooLarge).then(|| why.to_string()))
 }
 
 #[cfg(test)]

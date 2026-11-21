@@ -165,6 +165,9 @@ struct Known {
     /// Whether a server asks watchman again before each query: its
     /// warnings then speak of queries, not searches.
     each_query: bool,
+    /// What this process already reported as left out: a server finds the
+    /// same ones again at each query.
+    left_out: Mutex<std::collections::HashSet<Diagnostic>>,
 }
 
 impl Known {
@@ -211,6 +214,14 @@ impl Known {
             && self.state[id].fetch_or(WARNED, Ordering::AcqRel) & WARNED == 0;
         if first {
             eprintln!("warning: excluding {}: {why}", path.display());
+        }
+    }
+
+    /// Add `what` to `out` unless this process already reported it.
+    fn left_out_once(&self, what: Diagnostic, out: &mut Vec<Diagnostic>) {
+        let mut said = self.left_out.lock().unwrap_or_else(PoisonError::into_inner);
+        if said.insert(what.clone()) {
+            out.push(what);
         }
     }
 
@@ -541,6 +552,7 @@ impl Files {
                 moved_ignores: Mutex::default(),
                 complete: AtomicBool::new(false),
                 each_query: false,
+                left_out: Mutex::default(),
             }),
             index: None,
             last: Mutex::default(),
@@ -635,14 +647,6 @@ impl Files {
         };
         let n = paths.len();
         timed(format_args!("{}", named(n, kept)), asked, applied);
-        if crate::verbose::verbose() {
-            let n = self.known.added().live().count();
-            if n > 0 {
-                eprintln!(
-                    "note: {n} file(s) added since indexing are scanned in full by every query"
-                );
-            }
-        }
         Learned::Answered { named: n, kept }
     }
 
@@ -669,10 +673,15 @@ impl Files {
     /// token, then re-check those paths; when watchman cannot say, check
     /// every file as a new load would. On stderr, why every file was
     /// checked, each time the reason changes, and a note once watchman
-    /// answers again.
-    pub fn recheck(&self, files: Checked<'_>, lens: &[u64], left_out: &mut Vec<Diagnostic>) {
+    /// answers again. Whether it re-checked.
+    pub fn recheck(
+        &self,
+        files: Checked<'_>,
+        lens: &[u64],
+        left_out: &mut Vec<Diagnostic>,
+    ) -> bool {
         if self.index.is_none() || !self.known.each_query {
-            return;
+            return false;
         }
         self.known.reload_rules();
         let why = match self.askable(files) {
@@ -689,6 +698,7 @@ impl Files {
             _ => {}
         }
         *said = why;
+        true
     }
 
     /// The ask and re-check of [`Self::recheck`]: why every file must be
@@ -837,8 +847,9 @@ impl Files {
         snap
     }
 
-    /// Added doc `doc`'s whole bytes; one now missing, unreadable or binary
-    /// is dropped silently: `None`.
+    /// Added doc `doc`'s whole bytes; one now missing or binary is dropped
+    /// silently, one unreadable or too large with an entry in `left_out`:
+    /// `None`.
     pub fn read_added(&self, doc: usize, left_out: &mut Vec<Diagnostic>) -> Option<Vec<u8>> {
         self.known.read_added(doc, left_out)
     }
