@@ -1,5 +1,6 @@
 use super::*;
-use crate::cli::params::Mode;
+use crate::cli::params::{Mode, QueryParams};
+use crate::manifest::Manifest;
 
 /// The client's part counts as the server does: a lines search its
 /// matched lines, with `--stats` and under `-o` rg's matches; so the
@@ -27,7 +28,11 @@ fn the_clients_part_counts_as_the_server_does() {
             stats,
             ..QueryParams::default()
         };
-        let part = part(&p, tmp.path(), &local, &mut Vec::new()).unwrap();
+        let manifest = Manifest::empty(tmp.path());
+        let req = p
+            .request(Path::new(""), &manifest, Some(tmp.path()))
+            .unwrap();
+        let part = part(&req, p.stats, tmp.path(), &local, &mut Vec::new()).unwrap();
         let q = &part.report.queries[0];
         assert_eq!(
             (q.total_matches, q.docs_matched),
@@ -65,7 +70,11 @@ fn the_clients_stats_corpus_is_what_the_filter_keeps() {
             globs: globs.iter().map(|g| (*g).to_owned()).collect(),
             ..QueryParams::default()
         };
-        let part = part(&p, tmp.path(), &local, &mut Vec::new()).unwrap();
+        let manifest = Manifest::empty(tmp.path());
+        let req = p
+            .request(Path::new(""), &manifest, Some(tmp.path()))
+            .unwrap();
+        let part = part(&req, p.stats, tmp.path(), &local, &mut Vec::new()).unwrap();
         assert_eq!(part.corpus, want, "{globs:?} {stats}");
     }
 }
