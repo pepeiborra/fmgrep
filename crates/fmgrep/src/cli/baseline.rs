@@ -22,18 +22,25 @@ use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
 use crate::wire::MAX_SKIP;
 
+/// What runs once a warning that watchman cannot say prints: it keeps the
+/// search after it quiet.
+pub type Said = Option<Box<dyn FnOnce()>>;
+
 /// The skip list of the checkout at `top` against the served commit
 /// `commit`, and the files of it this client searches; or why the
 /// checkout cannot be compared. A search that asked git says so only
 /// once the client can search the files it lists. Where watchman cannot
 /// say what changed, git is asked on every search, and the warning says so
 /// once for each reason and served commit, until watchman answers (always
-/// under `FMGREP_VERBOSE`). `p` is the search, for the note.
+/// under `FMGREP_VERBOSE`): what keeps it quiet is returned, to run once
+/// the warning prints. Its lines go to `left_out`, in the order found.
+/// `p` is the search, for the note.
 pub fn skip_list(
     top: &Path,
     commit: &str,
     p: &QueryParams,
-) -> Result<(Vec<String>, Local), String> {
+    left_out: &mut Vec<Diagnostic>,
+) -> Result<(Vec<String>, Local, Said), String> {
     let of = Of::commit(commit);
     let (token, why) = match remembered(top, &of) {
         Remembered::Since {
@@ -44,51 +51,34 @@ pub fn skip_list(
         } => match since(top, baseline, &extra, changed) {
             Ok(skip) => {
                 if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
-                    super::say_once(&line);
+                    left_out.push(Diagnostic::Unsaved(line));
                 }
-                let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
-                note(
-                    top,
-                    Some(&of),
-                    commit,
-                    "watchman since the baseline",
-                    &skip,
-                    &local,
-                    p,
-                );
-                return Ok((skip, local));
+                let local = resolve(top, &skip, commit, left_out)?;
+                let source = "watchman since the baseline";
+                left_out.extend(note(top, Some(&of), commit, source, &skip, &local, p));
+                return Ok((skip, local, None));
             }
             Err(why) => (token, why),
         },
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = printed(|left_out| changes(top, commit, left_out))?;
+            let skip = changes(top, commit, left_out)?;
             let took = asked.elapsed();
-            let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
+            let local = resolve(top, &skip, commit, left_out)?;
             // Said once while the reason holds; git is asked every time.
             let said = unsaid(top, &of, &why);
             if said.is_some() || crate::verbose::verbose() {
-                crate::held::then(
-                    &format!(
-                        "warning: watchman cannot say what changed ({why}); asked git what \
-                         differs from the served commit {} (took {})",
-                        short(commit),
-                        crate::verbose::Us(took.as_secs_f64() * 1e6)
-                    ),
-                    said,
-                );
+                left_out.push(Diagnostic::Warning(format!(
+                    "watchman cannot say what changed ({why}); asked git what differs from the \
+                     served commit {} (took {})",
+                    short(commit),
+                    crate::verbose::Us(took.as_secs_f64() * 1e6)
+                )));
             }
-            note(
-                top,
-                None,
-                commit,
-                "git, as watchman cannot say",
-                &skip,
-                &local,
-                p,
-            );
-            return Ok((skip, local));
+            let source = "git, as watchman cannot say";
+            left_out.extend(note(top, None, commit, source, &skip, &local, p));
+            return Ok((skip, local, said));
         }
     };
     // The inputs before git reads them: one that moves while git runs
@@ -100,41 +90,32 @@ pub fn skip_list(
     let listed = settings(top);
     let git = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
-    let skip = printed(|left_out| changes(top, commit, left_out))?;
+    let skip = changes(top, commit, left_out)?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env()});
         if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
-            super::say_once(&line);
+            left_out.push(Diagnostic::Unsaved(line));
         }
     }
-    let local = printed(|left_out| resolve(top, &skip, commit, left_out))?;
+    let local = resolve(top, &skip, commit, left_out)?;
     let next = match same {
         true => "later searches ask watchman",
         false => "git's config files changed while git ran; the next search asks git again",
     };
-    super::warn(&format!(
+    left_out.push(Diagnostic::Warning(format!(
         "asked git what differs from the served commit {} ({why}; took {}); {next}",
         short(commit),
         crate::verbose::Us(took.as_secs_f64() * 1e6)
-    ));
+    )));
     let source = "git, a new baseline";
-    note(top, same.then_some(&of), commit, source, &skip, &local, p);
-    Ok((skip, local))
+    let saved = same.then_some(&of);
+    left_out.extend(note(top, saved, commit, source, &skip, &local, p));
+    Ok((skip, local, None))
 }
 
-/// What `find` leaves out of the checkout's files, printed as soon as it
-/// returns, before the lines of the search that follow: in a search that
-/// holds its lines these join them, in this order.
-fn printed<T>(find: impl FnOnce(&mut Vec<Diagnostic>) -> T) -> T {
-    let mut left_out = Vec::new();
-    let found = find(&mut left_out);
-    super::print_diagnostics(left_out);
-    found
-}
-
-/// Under `FMGREP_VERBOSE`, one note: where the skip list `skip` of the
+/// Under `FMGREP_VERBOSE`, the note: where the skip list `skip` of the
 /// checkout at `top` came from (`source`), its size, the files of
 /// `local` that the client searches for `p` (those that its PATHs, globs
 /// and cwd keep, as `--stats` counts them), the served commit `commit`,
@@ -147,9 +128,9 @@ fn note(
     skip: &[String],
     local: &Local,
     p: &QueryParams,
-) {
+) -> Option<Diagnostic> {
     if !crate::verbose::verbose() {
-        return;
+        return None;
     }
     let record = of
         .and_then(|of| crate::source::record_path(top, of))
@@ -161,14 +142,14 @@ fn note(
         _ => (local.files.len(), local.bytes),
     };
     let s = skip.len();
-    crate::held::line(&format!(
-        "note: local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
+    Some(Diagnostic::Note(format!(
+        "local changes from {source}: {s} path{} on the skip list, {n} file{} ({} bytes) \
          searched here; served commit {}; record {record}",
         crate::verbose::plural(s),
         crate::verbose::plural(n),
         bytes,
         short(commit)
-    ));
+    )))
 }
 
 /// The baseline plus what watchman says `changed`, when the variables
