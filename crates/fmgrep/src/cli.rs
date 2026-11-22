@@ -5,16 +5,13 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 mod args;
-mod baseline;
 mod frames;
 mod locate;
-mod merge;
 pub(crate) mod params;
 mod print;
 mod serve;
 mod status;
 
-use crate::checkout;
 use crate::diagnostic::Diagnostic;
 use crate::events::JsonSink;
 use crate::fetch::Ask;
@@ -26,6 +23,7 @@ use crate::query::{answer as answer_local, load};
 use crate::remote::{Conn, Server};
 use crate::sink::{Discard, MatchSink};
 use crate::wire::{IndexSummary, OutputReport, ServeStatus};
+use crate::{baseline, checkout, merge};
 use args::{Cli, Command, Search, ServeArgs, StatusArgs};
 use locate::{Located, locate};
 use params::{Mode, QueryParams};
