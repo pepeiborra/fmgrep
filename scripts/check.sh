@@ -7,8 +7,11 @@
 #
 # Format and lints always cover the whole workspace; they take seconds
 # once built. Tests take minutes, so a local run skips the crates that
-# cannot have changed. The changes are those since the merge base with
-# origin/main, committed or not, plus untracked files.
+# cannot have changed. The changes are those since the base, committed or
+# not, plus untracked files. The base is the nearest commit below HEAD among
+# the merge base with origin/main, the tips of the local pr/* branches and
+# the refs under refs/jobs/. In a stack of pull requests that is the one
+# below this branch. A ref at HEAD itself is not below it.
 #
 # cargo-test-changed (a cargo subcommand that tests the changed crates and
 # their dependents) would do the selection, but not the rest: files outside
@@ -41,12 +44,26 @@ select_packages() {
   if ! base=$(git merge-base HEAD origin/main 2>/dev/null); then
     echo "all crates: no merge base with origin/main"; return
   fi
+  # In a stack, a nearer base: the closest proper ancestor among the pr/*
+  # branches and the jobs. Ties keep the merge base.
+  local label=origin/main head sha ref n best
+  head=$(git rev-parse HEAD)
+  best=$(git rev-list --count "$base..HEAD")
+  while read -r sha ref; do
+    [ -n "$sha" ] && [ "$sha" != "$head" ] || continue
+    git merge-base --is-ancestor "$sha" HEAD 2>/dev/null || continue
+    n=$(git rev-list --count "$sha..HEAD")
+    if [ "$n" -lt "$best" ]; then best=$n; base=$sha; label=$ref; fi
+  done <<EOF
+$(git for-each-ref --format='%(objectname) %(refname:short)' refs/heads/pr/ refs/jobs/)
+EOF
+  [ "$label" = origin/main ] || echo "check: base is $label, not origin/main" >&2
   # --no-renames lists the path a file left as well as the one it reached;
   # quotePath=false keeps non-ASCII names readable by the patterns below.
   changed=$( { git -c core.quotePath=false diff --name-only --no-renames "$base"
               git -c core.quotePath=false ls-files --others --exclude-standard; } | sort -u)
   if [ -z "$changed" ]; then
-    echo "all crates: no change since origin/main"; return
+    echo "all crates: no change since $label"; return
   fi
   local mem; mem=$(members)
   local docs=0

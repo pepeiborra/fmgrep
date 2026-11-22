@@ -6,7 +6,9 @@ Bug reports, fixes and measurements are welcome.
 
 - `scripts/check.sh` (format, clippy, tests) must pass. It tests the crates
   your branch changes and the crates that depend on them; `--all` tests every
-  crate. CI runs `--all` on Linux and macOS.
+  crate. In a stack of pull requests, "changes" means those above the nearest
+  `pr/*` branch or job ref below HEAD, else since the merge base with
+  `origin/main`. CI runs `--all` on Linux and macOS.
 - A test that needs watchman starts a private daemon of its own, from
   `$FMGREP_TEST_WATCHMAN` or else `watchman` on `PATH`, and never uses
   yours. Without watchman it prints one `skipped` line. CI's Watchman job
