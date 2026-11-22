@@ -15,9 +15,9 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use super::params::QueryParams;
 use crate::checkout::{Local, changes, resolve, short};
 use crate::diagnostic::Diagnostic;
+use crate::filter::PathFilter;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
 use crate::vcs;
 use crate::wire::MAX_SKIP;
@@ -34,11 +34,11 @@ pub type Said = Option<Box<dyn FnOnce()>>;
 /// once for each reason and served commit, until watchman answers (always
 /// under `FMGREP_VERBOSE`): what keeps it quiet is returned, to run once
 /// the warning prints. Its lines go to `left_out`, in the order found.
-/// `p` is the search, for the note.
+/// `filter` is the search's, for the note.
 pub fn skip_list(
     top: &Path,
     commit: &str,
-    p: &QueryParams,
+    filter: Option<&PathFilter>,
     left_out: &mut Vec<Diagnostic>,
 ) -> Result<(Vec<String>, Local, Said), String> {
     let of = Of::commit(commit);
@@ -55,7 +55,7 @@ pub fn skip_list(
                 }
                 let local = resolve(top, &skip, commit, left_out)?;
                 let source = "watchman since the baseline";
-                left_out.extend(note(top, Some(&of), commit, source, &skip, &local, p));
+                left_out.extend(note(top, Some(&of), commit, source, &skip, &local, filter));
                 return Ok((skip, local, None));
             }
             Err(why) => (token, why),
@@ -77,7 +77,7 @@ pub fn skip_list(
                 )));
             }
             let source = "git, as watchman cannot say";
-            left_out.extend(note(top, None, commit, source, &skip, &local, p));
+            left_out.extend(note(top, None, commit, source, &skip, &local, filter));
             return Ok((skip, local, said));
         }
     };
@@ -111,13 +111,13 @@ pub fn skip_list(
     )));
     let source = "git, a new baseline";
     let saved = same.then_some(&of);
-    left_out.extend(note(top, saved, commit, source, &skip, &local, p));
+    left_out.extend(note(top, saved, commit, source, &skip, &local, filter));
     Ok((skip, local, None))
 }
 
 /// Under `FMGREP_VERBOSE`, the note: where the skip list `skip` of the
 /// checkout at `top` came from (`source`), its size, the files of
-/// `local` that the client searches for `p` (those that its PATHs, globs
+/// `local` that the client searches for `filter` (those that its PATHs, globs
 /// and cwd keep, as `--stats` counts them), the served commit `commit`,
 /// and the record of `of`, when one is saved.
 fn note(
@@ -127,7 +127,7 @@ fn note(
     source: &str,
     skip: &[String],
     local: &Local,
-    p: &QueryParams,
+    filter: Option<&PathFilter>,
 ) -> Option<Diagnostic> {
     if !crate::verbose::verbose() {
         return None;
@@ -135,11 +135,9 @@ fn note(
     let record = of
         .and_then(|of| crate::source::record_path(top, of))
         .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
-    let (n, bytes) = match p.filter() {
-        Ok(Some(f)) => {
-            (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i]))
-        }
-        _ => (local.files.len(), local.bytes),
+    let (n, bytes) = match filter {
+        Some(f) => (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i])),
+        None => (local.files.len(), local.bytes),
     };
     let s = skip.len();
     Some(Diagnostic::Note(format!(
