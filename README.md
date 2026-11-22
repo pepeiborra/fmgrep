@@ -3,14 +3,14 @@
 fmgrep is ripgrep over a persistent index with efficient support for AND/OR expressions.
 
 `rg` scans every file of the tree on every search. With the files in the page cache, that takes a
-median 503 ms on the Chromium repo: not too bad for one search, but a lot for a coding agent that
+median 498 ms on the Chromium repo: not too bad for one search, but a lot for a coding agent that
 runs hundreds. fmgrep indexes the tree once, allowing it to resolve queries much faster following
 the same format and conventions as `rg`.
 
-An `fmgrep` server answers a query in the Chromium repo in a median 12.8 ms, 39X faster than `rg`,
-16 times faster than [tgrep](https://github.com/microsoft/tgrep), and 4.6 times faster than
+An `fmgrep` server answers a query in the Chromium repo in a median 12.1 ms, 41X faster than `rg`,
+17 times faster than [tgrep](https://github.com/microsoft/tgrep), and 4.8 times faster than
 [elgrep](https://github.com/eliosai/sngram). With no server, the median query takes 38 ms. The index
-takes 35 s to build and is 0.78X the size of the repo (medians over all queries; method and every
+takes 38 s to build and is 0.78X the size of the repo (medians over all queries; method and every
 row in [BENCHMARKS.md](BENCHMARKS.md)).
 
 ## Status
@@ -147,8 +147,8 @@ files are scanned in full; after many edits, remove `.fmgrep` and re-index.
 |---|--:|--:|--:|
 | index size | 1.11 GB / - | 2.22 GB / - | 12.00 GB / - |
 | files scanned per literal (mean) | 798 / all 95926 | 14219 / all 460698 | 1239 / all 1253798 |
-| literal p50 | 4.08 / 114 ms | 24.9 / 494 ms | 10.6 / 1560 ms |
-| regex p50 | 8.23 / 118 ms | 30.1 / 500 ms | 13.2 / 1580 ms |
+| literal p50 | 4.07 / 112 ms | 24.6 / 494 ms | 10.8 / 1520 ms |
+| regex p50 | 7.98 / 115 ms | 30.0 / 490 ms | 13.1 / 1530 ms |
 
 aosp is Android's platform source: 17.4 GB of text in 1.25 M files from
 about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
