@@ -49,7 +49,6 @@ mod expr;
 mod fetch;
 mod filter;
 mod fold;
-mod held;
 mod index;
 mod manifest;
 mod matching;

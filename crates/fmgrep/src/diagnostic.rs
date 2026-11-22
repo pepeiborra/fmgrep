@@ -37,6 +37,11 @@ pub enum Diagnostic {
     /// A warning of the check of what changed since the index, without its
     /// `warning: ` prefix: `status` prints it as one of its own lines.
     Check(String),
+    /// A warning of a search through a server, without its `warning: ` prefix.
+    Warning(String),
+    /// A checkout's record that cannot be saved, as `Warning`: the pin then
+    /// says nothing of the same cause.
+    Unsaved(String),
 }
 
 /// The line printed for an entry, with its `warning: ` prefix.
@@ -72,7 +77,9 @@ impl fmt::Display for Diagnostic {
                 root.display()
             ),
             Self::Note(text) => write!(f, "note: {text}"),
-            Self::Check(line) => write!(f, "warning: {line}"),
+            Self::Check(line) | Self::Warning(line) | Self::Unsaved(line) => {
+                write!(f, "warning: {line}")
+            }
         }
     }
 }

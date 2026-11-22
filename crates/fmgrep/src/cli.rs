@@ -442,10 +442,10 @@ fn find(
         });
     }
     if let Some(note) = note {
-        warn(&format!(
-            "Using local index {}{note}",
+        eprintln!(
+            "warning: Using local index {}{note}",
             found.index_dir.display()
-        ));
+        );
     }
     // `local` finds the index again, inside its spans.
     local(s.index.as_deref(), p, typed, s.json, out)
@@ -505,38 +505,43 @@ fn local(
 }
 
 /// What a load or a search left out, on stderr: the one place that prints
-/// entries, in the order they were found. In a search through a server that
-/// holds its lines they join the held ones, so that they print or drop with
-/// them, in the order of the lines they sit between.
+/// entries, in the order they were found.
 fn print_diagnostics(left_out: Vec<Diagnostic>) {
     #[cfg(test)]
     crate::tests::note_entries(&left_out);
     for d in left_out {
-        crate::held::line(&d.to_string());
+        eprintln!("{d}");
     }
 }
 
-/// `line` on stderr, as a warning.
-fn warn(line: &str) {
-    crate::held::line(&format!("warning: {line}"));
+/// What a search through a server has to say, kept until the server takes
+/// its query: the first frame, or the result, prints it. A query that the
+/// server refuses spoke of a commit it no longer serves: its
+/// `HeldDiagnostics` is dropped, and what it holds with it.
+#[derive(Default)]
+struct HeldDiagnostics {
+    entries: Vec<Diagnostic>,
+    /// What runs once the entries print: it keeps the note of a reason said.
+    said: baseline::Said,
+    /// Whether the server took the query.
+    printed: bool,
+    /// Whether any printed entry was a `Diagnostic::Unsaved`.
+    unsaved: bool,
 }
 
-/// `line`, a record or a pin that cannot be saved, as a warning, once per
-/// process; held with the lines of a search that sent its query pinned.
-fn say_once(line: &str) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SEEN: AtomicBool = AtomicBool::new(false);
-    if !SEEN.swap(true, Ordering::Relaxed) {
-        crate::held::once(Some(&SEEN), &format!("warning: {line}"));
+impl HeldDiagnostics {
+    /// Print what is not printed yet, then run `said`.
+    fn print(&mut self) {
+        self.unsaved |= self
+            .entries
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Unsaved(_)));
+        print_diagnostics(std::mem::take(&mut self.entries));
+        self.printed = true;
+        if let Some(said) = self.said.take() {
+            said();
+        }
     }
-}
-
-/// The one warning of a search whose local changes are ignored.
-fn degraded(why: &str) {
-    warn(&format!(
-        "local changes are ignored ({why}); these results are the server's alone; use \
-         --ignore-local-changes to avoid this warning"
-    ));
 }
 
 /// A search through `server`, on `conn`. With `ignore`
@@ -548,11 +553,11 @@ fn degraded(why: &str) {
 /// status. It searches as with a status of that commit: a search from a
 /// checkout reads only the format and the commit of a status, and a
 /// server of another commit or format refuses its pinned query before it
-/// searches. Its lines on stderr are held until the server answers. When
-/// the server refuses, or the search fails before an answer, the client
-/// asks for the status. If the status has the pinned commit, the lines
-/// print and the search ends as it would have; else they are dropped, and
-/// the search runs again as one without a pin.
+/// searches. Its lines on stderr are kept in a [`HeldDiagnostics`] until the
+/// server answers. When the server refuses, or the search fails before an answer,
+/// the client asks for the status. If the status has the pinned commit,
+/// the lines print and the search ends as it would have; else they are
+/// dropped, and the search runs again as one without a pin.
 fn client(
     server: &Server,
     mut conn: Conn,
@@ -567,66 +572,73 @@ fn client(
     let top = checkout::top(&cwd);
     let had =
         (top.as_deref()).map(|top| crate::source::pinned(top, &server.addr, checkout::full_id));
-    let mut search = |conn: &mut Conn, status: &ServeStatus, p: QueryParams| {
-        answer(server, conn, status, &cwd, ignore, p, typed, json, out)
-    };
+    let mut search =
+        |conn: &mut Conn, status: &ServeStatus, p: QueryParams, held: &mut HeldDiagnostics| {
+            answer(
+                server, conn, status, &cwd, ignore, p, typed, json, out, held,
+            )
+        };
+    let mut held = HeldDiagnostics::default();
     let status = match &had {
         Some(Pinned::Commit(id)) => {
-            crate::held::hold();
             if crate::verbose::verbose() {
                 let pin =
                     (top.as_deref()).and_then(|top| crate::source::pin_path(top, &server.addr));
                 let pin = pin.map_or_else(|| "none".to_owned(), |p| p.display().to_string());
-                crate::held::line(&format!(
-                    "note: sent the query pinned to the served commit {}, which the pin {pin} \
-                     keeps, with no status request",
+                held.entries.push(Diagnostic::Note(format!(
+                    "sent the query pinned to the served commit {}, which the pin {pin} keeps, \
+                     with no status request",
                     checkout::short(id)
-                ));
+                )));
             }
-            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone());
-            if !crate::held::holding() || tried.is_ok() {
-                crate::held::release();
+            let tried = search(&mut conn, &ServeStatus::pinned(id), p.clone(), &mut held);
+            if held.printed || tried.is_ok() {
+                held.print();
                 return tried;
             }
             let status = serve::status_on(&mut conn)
                 .and_then(|status| same_format(server, status.format).map(|()| status));
             match status {
                 Ok(status) if checkout::pin_of(&status) == Some(id) => {
-                    asked(server, "the search failed before a result came");
-                    crate::held::release();
+                    let why = "the search failed before a result came";
+                    held.entries.extend(asked(server, why));
+                    held.print();
                     return tried;
                 }
                 Ok(status) => {
-                    crate::held::discard();
+                    // What was held spoke of a commit the server no longer
+                    // serves.
+                    held = HeldDiagnostics::default();
                     let short = checkout::short(id);
-                    asked(
-                        server,
-                        &format!("it no longer serves {short}, the commit that the pin keeps"),
-                    );
+                    let why = format!("it no longer serves {short}, the commit that the pin keeps");
+                    print_diagnostics(asked(server, &why).into_iter().collect());
                     status
                 }
-                Err(e) => {
-                    crate::held::discard();
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
         other => {
             match other {
                 Some(Pinned::Damaged(why)) => {
-                    warn(&format!("{why}; asked {server} for its status"))
+                    eprintln!("warning: {why}; asked {server} for its status")
                 }
                 // Outside a checkout no pin applies: no note.
                 None => {}
-                Some(_) => asked(server, "no pin of an earlier search"),
+                Some(_) => print_diagnostics(
+                    asked(server, "no pin of an earlier search")
+                        .into_iter()
+                        .collect(),
+                ),
             }
             let status = serve::status_on(&mut conn)?;
             same_format(server, status.format)?;
             status
         }
     };
-    let answered = search(&mut conn, &status, p);
-    // After the search, so that a record that cannot be saved says so first.
+    let answered = search(&mut conn, &status, p, &mut held);
+    held.print();
+    // After the search, so that a record that cannot be saved says so first,
+    // and once: a pin that cannot be saved then says nothing.
     let now = checkout::pin_of(&status);
     let kept = match &had {
         Some(Pinned::Commit(id)) => now == Some(id.as_str()),
@@ -635,23 +647,24 @@ fn client(
     };
     if let Some(top) = top.filter(|_| !kept)
         && let Err(line) = crate::source::pin(&top, &server.addr, now)
+        && !held.unsaved
     {
-        say_once(&line);
+        eprintln!("warning: {line}");
     }
     answered
 }
 
-/// Under `FMGREP_VERBOSE`, that a search asked `server` for its status,
-/// and `why`.
-fn asked(server: &Server, why: &str) {
-    if crate::verbose::verbose() {
-        crate::held::line(&format!("note: asked {server} for its status ({why})"));
-    }
+/// Under `FMGREP_VERBOSE`, the note that a search asked `server` for its
+/// status, and `why`.
+fn asked(server: &Server, why: &str) -> Option<Diagnostic> {
+    (crate::verbose::verbose())
+        .then(|| Diagnostic::Note(format!("asked {server} for its status ({why})")))
 }
 
 /// A search through `server` of `status`, on `conn`, from the canonical
 /// `cwd`; PATHs resolve against the served tree, unless the cwd is in a
-/// checkout and the server serves a commit.
+/// checkout and the server serves a commit. What it has to say goes to
+/// `held`.
 #[allow(clippy::too_many_arguments)]
 fn answer(
     server: &Server,
@@ -663,11 +676,18 @@ fn answer(
     typed: &[String],
     json: bool,
     out: &mut dyn Write,
+    held: &mut HeldDiagnostics,
 ) -> Result<Outcome, String> {
     let mut ours = None;
     let plan = match ignore {
         true => checkout::Plan::Ignored,
         false => checkout::plan(server, status, cwd),
+    };
+    let degraded = |why: String| {
+        Diagnostic::Warning(format!(
+            "local changes are ignored ({why}); these results are the server's alone; use \
+             --ignore-local-changes to avoid this warning"
+        ))
     };
     match plan {
         // The checkout holds the served commit: PATHs and the cwd are
@@ -675,16 +695,19 @@ fn answer(
         checkout::Plan::Checkout { top, commit } => {
             rebase_into(&mut p, typed, Some(&top), "checkout")?;
             p.scope(Some(&top));
-            match baseline::skip_list(&top, &commit, &p) {
-                Ok(changes) => ours = Some((top, changes)),
-                Err(why) => degraded(&why),
+            match baseline::skip_list(&top, &commit, &p, &mut held.entries) {
+                Ok((skip, local, said)) => {
+                    held.said = said;
+                    ours = Some((top, (skip, local)));
+                }
+                Err(why) => held.entries.push(degraded(why)),
             }
             p.commit = Some(commit);
         }
         plan => {
             let pinned = match plan {
                 checkout::Plan::Degraded(why) => {
-                    degraded(&why);
+                    held.entries.push(degraded(why));
                     checkout::top(cwd).zip(status.commit.as_ref())
                 }
                 checkout::Plan::Ignored => checkout::top(cwd).zip(status.commit.as_ref()),
@@ -715,7 +738,7 @@ fn answer(
         // The client's own files go between the server's: it needs each
         // file of the server's in a frame of its own.
         Some((top, (skip, local))) if !local.files.is_empty() => {
-            merged(conn, p, &top, skip, &local, json, out)
+            merged(conn, p, &top, skip, &local, json, out, held)
         }
         // The server's files only, those on the skip list (deleted
         // files) left out: its output is the search's.
@@ -725,7 +748,7 @@ fn answer(
             if let Some((_, (skip, _))) = ours {
                 p.skip = skip;
             }
-            serve::rendered(conn, &p, json, out)
+            serve::rendered(conn, &p, json, out, held)
         }
     };
     answered
@@ -747,7 +770,9 @@ fn searched(report: OutputReport, p: &QueryParams) -> Result<OutputReport, Strin
 
 /// `p` answered by the client for its files `local` under `top`, and by
 /// the server for every other file, the skip list `skip` left out; the
-/// files printed in path order.
+/// files printed in path order. What the client's part leaves out goes to
+/// `held`.
+#[allow(clippy::too_many_arguments)]
 fn merged(
     conn: &mut Conn,
     mut p: QueryParams,
@@ -756,15 +781,13 @@ fn merged(
     local: &checkout::Local,
     json: bool,
     out: &mut dyn Write,
+    held: &mut HeldDiagnostics,
 ) -> Result<OutputReport, String> {
-    let mut left_out = Vec::new();
-    let part = merge::part(&p, top, local, &mut left_out);
-    print_diagnostics(left_out);
-    let part = part?;
+    let part = merge::part(&p, top, local, &mut held.entries)?;
     p.skip = skip;
     render(&p, json, out, |sink| {
         let mut both = merge::Merge::new(sink, &part);
-        let server = serve::remote(conn, &p, &mut both)?;
+        let server = serve::remote(conn, &p, &mut both, held)?;
         searched(merge::report(server, &part.report), &p)
     })
 }
