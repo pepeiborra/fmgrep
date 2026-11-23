@@ -42,6 +42,7 @@ index, and read the table below before you script a search. Details are in
 - `cargo install fmgrep` needs no C compiler.
 - `FMGREP_SERVER=HOST:PORT` searches a shared `fmgrep serve` from your own checkout, with your local edits, new files and commits included ([docs/shared-server.md](docs/shared-server.md)).
 - `--ignore-local-changes` prints the server's answer alone.
+- Through a server, a PATH into another checkout searches that checkout when it holds the served commit. Otherwise the search says why.
 - A search warns when it must ignore your local changes, and says why.
 - A local `.fmgrep` above the cwd wins over `FMGREP_SERVER`, with a warning. It is also used when `--server` cannot be reached.
 - `fmgrep index --store-docs` of a git checkout records the commit it holds. `--require-served-commit` makes that an error when it cannot.

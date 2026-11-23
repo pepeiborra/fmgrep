@@ -774,3 +774,84 @@ fn a_search_of_no_file_prints_what_a_local_one_prints_first() {
         }
     }
 }
+
+/// An outer repository that ignores `pub`, and a clone of the served
+/// commit in it.
+fn nested(r: &Remote) -> PathBuf {
+    let outer =
+        r.s.repo("outer", &[("top.rs", "x\n"), (".gitignore", "pub/\n")]);
+    let url = r.origin.display().to_string();
+    r.s.git(&outer, &["clone", "-q", &url, "pub"]);
+    std::fs::canonicalize(outer).unwrap()
+}
+
+/// A PATH into a checkout nested in the cwd's, or reached from no
+/// checkout, searches the checkout that holds the served commit, and
+/// prints the names as typed.
+#[test]
+fn a_path_into_a_nested_checkout_searches_that_checkout() {
+    let r = Remote::new(&FILES);
+    let outer = nested(&r);
+    let all = "pub/a.c\npub/dir/b.c\npub/dir/sub/c.h\npub/e.c\n";
+    for (args, want) in [
+        (&["-l", "printk", "pub"][..], all),
+        (&["-l", "printk", "pub/dir/b.c"], "pub/dir/b.c\n"),
+    ] {
+        let out = r.search(&outer, args);
+        assert_eq!(r.warnings(&out), "", "{args:?}");
+        assert_eq!((stdout(&out).as_str(), out.status.code()), (want, Some(0)));
+    }
+    // Its own changes are searched.
+    r.s.write(&outer.join("pub"), &[("a.c", "printk a\nprintk new\n")]);
+    let out = r.search(&outer, &["-c", "printk", "pub/a.c", "pub/e.c"]);
+    assert_eq!(r.warnings(&out), "");
+    assert_eq!(stdout(&out), "pub/a.c:2\npub/e.c:1\n");
+    // From no checkout at all.
+    let away = r.s.path("away");
+    std::fs::create_dir(&away).unwrap();
+    let client = r.client.display().to_string();
+    let out = r.search(&away, &["-l", "printk", &client]);
+    assert_eq!(r.warnings(&out), "");
+    let want: String = ["a.c", "dir/b.c", "dir/sub/c.h", "e.c"]
+        .iter()
+        .map(|f| format!("{client}/{f}\n"))
+        .collect();
+    assert_eq!((stdout(&out), out.status.code()), (want, Some(0)));
+}
+
+/// When neither the cwd's checkout nor the PATHs' holds the served
+/// commit, the search says so, in place of "not in the index".
+#[test]
+fn a_path_into_a_nested_checkout_without_the_commit_says_so() {
+    let r = Remote::new(&FILES);
+    r.s.write(&r.origin, &[("a.c", "printk a2\n")]);
+    r.s.commit(&r.origin, "second");
+    let outer = nested(&r);
+    std::fs::remove_dir_all(outer.join("pub")).unwrap();
+    let url = format!("file://{}", r.origin.display());
+    r.s.git(&outer, &["clone", "-q", "--depth", "1", &url, "pub"]);
+    let short = &r.commit[..7];
+    let why = format!(
+        "this checkout does not have the served commit {short}; run git fetch origin {}, unless \
+         this is another repository",
+        r.commit
+    );
+    let out = r.search(&outer, &["-l", "printk", "pub"]);
+    let error = format!(
+        "error: pub is in another checkout, at {}: {why}\n",
+        outer.join("pub").display()
+    );
+    assert_eq!(stderr(&out), format!("{}{error}", ignored(&why)));
+    assert_eq!((stdout(&out).as_str(), out.status.code()), ("", Some(2)));
+}
+
+/// A repository nested in a checkout that holds the served commit is
+/// still searched through that checkout.
+#[test]
+fn a_nested_repository_in_a_checkout_with_the_commit_is_unchanged() {
+    let r = Remote::new(&FILES);
+    r.s.repo("client/inner", &[("z.c", "printk z\n")]);
+    let out = r.search(&r.client, &["-l", "printk", "inner"]);
+    assert_eq!(stdout(&out), "inner/z.c\n", "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(0));
+}
