@@ -125,21 +125,12 @@ fn rebase_into(
     if typed.is_empty() {
         return Ok(());
     }
-    let resolve = |p: &Path| {
-        std::fs::canonicalize(p).map_err(|e| format!("error: cannot resolve {}: {e}", p.display()))
-    };
     let tree = tree.ok_or("error: a PATH needs the indexed tree; this index records none")?;
     let root = resolve(tree)?;
     p.paths = typed
         .iter()
         .map(|t| {
-            let path = Path::new(t);
-            // A symlink names its own path, not its target's.
-            let abs = match (path.parent(), path.file_name()) {
-                (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => resolve(dir)?.join(name),
-                (_, Some(name)) => resolve(Path::new("."))?.join(name),
-                _ => resolve(path)?,
-            };
+            let abs = resolved(t)?;
             let outside = || format!("error: {t} is outside the {what} at {}", root.display());
             let rel = abs.strip_prefix(&root).map_err(|_| outside())?;
             let parts: Option<Vec<&str>> =
@@ -153,6 +144,36 @@ fn rebase_into(
         })
         .collect::<Result<_, String>>()?;
     Ok(())
+}
+
+fn resolve(p: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(p).map_err(|e| format!("error: cannot resolve {}: {e}", p.display()))
+}
+
+/// The typed PATH `t` as an absolute path. A symlink names its own path,
+/// not its target's.
+fn resolved(t: &str) -> Result<PathBuf, String> {
+    let path = Path::new(t);
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => Ok(resolve(dir)?.join(name)),
+        (_, Some(name)) => Ok(resolve(Path::new("."))?.join(name)),
+        _ => resolve(path),
+    }
+}
+
+/// The checkout that holds every typed PATH: none when there are no
+/// PATHs, when they lie in different checkouts, or in none.
+fn paths_checkout(typed: &[String]) -> Option<PathBuf> {
+    let mut tops = typed.iter().map(|t| {
+        let abs = resolved(t).ok()?;
+        let dir = match abs.is_dir() {
+            true => abs.as_path(),
+            false => abs.parent()?,
+        };
+        checkout::top(dir)
+    });
+    let first = tops.next()??;
+    tops.all(|t| t.as_ref() == Some(&first)).then_some(first)
 }
 
 /// The tree a load of `found` reads the files from, when it overrides the
@@ -677,7 +698,7 @@ fn answer(
     held: &mut HeldDiagnostics,
 ) -> Result<Outcome, String> {
     let mut ours = None;
-    let plan = match ignore {
+    let mut plan = match ignore {
         true => checkout::Plan::Ignored,
         false => checkout::plan(server, status, cwd),
     };
@@ -687,6 +708,29 @@ fn answer(
              --ignore-local-changes to avoid this warning"
         ))
     };
+    // PATHs in another checkout than the cwd's: the search runs as from
+    // there when it has the served commit, and says so when none has.
+    if !ignore
+        && !matches!(plan, checkout::Plan::Checkout { .. })
+        && let Some(nested) =
+            paths_checkout(typed).filter(|t| Some(t) != checkout::top(cwd).as_ref())
+        && status.commit.is_some()
+    {
+        match checkout::plan(server, status, &nested) {
+            own @ checkout::Plan::Checkout { .. } => plan = own,
+            checkout::Plan::Degraded(own) => {
+                if let checkout::Plan::Degraded(why) = plan {
+                    held.entries.push(degraded(why));
+                }
+                return Err(format!(
+                    "error: {} is in another checkout, at {}: {own}",
+                    typed[0],
+                    nested.display()
+                ));
+            }
+            _ => {}
+        }
+    }
     match plan {
         // The checkout holds the served commit: PATHs and the cwd are
         // resolved here, against its top, and its changes searched here.
