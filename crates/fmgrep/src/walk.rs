@@ -176,10 +176,11 @@ pub fn outer_ignores(root: &Path) -> Vec<(String, Option<Stamp>)> {
 /// `root`, sorted by relative path, positional ids. A file [`text`] refuses
 /// is skipped: a binary one in one [`skip_summary`] line by default, a
 /// `warning:` each under [`verbose`]; a too-large one with a `warning:`
-/// always. An unlistable directory or an all-skipped tree is `Err`. `f` takes
-/// `(rel path, text, stamp, bytes read)`, the stamp being the read handle's
-/// fstat before the read; its `Err` stops the walk at once and is returned
-/// verbatim.
+/// always. A file gone by the time it is read is left out, with one summary
+/// `warning:` (one per file under [`verbose`]). An unlistable directory or an
+/// all-skipped tree is `Err`. `f` takes `(rel path, text, stamp, bytes read)`,
+/// the stamp being the read handle's fstat before the read; its `Err` stops
+/// the walk at once and is returned verbatim.
 ///
 /// `exclude` is a directory that is never descended: an index dir written
 /// under `root` is output, not input.
@@ -214,12 +215,21 @@ pub fn for_each_listed_doc(
     let pool = read_pool()?;
     let mut kept = 0usize;
     let mut skipped = 0usize;
+    let mut vanished = 0usize;
     let mut at = 0usize;
     while at < rels.len() {
         let end = batch_end(&rels, at);
         let batch = &rels[at..end];
         let read = read_batch(&pool, root, batch, &|(rel, _): &(String, u64)| rel.as_str())?;
-        for ((rel, _), (raw, stamp)) in batch.iter().zip(read) {
+        for ((rel, _), read) in batch.iter().zip(read) {
+            // Deleted since it was listed: as if it had been deleted before the run.
+            let Some((raw, stamp)) = read else {
+                vanished += 1;
+                if verbose() {
+                    eprintln!("warning: skipping {rel}: vanished while indexing");
+                }
+                continue;
+            };
             let got = raw.len() as u64;
             let text = if stamp.len > MAX_DOC_BYTES {
                 Err(Skip::TooLarge)
@@ -244,13 +254,21 @@ pub fn for_each_listed_doc(
         at = end;
     }
     if kept == 0 {
+        let why = if vanished > 0 {
+            "every file vanished while indexing"
+        } else {
+            "every file skipped as binary or too large"
+        };
         return Err(format!(
-            "error: no indexable files in {} (every file skipped as binary or too large)",
+            "error: no indexable files in {} ({why})",
             root.display()
         ));
     }
     if skipped > 0 {
         eprintln!("{}", skip_summary(skipped));
+    }
+    if vanished > 0 {
+        eprintln!("warning: {vanished} file(s) vanished while indexing; left out");
     }
     Ok(notes)
 }
@@ -301,6 +319,14 @@ fn list(root: &Path, exclude: Option<&Path>) -> Result<(Vec<(String, u64)>, Walk
             let entry = match entry {
                 Ok(entry) => entry,
                 // Only a listing error has a depth; an ignore file's is skipped, as rg does.
+                // A directory that is gone was never there.
+                Err(e)
+                    if e.depth().is_some()
+                        && e.io_error()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return ignore::WalkState::Continue;
+                }
                 Err(e) if e.depth().is_some() => {
                     let mut failed = failed.lock().unwrap_or_else(PoisonError::into_inner);
                     failed.get_or_insert(format!("error: cannot list folder {e}"));
@@ -512,29 +538,34 @@ fn batch_end(rels: &[(String, u64)], at: usize) -> usize {
 type Read = (Vec<u8>, Stamp);
 
 /// `fs::read`'s syscalls, with the fstat kept as the stamp. A file over
-/// [`MAX_DOC_BYTES`] is not read: its bytes are empty.
-fn read_doc(root: &Path, rel: &str) -> Result<Read, String> {
+/// [`MAX_DOC_BYTES`] is not read: its bytes are empty. `None` is a file
+/// that is gone.
+fn read_doc(root: &Path, rel: &str) -> Result<Option<Read>, String> {
     use std::io::Read as _;
     let path = root.join(rel);
     let failed = |e: std::io::Error| format!("error: cannot read {}: {e}", path.display());
-    let mut file = std::fs::File::open(&path).map_err(failed)?;
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(failed(e)),
+    };
     let stamp = Stamp::of(&file.metadata().map_err(failed)?);
     if stamp.len > MAX_DOC_BYTES {
-        return Ok((Vec::new(), stamp));
+        return Ok(Some((Vec::new(), stamp)));
     }
     let mut bytes = Vec::with_capacity(stamp.len as usize);
     file.read_to_end(&mut bytes).map_err(failed)?;
-    Ok((bytes, stamp))
+    Ok(Some((bytes, stamp)))
 }
 
-/// `batch`'s documents in `batch` order, read on `pool`; the lowest-index
-/// failure wins.
+/// `batch`'s documents in `batch` order, read on `pool`, `None` for a file
+/// that is gone; the lowest-index failure wins.
 pub fn read_batch<T: Sync>(
     pool: &rayon::ThreadPool,
     root: &Path,
     batch: &[T],
     rel: &(dyn Fn(&T) -> &str + Sync),
-) -> Result<Vec<Read>, String> {
+) -> Result<Vec<Option<Read>>, String> {
     let read: Vec<_> = pool.install(|| batch.par_iter().map(|t| read_doc(root, rel(t))).collect());
     read.into_iter().collect()
 }
@@ -935,7 +966,7 @@ mod tests {
         for (i, doc) in docs.iter().enumerate() {
             assert_eq!(doc.id, i);
             assert_eq!(doc.path, rels[i].0);
-            assert_eq!(doc.bytes, one[i].0);
+            assert_eq!(Some(&doc.bytes), one[i].as_ref().map(|r| &r.0));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -947,12 +978,55 @@ mod tests {
         let dir = scratch_dir("read-failure");
         std::fs::write(dir.join("big.c"), vec![b'x'; 8 << 20]).unwrap();
         let mut rels = vec!["big.c".to_string()];
-        rels.extend((1..64).map(|i| format!("gone-{i:02}.c")));
+        for i in 1..64 {
+            let rel = format!("shut-{i:02}.c");
+            let path = dir.join(&rel);
+            // Opens, but cannot be read, whoever runs the test.
+            std::fs::create_dir(&path).unwrap();
+            rels.push(rel);
+        }
         for threads in [1usize, 4] {
             let err = read_batch(&pool(threads), &dir, &rels, &String::as_str)
-                .expect_err("missing files must fail");
-            assert!(err.contains("gone-01.c"), "threads={threads} got: {err}");
+                .expect_err("unreadable files must fail");
+            assert!(err.contains("shut-01.c"), "threads={threads} got: {err}");
         }
+        // A missing file is not a failure: it comes back as `None`.
+        let mixed = ["big.c".to_string(), "gone.c".to_string()];
+        let read = read_batch(&pool(4), &dir, &mixed, &String::as_str).unwrap();
+        assert_eq!(
+            read.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [true, false]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file deleted after the walk listed it is left out, as if it had been
+    /// deleted before the run: not yielded, not a skip, and not an error.
+    #[test]
+    fn a_file_deleted_after_the_listing_is_left_out() {
+        let dir = scratch_dir("vanished");
+        let n = READ_BATCH_DOCS * 2 + 3;
+        let gone = [READ_BATCH_DOCS + 5, n - 1];
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i:04}.c")), format!("printk {i}\n")).unwrap();
+        }
+        let mut seen = Vec::new();
+        let notes = for_each_index_doc(&dir, None, |path, _, _, _| {
+            if seen.is_empty() {
+                for i in gone {
+                    std::fs::remove_file(dir.join(format!("f{i:04}.c"))).unwrap();
+                }
+            }
+            seen.push(path.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        let want: Vec<String> = (0..n)
+            .filter(|i| !gone.contains(i))
+            .map(|i| format!("f{i:04}.c"))
+            .collect();
+        assert_eq!(seen, want);
+        assert!(notes.skipped.is_empty(), "{:?}", notes.skipped);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -973,11 +1047,12 @@ mod tests {
         let rels: Vec<String> = walked.iter().map(|(p, _, _)| p.clone()).collect();
         let reread = read_batch(&read_pool().unwrap(), &dir, &rels, &String::as_str).unwrap();
         for ((_, bytes, stamp), got) in walked.iter().zip(&reread) {
+            let got = got.as_ref().unwrap();
             assert_eq!((bytes, stamp), (&got.0, &got.1));
         }
         let gone = ["gone.c".to_string()];
-        let err = read_batch(&read_pool().unwrap(), &dir, &gone, &String::as_str).unwrap_err();
-        assert!(err.contains("gone.c"), "got: {err}");
+        let none = read_batch(&read_pool().unwrap(), &dir, &gone, &String::as_str).unwrap();
+        assert_eq!(none, [None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

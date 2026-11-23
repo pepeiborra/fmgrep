@@ -39,7 +39,11 @@ pub fn read_files(root: &Path, cut: &Cut) -> Result<Vec<Document>, String> {
     let pool = crate::walk::read_pool()?;
     let read = crate::walk::read_batch(&pool, root, &cut.paths, &String::as_str)?;
     let mut out = Vec::with_capacity(read.len());
-    for (at, (id, (raw, stamp))) in cut.docs.clone().zip(read).enumerate() {
+    for (at, (id, read)) in cut.docs.clone().zip(read).enumerate() {
+        // Its id and length are already announced: a vanished file is a change.
+        let Some((raw, stamp)) = read else {
+            return Err(changed_while_indexing(&root.join(&cut.paths[at])));
+        };
         let whole = raw.len() as u64 == stamp.len;
         let text = crate::binary::text(raw).map(|t| t.bytes);
         match text {

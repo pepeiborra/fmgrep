@@ -276,6 +276,28 @@ fn file_changed_while_indexing_is_refused_by_path() {
 }
 
 #[test]
+fn file_deleted_while_indexing_is_refused_by_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("corpus");
+    std::fs::create_dir_all(&folder).unwrap();
+    stage_corpus(&folder);
+    let output = tmp.path().join("idx");
+    std::fs::create_dir_all(&output).unwrap();
+    let built = stream_while(&folder, &output, 1, false, |cuts| {
+        let cut = cuts.get(0).expect("slot 0");
+        std::fs::remove_file(folder.join(&cut.paths[0])).unwrap();
+        cuts.read(&cut).and_then(|_| cuts.read(&cut))
+    });
+    let Err(err) = built else {
+        panic!("a file deleted while indexing must be refused");
+    };
+    assert!(
+        err.contains("a.c") && err.contains("changed while indexing"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn the_last_cut_is_handed_over_without_a_reread() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("corpus");

@@ -68,6 +68,7 @@ index, and read the table below before you script a search. Details are in
 - Output matches rg for adjacent coloured matches, empty `-o` matches, `--json -U` and `-o '\A...'`.
 - `fmgrep index` no longer fails on a file name with a backslash in it.
 - A file over 2 GiB is skipped with a warning. It failed the whole index.
+- `fmgrep index` leaves out a file deleted while it runs, with a warning, instead of failing with exit 2.
 - `fmgrep serve` asks watchman before each query, so a query no longer misses a change saved just before it.
 - A search could miss a change while watchman was still reading the tree.
 - A tree on NFS, or shared by a virtual machine, is checked in full: watchman does not see edits made elsewhere.
