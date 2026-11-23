@@ -1,7 +1,9 @@
 //! `serve` and `--server`: newline-delimited JSON-RPC 2.0 over one loaded index.
 
+use std::any::Any;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
 const QUERY_FAILED: i64 = -32000;
 /// A query pinned to another index format or served commit than this
 /// server's.
@@ -317,7 +320,12 @@ fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String
             false,
         );
     };
-    match method {
+    let ran = catch_unwind(AssertUnwindSafe(|| match method {
+        #[cfg(test)]
+        "panic" => {
+            rayon::scope(|s| s.spawn(|_| panic!("boom")));
+            unreachable!()
+        }
         "query" => {
             let params = obj.get("params").cloned().unwrap_or(Value::Null);
             let has_terms = params.get("terms").is_some();
@@ -365,6 +373,24 @@ fn respond(session: &mut Served<'_>, line: &str, out: &mut dyn Write) -> (String
             failure(id, METHOD_NOT_FOUND, format!("unknown method {other:?}")),
             false,
         ),
+    }));
+    ran.unwrap_or_else(|payload| {
+        if crate::verbose::verbose() {
+            eprintln!("note: request {id} panicked; the server goes on");
+        }
+        let msg = format!("error: internal error: {}", panic_message(&*payload));
+        (failure(id, INTERNAL_ERROR, msg), false)
+    })
+}
+
+/// The text a panic carried, as `panic!` gives it.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    match payload.downcast_ref::<&str>() {
+        Some(s) => (*s).to_owned(),
+        None => match payload.downcast_ref::<String>() {
+            Some(s) => s.clone(),
+            None => "a panic with no message".to_owned(),
+        },
     }
 }
 
