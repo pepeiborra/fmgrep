@@ -36,6 +36,37 @@ fn result_report(response: &serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
+fn a_panicking_request_gets_an_error_and_the_server_goes_on() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = staged(tmp.path(), store_docs);
+        let got = serve_stdio(
+            &index,
+            &[
+                r#"{"jsonrpc":"2.0","id":1,"method":"panic"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"status"}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"query","params":{"terms":["printk"]}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"method":"shutdown"}"#,
+            ],
+        );
+        assert_eq!(got.len(), 4, "store_docs={store_docs}: {got:?}");
+        assert_eq!(got[0]["id"], 1, "store_docs={store_docs}");
+        assert_eq!(got[0]["error"]["code"], -32603, "store_docs={store_docs}");
+        assert_eq!(
+            got[0]["error"]["message"], "error: internal error: boom",
+            "store_docs={store_docs}"
+        );
+        assert_eq!(got[1]["result"]["files"], 2, "store_docs={store_docs}");
+        let want = query(&index, &["-F"], &["printk"]).unwrap();
+        assert_eq!(
+            result_report(&got[2]),
+            timeless(want),
+            "store_docs={store_docs}"
+        );
+    }
+}
+
+#[test]
 fn serve_stdio_matches_query() {
     for store_docs in LAYOUTS {
         let tmp = tempfile::tempdir().unwrap();

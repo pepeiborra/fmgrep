@@ -256,6 +256,7 @@ Counting semantics:
 | -32600 | a batch, a notification (no id), or a bad `jsonrpc` / `method` | `batch requests are not supported` |
 | -32601 | unknown method | `unknown method "nope"` |
 | -32602 | bad params | `` invalid params: missing field `terms` `` |
+| -32603 | the server hit a bug (a panic); it goes on serving | `error: internal error: corrupt docfm index: doc 7 out of range` |
 | -32000 | the search failed | `` error: invalid regex pattern "(": regex parse error: ... `` |
 | -32001 | `format` or `commit` is not this server's | `this server serves commit 81b12d8... of index format 9` |
 
