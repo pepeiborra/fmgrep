@@ -270,6 +270,50 @@ fn without_watchman_every_search_asks_git_and_says_so_once() {
     assert!(says(&text, &none), "back to the first reason: {text}");
 }
 
+/// The git commands of `runs`, as the word after `-C <dir>`.
+fn commands(runs: &[String]) -> Vec<&str> {
+    runs.iter().filter_map(|r| r.split(' ').nth(2)).collect()
+}
+
+/// One ask of git runs these commands and no more: the count only goes
+/// down. Without watchman, and for the first search with it.
+#[test]
+fn one_ask_of_git_runs_few_processes() {
+    let r = Remote::new(&FILES);
+    let (log, path) = logging_git(&r);
+    let sock = r.s.path("no-daemon");
+    let (out, runs) = unwatched(&r, &log, &path, &sock, &[], &["-l", "printk"]);
+    assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
+    let want = [
+        "cat-file",
+        "status",
+        "ls-files",
+        "config",
+        "ls-files",
+        "ls-files",
+        "rev-parse",
+    ];
+    assert_eq!(commands(&runs), want, "without watchman: {runs:?}");
+    if r.daemon.is_none() {
+        return;
+    }
+    let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
+    assert_eq!(stdout(&out), "a.c\ndir/b.c\ndir/sub/c.h\ne.c\n");
+    let want = [
+        "cat-file",
+        "config",
+        "rev-parse",
+        "var",
+        "var",
+        "status",
+        "ls-files",
+        "ls-files",
+        "ls-files",
+        "config",
+    ];
+    assert_eq!(commands(&runs), want, "with watchman: {runs:?}");
+}
+
 /// A watchman that answers in between makes the line come again once it
 /// cannot answer: the record, and the note of what was said, go with it.
 #[test]
