@@ -121,6 +121,15 @@ pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
     }
 }
 
+/// What the caller already has of git's answers, so that git is not asked
+/// again: the settings it listed (`git config --list --show-origin -z`) and
+/// the path it gave for `info/exclude`.
+#[derive(Default)]
+pub struct Held<'a> {
+    pub listed: Option<&'a [u8]>,
+    pub exclude: Option<&'a str>,
+}
+
 /// The skip list of the checkout at `top` against the served commit
 /// `commit`: every path where the checkout differs from it, as git says
 /// (`d/` for an untracked directory), ascending. Else why the checkout
@@ -128,6 +137,7 @@ pub fn plan(server: &Server, status: &ServeStatus, cwd: &Path) -> Plan {
 pub fn changes(
     top: &Path,
     commit: &str,
+    held: Held,
     left_out: &mut Vec<Diagnostic>,
 ) -> Result<Vec<String>, String> {
     let (status, noted) = vcs::noted(
@@ -165,7 +175,7 @@ pub fn changes(
         Some(_) => {}
     }
     hidden(top)?;
-    converts(top)?;
+    converts(top, held.listed)?;
     // An ignore file that differs can change which files of its directory
     // an index holds: the whole directory is searched here. So is a path
     // that is a directory now, as a tracked file replaced by one: git
@@ -183,7 +193,7 @@ pub fn changes(
     outer_ignores(top)?;
     // Tracked files that the client's own excludes ignore are left out of
     // its part when it resolves the list, as its index would leave them.
-    skip.extend(excluded(top)?);
+    skip.extend(excluded(top, held.exclude)?);
     skip.sort_unstable();
     skip.dedup();
     if skip.len() > MAX_SKIP {
@@ -311,9 +321,22 @@ fn hidden(top: &Path) -> Result<(), String> {
 /// they do not; or a sparse one. Git says what applies: the value of a
 /// setting that wins, and the attributes of the tracked files, from every
 /// attributes file.
-fn converts(top: &Path) -> Result<(), String> {
+fn converts(top: &Path, held: Option<&[u8]>) -> Result<(), String> {
+    // Git's settings, as git lists them: once, unless the caller has them.
+    let own;
+    let listed = match held {
+        Some(listed) => Some(listed),
+        None => {
+            own = vcs::listed(top).unwrap_or_default();
+            Some(&own[..]).filter(|l| !l.is_empty())
+        }
+    };
     // The value that wins: `true`, `false` (also when unset) or a string.
-    let get = |key: &str| {
+    let get = |key: &str| -> Result<String, String> {
+        let key_in = key.to_ascii_lowercase();
+        if let Some(value) = listed.and_then(|l| vcs::bool_or_str(&vcs::values(l, &key_in))) {
+            return Ok(value);
+        }
         let args = [
             "config",
             "--type=bool-or-str",
@@ -332,20 +355,19 @@ fn converts(top: &Path) -> Result<(), String> {
     if let v @ ("true" | "input") = get("core.autocrlf")?.as_str() {
         return converts(format!("core.autocrlf={v}"));
     }
-    let config = vcs::git(
-        top,
-        &[
-            "config",
-            "-z",
-            "--get-regexp",
-            r"^filter\..*\.(clean|smudge|process)$",
-        ],
-    );
-    // `git config --get-regexp` fails when nothing matches.
-    let config = config.unwrap_or_default();
-    for r in vcs::records(&config) {
-        let r = String::from_utf8_lossy(r);
-        let key = r.split_once('\n').map_or(&*r, |(key, _)| key);
+    let keys: Vec<String> = match listed {
+        Some(listed) => vcs::filter_keys(listed),
+        None => {
+            let args = ["config", "-z", "--get-regexp"];
+            let args = [&args[..], &[r"^filter\..*\.(clean|smudge|process)$"]].concat();
+            // `git config --get-regexp` fails when nothing matches.
+            let config = vcs::git(top, &args).unwrap_or_default();
+            let keys = vcs::records(&config).map(String::from_utf8_lossy);
+            keys.map(|r| r.split_once('\n').map_or(&*r, |(key, _)| key).to_owned())
+                .collect()
+        }
+    };
+    for key in keys {
         if let Some(name) = key
             .strip_prefix("filter.")
             .and_then(|k| k.rsplit_once('.'))
@@ -437,8 +459,11 @@ fn outer_ignores(top: &Path) -> Result<(), String> {
 /// The tracked files that rules the served commit does not carry ignore:
 /// the patterns of the checkout's `info/exclude` and of the global
 /// excludes file that the index's walk reads.
-fn excluded(top: &Path) -> Result<Vec<String>, String> {
-    let exclude = vcs::line(vcs::git(top, &["rev-parse", "--git-path", "info/exclude"])?)?;
+fn excluded(top: &Path, held: Option<&str>) -> Result<Vec<String>, String> {
+    let exclude = match held {
+        Some(exclude) => exclude.to_owned(),
+        None => vcs::line(vcs::git(top, &["rev-parse", "--git-path", "info/exclude"])?)?,
+    };
     let global = ignore::gitignore::gitconfig_excludes_path();
     // The last file passed wins; `info/exclude` wins in the walk.
     let from: Vec<String> = (global.into_iter())

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::checkout::{Local, changes, resolve, short};
+use crate::checkout::{Held, Local, changes, resolve, short};
 use crate::diagnostic::Diagnostic;
 use crate::filter::PathFilter;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
@@ -63,7 +63,7 @@ pub fn skip_list(
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = changes(top, commit, left_out)?;
+            let skip = changes(top, commit, Held::default(), left_out)?;
             let took = asked.elapsed();
             let local = resolve(top, &skip, commit, left_out)?;
             // Said once while the reason holds; git is asked every time.
@@ -88,9 +88,14 @@ pub fn skip_list(
     // saved.
     let asked = Instant::now();
     let listed = settings(top);
-    let git = git_inputs(top, &listed)?;
+    let (git, exclude) = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
-    let skip = changes(top, commit, left_out)?;
+    // What git said already: its listing, unless that failed or is empty.
+    let held = Held {
+        listed: Some(&listed[..]).filter(|l| !l.is_empty()),
+        exclude: exclude.as_deref(),
+    };
+    let skip = changes(top, commit, held, left_out)?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
@@ -204,8 +209,9 @@ fn since(
 /// what git status says: HEAD, the ref it is on, the packed refs, the
 /// index, the repository's config and the worktree's, and its
 /// `info/exclude` and `info/attributes`; and the config files that git
-/// reads, from its settings `listed`; as paths.
-fn git_inputs(top: &Path, listed: &[u8]) -> Result<Vec<String>, String> {
+/// reads, from its settings `listed`; as paths. And the path that git says
+/// `info/exclude` has, as it printed it, when it printed one for each.
+fn git_inputs(top: &Path, listed: &[u8]) -> Result<(Vec<String>, Option<String>), String> {
     let names = [
         "HEAD",
         "index",
@@ -219,28 +225,35 @@ fn git_inputs(top: &Path, listed: &[u8]) -> Result<Vec<String>, String> {
     for name in names {
         args.extend(["--git-path".to_owned(), name.to_owned()]);
     }
-    args.extend(["--symbolic-full-name".to_owned(), "HEAD".to_owned()]);
+    args.extend(["--git-common-dir", "--symbolic-full-name", "HEAD"].map(str::to_owned));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = vcs::git(top, &args)?;
     let out = String::from_utf8(out).map_err(|_| "a git path is not UTF-8".to_owned())?;
-    let mut lines: Vec<String> = out
-        .lines()
+    let said: Vec<&str> = out.lines().collect();
+    let mut lines: Vec<String> = (said.iter().take(names.len()))
         .map(|l| top.join(l).display().to_string())
         .collect();
+    // A path that holds a newline makes more lines: git has to say.
+    let whole = said.len() == names.len() + 2;
     // The ref HEAD is on, when it is on one.
-    if let Some(name) = out
-        .lines()
-        .nth(names.len())
-        .filter(|n| n.starts_with("refs/"))
-    {
-        let path = vcs::line(vcs::git(top, &["rev-parse", "--git-path", name])?)?;
-        lines.truncate(names.len());
+    if let Some(name) = said.get(names.len() + 1).filter(|n| n.starts_with("refs/")) {
+        // Git keeps a ref in the common git directory, but those of
+        // `refs/bisect`, `refs/worktree` and `refs/rewritten`.
+        let own = ["bisect", "worktree", "rewritten"].iter().any(|d| {
+            name.strip_prefix("refs/")
+                .and_then(|n| n.strip_prefix(d))
+                .is_some_and(|n| n.is_empty() || n.starts_with('/'))
+        });
+        let common = said[names.len()];
+        let path = match whole && !own && common != "." && !common.ends_with('/') {
+            true => format!("{common}/{name}"),
+            false => vcs::line(vcs::git(top, &["rev-parse", "--git-path", name])?)?,
+        };
         lines.push(top.join(path).display().to_string());
-    } else {
-        lines.truncate(names.len());
     }
+    let exclude = (whole || said.len() == names.len() + 1).then(|| said[5].to_owned());
     lines.extend(config_files(top, listed));
-    Ok(lines)
+    Ok((lines, exclude))
 }
 
 /// The config files that git reads in the checkout at `top`: the system,
@@ -266,18 +279,23 @@ fn config_files(top: &Path, listed: &[u8]) -> Vec<String> {
     }
     // `git var` fails before git 2.42, and with `GIT_CONFIG_NOSYSTEM` or
     // `GIT_ATTR_NOSYSTEM`.
-    let found = [
-        vcs::git(top, &["var", "GIT_CONFIG_SYSTEM"]),
-        vcs::git(top, &["var", "GIT_ATTR_SYSTEM"]),
-        vcs::git(top, &["config", "--path", "core.excludesFile"]),
-        vcs::git(top, &["config", "--path", "core.attributesFile"]),
+    let mut found = vec![
+        vcs::git(top, &["var", "GIT_CONFIG_SYSTEM"]).and_then(vcs::line),
+        vcs::git(top, &["var", "GIT_ATTR_SYSTEM"]).and_then(vcs::line),
     ];
+    // The setting that wins, as `git config --path` prints it; git has to
+    // say when the list is empty (it failed) or a value is not plain.
+    for key in ["core.excludesFile", "core.attributesFile"] {
+        let derived = Some(listed)
+            .filter(|l| !l.is_empty())
+            .and_then(|l| vcs::path_of(&vcs::values(l, &key.to_ascii_lowercase())));
+        found.push(match derived {
+            Some(path) => path.ok_or_else(String::new),
+            None => vcs::git(top, &["config", "--path", key]).and_then(vcs::line),
+        });
+    }
     for found in found {
-        paths.extend(
-            found
-                .and_then(vcs::line)
-                .map(|p| top.join(p).display().to_string()),
-        );
+        paths.extend(found.map(|p| top.join(p).display().to_string()));
     }
     paths.sort_unstable();
     paths.dedup();
@@ -287,7 +305,7 @@ fn config_files(top: &Path, listed: &[u8]) -> Vec<String> {
 /// Every setting that git reads in the checkout at `top`, and the file
 /// it comes from, as `git config --list --show-origin -z` prints them.
 fn settings(top: &Path) -> Vec<u8> {
-    vcs::git(top, &["config", "--list", "--show-origin", "-z"]).unwrap_or_default()
+    vcs::listed(top).unwrap_or_default()
 }
 
 /// The file that `setting` (`<key>\n<value>`) of the config file `origin`
@@ -360,4 +378,68 @@ fn stamps(paths: &[PathBuf]) -> Vec<(String, Option<(u64, i64)>)> {
             (p.display().to_string(), stamp)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::git_inputs;
+    use crate::vcs::{git, line, listed};
+
+    /// A commit in the repository at `top`.
+    fn commit(top: &Path) {
+        let ident = ["-c", "user.name=a", "-c", "user.email=a@b"];
+        let args = [&ident[..], &["commit", "-q", "--allow-empty", "-m", "x"]].concat();
+        git(top, &args).unwrap();
+    }
+
+    /// The path of the ref HEAD is on and the one of `info/exclude` are
+    /// those that `git rev-parse --git-path` gives, in the main work tree,
+    /// a linked one, one with its git directory elsewhere, and for refs
+    /// that each work tree has of its own.
+    #[test]
+    fn the_ref_and_exclude_paths_are_what_git_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (main, linked, apart) = (root.join("main"), root.join("linked"), root.join("apart"));
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]).unwrap();
+        commit(&main);
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "other", "../linked"],
+        )
+        .unwrap();
+        std::fs::create_dir(&apart).unwrap();
+        git(
+            &apart,
+            &["init", "-q", "--separate-git-dir", "../apart.git"],
+        )
+        .unwrap();
+        commit(&apart);
+        for (top, head) in [
+            (&main, None),
+            (&linked, None),
+            (&apart, None),
+            (&main, Some("refs/worktree/w")),
+            (&main, Some("refs/bisect/b")),
+        ] {
+            if let Some(head) = head {
+                git(top, &["update-ref", head, "HEAD"]).unwrap();
+                git(top, &["symbolic-ref", "HEAD", head]).unwrap();
+            }
+            let (lines, exclude) = git_inputs(top, &listed(top).unwrap()).unwrap();
+            let said = |args: &[&str]| line(git(top, args).unwrap()).unwrap();
+            let name = said(&["rev-parse", "--symbolic-full-name", "HEAD"]);
+            let path = said(&["rev-parse", "--git-path", &name]);
+            assert_eq!(
+                lines[7],
+                top.join(path).display().to_string(),
+                "{top:?} {name}"
+            );
+            let path = said(&["rev-parse", "--git-path", "info/exclude"]);
+            assert_eq!(exclude, Some(path), "{top:?}");
+        }
+    }
 }

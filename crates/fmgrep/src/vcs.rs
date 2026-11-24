@@ -121,6 +121,98 @@ pub fn line(out: Vec<u8>) -> Result<String, String> {
     Ok(text.trim_end_matches('\n').to_owned())
 }
 
+/// Every setting that git reads in `dir`, and the file it comes from, as
+/// `git config --list --show-origin -z` prints them: `file:<path>`, then
+/// `<key>\n<value>` (a key with no `=` has no newline), for each setting.
+pub fn listed(dir: &Path) -> Result<Vec<u8>, String> {
+    git(dir, &["config", "--list", "--show-origin", "-z"])
+}
+
+/// The settings of `listed`, in order: the key as git prints it (section
+/// and name in lowercase), and its value, none for a key with no `=`.
+fn settings(listed: &[u8]) -> impl Iterator<Item = (&[u8], Option<&[u8]>)> {
+    let mut records = records(listed);
+    std::iter::from_fn(move || {
+        let (_origin, setting) = (records.next()?, records.next()?);
+        Some(match setting.iter().position(|&b| b == b'\n') {
+            Some(i) => (&setting[..i], Some(&setting[i + 1..])),
+            None => (setting, None),
+        })
+    })
+}
+
+/// The values of `key` (in lowercase) in `listed`, in order.
+pub fn values<'a>(listed: &'a [u8], key: &str) -> Vec<Option<&'a [u8]>> {
+    let found = settings(listed).filter(|(k, _)| *k == key.as_bytes());
+    found.map(|(_, value)| value).collect()
+}
+
+/// What `git config --type=bool-or-str --default=false --get <key>` prints
+/// for the `values` of the key, when it can be told with certainty; else
+/// none, and git has to say. The value that wins is the last.
+pub fn bool_or_str(values: &[Option<&[u8]>]) -> Option<String> {
+    let mut wins = "false".to_owned();
+    for value in values {
+        wins = match value {
+            None => "true".to_owned(),
+            Some(v) => {
+                let v = std::str::from_utf8(v).ok().filter(|v| !v.contains('\n'))?;
+                match v.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "on" => "true".to_owned(),
+                    "" | "false" | "no" | "off" => "false".to_owned(),
+                    // A number is a boolean: git tries one, with its
+                    // leading white space, sign and units.
+                    _ if v
+                        .starts_with(|c: char| c.is_ascii_whitespace() || "+-\x0b".contains(c)) =>
+                    {
+                        return None;
+                    }
+                    _ if v.starts_with(|c: char| c.is_ascii_digit()) => return None,
+                    _ => v.to_owned(),
+                }
+            }
+        };
+    }
+    Some(wins)
+}
+
+/// What `git config --path --get <key>` prints for the `values` of the key,
+/// when it can be told with certainty: none if git prints no path, the
+/// outer none if git has to say.
+pub fn path_of(values: &[Option<&[u8]>]) -> Option<Option<String>> {
+    let mut wins = None;
+    for value in values {
+        let v = std::str::from_utf8((*value)?).ok();
+        let v = v.filter(|v| !v.is_empty() && !v.contains('\n'))?;
+        wins = Some(match v.strip_prefix("~/") {
+            Some(rest) => {
+                let home = std::env::var("HOME").ok();
+                let home = home.filter(|h| !h.is_empty() && !h.ends_with('/'))?;
+                format!("{home}/{rest}")
+            }
+            // `~user`, `%(prefix)`, `:(optional)`.
+            None if v.starts_with(['~', '%', ':']) => return None,
+            None => v.to_owned(),
+        });
+    }
+    Some(wins)
+}
+
+/// The keys of `listed` that `git config --get-regexp
+/// '^filter\..*\.(clean|smudge|process)$'` prints, in order.
+pub fn filter_keys(listed: &[u8]) -> Vec<String> {
+    let ends = |k: &[u8]| {
+        [&b".clean"[..], b".smudge", b".process"]
+            .iter()
+            .any(|s| k.ends_with(s))
+    };
+    (settings(listed))
+        .map(|(key, _)| key)
+        .filter(|k| k.starts_with(b"filter.") && ends(&k[b"filter.".len()..]))
+        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .collect()
+}
+
 /// The NUL-terminated records of `out`.
 pub fn records(out: &[u8]) -> impl Iterator<Item = &[u8]> {
     out.split(|&b| b == 0).filter(|r| !r.is_empty())
@@ -268,7 +360,8 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    use super::command;
+    use super::{bool_or_str, command, filter_keys, listed, path_of, values};
+    use crate::vcs::{git, line, records};
 
     /// A git built with gettext says its warnings in the user's language, and
     /// a caller that matches a line of them would then see nothing: the
@@ -287,5 +380,90 @@ mod tests {
             Some((OsStr::new("LANGUAGE"), None)),
             "removed"
         );
+    }
+
+    /// Each of the `values` (`;` apart, `@` for the key) as the setting
+    /// `key` in a repository, with its list of settings; and an include.
+    fn each(key: &str, values: &str, mut check: impl FnMut(&Path, &[u8], &str)) {
+        for value in values.split(';') {
+            let tmp = tempfile::tempdir().unwrap();
+            let top = tmp.path();
+            git(top, &["init", "-q"]).unwrap();
+            let (section, name) = key.split_once('.').unwrap();
+            let set = if value.is_empty() {
+                "@".into()
+            } else {
+                format!("@ = {value}")
+            };
+            let config = format!(
+                "[{section}]\n\t{}\n[include]\n\tpath = inc\n",
+                set.replace('@', name)
+            );
+            let file = top.join(".git/config");
+            let text = std::fs::read_to_string(&file).unwrap();
+            std::fs::write(&file, text + &config).unwrap();
+            std::fs::write(top.join(".git/inc"), "[core]\n\tautocrlf = input\n").unwrap();
+            check(top, &listed(top).unwrap(), value);
+        }
+    }
+
+    /// What the list of settings gives for a key is what git says for it,
+    /// or nothing: git is asked when the answer is not certain.
+    #[test]
+    fn settings_derived_from_the_list_are_what_git_says() {
+        let flags = ";yes;TRUE;off;\"\";input;INPUT;08;0x10;\" on\";1;-1;1.5;yes\n\t@ = input;\
+            input\n\t@ = false;\"a\\nb\";false\n\t@ = 2;no\n\t@";
+        let paths = ";~;~/x;~/;~nobody/x;%(prefix)/x;\"\";:(optional)x;rel/x;/abs/x;a b;\
+            ~/x\n\t@ = y/z;y/z\n\t@ = ~/x;~/x\n\t@ = ~nobody/x";
+        let mut derived = 0;
+        for key in ["core.sparseCheckout", "core.autocrlf"] {
+            each(key, flags, |top, list, value| {
+                let args = [
+                    "config",
+                    "--type=bool-or-str",
+                    "--default=false",
+                    "--get",
+                    key,
+                ];
+                let old = line(git(top, &args).unwrap());
+                if let Some(new) = bool_or_str(&values(list, &key.to_ascii_lowercase())) {
+                    assert_eq!((key, value, Ok(new)), (key, value, old));
+                    derived += 1;
+                }
+            });
+        }
+        for key in ["core.excludesFile", "core.attributesFile"] {
+            each(key, paths, |top, list, value| {
+                let old = git(top, &["config", "--path", key]).and_then(line).ok();
+                if let Some(new) = path_of(&values(list, &key.to_ascii_lowercase())) {
+                    assert_eq!((key, value, new), (key, value, old));
+                    derived += 1;
+                }
+            });
+        }
+        assert!(derived >= 30, "{derived}");
+    }
+
+    /// The filters of the list are those that `git config --get-regexp`
+    /// finds, with their keys, in order.
+    #[test]
+    fn filters_derived_from_the_list_are_what_git_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path();
+        git(top, &["init", "-q"]).unwrap();
+        let config = "[Filter \"Up.x\"]\n\tClean = a\n\tsmudge\n[filter \"b\"]\n\tprocess = p\n\
+            \tclean = c\n\trequired = true\n[filter]\n\tclean = x\n[filter \"\"]\n\tsmudge = s\n";
+        let file = top.join(".git/config");
+        std::fs::write(&file, std::fs::read_to_string(&file).unwrap() + config).unwrap();
+        let regex = r"^filter\..*\.(clean|smudge|process)$";
+        let old = git(top, &["config", "-z", "--get-regexp", regex]).unwrap();
+        let old = records(&old).map(|r| {
+            String::from_utf8_lossy(r)
+                .split('\n')
+                .next()
+                .unwrap()
+                .to_owned()
+        });
+        assert_eq!(filter_keys(&listed(top).unwrap()), old.collect::<Vec<_>>());
     }
 }
