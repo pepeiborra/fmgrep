@@ -101,7 +101,7 @@ pub fn skip_list(
     let took = asked.elapsed();
     if same {
         let extra = json!({"git": git, "stamps": stamps, "env": env(), "index": index,
-            "moves": moves, "entries": entries});
+            "moves": moves, "entries": entries, "settings": digest(&listed)});
         if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
             left_out.push(Diagnostic::Unsaved(line));
         }
@@ -183,6 +183,15 @@ fn note(
 /// as in the record means the same answer; another is checked by
 /// [`converts`]; a hidden entry or a submodule asks git, which refuses. With
 /// `GIT_ATTR_SOURCE` set attributes follow HEAD, so a move of it asks too.
+///
+/// What HEAD still decides is git's settings: `includeIf "onbranch:..."`
+/// reads a config file on one branch and not on another, with no file
+/// changed, and that file may turn a conversion on or name another
+/// excludes or attributes file, which no stamp covers. So when HEAD itself
+/// moved (a checkout, a rebase; a commit moves the ref only), git lists
+/// its settings again (one git run) and they must be those of the record,
+/// else git is asked. A reftable repository never rewrites HEAD, so there
+/// a move of a list of ref tables counts as one of HEAD, a commit too.
 fn since(
     top: &Path,
     mut skip: Vec<String>,
@@ -210,6 +219,7 @@ fn since(
         return Err(format!("{path} changed"));
     }
     let mut extra = extra.clone();
+    let mut listed = None;
     if let Some(path) = moved.iter().find(|p| moves.contains(p))
         && std::env::var_os("GIT_ATTR_SOURCE").is_some()
     {
@@ -219,8 +229,15 @@ fn since(
         let asked = || format!("{index} changed");
         let digest = tracked(top).map_err(|_| asked())?;
         if digest != entries {
-            converts(top, None).map_err(|_| asked())?;
+            let held = listed.insert(settings(top));
+            converts(top, Some(&held[..]).filter(|l| !l.is_empty())).map_err(|_| asked())?;
             extra["entries"] = Value::String(digest);
+        }
+    }
+    if (moved.iter()).any(|p| moves.first() == Some(*p) || p.ends_with(TABLES)) {
+        let listed = listed.unwrap_or_else(|| settings(top));
+        if listed.is_empty() || extra["settings"].as_str() != Some(&digest(&listed)) {
+            return Err("git's settings changed with the branch".to_owned());
         }
     }
     if !moved.is_empty() {
@@ -251,10 +268,13 @@ fn since(
     Ok((skip, extra))
 }
 
+/// The list of ref tables of a reftable repository, in a git directory.
+const TABLES: &str = "reftable/tables.list";
+
 /// What [`git_inputs`] finds: the paths; the path that git says
 /// `info/exclude` has, as it printed it, when it printed one for each; the
-/// path of the index; and those of HEAD, the packed refs and the ref HEAD
-/// is on, which may move without a new ask (see [`since`]).
+/// path of the index; and those of HEAD, the packed refs, the ref HEAD is
+/// on and the ref tables, which may move without a new ask (see [`since`]).
 type Inputs = (Vec<String>, Option<String>, String, Vec<String>);
 
 /// The files in the git directory of the checkout at `top` that decide
@@ -306,6 +326,18 @@ fn git_inputs(top: &Path, listed: &[u8]) -> Result<Inputs, String> {
     let index = lines[1].clone();
     let mut moves = vec![lines[0].clone(), lines[4].clone()];
     moves.extend(lines.get(names.len()).cloned());
+    // A reftable repository never rewrites HEAD: a checkout writes the
+    // list of tables beside it (a linked worktree has its own), and a
+    // commit the list of the common git directory.
+    let beside = Path::new(&lines[0]).with_file_name(TABLES);
+    let shared = whole.then(|| top.join(said[names.len()]).join(TABLES));
+    for list in [Some(beside), shared].into_iter().flatten() {
+        let list = list.display().to_string();
+        if !moves.contains(&list) && Path::new(&list).exists() {
+            lines.push(list.clone());
+            moves.push(list);
+        }
+    }
     lines.extend(config_files(top, listed));
     Ok((lines, exclude, index, moves))
 }
@@ -376,6 +408,12 @@ fn included(origin: &Path, setting: &[u8]) -> Option<PathBuf> {
         Some(rest) => Some(PathBuf::from(std::env::var_os("HOME")?).join(rest)),
         None => Some(origin.parent()?.join(value)),
     }
+}
+
+/// The digest of git's settings `listed`, as [`settings`] prints them.
+fn digest(listed: &[u8]) -> String {
+    let hash = crate::source::fnv_with(crate::source::FNV_BASIS, listed);
+    format!("{hash:016x}")
 }
 
 /// The variables that choose which config and attributes files git reads,
