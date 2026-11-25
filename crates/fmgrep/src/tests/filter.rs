@@ -326,6 +326,91 @@ fn a_single_file_path_prints_no_file_name() {
     }
 }
 
+/// A search over `sub/c.c` and `sub`, which reach `sub/c.c` twice. The
+/// expected texts are what rg 15.2.0 prints for the same arguments, sorted by
+/// path.
+#[test]
+fn a_file_two_paths_reach_prints_once_for_each() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let (all, _) = trees(tmp.path(), store_docs);
+        let sub = all.join("sub").display().to_string();
+        let c = format!("{sub}/c.c");
+        let d = format!("{sub}/d.h");
+        let run =
+            |flags: &[&str], terms: &[&str]| printed(&all, flags, &[terms, &[&c, &sub]].concat());
+        assert_eq!(
+            run(&["-n"], &["printk"]),
+            format!("{c}:2:printk three alpha\n{c}:2:printk three alpha\n{d}:1:alpha printk\n")
+        );
+        assert_eq!(run(&["-l"], &["printk"]), format!("{c}\n{c}\n{d}\n"));
+        for flag in ["-c", "--count-matches"] {
+            assert_eq!(run(&[flag], &["printk"]), format!("{c}:1\n{c}:1\n{d}:1\n"));
+        }
+        // The expression engine copies a file too.
+        let expr = ["--expr", "printk AND alpha"];
+        assert_eq!(
+            run(&[&expr[..], &["-n"]].concat(), &[]),
+            format!("{c}:2:printk three alpha\n{c}:2:printk three alpha\n{d}:1:alpha printk\n")
+        );
+        assert_eq!(
+            run(&[&expr[..], &["-l"]].concat(), &[]),
+            format!("{c}\n{c}\n{d}\n")
+        );
+        assert_eq!(
+            run(&[&expr[..], &["-c"]].concat(), &[]),
+            format!("{c}:1\n{c}:1\n{d}:1\n")
+        );
+        // Each copy opens its own begin event.
+        let json = run(&["--json", "--matches"], &["printk"]);
+        let begins = timeless_lines(&json)
+            .into_iter()
+            .filter(|v| v["type"] == "begin")
+            .count();
+        assert_eq!(begins, 3);
+        // A context group closes before the next copy of the file.
+        assert_eq!(
+            run(&["-n", "-B1"], &["printk"]),
+            format!(
+                "{c}-1-first\n{c}:2:printk three alpha\n--\n{c}-1-first\n\
+                 {c}:2:printk three alpha\n--\n{d}:1:alpha printk\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn every_way_to_reach_a_file_twice_prints_it_twice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (all, _) = trees(tmp.path(), true);
+    let root = all.display().to_string();
+    let sub = format!("{root}/sub");
+    let on = |paths: &[&str]| printed(&all, &["-c"], &[&["printk"][..], paths].concat());
+    let (a, c, d) = (
+        format!("{root}/a.c"),
+        format!("{sub}/c.c"),
+        format!("{sub}/d.h"),
+    );
+    let (b, z) = (format!("{root}/b.h"), format!("{root}/z.c"));
+    // A directory twice, spelled alike or not: its files stay together.
+    let doubled = format!("{c}:1\n{c}:1\n{d}:1\n{d}:1\n");
+    assert_eq!(on(&[&sub, &sub]), doubled);
+    assert_eq!(on(&[&format!("{sub}/"), &sub]), doubled);
+    // The file first or last.
+    let both = format!("{c}:1\n{c}:1\n{d}:1\n");
+    assert_eq!(on(&[&c, &sub]), both);
+    assert_eq!(on(&[&sub, &c]), both);
+    // A directory with one inside it.
+    assert_eq!(
+        on(&[&root, &sub]),
+        format!("{a}:1\n{b}:1\n{c}:1\n{c}:1\n{d}:1\n{d}:1\n{z}:1\n")
+    );
+    // A file given twice.
+    assert_eq!(on(&[&c, &c]), format!("{c}:1\n{c}:1\n"));
+    // A file that no other PATH reaches is not repeated.
+    assert_eq!(on(&[&a, &sub]), format!("{a}:1\n{c}:1\n{d}:1\n"));
+}
+
 #[test]
 fn a_path_outside_the_tree_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

@@ -394,17 +394,27 @@ fn prepare(pattern: Option<&str>, mode: MatchMode) -> Result<Option<PreparedPatt
         .transpose()
 }
 
-/// `path` as `filter` prints it.
-fn printed<'a>(
+/// `doc`'s path as `filter` prints it, once for each PATH that keeps it.
+pub(crate) fn names<'a>(
     paths: &'a Paths<'_>,
     filter: Option<&PathFilter>,
     doc: usize,
-) -> Result<Cow<'a, str>, String> {
+) -> Result<Vec<Cow<'a, str>>, String> {
     let path = path_of(paths, doc)?;
     Ok(match filter {
-        Some(f) => Cow::Owned(f.printed(path).into_owned()),
-        None => Cow::Borrowed(path),
+        Some(f) => f.names(path),
+        None => vec![Cow::Borrowed(path)],
     })
+}
+
+/// How many times a search covers `doc`: one for each PATH that keeps it.
+pub(crate) fn copies(
+    paths: &Paths<'_>,
+    filter: Option<&PathFilter>,
+    doc: usize,
+) -> Result<usize, String> {
+    let path = path_of(paths, doc)?;
+    Ok(filter.map_or(1, |f| f.copies(path)))
 }
 
 /// rg's files and bytes searched: the index's less the skip list's files,
@@ -441,22 +451,31 @@ fn corpus(
     }
 }
 
-/// `doc` searched by `s`, with the path it prints under when it matches.
-fn searched<'a>(
+/// `doc` searched by `s`: what it prints under each path it matches
+/// under, one for each PATH that keeps it. A search whose lines carry the
+/// path runs once for each; the rest reuse the one answer.
+pub(crate) fn searched<'a>(
     s: &DocSearch,
     paths: &'a Paths<'_>,
     filter: Option<&PathFilter>,
     output: QueryOutput,
     doc: usize,
     bytes: &[u8],
-) -> Result<Option<(Cow<'a, str>, Found)>, String> {
+) -> Result<Vec<(Cow<'a, str>, Found)>, String> {
+    let names = names(paths, filter, doc)?;
     if output.names_lines() {
-        let path = printed(paths, filter, doc)?;
-        return Ok(s.doc(&path, bytes)?.map(|f| (path, f)));
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            if let Some(f) = s.doc(&name, bytes)? {
+                out.push((name, f));
+            }
+        }
+        return Ok(out);
     }
-    (s.doc("", bytes)?)
-        .map(|f| Ok((printed(paths, filter, doc)?, f)))
-        .transpose()
+    let Some(found) = s.doc("", bytes)? else {
+        return Ok(Vec::new());
+    };
+    Ok(names.into_iter().map(|n| (n, found.clone())).collect())
 }
 
 /// Answer `terms` from `index` and `loaded` with one probe pass, then fetch
@@ -645,20 +664,23 @@ fn answer_terms(
         if emit {
             sink.term_start(term)?;
         } else {
-            for &(_, c) in &exact {
-                counts.add(c);
+            for &(id, c) in &exact {
+                for _ in 0..copies(&paths, filter, id)? {
+                    counts.add(c);
+                }
             }
         }
         // Counts mode counts regex candidates and stale docs as the index
         // would; the emit modes search them as rg does, BOM stripped.
         let needle = memchr::memmem::Finder::new(literal);
+        let exact_counts = probe_count_is_rgs(req.output, literal);
         let map = |doc: usize, raw: &[u8]| {
             let bytes = matching::strip_bom(raw);
             Ok::<_, String>(match (emit, search, pattern.as_ref()) {
                 (true, Some(s), _) => (0, searched(s, &paths, filter, req.output, doc, bytes)?),
-                (true, None, _) => (0, None),
-                (false, _, Some(p)) => (p.count(bytes), None),
-                (false, _, None) => (count_overlapping(raw, &needle), None),
+                (true, None, _) => (0, Vec::new()),
+                (false, _, Some(p)) => (p.count(bytes), Vec::new()),
+                (false, _, None) => (count_overlapping(raw, &needle), Vec::new()),
             })
         };
         // Two-pointer merge of the probe-exact documents this mode did not
@@ -673,37 +695,35 @@ fn answer_terms(
             &mut |doc, _, scanned| {
                 let (count, found) = scanned?;
                 if !emit {
-                    counts.add(count);
+                    for _ in 0..copies(&paths, filter, doc)? {
+                        counts.add(count);
+                    }
                     return Ok(());
                 }
                 while next_exact < exact.len() && paths.cmp(exact[next_exact].0, doc).is_lt() {
                     let (i, c) = exact[next_exact];
                     next_exact += 1;
-                    counts.add(emit_probe_exact(
-                        sink, &paths, filter, req.output, literal, i, c,
-                    )?);
+                    emit_probe_exact(sink, &paths, filter, exact_counts, i, c, &mut counts)?;
                 }
                 if exact.get(next_exact).is_some_and(|&(i, _)| i == doc) {
                     next_exact += 1;
                 }
-                let Some((path, f)) = found else {
-                    return Ok(());
-                };
-                counts.add(f.count.max(1));
-                sink.doc(DocMatches {
-                    rel: path_of(&paths, doc)?,
-                    path: &path,
-                    printed: &f.printed,
-                    stats: &f.stats,
-                })
+                for (path, f) in found {
+                    counts.add(f.count.max(1));
+                    sink.doc(DocMatches {
+                        rel: path_of(&paths, doc)?,
+                        path: &path,
+                        printed: &f.printed,
+                        stats: &f.stats,
+                    })?;
+                }
+                Ok(())
             },
             left_out,
         )?;
         if emit {
             for &(i, c) in &exact[next_exact..] {
-                counts.add(emit_probe_exact(
-                    sink, &paths, filter, req.output, literal, i, c,
-                )?);
+                emit_probe_exact(sink, &paths, filter, exact_counts, i, c, &mut counts)?;
             }
         }
         let report = QueryReport {
@@ -818,22 +838,21 @@ fn scan_ids(
     ids
 }
 
-/// Emit a probe-exact document this mode did not fetch and return its
-/// contribution to `total_matches`: rg's span count where the probe count is
-/// rg's, else 1 for the membership the probe proves.
+/// Emit a probe-exact document this mode did not fetch, once for each PATH
+/// that keeps it, and add its contribution to `counts`: rg's span count
+/// where the probe count is rg's, else 1 for the membership the probe proves.
 fn emit_probe_exact(
     sink: &mut dyn MatchSink,
     paths: &Paths<'_>,
     filter: Option<&PathFilter>,
-    output: QueryOutput,
-    term: &[u8],
+    exact: bool,
     doc: usize,
     count: u64,
-) -> Result<u64, String> {
+    counts: &mut TermCounts,
+) -> Result<(), String> {
     if count == 0 {
-        return Ok(0);
+        return Ok(());
     }
-    let exact = probe_count_is_rgs(output, term);
     let printed_count = match exact {
         true => format!("{count}\n"),
         false => String::new(),
@@ -842,13 +861,16 @@ fn emit_probe_exact(
     if exact {
         stats.add_matches(count);
     }
-    sink.doc(DocMatches {
-        rel: path_of(paths, doc)?,
-        path: &printed(paths, filter, doc)?,
-        printed: printed_count.as_bytes(),
-        stats: &stats,
-    })?;
-    Ok(if exact { count } else { 1 })
+    for name in names(paths, filter, doc)? {
+        sink.doc(DocMatches {
+            rel: path_of(paths, doc)?,
+            path: &name,
+            printed: printed_count.as_bytes(),
+            stats: &stats,
+        })?;
+        counts.add(if exact { count } else { 1 });
+    }
+    Ok(())
 }
 
 fn path_of<'a>(paths: &'a Paths<'_>, doc: usize) -> Result<&'a str, String> {

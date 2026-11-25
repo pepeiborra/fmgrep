@@ -326,6 +326,88 @@ fn files_print_under_the_first_path_that_keeps_them() {
     assert_eq!(f.printed("sub/c.txt"), "c.txt");
 }
 
+/// `path`'s names under `paths`, typed from the root, with `globs`.
+fn names(globs: &[&str], paths: &[(&str, &str)], path: &str) -> Vec<String> {
+    let f = from("", globs, paths);
+    f.names(path).into_iter().map(Cow::into_owned).collect()
+}
+
+#[test]
+fn a_file_prints_once_under_each_path_that_keeps_it() {
+    let all = |paths: &[&str], path: &str| {
+        let paths: Vec<_> = paths.iter().map(|p| (*p, *p)).collect();
+        names(&[], &paths, path)
+    };
+    // A file and the directory over it, in PATH order.
+    assert_eq!(
+        all(&["sub/c.txt", "sub"], "sub/c.txt"),
+        ["sub/c.txt", "sub/c.txt"]
+    );
+    assert_eq!(
+        names(&[], &[("sub", "sub"), ("sub/c.txt", "c")], "sub/c.txt"),
+        ["sub/c.txt", "c"]
+    );
+    // A directory twice, and a directory and one inside it.
+    assert_eq!(
+        all(&["sub", "sub"], "sub/c.txt"),
+        ["sub/c.txt", "sub/c.txt"]
+    );
+    assert_eq!(
+        names(&[], &[("sub", "sub"), ("sub/deep", "d")], "sub/deep/d.txt"),
+        ["sub/deep/d.txt", "d/d.txt"]
+    );
+    // The root and a directory, in either order.
+    assert_eq!(
+        names(&[], &[("", "."), ("sub", "sub")], "sub/c.txt"),
+        ["./sub/c.txt", "sub/c.txt"]
+    );
+    assert_eq!(
+        names(&[], &[("sub", "sub"), ("", ".")], "sub/c.txt"),
+        ["sub/c.txt", "./sub/c.txt"]
+    );
+    // Two spellings of one directory, and an absolute path with a relative one.
+    assert_eq!(
+        names(&[], &[("sub", "sub"), ("sub/", "sub/")], "sub/c.txt"),
+        ["sub/c.txt", "sub/c.txt"]
+    );
+    assert_eq!(
+        names(&[], &[("sub", "sub"), ("sub", "/r/sub")], "sub/c.txt"),
+        ["sub/c.txt", "/r/sub/c.txt"]
+    );
+}
+
+#[test]
+fn a_glob_drops_a_file_from_the_paths_that_walk_it_only() {
+    let both = [("sub/c.txt", "sub/c.txt"), ("sub", "sub")];
+    // The file PATH keeps it whatever the globs; the walk of `sub` drops it.
+    assert_eq!(names(&["!c.txt"], &both, "sub/c.txt"), ["sub/c.txt"]);
+    assert_eq!(names(&["!*.txt"], &both, "sub/c.txt"), ["sub/c.txt"]);
+    // A directory excluded for one PATH only: the other holds the file.
+    let nested = [("sub", "sub"), ("sub/deep", "sub/deep")];
+    assert_eq!(
+        names(&["!sub/deep"], &nested, "sub/deep/d.txt"),
+        ["sub/deep/d.txt"]
+    );
+    assert_eq!(
+        names(&["!deep"], &nested, "sub/deep/d.txt"),
+        ["sub/deep/d.txt"]
+    );
+    assert_eq!(names(&["!deep"], &nested, "sub/c.txt"), ["sub/c.txt"]);
+}
+
+#[test]
+fn without_overlap_a_file_has_the_one_printed_name() {
+    let apart = [("sub", "sub"), ("sub2", "sub2"), ("a.txt", "a.txt")];
+    let f = from("", &[], &apart);
+    for path in ["sub/c.txt", "sub2/g.txt", "a.txt", "b.rs"] {
+        assert_eq!(f.names(path), [f.printed(path)], "{path}");
+        assert_eq!(f.copies(path), 1, "{path}");
+    }
+    let f = from("", &[], &[("sub", "sub"), ("sub/deep", "d")]);
+    assert_eq!(f.copies("sub/deep/e.rs"), 2);
+    assert_eq!(f.copies("sub/c.txt"), 1);
+}
+
 #[test]
 fn the_cwd_of_a_search_without_paths_is_the_default_path() {
     let cwd = |globs: &[&str]| from("/r/sub", globs, &[("sub", "")]);
