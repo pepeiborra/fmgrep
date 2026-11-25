@@ -122,6 +122,57 @@ fn each_uncommitted_change_answers_as_a_local_index() {
     }
 }
 
+/// A file that two PATHs reach prints once for each, as in rg, whether the
+/// server or the client searches it: `dir/b.c` is given alone and inside
+/// `dir`. The expected lines are what rg 15.2.0 prints, sorted by path.
+#[test]
+fn a_file_that_two_paths_reach_prints_once_for_each() {
+    let r = Remote::new(&FILES);
+    let cases: [(&str, Change, &str); 3] = [
+        ("served and unchanged", |_, _| {}, "printk b"),
+        (
+            "edited in a commit above the served one",
+            |r, c| {
+                r.s.write(c, &[("dir/b.c", "printk b changed\nother\n")]);
+                r.s.commit(c, "above");
+            },
+            "printk b changed",
+        ),
+        (
+            "edited and not committed",
+            |r, c| r.s.write(c, &[("dir/b.c", "printk b changed\nother\n")]),
+            "printk b changed",
+        ),
+    ];
+    for (name, change, b) in cases {
+        reset(&r);
+        change(&r, &r.client);
+        let paths = ["dir/b.c", "a.c", "dir"];
+        let lines = |flags: &[&str]| {
+            let args = [flags, &["printk"], &paths[..]].concat();
+            r.same("", &args);
+            stdout(&r.search(&r.client, &args))
+        };
+        assert_eq!(
+            lines(&["-n"]),
+            format!("a.c:1:printk a\ndir/b.c:1:{b}\ndir/b.c:1:{b}\ndir/sub/c.h:1:printk c\n"),
+            "{name}"
+        );
+        assert_eq!(
+            lines(&["-c"]),
+            "a.c:1\ndir/b.c:1\ndir/b.c:1\ndir/sub/c.h:1\n",
+            "{name}"
+        );
+        // rg searches four files: a.c, `dir/b.c` twice and `dir/sub/c.h`.
+        let stats = lines(&["--stats"]);
+        assert!(
+            stats.contains("\n4 files contained matches\n"),
+            "{name}: {stats}"
+        );
+        assert!(stats.contains("\n4 files searched\n"), "{name}: {stats}");
+    }
+}
+
 /// A PATH the index skips is an error, through the server as in a local
 /// index of the checkout: the server names what it lacks, and the client
 /// drops the PATHs that hold one of its own files.

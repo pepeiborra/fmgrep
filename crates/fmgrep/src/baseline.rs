@@ -250,7 +250,9 @@ fn note(
         .and_then(|of| crate::source::record_path(top, of))
         .map_or_else(|| "none".to_owned(), |p| p.display().to_string());
     let (n, bytes) = match filter {
-        Some(f) => (f.kept_of(&local.files)).fold((0, 0), |(n, b), i| (n + 1, b + local.lens[i])),
+        Some(f) => (f.kept_of(&local.files)).fold((0, 0), |(n, b), (i, k)| {
+            (n + k, b + local.lens[i] * k as u64)
+        }),
         None => (local.files.len(), local.bytes),
     };
     let s = skip.len();

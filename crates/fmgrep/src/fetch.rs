@@ -488,6 +488,18 @@ impl DocStore {
         Ok((docs, bytes))
     }
 
+    /// The leading UTF-8 BOM bytes of indexed doc `id` at `rel`: 3 or 0.
+    pub fn bom(&self, id: usize, rel: &str) -> Result<u64, String> {
+        use std::io::Read as _;
+        let Source::Files(f) = &self.source else {
+            return Ok(if self.has_bom(id)? { 3 } else { 0 });
+        };
+        let mut head = Vec::new();
+        let read = std::fs::File::open(f.root().join(rel))
+            .and_then(|file| file.take(3).read_to_end(&mut head));
+        Ok(3 * u64::from(read.is_ok() && head == [0xEF, 0xBB, 0xBF]))
+    }
+
     /// Whether indexed doc `id` starts with a UTF-8 BOM, as stored.
     fn has_bom(&self, id: usize) -> Result<bool, String> {
         let mut head = [0u8; 3];

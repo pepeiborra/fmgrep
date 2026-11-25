@@ -422,7 +422,8 @@ pub(crate) fn copies(
 /// bytes (rg's JSON summary, `--stats`). Under `--stats`, the indexed files
 /// that a PATH, a glob or the cwd keeps and the skip list does not hold,
 /// and their bytes, BOMs included: the index does not record which file
-/// has one. That reads the path of every file the filter may keep.
+/// has one. That reads the path of every file the filter may keep. An extra
+/// copy of a file that several PATHs keep reads the file's BOM.
 fn corpus(
     req: &QueryRequest<'_>,
     docs: &DocStore,
@@ -434,19 +435,29 @@ fn corpus(
         QueryOutput::Matches(matching::Print { stats: true, .. })
     );
     let whole = docs.corpus(m, req.output.json() || stats)?;
-    let (Some(f), true) = (&req.filter, stats) else {
-        return Ok(whole);
+    let json = req.output.json() && !stats;
+    let f = match &req.filter {
+        Some(f) if stats || (json && f.overlaps()) => f,
+        _ => return Ok(whole),
     };
     let ranges =
         (f.cover(&m.files)?).unwrap_or_else(|| std::iter::once(0..m.files.len()).collect());
     let ids = ranges.into_iter().flatten().filter(|&id| !docs.skipped(id));
-    let (mut failed, mut kept) = (None, (0, 0));
+    // The kept files, BOMs counted, and each extra copy of a file that
+    // several PATHs keep, BOM left out as in `whole`.
+    let (mut failed, mut kept, mut extra, mut n) = (None, (0, 0), (0, 0), 0);
     for id in f.kept(paths, ids, &mut failed) {
-        kept = (kept.0 + 1, kept.1 + m.doc_lens[id]);
+        let k = copies(paths, req.filter.as_ref(), id)?;
+        n += 1;
+        kept = (kept.0 + k, kept.1 + m.doc_lens[id] * k as u64);
+        if k > 1 {
+            let len = m.doc_lens[id] - docs.bom(id, path_of(paths, id)?)?;
+            extra = (extra.0 + k - 1, extra.1 + len * (k - 1) as u64);
+        }
     }
-    match (failed, kept.0 == whole.0) {
+    match (failed, json || n == whole.0) {
         (Some(e), _) => Err(e),
-        (None, true) => Ok(whole),
+        (None, true) => Ok((whole.0 + extra.0, whole.1 + extra.1)),
         (None, false) => Ok(kept),
     }
 }
