@@ -233,6 +233,27 @@ pub struct PreparedPattern {
     empty: bool,
 }
 
+/// The regex that counts matches of `pattern` as `-w` or `-x` narrows them.
+/// It is built from the parsed pattern, as grep-regex wraps it: wrapping the
+/// text would let an unbalanced pattern compile, and a `#` comment under
+/// `(?x)` swallow the closing parenthesis.
+fn wrapped_regex(pattern: &str, mode: MatchMode) -> Result<regex::bytes::Regex, RegexError> {
+    let text = match regex_syntax::ParserBuilder::new()
+        .utf8(false)
+        .case_insensitive(mode.ignore_case)
+        .build()
+        .parse(pattern)
+    {
+        Ok(hir) => crate::matching::wrap(hir, mode).to_string(),
+        Err(_) if mode.line => format!("(?m:^)(?:{pattern})(?m:$)"),
+        Err(_) => format!("\\b{{start-half}}(?:{pattern})\\b{{end-half}}"),
+    };
+    regex::bytes::RegexBuilder::new(&text)
+        .case_insensitive(mode.ignore_case)
+        .build()
+        .map_err(|e| RegexError::new(pattern, e.to_string()))
+}
+
 /// The anchor of a parsed pattern: its required literal, unless that literal
 /// holds the separator byte.
 fn anchor_of(hir: &regex_syntax::hir::Hir) -> Option<Vec<u8>> {
@@ -268,6 +289,10 @@ impl PreparedPattern {
             .case_insensitive(mode.ignore_case)
             .build()
             .map_err(|e| RegexError::new(pattern, e.to_string()))?;
+        let re = match mode.wrapped() {
+            true => wrapped_regex(pattern, mode)?,
+            false => re,
+        };
         // A pattern the HIR parser refuses (it rejects matching invalid
         // UTF-8, which `regex::bytes` allows) simply prunes with nothing.
         let hir = regex_syntax::ParserBuilder::new()
@@ -302,11 +327,11 @@ impl PreparedPattern {
             re,
             anchor,
             others,
-            literal,
+            literal: literal.filter(|_| !mode.wrapped()),
             fold,
             automaton,
             deferred,
-            empty: pattern.is_empty(),
+            empty: pattern.is_empty() && !mode.wrapped(),
         })
     }
 
@@ -695,6 +720,71 @@ mod tests {
             assert_eq!(lit(p, plain), None, "{p:?}");
         }
         assert_eq!(lit("printk", ci()), None);
+    }
+
+    fn word() -> MatchMode {
+        MatchMode {
+            word: true,
+            ..MatchMode::default()
+        }
+    }
+
+    fn line() -> MatchMode {
+        MatchMode {
+            line: true,
+            ..MatchMode::default()
+        }
+    }
+
+    #[test]
+    fn word_and_line_rules_keep_the_prune_but_drop_the_exact_count() {
+        for mode in [word(), line()] {
+            let p = PreparedPattern::prepare_with("foo", mode).unwrap();
+            // The bare literal still narrows, but it is no longer the answer.
+            assert_eq!(anchor(&p), Some(&b"foo"[..]));
+            assert_eq!(literal(&p), None);
+            let p = PreparedPattern::prepare_with("Int(32|64)#", mode).unwrap();
+            assert!(p.automaton().is_some());
+        }
+        let p = PreparedPattern::prepare_with("foo", MatchMode::default()).unwrap();
+        assert_eq!(literal(&p), Some(&b"foo"[..]));
+    }
+
+    #[test]
+    fn count_follows_the_wrapped_pattern() {
+        let n = |pattern: &str, mode: MatchMode, raw: &[u8]| {
+            PreparedPattern::prepare_with(pattern, mode)
+                .unwrap()
+                .count(raw)
+        };
+        assert_eq!(n("foo", word(), b"foobar foo"), 1);
+        assert_eq!(n("foo", MatchMode::default(), b"foobar foo"), 2);
+        // A pattern that ends with a non-word character needs only a
+        // non-word character after it.
+        assert_eq!(n("foo-", word(), b"foo-bar\nfoo- x"), 1);
+        assert_eq!(n("-foo", word(), b"x-foo -foo"), 1);
+        // Unicode words: the accent is a word character.
+        assert_eq!(n("caf", word(), "caf\u{e9} caf".as_bytes()), 1);
+        assert_eq!(n("foo", line(), b"foo\nfoo bar\nfoo\n"), 2);
+        // The line rule wins when both are set.
+        let both = MatchMode {
+            word: true,
+            line: true,
+            ..MatchMode::default()
+        };
+        assert_eq!(n("foo", both, b"foo\nfoo bar\n"), 1);
+        // The empty pattern under -x counts the empty lines only.
+        assert_eq!(n("", line(), b"a\n\nb\n\nc"), 2);
+        assert_eq!(n("", MatchMode::default(), b"a\n\nb\n"), 3);
+    }
+
+    #[test]
+    fn the_wrap_is_built_from_the_parse_not_the_text() {
+        // Wrapping the text would let this compile, and a comment under
+        // (?x) would swallow the closing parenthesis.
+        assert!(PreparedPattern::prepare_with("a)(b", word()).is_err());
+        let p = PreparedPattern::prepare_with("(?x) foo # a comment", word()).unwrap();
+        assert_eq!(p.count(b"foo foobar"), 1);
     }
 
     #[test]

@@ -51,6 +51,8 @@ response line each, after any [frames](#streamed-output).
 | `expr` | Expr | absent | one expression instead of `terms` |
 | `regex` | bool | false | every term is a regex; the CLI sends true, and false for `-F` |
 | `ignore_case` | bool | false | `-i` |
+| `word_regexp` | bool | false | `-w`: a match must be a whole word |
+| `line_regexp` | bool | false | `-x`: a match must be a whole line; when both are true, the line rule wins |
 | `multiline` | bool | false | `-U` |
 | `dotall` | bool | false | `--multiline-dotall` |
 | `mode` | string | `counts` | what to answer, below |
@@ -192,8 +194,8 @@ it.
 An Expr is `{"term": s}` (a literal, verbatim), `{"regex": s}`, `{"and":
 [Expr, ...]}` or `{"or": [Expr, ...]}`, nested freely, and every `and` /
 `or` needs at least one operand. A document satisfies a leaf when the leaf
-matches anywhere in it. `ignore_case`, `multiline` and `dotall` apply to
-every leaf. The report names the query in the text form, with `AND` /
+matches anywhere in it. `ignore_case`, `word_regexp`, `line_regexp`, `multiline` and `dotall` apply to
+every leaf. A leaf then satisfies a document when it matches there as a word, or as a whole line. The report names the query in the text form, with `AND` /
 `OR` in capitals. A request nesting `and` / `or` more than 62 deep exceeds
 serde_json's recursion limit and fails with -32700. The CLI's `--expr`
 caps nesting at 60.

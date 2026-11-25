@@ -66,7 +66,7 @@ fn leaves<'a>(expr: &'a Expr, req: &QueryRequest<'_>) -> Result<Vec<Leaf<'a>>, S
         };
         let literal = text.is_some();
         let (src, pattern) = match (text, regex) {
-            (Some(t), _) if req.mode.ignore_case && !t.is_empty() => {
+            (Some(t), _) if (req.mode.ignore_case || req.mode.wrapped()) && !t.is_empty() => {
                 let pattern = Cow::Owned(regex::escape(&t));
                 (t, Some(pattern))
             }

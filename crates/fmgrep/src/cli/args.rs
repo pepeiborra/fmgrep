@@ -44,6 +44,9 @@ pub fn unindexable(flag: &str) -> Option<String> {
         "-z" | "--search-zip" => "files are indexed as they are on disk, not decompressed",
         "--pre" | "--pre-glob" => "files are indexed as they are on disk, not preprocessed",
         "-E" | "--encoding" => "files are indexed as bytes, and fmgrep decodes none",
+        "-v" | "--invert-match" => {
+            "an inverted search reads every file, so the index cannot prune it"
+        }
         _ => return None,
     };
     Some(format!(
@@ -189,6 +192,12 @@ pub struct Search {
     /// Ignore case unless a PATTERN holds an uppercase letter
     #[arg(short = 'S', long, overrides_with_all = ["ignore_case", "case_sensitive"])]
     pub smart_case: bool,
+    /// Match only whole words
+    #[arg(short = 'w', long, overrides_with = "line_regexp")]
+    pub word_regexp: bool,
+    /// Match only whole lines
+    #[arg(short = 'x', long, overrides_with = "word_regexp")]
+    pub line_regexp: bool,
     /// Let a match span lines
     #[arg(short = 'U', long)]
     pub multiline: bool,
@@ -355,6 +364,8 @@ impl Search {
             expr: self.expr(input)?,
             regex: !self.fixed_strings && self.expr.is_none() && self.expr_json.is_none(),
             ignore_case: self.ignore_case,
+            word_regexp: self.word_regexp,
+            line_regexp: self.line_regexp,
             multiline: self.multiline,
             dotall: self.multiline_dotall,
             mode,

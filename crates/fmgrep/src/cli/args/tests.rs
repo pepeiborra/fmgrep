@@ -151,6 +151,25 @@ fn the_last_case_flag_wins_and_smart_case_reads_the_patterns() {
 }
 
 #[test]
+fn word_and_line_flags_override_each_other() {
+    let got = |words: &[&str]| {
+        let p = params(words);
+        (p.word_regexp, p.line_regexp)
+    };
+    assert_eq!(got(&["a"]), (false, false));
+    assert_eq!(got(&["-w", "a"]), (true, false));
+    assert_eq!(got(&["--word-regexp", "a"]), (true, false));
+    assert_eq!(got(&["-x", "a"]), (false, true));
+    assert_eq!(got(&["--line-regexp", "a"]), (false, true));
+    // The last of the two wins, as in rg.
+    assert_eq!(got(&["-w", "-x", "a"]), (false, true));
+    assert_eq!(got(&["-x", "-w", "a"]), (true, false));
+    // Each reaches every leaf of an expression.
+    assert_eq!(got(&["-w", "--and", "-e", "a", "-e", "b"]), (true, false));
+    assert_eq!(got(&["-x", "--expr", "a OR b"]), (false, true));
+}
+
+#[test]
 fn last_mode_flag_wins() {
     for (words, want) in [
         (&["-c", "-l"][..], Mode::Files),
@@ -723,6 +742,14 @@ fn flags_that_ask_for_what_an_index_lacks_say_why() {
             "--pre cannot work on an index: files are indexed as they are on disk, not preprocessed",
         ),
         (
+            &["-v", "x"],
+            "-v cannot work on an index: an inverted search reads every file, so the index cannot prune it",
+        ),
+        (
+            &["--invert-match", "x"],
+            "--invert-match cannot work on an index: an inverted search reads every file, so the index cannot prune it",
+        ),
+        (
             &["-E", "utf-16", "x"],
             "-E cannot work on an index: files are indexed as bytes, and fmgrep decodes none",
         ),
@@ -741,7 +768,7 @@ fn flags_that_ask_for_what_an_index_lacks_say_why() {
     let e = e.err().unwrap();
     assert!(e.starts_with("error: unexpected argument"), "{e}");
     // Any other flag rg has that fmgrep lacks is only unknown.
-    for flag in ["-w", "-x", "-v", "-m", "--files", "-t"] {
+    for flag in ["-m", "--files", "-t"] {
         let e = dispatch_to([flag, "x"], &mut &b""[..], &mut Vec::new(), false);
         let e = e.err().unwrap();
         assert!(e.starts_with("error: unexpected argument"), "{flag}: {e}");

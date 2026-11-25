@@ -35,6 +35,26 @@ fn mode_defaults_to_counts() {
 }
 
 #[test]
+fn word_and_line_rules_are_sent_only_when_set() {
+    let p = parse(r#"{"terms":["a"],"word_regexp":true}"#).unwrap();
+    assert!(p.word_regexp && !p.line_regexp);
+    let p = parse(r#"{"terms":["a"],"line_regexp":true}"#).unwrap();
+    assert!(!p.word_regexp && p.line_regexp);
+    let both = QueryParams {
+        terms: vec!["x".into()],
+        word_regexp: true,
+        line_regexp: true,
+        ..QueryParams::default()
+    };
+    let json = serde_json::to_string(&both).unwrap();
+    assert!(
+        json.contains(r#""word_regexp":true,"line_regexp":true"#),
+        "{json}"
+    );
+    assert_eq!(parse(&json).unwrap(), both);
+}
+
+#[test]
 fn fields_before_mode_are_refused() {
     let err = parse(r#"{"terms":["a"],"approx_counts":true}"#).unwrap_err();
     assert!(err.starts_with("unknown field `approx_counts`"), "{err}");

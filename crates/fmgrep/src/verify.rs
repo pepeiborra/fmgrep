@@ -120,7 +120,7 @@ fn line_pattern(src: &str, matcher: &RegexMatcher, mode: MatchMode) -> Option<St
         .build()
         .parse(src)
         .ok()?;
-    Some(line_safe(&hir)?.to_string())
+    Some(line_safe(&matching::wrap(hir, mode))?.to_string())
 }
 
 /// No `\n` in any class or literal, `\A` / `\z` as line anchors; `None` on

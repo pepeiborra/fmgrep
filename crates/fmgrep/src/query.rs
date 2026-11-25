@@ -363,9 +363,12 @@ impl<'a> Term<'a> {
         let source = req.regex.then_some(name);
         let bare = |text: Cow<'a, str>| {
             let folded = req.mode.ignore_case && !text.is_empty();
+            // Under -w or -x the matcher wraps the pattern, so a literal is
+            // never answered from the index alone.
+            let escaped = folded || (req.mode.wrapped() && !text.is_empty());
             Term {
                 name: Cow::Borrowed(name),
-                pattern: folded.then(|| Cow::Owned(regex::escape(&text))),
+                pattern: escaped.then(|| Cow::Owned(regex::escape(&text))),
                 text,
                 folded,
             }

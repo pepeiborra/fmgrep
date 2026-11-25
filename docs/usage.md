@@ -79,8 +79,21 @@ and does nothing.
 rg wraps each pattern in a group, so it accepts a few patterns with an
 unbalanced `)`, such as `)(\d#?`. fmgrep refuses them with a parse error.
 
-`-P` and `--engine` do not exist: there is one engine. `-f`, `-w`, `-x` and
-`-v` are refused.
+`-P` and `--engine` do not exist: there is one engine. `-f` is
+refused. `-v` is refused with a reason: an inverted search reads every
+file, so the index cannot prune it; use rg.
+
+### -w and -x
+
+`-w` finds a pattern only as a whole word, and `-x` only as a whole line,
+as in rg. The last of the two flags wins. They apply to every pattern, to
+`-F`, `-i` and `-U`, and to each leaf of `--and`, `--or` and `--expr`.
+A word is Unicode, so `café` holds the word `café`, not `caf`. A pattern
+that starts or ends with a non-word character needs only a non-word
+character, or the edge of the line, on that side: `-w -- -foo` finds
+`-foo end` but not `x-foo`. The index still narrows the files by the
+pattern itself, and every file it names is read, so `-w HscEnv` costs about
+what `HscEnv` does.
 
 ### The PATTERN and the PATHs
 
@@ -111,14 +124,14 @@ To search for one of these words, put `--` or any flag first:
 
 ### Flags
 
-These work as in rg: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`,
+These work as in rg: `-e`, `-F`, `-i`, `-s`, `-S`, `-w`, `-x`, `-U`,
 `--multiline-dotall`, `-g`, `--iglob`, `--glob-case-insensitive`, `-c`,
 `--count-matches`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
 `--no-heading`, `--color` and `--stats`. `fmgrep --help` lists them. Any
 other flag of rg is refused with `error: unexpected argument` and exit 2.
 These are some of them:
 
-- patterns: `-f`, `-w`, `-x`, `-v`, `-P`, `--engine`
+- patterns: `-f`, `-P`, `--engine`
 - files: `-t`, `-T`, `--type-add`, `-d`, `--max-filesize`, `--files`,
   `--files-without-match`
 - output: `-m`, `-r`, `-H`, `-I`, `-0`, `--column`, `--vimgrep`,
@@ -129,7 +142,7 @@ These are some of them:
 An index cannot honour these, and each is refused with its reason, such as
 `error: --hidden cannot work on an index: hidden files are not indexed; use
 rg`: `--hidden`, `-.`, `--no-ignore` and its variants, `-u`, `-L`, `-a`,
-`--binary`, `-z`, `--pre`, `--pre-glob` and `-E`.
+`--binary`, `-z`, `--pre`, `--pre-glob`, `-E`, `-v` and `--invert-match`.
 
 fmgrep does not search stdin, and does not read a `RIPGREP_CONFIG_PATH`
 file. To filter a pipe, or to use a flag above, use rg.
