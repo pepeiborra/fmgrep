@@ -147,16 +147,214 @@ fn later_searches_ask_watchman_not_git() {
         let want = r.oracle("", &["-l", "printk"]);
         assert_eq!(stdout(&out), stdout(&want));
     }
-    // A commit moves HEAD and the index: git is asked again.
+    // A commit moves HEAD, a ref and the index, and the entries stay: git
+    // lists them once to see so, and is not asked what differs.
     r.s.commit(c, "on top");
     let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
-    assert!(runs.iter().any(|r| r.contains("diff-tree")), "{runs:?}");
+    // The commit tracked the new files, so git also says whether it
+    // converts them.
+    checked_and_converts(&out, &bare(runs));
     assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
-    let head = std::fs::canonicalize(c.join(".git/HEAD")).unwrap();
-    let index = std::fs::canonicalize(c.join(".git/index")).unwrap();
-    let text = stderr(&out);
-    let moved = [&head, &index].map(|p| format!("({} changed;", p.display()));
-    assert!(moved.iter().any(|m| text.contains(m)), "{text}");
+}
+
+/// The git runs of `runs` without the `-C <checkout>` that starts each.
+fn bare(runs: Vec<String>) -> Vec<String> {
+    let rest = |run: String| match run.strip_prefix("-C ").and_then(|r| r.split_once(' ')) {
+        Some((_, rest)) => rest.to_owned(),
+        None => run,
+    };
+    runs.into_iter().map(rest).collect()
+}
+
+/// The one git run that tells whether the index still holds what the
+/// record saw: `git ls-files -z -s -v`.
+const LS_FILES: &str = "ls-files -z -s -v";
+
+/// A search from a checkout with a daemon: the baseline, with its one
+/// warning that git was asked; then `setup` (before it) and `change`
+/// (after it), and the search again, with the logging git. The answer is
+/// the oracle's, and the output and the git runs are returned.
+fn after(
+    files: &[(&str, &str)],
+    setup: impl FnOnce(&Remote, &Path),
+    change: impl FnOnce(&Remote, &Path),
+) -> Option<(Output, Vec<String>)> {
+    let r = Remote::new(files);
+    let daemon = r.daemon.as_ref()?;
+    let c = &r.client;
+    setup(&r, c);
+    let (log, path) = logging_git(&r);
+    let (first, _) = logged(&r, &log, &path, &["-l", "printk"]);
+    asked_again(&r, &first, "no record of an earlier search");
+    change(&r, c);
+    daemon.watch(c);
+    let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
+    assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
+    Some((out, bare(runs)))
+}
+
+/// What the search ran when the index moved but its entries did not: one
+/// `ls-files`, no ask.
+fn checked_only(out: &Output, runs: &[String]) {
+    assert_eq!(stderr(out), "");
+    assert_eq!(runs, [LS_FILES]);
+}
+
+/// What it ran when the entries changed with nothing that git refuses:
+/// `ls-files`, then what finds whether git would convert a file; no
+/// `status`.
+fn checked_and_converts(out: &Output, runs: &[String]) {
+    assert_eq!(stderr(out), "");
+    assert_eq!(runs[0], LS_FILES);
+    let asked = |r: &String| r.starts_with("status") || r.starts_with("diff-tree");
+    assert!(!runs.iter().any(asked), "{runs:?}");
+}
+
+/// A stat-only rewrite of the index (`git status` after a touch) is no
+/// reason to ask git what differs.
+#[test]
+fn a_status_after_a_touch_does_not_ask_git() {
+    let touch = |r: &Remote, c: &Path| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(c.join("a.c"))
+            .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        file.set_modified(later).unwrap();
+        r.s.git(c, &["status", "--short"]);
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, touch) {
+        checked_only(&out, &runs);
+    }
+}
+
+/// Staging a changed file, a commit, and a `reset --soft` after it: the
+/// entries stay, and the last two move HEAD and a ref only.
+#[test]
+fn add_commit_and_reset_soft_do_not_ask_git() {
+    let edit = |r: &Remote, c: &Path| r.s.write(c, &[("a.c", "none\n")]);
+    let add = |r: &Remote, c: &Path| {
+        edit(r, c);
+        r.s.git(c, &["add", "a.c"]);
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, add) {
+        checked_only(&out, &runs);
+    }
+    let commit = |r: &Remote, c: &Path| {
+        edit(r, c);
+        r.s.commit(c, "on top");
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, commit) {
+        checked_only(&out, &runs);
+    }
+    // HEAD is already past the served commit in the record: the soft
+    // reset moves a ref alone, and no git runs.
+    let soft = |r: &Remote, c: &Path| {
+        r.s.git(c, &["reset", "-q", "--soft", "HEAD~1"]);
+    };
+    let on_top = |r: &Remote, c: &Path| {
+        edit(r, c);
+        r.s.commit(c, "on top");
+    };
+    if let Some((out, runs)) = after(&FILES, on_top, soft) {
+        assert_eq!((stderr(&out), runs), (String::new(), Vec::new()));
+    }
+}
+
+/// A file that git ignores comes to be tracked (`add -f`), and another
+/// stops being (`rm --cached`), and is edited after: the entries
+/// differ, git is not asked, and every answer is the oracle's.
+#[test]
+fn tracking_and_untracking_a_file_does_not_ask_git() {
+    let ignored = |r: &Remote, c: &Path| {
+        r.s.write(
+            c,
+            &[
+                (".git/info/exclude", "ign.txt\n"),
+                ("ign.txt", "printk i\n"),
+            ],
+        );
+    };
+    let force = |r: &Remote, c: &Path| {
+        r.s.git(c, &["add", "-f", "ign.txt"]);
+    };
+    if let Some((out, runs)) = after(&FILES, ignored, force) {
+        checked_and_converts(&out, &runs);
+    }
+    let untrack = |r: &Remote, c: &Path| {
+        r.s.git(c, &["rm", "-q", "--cached", "e.c"]);
+        r.s.write(c, &[("e.c", "none\n")]);
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, untrack) {
+        checked_and_converts(&out, &runs);
+    }
+}
+
+/// Another branch, and a rebase: git writes the files that differ and
+/// watchman says so; the entries differ, and git is not asked.
+#[test]
+fn a_checkout_and_a_rebase_do_not_ask_git() {
+    let side = |r: &Remote, c: &Path| {
+        r.s.git(c, &["checkout", "-q", "-b", "side"]);
+        r.s.write(c, &[("a.c", "none\n"), ("n.c", "printk n\n")]);
+        r.s.commit(c, "side");
+        r.s.git(c, &["checkout", "-q", "-"]);
+    };
+    let switch = |r: &Remote, c: &Path| {
+        r.s.git(c, &["checkout", "-q", "side"]);
+    };
+    if let Some((out, runs)) = after(&FILES, side, switch) {
+        checked_and_converts(&out, &runs);
+    }
+    let rebase = |r: &Remote, c: &Path| {
+        r.s.write(c, &[("e.c", "none\n")]);
+        r.s.commit(c, "main");
+        r.s.git(c, &["rebase", "-q", "HEAD", "side"]);
+    };
+    if let Some((out, runs)) = after(&FILES, side, rebase) {
+        checked_and_converts(&out, &runs);
+    }
+}
+
+/// What a new ask would refuse is still refused: a skip-worktree bit set
+/// later, a submodule added, and a file that an attribute converts, now
+/// tracked. Each asks git, which refuses.
+#[test]
+fn what_a_new_ask_refuses_is_still_refused() {
+    let hide = |r: &Remote, c: &Path| {
+        r.s.git(c, &["update-index", "--skip-worktree", "e.c"]);
+    };
+    let refused = |out: &Output, runs: &[String], why: &str| {
+        let line = format!("warning: local changes are ignored ({why})");
+        assert!(stderr(out).starts_with(&line), "{}", stderr(out));
+        assert!(runs.iter().any(|r| r.starts_with("status")), "{runs:?}");
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, hide) {
+        let why = "git hides changes to 1 file (assume-unchanged or skip-worktree)";
+        refused(&out, &runs, why);
+    }
+    let submodule = |r: &Remote, c: &Path| {
+        let cache = format!("160000,{},sub", r.commit);
+        r.s.git(c, &["update-index", "--add", "--cacheinfo", &cache]);
+    };
+    if let Some((out, runs)) = after(&FILES, |_, _| {}, submodule) {
+        refused(&out, &runs, "the checkout holds a submodule (sub)");
+    }
+    let mut files = FILES.to_vec();
+    files.push((".gitattributes", "*.txt text\n"));
+    let untracked = |r: &Remote, c: &Path| r.s.write(c, &[("n.txt", "printk n\n")]);
+    let r = Remote::new(&files);
+    if let Some(daemon) = &r.daemon {
+        let c = &r.client;
+        untracked(&r, c);
+        let (log, path) = logging_git(&r);
+        logged(&r, &log, &path, &["-l", "printk"]);
+        r.s.git(c, &["add", "n.txt"]);
+        daemon.watch(c);
+        let (out, runs) = logged(&r, &log, &path, &["-l", "printk"]);
+        let why = "git converts files (the attribute text applies to n.txt)";
+        refused(&out, &bare(runs), why);
+    }
 }
 
 /// The one line of a search that asked git for a new baseline, `why`.
@@ -528,4 +726,22 @@ fn another_choice_of_config_files_asks_git_again() {
         asked_again(&r, &out, &format!("{var} changed"));
         assert!(!search(&env).0, "{var}: the new record");
     }
+}
+
+/// With `GIT_ATTR_SOURCE` set, attributes come from a tree, so a commit
+/// can change what converts: git is asked again.
+#[test]
+fn a_commit_asks_git_again_while_attributes_follow_head() {
+    let r = Remote::new(&FILES);
+    let Some(daemon) = &r.daemon else {
+        return;
+    };
+    let (log, path) = logging_git(&r);
+    let env = [("GIT_ATTR_SOURCE", "HEAD")];
+    logged_env(&r, &log, &path, &env, &["-l", "printk"]);
+    r.s.commit(&r.client, "again");
+    daemon.watch(&r.client);
+    let (out, runs) = logged_env(&r, &log, &path, &env, &["-l", "printk"]);
+    assert!(bare(runs).iter().any(|r| r.starts_with("status")));
+    assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
 }

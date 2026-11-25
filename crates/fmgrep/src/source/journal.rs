@@ -25,6 +25,8 @@ use crate::diagnostic::Diagnostic;
 mod watchman;
 
 const VERSION: u32 = 2;
+/// The version of a checkout's record: 3 keeps the digest of its index.
+const CHECKOUT_VERSION: u32 = 3;
 /// Below this many docs the stat pass beats asking.
 const MIN_DOCS: usize = 50_000;
 
@@ -258,11 +260,19 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// FNV-1a, 64 bits: stable across builds, so a record keeps its name.
-fn fnv(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+/// The start of an FNV-1a hash, 64 bits.
+pub const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a, 64 bits, of `bytes` after those that gave `hash` (start at
+/// [`FNV_BASIS`]): stable across builds, so a record keeps its name.
+pub fn fnv_with(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    fnv_with(FNV_BASIS, bytes)
 }
 
 /// The record of canonical tree `root` and `key`:
@@ -276,6 +286,8 @@ fn path(root: &str, key: &str) -> Option<PathBuf> {
 /// What a record's baseline differs from: `key` names its file, and `of`,
 /// which the record keeps, must match for the record to be used.
 pub struct Of {
+    /// The record format that this kind of record is written in.
+    v: u32,
     key: String,
     of: String,
     /// Says what a record of another `of` was written for.
@@ -287,6 +299,7 @@ impl Of {
     /// commit, so that searches through servers of two commits keep two.
     pub fn commit(id: &str) -> Self {
         Self {
+            v: CHECKOUT_VERSION,
             key: format!("git {id}"),
             of: format!("git {id}"),
             other: "another commit",
@@ -299,6 +312,7 @@ impl Index {
     fn of(&self) -> Result<Of, String> {
         let dir = self.dir.to_str().ok_or("the index path is not UTF-8")?;
         Ok(Of {
+            v: VERSION,
             key: dir.to_owned(),
             of: format!("index {dir}@{}", self.started_ns),
             other: "another index build",
@@ -316,7 +330,7 @@ impl Record {
         })?;
         let malformed = |e: serde_json::Error| format!("{} is malformed ({e})", path.display());
         let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(malformed)?;
-        if value.get("v").and_then(serde_json::Value::as_u64) != Some(u64::from(VERSION)) {
+        if value.get("v").and_then(serde_json::Value::as_u64) != Some(u64::from(of.v)) {
             return Err(format!(
                 "{} was written by another fmgrep version",
                 path.display()
@@ -859,7 +873,7 @@ pub fn remember(
         )));
     };
     let record = Record {
-        v: VERSION,
+        v: of.v,
         root: root.to_owned(),
         of: of.of.clone(),
         token,

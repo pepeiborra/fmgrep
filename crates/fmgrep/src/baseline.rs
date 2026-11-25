@@ -6,16 +6,17 @@
 //! token, the watchman socket and watch, and the paths found to differ. A
 //! later search takes a new token, asks watchman what changed since the
 //! old one, and adds that to the baseline, with no git run; unless one of
-//! the files that decide what git says (HEAD, the index, a config, ignore
-//! or attributes file outside the tree) moved, or a variable that chooses
-//! those files changed, and then it asks git again.
+//! the files that decide what git says (a config, ignore or attributes
+//! file outside the tree) moved, or a variable that chooses those files
+//! changed, and then it asks git again. A commit, `git status` or `git
+//! add` moves HEAD, a ref or the index without any of that: see [`since`].
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::checkout::{Held, Local, changes, resolve, short};
+use crate::checkout::{Held, Local, changes, converts, resolve, short, tracked};
 use crate::diagnostic::Diagnostic;
 use crate::filter::PathFilter;
 use crate::source::{Of, Remembered, remember, remembered, unsaid};
@@ -49,7 +50,7 @@ pub fn skip_list(
             extra,
             changed,
         } => match since(top, baseline, &extra, changed) {
-            Ok(skip) => {
+            Ok((skip, extra)) => {
                 if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
                     left_out.push(Diagnostic::Unsaved(line));
                 }
@@ -63,7 +64,7 @@ pub fn skip_list(
         Remembered::Fresh { token, why } => (token, why),
         Remembered::Cannot(why) => {
             let asked = Instant::now();
-            let skip = changes(top, commit, Held::default(), left_out)?;
+            let (skip, _) = changes(top, commit, Held::default(), left_out)?;
             let took = asked.elapsed();
             let local = resolve(top, &skip, commit, left_out)?;
             // Said once while the reason holds; git is asked every time.
@@ -88,18 +89,19 @@ pub fn skip_list(
     // saved.
     let asked = Instant::now();
     let listed = settings(top);
-    let (git, exclude) = git_inputs(top, &listed)?;
+    let (git, exclude, index, moves) = git_inputs(top, &listed)?;
     let stamps = stamps(&inputs(top, &git));
     // What git said already: its listing, unless that failed or is empty.
     let held = Held {
         listed: Some(&listed[..]).filter(|l| !l.is_empty()),
         exclude: exclude.as_deref(),
     };
-    let skip = changes(top, commit, held, left_out)?;
+    let (skip, entries) = changes(top, commit, held, left_out)?;
     let same = settings(top) == listed;
     let took = asked.elapsed();
     if same {
-        let extra = json!({"git": git, "stamps": stamps, "env": env()});
+        let extra = json!({"git": git, "stamps": stamps, "env": env(), "index": index,
+            "moves": moves, "entries": entries});
         if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
             left_out.push(Diagnostic::Unsaved(line));
         }
@@ -155,30 +157,74 @@ fn note(
     )))
 }
 
-/// The baseline plus what watchman says `changed`, when the variables
-/// and the inputs that `extra` keeps are as they were; else why git must
-/// be asked again.
+/// The baseline plus what watchman says `changed`, and the record's `extra`
+/// as it is now, when the variables and the inputs that `extra` keeps are
+/// as they were, but for HEAD, the ref it is on, the packed refs and the
+/// index; else why git must be asked again.
+///
+/// Why those four may move with no ask. The skip list must hold every path
+/// where the work tree W differs from the served commit C, and each path
+/// that the client's excludes hide of C. C never changes. W changes only
+/// by writes to files, and watchman reports each. So if the baseline B0
+/// held the paths where W0 differed from C when git was asked, then
+/// `W1 != C` is inside `B0 + (W1 != W0)`, which is inside `B0 + what watchman
+/// says`. The paths of C that the excludes hide are in B0 too: through
+/// `excluded` when tracked, through status or diff-tree when not; they
+/// depend on C and the exclude files, which stay stamped. HEAD, a ref or
+/// the packed refs moving (a commit, `reset --soft`, a checkout, a
+/// rebase) changes none of this: a checkout or rebase writes the files it
+/// changes, and watchman says so. Staging (`add`, `add -f`, `rm --cached`)
+/// writes no file. So B0 stays a superset, and only grows.
+///
+/// What the index still decides is whether a new ask would refuse: a
+/// hidden entry (skip-worktree, assume-unchanged), a submodule, and a file
+/// that a conversion applies to and that is tracked now. [`tracked`] reads
+/// the entries again (one git run) when the index moved: the same digest
+/// as in the record means the same answer; another is checked by
+/// [`converts`]; a hidden entry or a submodule asks git, which refuses. With
+/// `GIT_ATTR_SOURCE` set attributes follow HEAD, so a move of it asks too.
 fn since(
     top: &Path,
     mut skip: Vec<String>,
     extra: &Value,
     changed: Vec<String>,
-) -> Result<Vec<String>, String> {
-    let git: Vec<String> = serde_json::from_value(extra["git"].clone())
-        .map_err(|_| "the record is malformed".to_owned())?;
-    let was: Vec<(String, Option<(u64, i64)>)> = serde_json::from_value(extra["stamps"].clone())
-        .map_err(|_| "the record is malformed".to_owned())?;
-    let vars: Vec<(String, Option<String>)> = serde_json::from_value(extra["env"].clone())
-        .map_err(|_| "the record is malformed".to_owned())?;
+) -> Result<(Vec<String>, Value), String> {
+    let malformed = |_| "the record is malformed".to_owned();
+    let git: Vec<String> = serde_json::from_value(extra["git"].clone()).map_err(malformed)?;
+    let was: Vec<(String, Option<(u64, i64)>)> =
+        serde_json::from_value(extra["stamps"].clone()).map_err(malformed)?;
+    let vars: Vec<(String, Option<String>)> =
+        serde_json::from_value(extra["env"].clone()).map_err(malformed)?;
+    let index: String = serde_json::from_value(extra["index"].clone()).map_err(malformed)?;
+    let moves: Vec<String> = serde_json::from_value(extra["moves"].clone()).map_err(malformed)?;
+    let entries: String = serde_json::from_value(extra["entries"].clone()).map_err(malformed)?;
     if let Some((name, _)) = env().iter().find(|v| !vars.contains(v)) {
         return Err(format!("{name} changed"));
     }
     let now = stamps(&inputs(top, &git));
-    if let Some((path, _)) = now.iter().find(|s| !was.contains(s)) {
+    let moved: Vec<&String> = (now.iter().filter(|s| !was.contains(s)))
+        .chain(was.iter().filter(|s| !now.contains(s)))
+        .map(|(path, _)| path)
+        .collect();
+    if let Some(path) = moved.iter().find(|p| **p != &index && !moves.contains(p)) {
         return Err(format!("{path} changed"));
     }
-    if let Some((path, _)) = was.iter().find(|s| !now.contains(s)) {
+    let mut extra = extra.clone();
+    if let Some(path) = moved.iter().find(|p| moves.contains(p))
+        && std::env::var_os("GIT_ATTR_SOURCE").is_some()
+    {
         return Err(format!("{path} changed"));
+    }
+    if moved.contains(&&index) {
+        let asked = || format!("{index} changed");
+        let digest = tracked(top).map_err(|_| asked())?;
+        if digest != entries {
+            converts(top, None).map_err(|_| asked())?;
+            extra["entries"] = Value::String(digest);
+        }
+    }
+    if !moved.is_empty() {
+        extra["stamps"] = json!(now);
     }
     for p in changed {
         if p == ".git" || p.starts_with(".git/") {
@@ -202,16 +248,21 @@ fn since(
     if skip.len() > MAX_SKIP {
         return Err(format!("more than {MAX_SKIP} paths changed"));
     }
-    Ok(skip)
+    Ok((skip, extra))
 }
+
+/// What [`git_inputs`] finds: the paths; the path that git says
+/// `info/exclude` has, as it printed it, when it printed one for each; the
+/// path of the index; and those of HEAD, the packed refs and the ref HEAD
+/// is on, which may move without a new ask (see [`since`]).
+type Inputs = (Vec<String>, Option<String>, String, Vec<String>);
 
 /// The files in the git directory of the checkout at `top` that decide
 /// what git status says: HEAD, the ref it is on, the packed refs, the
 /// index, the repository's config and the worktree's, and its
 /// `info/exclude` and `info/attributes`; and the config files that git
-/// reads, from its settings `listed`; as paths. And the path that git says
-/// `info/exclude` has, as it printed it, when it printed one for each.
-fn git_inputs(top: &Path, listed: &[u8]) -> Result<(Vec<String>, Option<String>), String> {
+/// reads, from its settings `listed`; as paths. And the rest of [`Inputs`].
+fn git_inputs(top: &Path, listed: &[u8]) -> Result<Inputs, String> {
     let names = [
         "HEAD",
         "index",
@@ -252,8 +303,11 @@ fn git_inputs(top: &Path, listed: &[u8]) -> Result<(Vec<String>, Option<String>)
         lines.push(top.join(path).display().to_string());
     }
     let exclude = (whole || said.len() == names.len() + 1).then(|| said[5].to_owned());
+    let index = lines[1].clone();
+    let mut moves = vec![lines[0].clone(), lines[4].clone()];
+    moves.extend(lines.get(names.len()).cloned());
     lines.extend(config_files(top, listed));
-    Ok((lines, exclude))
+    Ok((lines, exclude, index, moves))
 }
 
 /// The config files that git reads in the checkout at `top`: the system,
@@ -429,7 +483,7 @@ mod tests {
                 git(top, &["update-ref", head, "HEAD"]).unwrap();
                 git(top, &["symbolic-ref", "HEAD", head]).unwrap();
             }
-            let (lines, exclude) = git_inputs(top, &listed(top).unwrap()).unwrap();
+            let (lines, exclude, ..) = git_inputs(top, &listed(top).unwrap()).unwrap();
             let said = |args: &[&str]| line(git(top, args).unwrap()).unwrap();
             let name = said(&["rev-parse", "--symbolic-full-name", "HEAD"]);
             let path = said(&["rev-parse", "--git-path", &name]);

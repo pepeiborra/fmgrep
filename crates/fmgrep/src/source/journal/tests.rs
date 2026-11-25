@@ -105,6 +105,16 @@ fn a_record_is_used_only_by_its_index_build() {
         let err = Record::read("/src/linux", &of).unwrap_err();
         assert!(err.contains("malformed"), "{err}");
     }
+    // A checkout's record of the version before its index digest is not used.
+    let commit = Of::commit("abc");
+    let old = json!({"v": 2, "root": "/src/linux", "of": "git abc", "token": token("c:1:2"),
+        "baseline": [], "extra": {}});
+    std::fs::write(path("/src/linux", &commit.key).unwrap(), old.to_string()).unwrap();
+    let err = Record::read("/src/linux", &commit).unwrap_err();
+    assert!(
+        err.ends_with(" was written by another fmgrep version"),
+        "{err}"
+    );
     // A record of fmgrep 0.1's format names the index and its build apart.
     let old = json!({"v": 1, "root": "/src/linux", "index": "/src/linux/.fmgrep",
         "index_started_ns": 7, "token": token("c:1:2"), "baseline": []});

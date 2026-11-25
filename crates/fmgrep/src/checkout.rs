@@ -132,14 +132,15 @@ pub struct Held<'a> {
 
 /// The skip list of the checkout at `top` against the served commit
 /// `commit`: every path where the checkout differs from it, as git says
-/// (`d/` for an untracked directory), ascending. Else why the checkout
-/// cannot be compared: the reason of the warning.
+/// (`d/` for an untracked directory), ascending; and the digest of what
+/// its index holds, from [`tracked`]. Else why the checkout cannot be
+/// compared: the reason of the warning.
 pub fn changes(
     top: &Path,
     commit: &str,
     held: Held,
     left_out: &mut Vec<Diagnostic>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, String), String> {
     let (status, noted) = vcs::noted(
         top,
         &[
@@ -174,7 +175,7 @@ pub fn changes(
         Some(h) if h != commit => skip.extend(committed(top, commit, h)?),
         Some(_) => {}
     }
-    hidden(top)?;
+    let digest = tracked(top)?;
     converts(top, held.listed)?;
     // An ignore file that differs can change which files of its directory
     // an index holds: the whole directory is searched here. So is a path
@@ -203,7 +204,7 @@ pub fn changes(
     // and says so only here. A tracked file in it is not listed either, and
     // git says nothing of it: the server's copy answers.
     left_out.extend(unopened(&noted, &skip));
-    Ok(skip)
+    Ok((skip, digest))
 }
 
 /// The entries for git's stderr `noted` that the client passes on: each
@@ -290,9 +291,15 @@ pub fn over(n: usize, commit: &str) -> String {
 
 /// Refuse a checkout whose index hides changes from git status
 /// (assume-unchanged or skip-worktree entries), or that holds a submodule.
-fn hidden(top: &Path) -> Result<(), String> {
+/// Else the digest of what a search needs from the index: 16 hex digits
+/// over the tag, mode and path of each entry, and the blob of each
+/// `.gitattributes` (git reads it from the index when the file is gone
+/// from the work tree). Staging a changed file, or a commit, leaves it
+/// as it was; it moves with the set of tracked paths, a mode or a tag.
+pub fn tracked(top: &Path) -> Result<String, String> {
     let listed = vcs::git(top, &["ls-files", "-z", "-s", "-v"])?;
     let mut hidden = 0;
+    let mut digest = crate::source::FNV_BASIS;
     for r in vcs::records(&listed) {
         // `<tag> <mode> <oid> <stage>\t<path>`: `S` is skip-worktree, a
         // lowercase tag assume-unchanged.
@@ -305,9 +312,24 @@ fn hidden(top: &Path) -> Result<(), String> {
             let path = String::from_utf8_lossy(entry.path);
             return Err(format!("the checkout holds a submodule ({path})"));
         }
+        let name = entry.path.rsplit(|&b| b == b'/').next();
+        let oid = if name == Some(b".gitattributes") {
+            entry.oid
+        } else {
+            ""
+        };
+        for part in [
+            tag,
+            entry.mode.as_bytes(),
+            oid.as_bytes(),
+            entry.path,
+            b"\0",
+        ] {
+            digest = crate::source::fnv_with(digest, part);
+        }
     }
     match hidden {
-        0 => Ok(()),
+        0 => Ok(format!("{digest:016x}")),
         n => Err(format!(
             "git hides changes to {n} file{} (assume-unchanged or skip-worktree)",
             crate::verbose::plural(n)
@@ -321,7 +343,7 @@ fn hidden(top: &Path) -> Result<(), String> {
 /// they do not; or a sparse one. Git says what applies: the value of a
 /// setting that wins, and the attributes of the tracked files, from every
 /// attributes file.
-fn converts(top: &Path, held: Option<&[u8]>) -> Result<(), String> {
+pub fn converts(top: &Path, held: Option<&[u8]>) -> Result<(), String> {
     // Git's settings, as git lists them: once, unless the caller has them.
     let own;
     let listed = match held {

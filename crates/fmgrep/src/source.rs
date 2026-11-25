@@ -20,8 +20,8 @@ mod journal;
 mod recorded;
 
 pub use journal::{
-    Index, Of, Pinned, Remembered, not_due, pin, pin_path, pinned, record_path, recorded, remember,
-    remembered, request_watch, unsaid,
+    FNV_BASIS, Index, Of, Pinned, Remembered, fnv_with, not_due, pin, pin_path, pinned,
+    record_path, recorded, remember, remembered, request_watch, unsaid,
 };
 pub use recorded::{Recorded, write_walk};
 use recorded::{direct, outermost};
