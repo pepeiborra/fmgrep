@@ -155,6 +155,113 @@ fn matches_mode_fetches_probe_exact_docs_too() {
     }
 }
 
+/// `terms` searched under `mode`, with the lines emitted.
+fn word_query(
+    index: &Path,
+    regex: bool,
+    terms: &[&str],
+    mode: MatchMode,
+    output: QueryOutput,
+) -> (OutputReport, Recorder) {
+    let manifest = read_manifest(index).unwrap();
+    let terms: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+    let req = QueryRequest {
+        regex,
+        mode,
+        ..request(index, &manifest, &terms, output)
+    };
+    let mut rec = Recorder::default();
+    let out = run_query(&req, &mut rec).unwrap();
+    (out, rec)
+}
+
+#[test]
+fn word_and_line_rules_narrow_every_kind_of_term() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = stage_corpus(
+        tmp.path(),
+        &[
+            ("w1.txt", b"foobar foo\nfoo-\nxfoo\nFOO\nfoo\n"),
+            ("w2.txt", b"foo bar\nfoo\n"),
+            ("w3.txt", b"foobar\nbarfoo\n"),
+        ],
+    );
+    for store_docs in LAYOUTS {
+        let index = tmp.path().join(format!("idx-{store_docs}"));
+        index_it(&folder, &index, store_docs);
+        let lines = |regex: bool, term: &str, mode: MatchMode| -> Vec<(String, u64)> {
+            let (_, rec) = word_query(&index, regex, &[term], mode, MATCHES);
+            rec.emitted().into_iter().map(|e| (e.0, e.1)).collect()
+        };
+        let at = |v: &[(&str, u64)]| -> Vec<(String, u64)> {
+            v.iter().map(|(p, n)| (p.to_string(), *n)).collect()
+        };
+        let word = MatchMode {
+            word: true,
+            ..MatchMode::default()
+        };
+        let line = MatchMode {
+            line: true,
+            ..MatchMode::default()
+        };
+        let want_word = at(&[
+            ("w1.txt", 1),
+            ("w1.txt", 2),
+            ("w1.txt", 5),
+            ("w2.txt", 1),
+            ("w2.txt", 2),
+        ]);
+        // A literal term, a regex that is only a literal, and a real regex
+        // find the same lines; w3.txt, which holds only parts of words, is
+        // never listed.
+        for (regex, term) in [(false, "foo"), (true, "foo"), (true, "fo+")] {
+            assert_eq!(
+                lines(regex, term, word),
+                want_word,
+                "{term} store_docs={store_docs}"
+            );
+        }
+        let want_line = at(&[("w1.txt", 5), ("w2.txt", 2)]);
+        for (regex, term) in [(false, "foo"), (true, "foo"), (true, "fo+")] {
+            assert_eq!(
+                lines(regex, term, line),
+                want_line,
+                "{term} store_docs={store_docs}"
+            );
+        }
+        // The line rule wins when both are set.
+        let both = MatchMode {
+            word: true,
+            line: true,
+            ..MatchMode::default()
+        };
+        assert_eq!(lines(false, "foo", both), want_line);
+        // Under -i the fold walk still finds the candidates.
+        let ci = MatchMode {
+            ignore_case: true,
+            ..word
+        };
+        let want_ci = at(&[
+            ("w1.txt", 1),
+            ("w1.txt", 2),
+            ("w1.txt", 4),
+            ("w1.txt", 5),
+            ("w2.txt", 1),
+            ("w2.txt", 2),
+        ]);
+        assert_eq!(lines(false, "Foo", ci), want_ci, "store_docs={store_docs}");
+        // -l never lists a file from the index alone.
+        let (_, rec) = word_query(&index, false, &["foo"], word, QueryOutput::FilesWithMatches);
+        let files: Vec<&str> = rec.seen.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(files, ["w1.txt", "w2.txt"], "store_docs={store_docs}");
+        // Counts mode counts the wrapped matches, and says it is inexact.
+        let (out, _) = word_query(&index, false, &["foo"], word, QueryOutput::Counts);
+        assert_eq!(out.queries[0].total_matches, 5, "store_docs={store_docs}");
+        assert_eq!(out.queries[0].docs_matched, 2, "store_docs={store_docs}");
+        assert!(!out.queries[0].counts_exact, "store_docs={store_docs}");
+    }
+}
+
 #[test]
 fn counts_mode_report_has_only_the_counting_keys() {
     for store_docs in LAYOUTS {

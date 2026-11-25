@@ -81,9 +81,9 @@ are the differences.
   with a `-g` glob. A PATH that names one is an error, as is a PATH
   outside the indexed tree; `rg` searches them. A search also finds
   matches in a file edited or added since the index.
-* **Fewer flags.** These work: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`, `-g`,
-  `--iglob`, `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
-  `--color` and `--stats`. Other flags of `rg`, such as `-w`, `-x`, `-v`,
+* **Fewer flags.** These work: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`, `-w`, `-x`,
+  `-g`, `--iglob`, `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
+  `--color` and `--stats`. Other flags of `rg`, such as `-v`,
   `-t`, `-m` and `--sort`, fail with exit 2. So do `--hidden` and
   `--no-ignore`, which no index can honour. `fmgrep --help` lists the
   flags that work.

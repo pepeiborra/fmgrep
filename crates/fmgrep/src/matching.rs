@@ -37,6 +37,31 @@ pub struct MatchMode {
     pub dotall: bool,
     /// rg `-i`.
     pub ignore_case: bool,
+    /// rg `-w`: a match must be a whole word.
+    pub word: bool,
+    /// rg `-x`: a match must be a whole line. It wins over `word`.
+    pub line: bool,
+}
+
+impl MatchMode {
+    /// Whether the term is narrowed to words or lines.
+    pub fn wrapped(self) -> bool {
+        self.word || self.line
+    }
+}
+
+/// `hir` as rg's `-w` or `-x` reads it, as grep-regex wraps a parsed
+/// pattern: the whole line rule wins over the word rule, and a word is
+/// Unicode, so a pattern that starts or ends with a non-word character
+/// needs only a non-word character, or the edge, on that side.
+pub fn wrap(hir: regex_syntax::hir::Hir, mode: MatchMode) -> regex_syntax::hir::Hir {
+    use regex_syntax::hir::{Hir, Look};
+    let (start, end) = match () {
+        _ if mode.line => (Look::StartLF, Look::EndLF),
+        _ if mode.word => (Look::WordStartHalfUnicode, Look::WordEndHalfUnicode),
+        _ => return hir,
+    };
+    Hir::concat(vec![Hir::look(start), hir, Hir::look(end)])
 }
 
 /// What the drive must produce per query; the CLI maps flags onto it.
@@ -91,7 +116,10 @@ pub fn matcher(
     mode: MatchMode,
 ) -> Result<Option<RegexMatcher>, String> {
     let mut b = RegexMatcherBuilder::new();
-    b.multi_line(true).case_insensitive(mode.ignore_case);
+    b.multi_line(true)
+        .case_insensitive(mode.ignore_case)
+        .word(mode.word)
+        .whole_line(mode.line);
     // rg's binary detection makes a NUL impossible to match; a pattern that
     // needs one is refused, as rg does, and a class loses it.
     b.ban_byte(Some(0));

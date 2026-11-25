@@ -25,6 +25,12 @@ pub struct QueryParams {
     pub regex: bool,
     #[serde(default)]
     pub ignore_case: bool,
+    /// `-w`: a match must be a whole word.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub word_regexp: bool,
+    /// `-x`: a match must be a whole line; it wins over `word_regexp`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub line_regexp: bool,
     #[serde(default)]
     pub multiline: bool,
     #[serde(default)]
@@ -146,6 +152,8 @@ impl Default for QueryParams {
             expr: None,
             regex: false,
             ignore_case: false,
+            word_regexp: false,
+            line_regexp: false,
             multiline: false,
             dotall: false,
             mode: Mode::Counts,
@@ -212,6 +220,8 @@ impl QueryParams {
                 multiline: self.multiline,
                 dotall: self.dotall,
                 ignore_case: self.ignore_case,
+                word: self.word_regexp,
+                line: self.line_regexp,
             },
             terms: &self.terms,
             expr: self.expr.as_ref(),

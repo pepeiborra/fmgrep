@@ -111,6 +111,46 @@ fn set_membership_equals_line_scan() {
 }
 
 #[test]
+fn line_rule_leaves_share_the_set_and_word_leaves_search_alone() {
+    let srcs = [r"alpha", r"\w+", r"one", r"", r"alpha one"];
+    for (word, line) in [(false, true), (true, false)] {
+        let mode = MatchMode {
+            word,
+            line,
+            ..MatchMode::default()
+        };
+        let matchers: Vec<RegexMatcher> = srcs.iter().map(|p| re(p, mode)).collect();
+        let set = set_of(&srcs, &matchers, mode);
+        for t in &set.tests {
+            // A whole-line rule is a line anchor on each side; the half
+            // word boundaries are decoded across the line start, so a
+            // word leaf is searched on its own.
+            assert_eq!(matches!(t, Test::Set(..)), line);
+        }
+        for doc in DOCS {
+            for (p, got) in srcs.iter().zip(filled(&set, doc)) {
+                assert_eq!(
+                    got,
+                    scan(p, mode, doc),
+                    "-w={word} -x={line} {p:?} on {:?}",
+                    String::from_utf8_lossy(doc)
+                );
+            }
+        }
+    }
+    // The set tests the wrapped pattern: a line that merely holds the leaf
+    // is no member.
+    let mode = MatchMode {
+        line: true,
+        ..MatchMode::default()
+    };
+    let matchers = [re("foo", mode)];
+    let set = set_of(&["foo"], &matchers, mode);
+    assert_eq!(filled(&set, b"foo bar\n"), [false]);
+    assert_eq!(filled(&set, b"foo bar\nfoo\n"), [true]);
+}
+
+#[test]
 fn crlf_and_multiline_leaves_use_their_own_scan() {
     let cases: [(&str, MatchMode); 5] = [
         (r"(?R)two$", MatchMode::default()),

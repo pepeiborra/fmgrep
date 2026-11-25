@@ -457,7 +457,7 @@ check_expr() {
     shift 3
     MFLAGS=""
     for w in $theirs; do
-        case "$w" in -i | -U | --multiline-dotall) MFLAGS+=" $w" ;; esac
+        case "$w" in -i | -U | -w | -x | --multiline-dotall) MFLAGS+=" $w" ;; esac
     done
     parse "$@"
     : > "$WORK/theirs"
@@ -858,6 +858,7 @@ printf 'alpha nested ignore\n' > "$CORPUS/ns/g.log"
 printf 'alpha soon ignored\n' > "$CORPUS/n.md"
 # Patterns with a meaning to a regex, and the text that each reads as one.
 printf 'a.b\naxb\na+b\nfoo(bar)\n/usr/lib/x\n/a.b/\nC++ code\necho $HOME\nx.unwrap()\nif a || b\narr[0] arr0\nStgClosure *\nfoo upper Foo\nFOO BAR\ncall (Foo) (foo)\n-dash alpha\n' > "$CORPUS/p.txt"
+printf 'alpha\nalphabet\nx-alpha\n-alpha\nalpha_1\ncaf\xc3\xa9 alpha\n  alpha  \n\nfoo-\nFoo-Bar\n' > "$CORPUS/w.txt"
 # What rg searches when it is a PATH, and an index never holds: a hidden file,
 # a binary file (nul.dat, which rg's cases skip), and a symlink.
 printf 'alpha hidden\n' > "$CORPUS/.hid"
@@ -948,6 +949,36 @@ for term in alpha ALPHA Alpha printk PRINTK class; do
 done
 check ci-regex-lines   "--heading -n -i"    "--heading -n -i"             'alpha \w+'
 check ci-regex-only    "--heading -n -i -o" "--heading -n -i -o"          'ALPHA \w+'
+
+# -w and -x: rg's word and line rules, over every output and pattern kind. A
+# pattern that starts or ends with a non-word character needs only a
+# non-word character, or the edge, on that side; the empty pattern is a
+# match of every word boundary.
+for flag in -w -x; do
+    for term in alpha -alpha 'alpha\w*' 'foo-' '\w+' ''; do
+        check "word-lines   [$flag $term]" "--heading -n $flag"    "--heading -n $flag"    "$term"
+        check "word-only    [$flag $term]" "--heading -n -o $flag" "--heading -n -o $flag" "$term"
+        check "word-count   [$flag $term]" "-c $flag"              "-c $flag"              "$term"
+        check "word-countm  [$flag $term]" "--count-matches $flag" "--count-matches $flag" "$term"
+        check "word-files   [$flag $term]" "-l $flag"              "-l $flag"              "$term"
+        check "word-context [$flag $term]" "--heading -n -C 1 $flag" "--heading -n -C 1 $flag" "$term"
+    done
+    check "word-ci      [$flag ALPHA]" "--heading -n -i $flag"  "--heading -n -i $flag" ALPHA
+    check "word-ci-only [$flag FOO-BAR]" "--heading -n -o -i $flag" "--heading -n -o -i $flag" 'FOO-BAR'
+    check "word-fixed   [$flag a.b]"  "--heading -n -F $flag"   "--heading -n -F $flag" 'a.b'
+    check "word-fixed   [$flag foo-]" "--heading -n -F $flag"   "--heading -n -F $flag" 'foo-'
+    check "word-multi   [$flag alpha one\nbeta]" "--heading -n -U $flag" "--heading -n -U $flag" 'alpha one\nbeta'
+    check_e "word-e     [$flag -e alpha -e beta]" "--heading -n $flag -e alpha -e beta" "--heading -n $flag -e alpha -e beta"
+    check_e "word-e-fix [$flag -e a.b -e foo-]" "--heading -n -F $flag -e a.b -e foo-" "--heading -n -F $flag -e a.b -e foo-"
+done
+# The last of -w and -x wins.
+check "word-then-line" "--heading -n -w -x" "--heading -n -w -x" alpha
+check "line-then-word" "--heading -n -x -w" "--heading -n -x -w" alpha
+check_flags "word-and [-w --and alpha beta]" "--heading -n -w" "--heading -n -w" and t:alpha t:beta
+check_flags "word-or  [-w --or alpha zeta]"  "-l -w" "-l -w" or t:alpha t:zeta
+check_flags "line-or  [-x --or alpha beta]"  "--heading -n -x" "--heading -n -x" or t:alpha t:beta
+check_expr "word-expr [-w alpha AND /\w+ one/]" "--heading -n -w" "--heading -n -w" 'and{' t:alpha 'r:\w+ one' '}'
+check_expr "line-expr [-x alpha OR beta]" "-l -x" "-l -x" 'or{' t:alpha t:beta '}'
 
 # -i x -U: the multiline test runs on the FOLDED pattern, so a term reaches
 # rg's multiline core under -i exactly where it does without it.

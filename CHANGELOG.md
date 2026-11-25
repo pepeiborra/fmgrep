@@ -38,7 +38,8 @@ index, and read the table below before you script a search. Details are in
 ### New
 
 - `-e`/`--regexp`, `-F`/`--fixed-strings`, `-s`/`--case-sensitive` and `-S`/`--smart-case`, as in rg.
-- `--no-ignore`, `-u`, `--hidden`, `-L`, `-a`, `-z`, `--pre` and `-E` are refused with a reason, not as an unexpected argument.
+- `-w`/`--word-regexp` and `-x`/`--line-regexp`, as in rg.
+- `--no-ignore`, `-u`, `--hidden`, `-L`, `-a`, `-z`, `--pre`, `-E` and `-v` are refused with a reason, not as an unexpected argument.
 - `cargo install fmgrep` needs no C compiler.
 - `FMGREP_SERVER=HOST:PORT` searches a shared `fmgrep serve` from your own checkout, with your local edits, new files and commits included ([docs/shared-server.md](docs/shared-server.md)).
 - `--ignore-local-changes` prints the server's answer alone.
