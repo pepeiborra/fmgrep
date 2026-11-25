@@ -11,8 +11,9 @@
 //! changed, and then it asks git again. A commit, `git status` or `git
 //! add` moves HEAD, a ref or the index without any of that: see [`since`].
 
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -43,44 +44,64 @@ pub fn skip_list(
     left_out: &mut Vec<Diagnostic>,
 ) -> Result<(Vec<String>, Local, Said), String> {
     let of = Of::commit(commit);
-    let (token, why) = match remembered(top, &of) {
-        Remembered::Since {
-            token,
-            baseline,
-            extra,
-            changed,
-        } => match since(top, baseline, &extra, changed) {
-            Ok((skip, extra)) => {
-                if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
-                    left_out.push(Diagnostic::Unsaved(line));
+    // Searches started together find no record and would all ask git: one
+    // at a time asks (see [`Lock`]), and the others read what it saved.
+    let record = crate::source::record_path(top, &of);
+    let seen = record.as_deref().map(stamp);
+    let mut lock: Option<Lock> = None;
+    let mut found = remembered(top, &of);
+    let (token, why) = loop {
+        let (token, why) = match found {
+            Remembered::Since {
+                token,
+                baseline,
+                extra,
+                changed,
+            } => match since(top, baseline, &extra, changed) {
+                Ok((skip, extra)) => {
+                    if let Err(line) = remember(top, &of, token, skip.clone(), extra) {
+                        left_out.push(Diagnostic::Unsaved(line));
+                    }
+                    let local = resolve(top, &skip, commit, left_out)?;
+                    let source = "watchman since the baseline";
+                    left_out.extend(note(top, Some(&of), commit, source, &skip, &local, filter));
+                    return Ok((skip, local, None));
                 }
+                Err(why) => (token, why),
+            },
+            Remembered::Fresh { token, why } => (token, why),
+            Remembered::Cannot(why) => {
+                let asked = Instant::now();
+                let (skip, _) = changes(top, commit, Held::default(), left_out)?;
+                let took = asked.elapsed();
                 let local = resolve(top, &skip, commit, left_out)?;
-                let source = "watchman since the baseline";
-                left_out.extend(note(top, Some(&of), commit, source, &skip, &local, filter));
-                return Ok((skip, local, None));
+                // Said once while the reason holds; git is asked every time.
+                let said = unsaid(top, &of, &why);
+                if said.is_some() || crate::verbose::verbose() {
+                    left_out.push(Diagnostic::Warning(format!(
+                        "watchman cannot say what changed ({why}); asked git what differs from the \
+                         served commit {} (took {})",
+                        short(commit),
+                        crate::verbose::Us(took.as_secs_f64() * 1e6)
+                    )));
+                }
+                let source = "git, as watchman cannot say";
+                left_out.extend(note(top, None, commit, source, &skip, &local, filter));
+                return Ok((skip, local, said));
             }
-            Err(why) => (token, why),
-        },
-        Remembered::Fresh { token, why } => (token, why),
-        Remembered::Cannot(why) => {
-            let asked = Instant::now();
-            let (skip, _) = changes(top, commit, Held::default(), left_out)?;
-            let took = asked.elapsed();
-            let local = resolve(top, &skip, commit, left_out)?;
-            // Said once while the reason holds; git is asked every time.
-            let said = unsaid(top, &of, &why);
-            if said.is_some() || crate::verbose::verbose() {
-                left_out.push(Diagnostic::Warning(format!(
-                    "watchman cannot say what changed ({why}); asked git what differs from the \
-                     served commit {} (took {})",
-                    short(commit),
-                    crate::verbose::Us(took.as_secs_f64() * 1e6)
-                )));
-            }
-            let source = "git, as watchman cannot say";
-            left_out.extend(note(top, None, commit, source, &skip, &local, filter));
-            return Ok((skip, local, said));
+        };
+        // Git is asked next. After the wait for the lock, or when another
+        // search saved a record meanwhile, the record is read again.
+        if lock.is_some() {
+            break (token, why);
         }
+        let held = Lock::take(record.as_deref(), left_out);
+        let again = held.waited || record.as_deref().map(stamp) != seen;
+        lock = Some(held);
+        if !again {
+            break (token, why);
+        }
+        found = remembered(top, &of);
     };
     // The inputs before git reads them: one that moves while git runs
     // makes the next search ask git again. Git lists its settings again
@@ -120,6 +141,92 @@ pub fn skip_list(
     let saved = same.then_some(&of);
     left_out.extend(note(top, saved, commit, source, &skip, &local, filter));
     Ok((skip, local, None))
+}
+
+/// How long a search waits for another to finish asking git.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// The lock of a checkout's record: held while a search asks git, so that
+/// searches started together ask once. It is an advisory lock (`flock`) on
+/// the file of the record with `.lock` added, which stays: the kernel lets
+/// go of the lock when the search ends, crashed or not. A search that
+/// cannot take it, because the file cannot be opened or locked, or because
+/// another holds it past [`LOCK_WAIT`], asks git as it did without it.
+struct Lock {
+    /// Whether the search had to wait for another to let go.
+    waited: bool,
+    /// The lock file, held until it drops.
+    _file: Option<File>,
+}
+
+impl Lock {
+    /// The lock of the record at `record`, waiting at most [`LOCK_WAIT`].
+    /// Under `FMGREP_VERBOSE`, a note to `left_out` says why it is not held.
+    fn take(record: Option<&Path>, left_out: &mut Vec<Diagnostic>) -> Self {
+        let mut held = Self {
+            waited: false,
+            _file: None,
+        };
+        let Some(record) = record else {
+            return held;
+        };
+        let mut path = record.as_os_str().to_owned();
+        path.push(".lock");
+        let path = PathBuf::from(path);
+        let mut say = |line: String| {
+            if crate::verbose::verbose() {
+                left_out.push(Diagnostic::Note(line));
+            }
+        };
+        let file = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| File::create(&path));
+        let file = match file {
+            Ok(file) => file,
+            Err(e) => {
+                say(format!(
+                    "cannot lock {} ({e}); asked git without it",
+                    path.display()
+                ));
+                return held;
+            }
+        };
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    held._file = Some(file);
+                    return held;
+                }
+                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                    held.waited = true;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let secs = LOCK_WAIT.as_secs();
+                    say(format!(
+                        "another search held {} for {secs} s; asked git as well",
+                        path.display()
+                    ));
+                    return held;
+                }
+                Err(TryLockError::Error(e)) => {
+                    say(format!(
+                        "cannot lock {} ({e}); asked git without it",
+                        path.display()
+                    ));
+                    return held;
+                }
+            }
+        }
+    }
+}
+
+/// The size and mtime of `path`, when it exists.
+fn stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 /// Under `FMGREP_VERBOSE`, the note: where the skip list `skip` of the

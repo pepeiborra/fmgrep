@@ -331,6 +331,15 @@ note goes once watchman answers, so the line comes again when it cannot;
 a note that cannot be written is not kept, and the next search says it
 again.
 
+A search that is about to ask git takes a lock first: an advisory `flock`
+on the record's file name with `.lock` added (`<checkout name>-<16 hex digits>.json.lock`,
+never removed; the kernel lets go of the lock when the search ends, crashed
+or not). Searches started together in one checkout thus ask git once: the
+others wait up to 2 s, then read the record again and go on with watchman;
+only the one that asked prints the warning.
+A search that cannot open or lock the file, or that waited 2 s, asks git
+as it would without a lock; `FMGREP_VERBOSE=1` says so in a note.
+
 Such a search also keeps a **pin**, one per checkout and server
 address: `<checkout name>-<16 hex digits>.pin`, in the same directory,
 written in the same way. It keeps the served commit of the server's

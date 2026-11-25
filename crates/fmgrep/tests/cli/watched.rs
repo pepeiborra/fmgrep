@@ -760,6 +760,115 @@ fn another_choice_of_config_files_asks_git_again() {
         assert!(!search(&env).0, "{var}: the new record");
     }
 }
+/// Searches started together in one checkout ask git once: the others
+/// wait for the first, then read what it saved. Each answers right. The
+/// one that asked prints the warning, and the others print nothing.
+#[test]
+fn searches_started_together_ask_git_once() {
+    let r = Remote::new(&FILES);
+    let Some(daemon) = &r.daemon else {
+        return;
+    };
+    let log = r.s.path("git.log");
+    // A slow `status`, so that the searches overlap.
+    let path = first_on_path(&r, "slow", |real| {
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$*\" in\n*status*) sleep 0.5 ;;\nesac\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        )
+    });
+    // The server answers a first query slowly: a search that skips local
+    // changes warms it, and the four then reach git together.
+    let warm =
+        r.s.fmgrep(&r.client)
+            .env("FMGREP_SERVER", &r.addr)
+            .args(["--ignore-local-changes", "-l", "printk"])
+            .output()
+            .unwrap();
+    assert!(warm.status.success());
+    daemon.watch(&r.client);
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            let mut cmd = r.s.fmgrep(&r.client);
+            cmd.env("WATCHMAN_SOCK", &daemon.sock)
+                .env("FMGREP_SERVER", &r.addr)
+                .env("PATH", &path)
+                .args(["-l", "printk"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let want = stdout(&r.oracle("", &["-l", "printk"]));
+    let mut said = Vec::new();
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(stdout(&out), want);
+        if !stderr(&out).is_empty() {
+            said.push(out);
+        }
+    }
+    assert_eq!(said.len(), 1, "one search asked git");
+    asked_again(&r, &said[0], "no record of an earlier search");
+    let runs = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        runs.lines().filter(|l| l.contains("status")).count(),
+        1,
+        "{runs}"
+    );
+}
+
+/// A search that cannot take the lock of its checkout asks git all the
+/// same: after 2 s when another holds it, at once when the file cannot be
+/// opened. Verbose says so.
+#[test]
+fn a_lock_that_is_held_or_unusable_does_not_stop_the_ask() {
+    let r = Remote::new(&FILES);
+    if r.daemon.is_none() {
+        return;
+    }
+    let (log, path) = logging_git(&r);
+    let verbose = [("FMGREP_VERBOSE", "1")];
+    let (out, _) = logged_env(&r, &log, &path, &verbose, &["-l", "printk"]);
+    let text = stderr(&out);
+    let record = PathBuf::from(text.rsplit("record ").next().unwrap().trim());
+    let lock = PathBuf::from(format!("{}.lock", record.display()));
+    assert!(lock.is_file(), "{text}");
+    let held = std::fs::File::open(&lock).unwrap();
+    held.lock().unwrap();
+    std::fs::remove_file(&record).unwrap();
+    let started = std::time::Instant::now();
+    let (out, runs) = logged_env(&r, &log, &path, &verbose, &["-l", "printk"]);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+    assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
+    let text = stderr(&out);
+    let note = format!(
+        "note: another search held {} for 2 s; asked git as well",
+        lock.display()
+    );
+    assert!(text.lines().any(|l| l == note), "{text}");
+    // The ask warns as any other does.
+    let asked = format!(
+        "warning: asked git what differs from the served commit {} (no record of an earlier \
+         search; took ",
+        &r.commit[..7]
+    );
+    assert!(text.lines().any(|l| l.starts_with(&asked)), "{text}");
+    drop(held);
+    // A directory where the lock file goes: it cannot be opened.
+    std::fs::remove_file(&record).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    let (out, runs) = logged_env(&r, &log, &path, &verbose, &["-l", "printk"]);
+    assert!(runs.iter().any(|r| r.contains("status")), "{runs:?}");
+    let text = stderr(&out);
+    let note = format!("note: cannot lock {} (", lock.display());
+    assert!(text.lines().any(|l| l.starts_with(&note)), "{text}");
+    assert!(text.lines().any(|l| l.starts_with(&asked)), "{text}");
+    assert_eq!(stdout(&out), stdout(&r.oracle("", &["-l", "printk"])));
+}
 
 /// With `GIT_ATTR_SOURCE` set, attributes come from a tree, so a commit
 /// can change what converts: git is asked again.
