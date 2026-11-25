@@ -15,8 +15,8 @@ authors.workspace = true
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-docfm-bits = { path = "../docfm-bits", version = "0.1.0" }
-msbwt = { path = "../msbwt", version = "0.1.0" }
+docfm-bits = { path = "../docfm-bits", version = "0.2.0" }
+msbwt = { path = "../msbwt", version = "0.2.0" }
 rayon = "1"
 thiserror = "2"
 zerocopy = { version = "0.8", features = ["derive"] }

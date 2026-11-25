@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
-docfm = { path = "../docfm", version = "0.1.0" }
+docfm = { path = "../docfm", version = "0.2.0" }
 globset = { version = "0.4", default-features = false }
 grep-matcher = "0.1.9"
 grep-printer = "0.3.1"

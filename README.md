@@ -1,14 +1,13 @@
 # fmgrep
 
-fmgrep is ripgrep over a persistent index with efficient support for AND/OR expressions.
+fmgrep is grep over a persistent index with efficient support for AND/OR expressions.
 
-`rg` scans every file of the tree on every search. With the files in the page cache, that takes a
+Both `grep` and `rg` scan every file of the file tree on every search. With the files in the page cache, that takes `rg` a
 median 498 ms on the Chromium repo: not too bad for one search, but a lot for a coding agent that
-runs hundreds. fmgrep indexes the tree once, allowing it to resolve queries much faster following
-the same format and conventions as `rg`.
+runs hundreds. `fmgrep` indexes the tree once, allowing it to resolve queries much faster, while following the same format and conventions as `rg`.
 
 An `fmgrep` server answers a query in the Chromium repo in a median 12.1 ms, 41X faster than `rg`,
-17 times faster than [tgrep](https://github.com/microsoft/tgrep), and 4.8 times faster than
+17X faster than [tgrep](https://github.com/microsoft/tgrep), and 4.8X faster than
 [elgrep](https://github.com/eliosai/sngram). With no server, the median query takes 38 ms. The index
 takes 38 s to build and is 0.78X the size of the repo (medians over all queries; method and every
 row in [BENCHMARKS.md](BENCHMARKS.md)).
@@ -34,26 +33,16 @@ or, from a checkout, `cargo install --path crates/fmgrep`. It needs Rust
 
 ## Dependencies
 
-To run a search you need nothing beyond fmgrep. It does not call `rg`.
-Two programs are optional.
-
-* [Watchman](https://facebook.github.io/watchman/) is a file watcher.
-  On a tree of 50,000 files or more, a search asks it which files
-  changed since the index. Without it, such a search checks every file
-  and prints a warning. The answers are the same. On the Linux kernel,
-  the search takes 76 ms instead of 7.5 ms. `fmgrep serve` needs
-  watchman, unless given `--no-watch` or a `--store-docs` index. See
-  [docs/watchman.md](docs/watchman.md).
-* fmgrep needs `git` only for a shared server of a git checkout.
-  `fmgrep index --store-docs` runs it to learn which commit it indexed.
-  A search from a checkout runs it to find the local changes. Without
-  git, the index records no commit. A client without git prints the
-  server's answer without its own local changes, and warns. See
-  [docs/shared-server.md](docs/shared-server.md).
+* [Watchman](https://facebook.github.io/watchman/) is used to keep track of
+  tree changes since the index was minted. Without `watchman`, `fmgrep` needs
+  to stat every file in the tree unless given `--no-watch` or `--store-docs`.
+  See [docs/watchman.md](docs/watchman.md).
+* `git` is used to enable local change tracking in a remote server scenario.
+  Without a git repo, local changes are ignored. See [docs/shared-server.md](docs/shared-server.md).
 
 ## Usage
 
-Index a tree once, at its root. Then search from anywhere below it, and
+Index a tree once, then search from anywhere below it, and
 the nearest `.fmgrep` index is used. Add `.fmgrep` to `.gitignore`.
 
 ```console
@@ -73,20 +62,13 @@ compiler/GHC/Driver/Main/Hsc.hs
 143:initHscEnv mb_top_dir = do
 ```
 
-`fmgrep` behaves like `rg`, with the same output and exit status. These
-are the differences.
+`fmgrep` behaves like `rg`, with a subset of `rg` flags, the same output and exit status. These are the main differences:
 
 * **It needs an index, and searches only what the index holds.** It
   never finds a hidden, ignored, symlinked or binary file, not even
   with a `-g` glob. A PATH that names one is an error, as is a PATH
   outside the indexed tree; `rg` searches them. A search also finds
   matches in a file edited or added since the index.
-* **Fewer flags.** These work: `-e`, `-F`, `-i`, `-s`, `-S`, `-U`, `-w`, `-x`,
-  `-g`, `--iglob`, `-c`, `-l`, `-o`, `-A`, `-B`, `-C`, `-n`, `-N`, `--heading`,
-  `--color` and `--stats`. Other flags of `rg`, such as `-v`,
-  `-t`, `-m` and `--sort`, fail with exit 2. So do `--hidden` and
-  `--no-ignore`, which no index can honour. `fmgrep --help` lists the
-  flags that work.
 * **It does not search stdin or read a `RIPGREP_CONFIG_PATH` file.** `-` is a
   PATH like any other, not stdin. To filter a pipe, use `rg`.
 * **`--json` prints a counts report.** `--json --matches` prints the
@@ -94,10 +76,7 @@ are the differences.
 * **`index`, `serve` and `status` are commands** when they are the first
   word. Put `--` first to search for one of them.
 
-[docs/usage.md](docs/usage.md) gives each difference with the commands
-that show it. It also covers `fmgrep status`, `--stats` and colour.
-`status` says which index or server a search uses, and what changed
-since.
+See [docs/usage.md](docs/usage.md) for more details.
 
 To search many times in a row, keep the index loaded in a server.
 
@@ -132,16 +111,17 @@ prints the lines of every PATTERN in those files.
 ## Indexing
 
 ```sh
-fmgrep index .              # index the current folder
+fmgrep index [--store-docs] . # Produces an index of the current folder
 ```
 
 `index` takes the files `rg --files` lists (`.gitignore`, `.ignore` and
 `.rgignore` apply; hidden files and symlinks are skipped), minus binary
 files.
 
-A search scans every file it prints, and a regex every candidate. By
-default it opens them in the tree, so answers stay current: edited and new
-files are scanned in full; after many edits, remove `.fmgrep` and re-index.
+A search scans every file it prints. By default it opens them in the tree, 
+so answers stay current: edited and new files are scanned in full. With 
+`--store-docs` the full text is included in the index, and the tree is no
+longer scanned; this reduces latency and enables remote servers without a checkout.
 
 | fmgrep / rg | linux | chromium | aosp |
 |---|--:|--:|--:|
@@ -151,16 +131,12 @@ files are scanned in full; after many edits, remove `.fmgrep` and re-index.
 | regex p50 | 7.98 / 115 ms | 30.0 / 490 ms | 13.1 / 1530 ms |
 
 aosp is Android's platform source: 17.4 GB of text in 1.25 M files from
-about a thousand repositories. AWS i4i.4xlarge, Linux; method and full
-tables in [BENCHMARKS.md](BENCHMARKS.md).
-[scripts/ec2-bench.sh](scripts/ec2-bench.sh) runs the benchmark on such an
-instance ([docs/benchmark.md](docs/benchmark.md#ec2)).
+about a thousand repositories. Method and full tables in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## How it works
 
-An indexed search engine avoids scanning a regex over every file of a
-large tree. Most build an inverted index of posting lists keyed
-by n-grams. fmgrep builds an
+Most indexed search engines build an inverted index of posting lists keyed
+by n-grams; fmgrep builds an
 [FM-index](https://en.wikipedia.org/wiki/FM-index) instead. This idea was
 originally coined and pursued by Nathan Hawkes (@nhawkes) at Meta. 
 fmgrep keeps the Burrows-Wheeler transform of the tree, with the id of the 
@@ -168,13 +144,12 @@ file at sampled rows ([crates/docfm](crates/docfm/README.md)). The
 index is mapped from disk and used in place, so a search touches only
 the pages it needs.
 
-An FM-index provides two main operations.
+An FM-index provides two main operations:
 
 * `count` says how many times a pattern occurs in the tree. It takes
-  time proportional to the length of the pattern, whatever the size of
-  the tree.
-* `locate` says which files hold the pattern. It takes time proportional
-  to the number of occurrences of the pattern in the tree. 
+  O(pattern) time, whatever the size of the tree.
+* `locate` says which files hold the pattern. It takes O(occurrences) time,
+  that is, the number of occurrences of the pattern in the tree. 
 
 fmgrep answers a literal with `locate`, which also gives its count in
 each file. An AND `count`s each side and `locate`s the rarest, 
@@ -187,17 +162,16 @@ match holds, or walks the regex over the index as an automaton. Either
 gives candidate files, which are then scanned: in the worst case, a regex
 that gives the index nothing to narrow makes every file a candidate.
 
-By comparison, an n-gram index must break a pattern into n-grams. The files it 
-finds hold the n-grams, not necessarily the pattern, so it scans each one to
+By comparison, an n-gram index must break a pattern into n-grams. The candidates it finds hold the n-grams, not necessarily the pattern. 
+So it must scan the intersection of all the candidates to
 confirm. An FM-index looks up a literal whole, so every file it finds
-holds the literal. That has three consequences.
+holds the literal. That has three consequences:
 
 * A literal search scans only the files it prints lines from, and `-l`
   scans none. The exception is a file edited since the index, which is
   scanned in full.
 * There are no posting lists to intersect, except for the sides of an AND.
-* The index is never lowercased to support `-i`. It holds the text as
-  written, and a `-i` term walks its case variants through the index.
+* The index is never lowercased to support `-i`: an `-i` query walks all the case variants through the index.
   The case variants are those of Unicode simple case folding.
 
 ## Links
