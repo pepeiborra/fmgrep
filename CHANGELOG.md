@@ -10,11 +10,10 @@ index, and read the table below before you script a search. Details are in
 
 - An index of v0.1.0 is refused: remove `.fmgrep` and run `fmgrep index` again. The format is now 9.
 - The manifest is `manifest.bin` now: read it with `fmgrep status --json`, not `jq`.
-- An index holds the files that `rg --files` lists, minus binary files. Ignored, hidden and symlinked files are left out.
+- An index holds the files that `rg --files` lists, minus binary files. Ignored and symlinked files are now left out, as hidden files already were.
 - A PATTERN is a regex, as in rg. `-F` makes it text. The slashes of `/re/` are now text.
 - The first argument is the PATTERN and every other is a PATH, as in rg. Give several patterns with `-e`.
 - A PATH that does not exist, or that the index lacks, is an error (exit 2). The other PATHs are still searched.
-- `--no-ignore`, `-u`, `--hidden`, `-L`, `-a`, `-z`, `--pre` and `-E` are refused with a reason.
 - An empty pattern matches every line, as in rg.
 - Piped output prints `path:text`, with no headings and no line numbers, as rg does.
 - `fmgrep status` is a command: search for the word with `fmgrep -- status`. The flag `--status` is gone.
@@ -39,6 +38,7 @@ index, and read the table below before you script a search. Details are in
 ### New
 
 - `-e`/`--regexp`, `-F`/`--fixed-strings`, `-s`/`--case-sensitive` and `-S`/`--smart-case`, as in rg.
+- `--no-ignore`, `-u`, `--hidden`, `-L`, `-a`, `-z`, `--pre` and `-E` are refused with a reason, not as an unexpected argument.
 - `cargo install fmgrep` needs no C compiler.
 - `FMGREP_SERVER=HOST:PORT` searches a shared `fmgrep serve` from your own checkout, with your local edits, new files and commits included ([docs/shared-server.md](docs/shared-server.md)).
 - `--ignore-local-changes` prints the server's answer alone.
@@ -48,7 +48,7 @@ index, and read the table below before you script a search. Details are in
 - `fmgrep status` says which index or server a search uses, what it holds and what changed since the build ([docs/usage.md](docs/usage.md#status)).
 - `--stats` prints rg's statistics after the matched lines.
 - Files that start with a UTF-16 byte order mark are indexed and searched, as in rg.
-- A file or directory that a search cannot read gets a warning. It used to drop out silently.
+- A file new since the index that a search cannot read gets a warning, as an indexed file does. It used to drop out silently.
 - A search that cannot use watchman says why, once, and checks every file.
 - An ignore file edited after the index applies to the next search, with a warning.
 - `FMGREP_VERBOSE=1` prints how long each phase of a search took.
@@ -59,8 +59,7 @@ index, and read the table below before you script a search. Details are in
 - A regex with a literal in it reads far fewer files.
 - A `-i` search with a PATH or a glob is faster.
 - A search without a server opens its index sooner.
-- A local or served search waits at most 100 ms for watchman's answer, not 1 to 5 s.
-- A search from a checkout through a shared server waits at most 500 ms for it.
+- A search waits at most 100 ms for watchman's answer, not 1 to 5 s.
 - Finding the daemon can add up to 500 ms, when no earlier search left a record of it.
 
 ### Fixed
