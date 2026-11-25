@@ -379,6 +379,81 @@ fn a_file_two_paths_reach_prints_once_for_each() {
     }
 }
 
+/// rg 15.2.0 says "3 files contained matches", "3 files searched" and "63
+/// bytes searched" for the same arguments.
+#[test]
+fn stats_count_each_copy_of_a_file() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let (all, _) = trees(tmp.path(), store_docs);
+        let sub = all.join("sub").display().to_string();
+        let c = format!("{sub}/c.c");
+        for (paths, want) in [
+            (
+                vec![sub.clone()],
+                ["2 files contained", "2 files searched", "38 bytes"],
+            ),
+            (
+                vec![c.clone(), sub.clone()],
+                ["3 files contained", "3 files searched", "63 bytes"],
+            ),
+        ] {
+            let out = printed(
+                &all,
+                &["--stats", "-n"],
+                &[
+                    &["printk"][..],
+                    &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+                ]
+                .concat(),
+            );
+            for line in want {
+                assert!(out.contains(line), "{paths:?} {line}: {out}");
+            }
+        }
+    }
+}
+
+/// The JSON summary counts the index plus each extra copy, so it never says
+/// more files matched than were searched. rg says 4 and 4 for `sub sub`.
+#[test]
+fn the_json_summary_counts_each_copy() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let (all, _) = trees(tmp.path(), store_docs);
+        let sub = all.join("sub").display().to_string();
+        let json = printed(&all, &["--json", "--matches"], &["printk", &sub, &sub]);
+        let summary = timeless_lines(&json)
+            .into_iter()
+            .find(|v| v["type"] == "summary")
+            .unwrap();
+        let stats = &summary["data"]["stats"];
+        let (searches, matched) = (&stats["searches"], &stats["searches_with_match"]);
+        assert_eq!(matched, 4, "{summary}");
+        assert_eq!(searches, 7, "{summary}");
+    }
+}
+
+/// A BOM is not searched, in a copy as in the first. rg 15.2.0 says 8 bytes
+/// for `a.txt a.txt` under --json and --stats, 4 in each file's event.
+#[test]
+fn an_extra_copy_leaves_its_bom_out() {
+    for store_docs in LAYOUTS {
+        let tmp = tempfile::tempdir().unwrap();
+        let bom: &[u8] = b"\xef\xbb\xbffoo\n";
+        let all = dotted_tree(tmp.path(), "t", &[("a.txt", bom)], store_docs);
+        let a = all.join("a.txt").display().to_string();
+        let json = printed(&all, &["--json", "--matches"], &["foo", &a, &a]);
+        let summary = timeless_lines(&json)
+            .into_iter()
+            .find(|v| v["type"] == "summary")
+            .unwrap();
+        assert_eq!(summary["data"]["stats"]["bytes_searched"], 8, "{summary}");
+        let stats = printed(&all, &["--stats"], &["foo", &a, &a]);
+        assert!(stats.contains("\n8 bytes searched\n"), "{stats}");
+    }
+}
+
 #[test]
 fn every_way_to_reach_a_file_twice_prints_it_twice() {
     let tmp = tempfile::tempdir().unwrap();

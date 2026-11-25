@@ -46,7 +46,8 @@ outside the indexed tree, a search covers the whole tree, relative to
 its root. A PATH is relative to the cwd, and its files print as rg
 prints them. Files print in path order. A file that several PATHs keep
 prints once for each, under each one's name, as in rg: the copies sit
-together, in PATH order. `-c`, `-l` and the JSON events count each copy.
+together, in PATH order. `-c`, `-l` and the JSON events count each copy, and so does the JSON
+summary's `searches`.
 
 ### A PATTERN is a regex
 

@@ -223,9 +223,12 @@ impl PathFilter {
 
     /// The positions of `rels`, paths from the root of files that no index
     /// holds, that a search keeps.
-    pub fn kept_of<'a>(&'a self, rels: &'a [String]) -> impl Iterator<Item = usize> + 'a {
+    /// Each comes with how many PATHs keep it.
+    pub fn kept_of<'a>(&'a self, rels: &'a [String]) -> impl Iterator<Item = (usize, usize)> + 'a {
         let mut keep = self.keeper();
-        (rels.iter().enumerate()).filter_map(move |(i, rel)| keep(rel).then_some(i))
+        (rels.iter().enumerate())
+            .filter(move |(_, rel)| keep(rel))
+            .map(move |(i, rel)| (i, self.copies(rel)))
     }
 
     /// Keep the items whose file a search keeps; Err, and every item kept,
@@ -348,6 +351,11 @@ impl PathFilter {
             out.push(self.printed(path));
         }
         out
+    }
+
+    /// Whether a file may be reached by several PATHs.
+    pub fn overlaps(&self) -> bool {
+        self.overlap
     }
 
     /// How many names [`PathFilter::names`] gives `path`.

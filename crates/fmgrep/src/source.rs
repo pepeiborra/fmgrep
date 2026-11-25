@@ -557,6 +557,11 @@ pub struct Files {
 }
 
 impl Files {
+    /// The tree the docs are read from.
+    pub fn root(&self) -> &Path {
+        &self.known.root
+    }
+
     /// Checks the root only; no doc is statted here.
     pub fn open(root: PathBuf, stamps: Stamps, num_docs: usize) -> Result<Self, String> {
         if !root.is_dir() {

@@ -139,7 +139,8 @@ printed bytes:
 | a matching file | `{"doc":"<path from the root>","path":"<path as printed>","stats":[matches,matched_lines,bytes_printed]}`, a newline, then the file's printed bytes; the three counts are 0 in `lines` without `stats` |
 | a term ends | `{"end":<QueryReport>}` |
 
-Files come in path order within each term. Banners, headings and `--`
+Files come in path order within each term. A file that several PATHs keep
+comes once for each, in PATH order. Banners, headings and `--`
 separators are not in the frames: the client adds them. A file's frame
 holds all that the file prints, however long. The result is
 `{"report"}`. A search that fails after output started sends the frames
@@ -481,7 +482,8 @@ deliberate:
 3. `binary_offset` is always null, because binary files are skipped at
    index time.
 4. `searches` and `bytes_searched` cover the whole index, which is what rg
-   over the indexed file list reports, whatever `-g` or PATH. Leading UTF-8
+   over the indexed file list reports, whatever `-g` or PATH, plus one for
+   each extra copy of a file that several PATHs keep. Leading UTF-8
    BOMs are excluded, as rg's searcher strips them.
 5. `path` is always `{"text": ...}`, because manifest paths are UTF-8.
 6. `-c`, `--count-matches` and `-l` with `--json` print the report; rg

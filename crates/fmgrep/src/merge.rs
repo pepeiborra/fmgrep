@@ -73,9 +73,13 @@ pub fn part(
 ) -> Result<Part, String> {
     let (index, mut loaded) = listed(top, &local.files)?;
     let corpus = match (&req.filter, stats) {
-        (Some(f), true) => {
-            (f.kept_of(&local.files)).fold((0, 0), |(n, bytes), i| (n + 1, bytes + local.lens[i]))
-        }
+        (Some(f), true) => (f.kept_of(&local.files)).fold((0, 0), |(n, bytes), (i, k)| {
+            (n + k, bytes + local.lens[i] * k as u64)
+        }),
+        (Some(f), false) if req.output.json() && f.overlaps() => (f.kept_of(&local.files))
+            .fold((local.files.len(), local.bytes), |(n, bytes), (i, k)| {
+                (n + k - 1, bytes + local.lens[i] * (k - 1) as u64)
+            }),
         _ => (local.files.len(), local.bytes),
     };
     let mut keep = Keep::default();
