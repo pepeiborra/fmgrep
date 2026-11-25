@@ -316,6 +316,39 @@ fn a_checkout_and_a_rebase_do_not_ask_git() {
     }
 }
 
+/// A branch whose config file (`includeIf "onbranch:side"`) sets
+/// `core.autocrlf`: a checkout of it changes no file, but git's settings,
+/// and the search falls back with the warning, as a first search on that
+/// branch does. Also in a reftable repository, where a checkout leaves the
+/// HEAD file as it is (with a git that cannot migrate, ref files again).
+#[test]
+fn a_branch_that_turns_a_conversion_on_asks_git_again() {
+    for reftable in [false, true] {
+        a_switch_to_a_converting_branch(reftable);
+    }
+}
+
+fn a_switch_to_a_converting_branch(reftable: bool) {
+    let side = |r: &Remote, c: &Path| {
+        let migrate = ["refs", "migrate", "--ref-format=reftable"];
+        if reftable && r.s.git_output(c, &migrate).status.success() {
+            assert!(c.join(".git/reftable/tables.list").exists());
+        }
+        std::fs::write(c.join(".git/side.cfg"), "[core]\n\tautocrlf = true\n").unwrap();
+        r.s.git(c, &["config", "includeIf.onbranch:side.path", "side.cfg"]);
+        r.s.git(c, &["branch", "side"]);
+    };
+    let switch = |r: &Remote, c: &Path| {
+        r.s.git(c, &["checkout", "-q", "side"]);
+    };
+    if let Some((out, runs)) = after(&FILES, side, switch) {
+        let converts =
+            "warning: local changes are ignored (git converts files (core.autocrlf=true))";
+        assert!(stderr(&out).starts_with(converts), "{}", stderr(&out));
+        assert!(runs.iter().any(|r| r.starts_with("status")), "{runs:?}");
+    }
+}
+
 /// What a new ask would refuse is still refused: a skip-worktree bit set
 /// later, a submodule added, and a file that an attribute converts, now
 /// tracked. Each asks git, which refuses.

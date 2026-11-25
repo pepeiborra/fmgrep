@@ -291,7 +291,7 @@ index directory. The record is one line of JSON:
 | `v` | `2` for an index load, `3` for a checkout; a record of another version is not used |
 | `root` | the canonical tree |
 | `of` | what the baseline differs from: `index <canonical index directory>@<the manifest's index_started_ns>`, so a rebuilt index does not use it; or `git <commit>` |
-| `extra` | a search through a server only: `git`, the paths in the checkout's git directory that decide what git status says and the config files that git reads (system, global, the repository's and the worktree's, those that `include.path` and `includeIf` name and the system file that `git var GIT_CONFIG_SYSTEM` names, also when missing or empty, the system attributes file that `git var GIT_ATTR_SYSTEM` names, and the `core.excludesFile` and `core.attributesFile` they set); `stamps`, the `[path, [size, mtime_ns]]` (or `null`) of those and of the global git config, ignore and attributes files and the `.ignore` and `.rgignore` files above the checkout; and `env`, the `[name, value]` (or `[name, null]` when unset) of the variables that choose those files: `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `HOME`, `XDG_CONFIG_HOME`, `GIT_ATTR_NOSYSTEM` and `GIT_ATTR_SOURCE`; and, of a checkout, `index` (the path of git's index), `moves` (the paths of HEAD, the packed refs and the ref HEAD is on, which may move with no new ask) and `entries`, a digest (FNV-1a, 16 hex digits) of the tag, mode and path of each entry of `git ls-files -s -v`, and of the blob of each `.gitattributes` |
+| `extra` | a search through a server only: `git`, the paths in the checkout's git directory that decide what git status says and the config files that git reads (system, global, the repository's and the worktree's, those that `include.path` and `includeIf` name and the system file that `git var GIT_CONFIG_SYSTEM` names, also when missing or empty, the system attributes file that `git var GIT_ATTR_SYSTEM` names, and the `core.excludesFile` and `core.attributesFile` they set); `stamps`, the `[path, [size, mtime_ns]]` (or `null`) of those and of the global git config, ignore and attributes files and the `.ignore` and `.rgignore` files above the checkout; and `env`, the `[name, value]` (or `[name, null]` when unset) of the variables that choose those files: `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `HOME`, `XDG_CONFIG_HOME`, `GIT_ATTR_NOSYSTEM` and `GIT_ATTR_SOURCE`; and, of a checkout, `index` (the path of git's index), `moves` (the paths of HEAD, the packed refs and the ref HEAD is on, and `reftable/tables.list` in a reftable repository, of the worktree and of the common git directory, which may move with no new ask) and `entries`, a digest (FNV-1a, 16 hex digits) of the tag, mode and path of each entry of `git ls-files -s -v`, and of the blob of each `.gitattributes`; and `settings`, a digest (FNV-1a, 16 hex digits) of what `git config --list --show-origin -z` printed |
 | `token` | `sock`, `watch`, `relative`, `clock`: a watchman clock of the watch on the tree, and the daemon's socket |
 | `baseline` | the paths that may differ from the index, ascending; `null` when more than an eighth of the documents (at least 64) do |
 
@@ -308,12 +308,17 @@ another value, when a `.gitattributes` changed, or when more than 10,000
 paths would be listed. A move of HEAD, of the ref it is on, of the packed
 refs or of the index is not an input of that kind: the skip list only has
 to hold the files that differ from the served commit, and watchman names
-each file that git writes. When only HEAD or a ref moved, the search
-refreshes the stamps and runs no git. When the index moved, it runs
+each file that git writes. When only a ref or the packed refs moved, the
+search refreshes the stamps and runs no git. When HEAD itself moved (a
+checkout, a rebase), git lists its settings once, as `includeIf
+"onbranch:..."` can change them with no file changed: settings other
+than the record's make it ask git. A reftable repository never rewrites
+HEAD, so there a move of a `reftable/tables.list` counts as a move of
+HEAD, and a commit lists the settings too. When the index moved, it runs
 `git ls-files -s -v` once: the same `entries` as in the record means no
 ask; other entries are checked for what git would convert, and for a
 hidden entry or a submodule; only those make it ask git, which then
-refuses. With `GIT_ATTR_SOURCE` set, a move of HEAD or a ref asks too,
+refuses. With `GIT_ATTR_SOURCE` set, a move of HEAD, a ref or a ref table asks too,
 as attributes follow HEAD. Git lists its settings before and after it runs
 for a new baseline; when the two lists differ, the search saves no
 record, and the next one asks git again. Without watchman it asks git
