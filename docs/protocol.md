@@ -333,7 +333,10 @@ runs git with `LC_ALL=C`.
 
 It asks git once and saves what git found with a watchman token in a
 record ([index-format.md](index-format.md#watchman)); later searches ask
-watchman what changed since, and run no git. A search that asks git for
+watchman what changed since, and run no git. A commit, `git status`,
+`git add` or a checkout does not make it ask again: at most the search
+lists the index once (`git ls-files`) to see that git would not refuse
+the checkout now. A search that asks git for
 a new baseline says why, in one line: `warning: asked git what differs
 from the served commit <id> (<why>; took <time>); later searches ask
 watchman`. When git's settings changed while git ran, the line ends
