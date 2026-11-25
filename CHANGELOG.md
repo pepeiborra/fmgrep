@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.2.0)
+## 0.2.0 (2026-11-25)
 
 This release breaks the command line and the index of v0.1.0. Rebuild every
 index, and read the table below before you script a search. Details are in
