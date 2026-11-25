@@ -44,7 +44,9 @@ Without a PATH, a search covers the subtree of the cwd. Paths print
 relative to the cwd, as in rg, and `-g` globs match relative to it. From
 outside the indexed tree, a search covers the whole tree, relative to
 its root. A PATH is relative to the cwd, and its files print as rg
-prints them. Files print in path order.
+prints them. Files print in path order. A file that several PATHs keep
+prints once for each, under each one's name, as in rg: the copies sit
+together, in PATH order. `-c`, `-l` and the JSON events count each copy.
 
 ### A PATTERN is a regex
 

@@ -76,3 +76,4 @@ index, and read the table below before you script a search. Details are in
 - A query that panics in `fmgrep serve` now gets error -32603, and the server goes on serving other queries.
 - A served search that fails mid-way prints what it found, then the error, as a local search does.
 - An idle `fmgrep serve` on Linux no longer keeps 8 cores busy and grows by 550 MB.
+- A file that two PATHs reach, or a PATH given twice, prints once for each PATH, as in rg. It printed once.

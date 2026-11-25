@@ -119,6 +119,7 @@ pub fn line_scan(m: &RegexMatcher, mode: MatchMode) -> bool {
 }
 
 /// A matching document's printed bytes and the stats its printer kept.
+#[derive(Clone)]
 pub struct Found {
     pub printed: Vec<u8>,
     /// rg's stats; none from the lines printer without `--stats` or `-o`.

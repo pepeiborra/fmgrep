@@ -14,7 +14,7 @@ use std::time::Instant;
 use grep_printer::Stats;
 use grep_regex::RegexMatcher;
 
-use super::{Loaded, QueryRequest, corpus, in_index, path_of, prepare, printed, searched};
+use super::{Loaded, QueryRequest, copies, corpus, in_index, names, path_of, prepare, searched};
 use crate::UNIFIED_SEPARATOR;
 use crate::diagnostic::Diagnostic;
 use crate::expr::{Expr, REGEX_REFUSAL, TERMS_REFUSAL};
@@ -503,13 +503,15 @@ pub fn answer_expr(
                 &order,
                 fetch_threads(),
                 &map,
-                &mut |_, _, counts| {
+                &mut |doc, _, counts| {
                     if let Some(counts) = counts {
-                        docs_matched += 1;
-                        leaf_totals
-                            .iter_mut()
-                            .zip(counts)
-                            .for_each(|(t, c)| *t += c);
+                        for _ in 0..copies(&paths, filter, doc)? {
+                            docs_matched += 1;
+                            leaf_totals
+                                .iter_mut()
+                                .zip(&counts)
+                                .for_each(|(t, c)| *t += c);
+                        }
                     }
                     Ok(())
                 },
@@ -517,14 +519,14 @@ pub fn answer_expr(
             )?;
             // Decided members left unfetched: every regex leaf counts 0 there.
             let rest = difference(&root.yes, &fetch);
-            docs_matched += rest.len();
+            for &d in &rest {
+                docs_matched += copies(&paths, filter, d)?;
+            }
             for ((l, (exact, _)), total) in leaves.iter().zip(&hits).zip(&mut leaf_totals) {
                 if matches!(l.probe, Probe::Literal(_)) {
-                    *total += exact
-                        .iter()
-                        .filter(|(d, _)| rest.binary_search(d).is_ok())
-                        .map(|&(_, c)| c)
-                        .sum::<u64>();
+                    for &(d, c) in exact.iter().filter(|(d, _)| rest.binary_search(d).is_ok()) {
+                        *total += c * copies(&paths, filter, d)? as u64;
+                    }
                 }
             }
             report.counts_exact = sum_is_exact(&leaves);
@@ -540,9 +542,8 @@ pub fn answer_expr(
                 while *n < root.yes.len()
                     && below.is_none_or(|b| paths.cmp(root.yes[*n], b).is_lt())
                 {
-                    listed(sink, &paths, filter, root.yes[*n])?;
+                    docs_matched += listed(sink, &paths, filter, root.yes[*n])?;
                     *n += 1;
-                    docs_matched += 1;
                 }
                 Ok(())
             };
@@ -558,8 +559,7 @@ pub fn answer_expr(
                 &mut |doc, _, member| {
                     emit_yes(sink, Some(doc), &mut next_yes)?;
                     if member {
-                        members += 1;
-                        listed(sink, &paths, filter, doc)?;
+                        members += listed(sink, &paths, filter, doc)?;
                     }
                     Ok(())
                 },
@@ -591,9 +591,10 @@ pub fn answer_expr(
                     return Ok::<_, String>(None);
                 }
                 let bytes = matching::strip_bom(raw);
-                let Some(found) = searched(alt, &paths, filter, req.output, doc, bytes)? else {
+                let found = searched(alt, &paths, filter, req.output, doc, bytes)?;
+                if found.is_empty() {
                     return Ok(None);
-                };
+                }
                 let mut counts = Vec::with_capacity(counters.len());
                 for c in &counters {
                     let found = c.as_ref().map(|c| c.doc("", bytes)).transpose()?.flatten();
@@ -608,21 +609,24 @@ pub fn answer_expr(
                 fetch_threads(),
                 &map,
                 &mut |doc, _, scanned| {
-                    let Some(((path, f), counts)) = scanned? else {
+                    let Some((found, counts)) = scanned? else {
                         return Ok(());
                     };
-                    docs_matched += 1;
-                    report.total_matches += f.count.max(1);
-                    leaf_totals
-                        .iter_mut()
-                        .zip(counts)
-                        .for_each(|(t, c)| *t += c);
-                    sink.doc(DocMatches {
-                        rel: path_of(&paths, doc)?,
-                        path: &path,
-                        printed: &f.printed,
-                        stats: &f.stats,
-                    })
+                    for (path, f) in found {
+                        docs_matched += 1;
+                        report.total_matches += f.count.max(1);
+                        leaf_totals
+                            .iter_mut()
+                            .zip(&counts)
+                            .for_each(|(t, c)| *t += c);
+                        sink.doc(DocMatches {
+                            rel: path_of(&paths, doc)?,
+                            path: &path,
+                            printed: &f.printed,
+                            stats: &f.stats,
+                        })?;
+                    }
+                    Ok(())
                 },
                 left_out,
             )?;
@@ -760,19 +764,24 @@ fn alternation_of(
     Ok(m.map(|m| DocSearch::new(m, req.output, req.mode)))
 }
 
-/// A `-l` line: membership only.
+/// The `-l` lines of a file: membership only, one for each PATH that keeps
+/// it. Returns how many.
 fn listed(
     sink: &mut dyn MatchSink,
     paths: &Paths<'_>,
     filter: Option<&PathFilter>,
     doc: usize,
-) -> Result<(), String> {
-    sink.doc(DocMatches {
-        rel: path_of(paths, doc)?,
-        path: &printed(paths, filter, doc)?,
-        printed: &[],
-        stats: &Stats::new(),
-    })
+) -> Result<usize, String> {
+    let names = names(paths, filter, doc)?;
+    for name in &names {
+        sink.doc(DocMatches {
+            rel: path_of(paths, doc)?,
+            path: name,
+            printed: &[],
+            stats: &Stats::new(),
+        })?;
+    }
+    Ok(names.len())
 }
 
 /// Everything a fetched document is judged by.

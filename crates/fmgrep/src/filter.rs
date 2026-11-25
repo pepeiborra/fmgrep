@@ -26,6 +26,9 @@ pub struct PathFilter {
     includes: usize,
     paths: Vec<SearchPath>,
     cwd: String,
+    /// Whether two PATHs are equal or one lies under the other, so that a
+    /// file may be reached by several.
+    overlap: bool,
 }
 
 struct Rule {
@@ -70,7 +73,14 @@ impl PathFilter {
             return Ok(None);
         }
         let set = set.build().map_err(|e| format!("error: {e}"))?;
+        let overlap = paths.iter().enumerate().any(|(i, a)| {
+            paths[i + 1..].iter().any(|b| {
+                let (x, y) = (a.path.trim_end_matches('/'), b.path.trim_end_matches('/'));
+                x == y || below(x, y).is_some() || below(y, x).is_some()
+            })
+        });
         Ok(Some(Self {
+            overlap,
             set,
             includes: rules.iter().filter(|r| !r.exclude).count(),
             rules,
@@ -305,6 +315,47 @@ impl PathFilter {
             }
         }
         Cow::Borrowed(path)
+    }
+
+    /// `path` as rg prints it under each PATH that keeps it, in PATH order:
+    /// a file that several PATHs reach is searched once for each.
+    pub fn names<'p>(&self, path: &'p str) -> Vec<Cow<'p, str>> {
+        if !self.overlap {
+            return vec![self.printed(path)];
+        }
+        let (mut hits, mut buf) = (Vec::new(), String::new());
+        let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let mut out = Vec::new();
+        for root in &self.paths {
+            let rest = below(&root.path, path);
+            if rest.is_none() && path != root.path.trim_end_matches('/') {
+                continue;
+            }
+            if let Some(rest) = rest
+                && !(self.open(root, parent, &mut hits, &mut buf)
+                    && self.admits(root, rest, &mut hits, &mut buf))
+            {
+                continue;
+            }
+            let mut name = String::new();
+            match rest {
+                Some(rest) => join(&root.name, rest, &mut name),
+                None => name.push_str(&root.name),
+            }
+            out.push(Cow::Owned(name));
+        }
+        if out.is_empty() {
+            out.push(self.printed(path));
+        }
+        out
+    }
+
+    /// How many names [`PathFilter::names`] gives `path`.
+    pub fn copies(&self, path: &str) -> usize {
+        match self.overlap {
+            true => self.names(path).len(),
+            false => 1,
+        }
     }
 
     /// Whether no directory from below `root` down to `dir` is excluded.
